@@ -1064,6 +1064,34 @@ def detectar_comando_tests(ws: Workspace, completo: bool = False) -> Optional[tu
                 return "make test", "make test"
         except OSError:
             pass
+    return _detectar_tests_otros(raiz)
+
+
+def _detectar_tests_otros(raiz: Path) -> Optional[tuple[str, str]]:
+    """Ruby (minitest), Perl (prove), PHP (phpunit o runner propio), Bash y Java sin build tool."""
+    if shutil.which("ruby"):
+        rb = sorted({*raiz.glob("test/**/test_*.rb"), *raiz.glob("test/**/*_test.rb")})
+        if rb:
+            carga = "; ".join(f"require './{p.relative_to(raiz).as_posix()}'" for p in rb[:40])
+            return f"ruby -Ilib -Itest -e {shlex.quote(carga)}", "minitest"
+    if shutil.which("prove") and (raiz / "t").is_dir() and any((raiz / "t").glob("*.t")):
+        return "prove -l t", "prove"
+    if shutil.which("php"):
+        if (raiz / "phpunit.xml").is_file() or (raiz / "phpunit.xml.dist").is_file():
+            local = raiz / "vendor" / "bin" / "phpunit"
+            if local.is_file():
+                return "vendor/bin/phpunit", "phpunit"
+            if shutil.which("phpunit"):
+                return "phpunit", "phpunit"
+        if (raiz / "tests" / "run.php").is_file():
+            return "php tests/run.php", "php tests"
+    if (raiz / "tests" / "run.sh").is_file() and shutil.which("bash"):
+        return "bash tests/run.sh", "bash tests"
+    sh = sorted((raiz / "tests").glob("test_*.sh")) if (raiz / "tests").is_dir() else []
+    if sh and shutil.which("bash"):
+        return " && ".join(f"bash {shlex.quote(p.relative_to(raiz).as_posix())}" for p in sh), "bash tests"
+    if (raiz / "tests" / "run_tests.sh").is_file():
+        return "sh tests/run_tests.sh", "sh tests"
     return None
 
 

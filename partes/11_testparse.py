@@ -63,13 +63,16 @@ _RE_JEST = re.compile(r"^Tests:\s+(.*?)(\d+)\s+total", re.M)
 _RE_VITEST = re.compile(r"^\s*Tests\s+(.*)\((\d+)\)", re.M)
 _RE_MOCHA = re.compile(r"^\s*(\d+)\s+(passing|failing|pending)", re.M)
 _RE_GO_CASO = re.compile(r"^\s*--- (PASS|FAIL|SKIP): (\S+)", re.M)
-_RE_GO_PAQUETE = re.compile(r"^(ok|FAIL|\?)\s+\S+", re.M)
+# "ok  \tmodulo/pkg\t0.01s", "FAIL\tmodulo/pkg [build failed]", "?   \tmodulo/cmd\t[no test files]"
+# (no confundir con TAP: "ok 1 - nombre")
+_RE_GO_PAQUETE = re.compile(r"^(ok|FAIL|\?)\s+(?!\d+\b)\S+\s+(?:[\d.]+s|\(cached\)|\[[\w ]+\])", re.M)
 _RE_CARGO = re.compile(r"test result: \w+\. (\d+) passed; (\d+) failed; (\d+) ignored")
 _RE_CARGO_FALLO = re.compile(r"^test (\S+) \.\.\. FAILED", re.M)
 
 
 def _pytest(salida: str) -> Optional[ConteoTests]:
-    lineas = [l for l in salida.splitlines() if re.search(r"\b(passed|failed|errors?)\b", l) and re.search(r"\bin\s+[\d.]+s", l)]
+    lineas = [l for l in salida.splitlines() if re.search(r"\b(passed|failed|errors?)\b", l)
+              and re.search(r"\bin\s+[\d.]+s", l) and not l.lstrip().startswith("test result:")]  # cargo
     if not lineas:
         if "no tests ran" in salida.lower():
             return ConteoTests(fuente="pytest", reconocido=True)
@@ -120,7 +123,7 @@ def _tap(salida: str) -> Optional[ConteoTests]:
     datos = {k: int(v) for k, v in _RE_TAP_RESUMEN.findall(salida)}
     if "pass" not in datos and "fail" not in datos:
         return None
-    c = ConteoTests(fuente="node --test", reconocido=True)
+    c = ConteoTests(fuente="node --test" if ("ℹ" in salida or "duration_ms" in salida) else "TAP", reconocido=True)
     c.pasados = datos.get("pass", 0)
     c.fallados = datos.get("fail", 0) + datos.get("cancelled", 0)
     c.omitidos = datos.get("skipped", 0) + datos.get("todo", 0)

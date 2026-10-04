@@ -313,6 +313,8 @@ class TestPlantillas(BaseTest):
                     continue
                 if not plantilla.disponible():
                     continue
+                if set(plantilla.requiere) & {"go", "cargo", "javac", "make"} and not os.getenv("REAPER_AUTOTEST_COMPLETO"):
+                    continue  # compilar Go/Rust/Java/C tarda: solo con REAPER_AUTOTEST_COMPLETO=1
                 destino = self.dir / "plantillas_generadas" / nombre.replace("-", "_")
                 creados = crear_desde_plantilla(nombre, destino)
                 self.assertIn("REAPER.md", creados)
