@@ -1,0 +1,17147 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+REAPER v7.0.0 «Dragón» — agente de programación autónomo para Termux vía OpenRouter
+(estilo Claude Code / Codex / Antigravity, pensado para sacarle el máximo a un modelo de 24B).
+
+Archivo único generado desde partes/ con empaquetar.py.
+
+QUÉ TRAE LA v7
+  1. Tests primero + torneo: el QA escribe la especificación ejecutable ANTES de
+     implementar; por tarea compiten N implementadores en copias aisladas del
+     proyecto (temperaturas 0.1 / 0.4 / 0.7) y gana el que pasa más tests reales.
+  2. Escalada: si una tarea falla la verificación 2 veces, un modelo más fuerte
+     (deepseek, qwen...) lee el error real y escribe el diagnóstico; Venice aplica.
+  3. Lecciones entre sesiones: cada reparación real deja una lección de una línea
+     en .reaper/lecciones.md (proyecto) y ~/reaper/lecciones.md (general).
+  4. Archivos largos sin romperse: escritura por partes, continuación automática
+     cuando el modelo se corta, esqueleto + relleno por función (replace_symbol).
+  5. read_symbol / replace_symbol / find_references, mapa de archivos relevantes
+     según el pedido, arreglos automáticos sin modelo, snapshots git por build.
+
+Instalar:
+    pip install httpx pyflakes      (opcionales: sin httpx usa urllib)
+    pkg install nodejs git          (opcionales: validan JS y guardan builds en git)
+
+Clave:
+    export OPENROUTER_API_KEY="tu_key"
+
+Ejecutar:
+    python3 reaper_v7.py                                  modo interactivo (/ayuda)
+    python3 reaper_v7.py --proyecto ~/mi_app              abre un workspace
+    python3 reaper_v7.py -p "agregá tests a utils.py"     un pedido y sale
+    python3 reaper_v7.py --construir "API de notas" --auto
+    python3 reaper_v7.py --autotest                       verifica REAPER sin gastar API
+    python3 reaper_v7.py --instalar                       crea el comando `reaper`
+"""
+
+from __future__ import annotations
+
+__version__ = "7.0.0"
+__codename__ = "Dragón"
+
+import argparse
+import ast
+import base64
+import collections
+import contextlib
+import copy
+import difflib
+import fnmatch
+import functools
+import hashlib
+import heapq
+import importlib.util
+import io
+import itertools
+import json
+import keyword
+import math
+import os
+import platform
+import queue
+import random
+import re
+import shlex
+import shutil
+import signal
+import socket
+import string
+import subprocess
+import sys
+import tempfile
+import textwrap
+import threading
+import time
+import traceback
+import unicodedata
+import unittest
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import asdict, dataclass, field, fields, replace
+from datetime import datetime, timedelta
+from difflib import SequenceMatcher
+from pathlib import Path
+from typing import Any, Callable, Iterable, Iterator, Optional, Sequence, Union
+
+if sys.version_info < (3, 9):  # pragma: no cover - Termux trae Python moderno
+    sys.stderr.write("REAPER necesita Python 3.9 o superior (pkg upgrade python).\n")
+    sys.exit(1)
+
+
+# ======================================================================
+# MÓDULO: ui
+# ======================================================================
+"""
+Salida de consola: colores (truecolor / 256 / básico), temas, diffs, spinner,
+cajas, tablas, resaltado de código, markdown y confirmaciones. Thread-safe.
+
+Todo lo que se imprime pasa por la clase UI. En tests se usa
+UI(silencioso=True, respuestas=[...]) para no imprimir y contestar preguntas.
+"""
+
+_ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+
+
+def _hay_color() -> bool:
+    if os.getenv("NO_COLOR"):
+        return False
+    if os.getenv("FORCE_COLOR") or os.getenv("REAPER_COLOR"):
+        return True
+    try:
+        return sys.stdout.isatty()
+    except (AttributeError, ValueError):
+        return False
+
+
+def _profundidad_color() -> int:
+    """24 = truecolor, 8 = 256 colores, 4 = 16 colores, 0 = sin color."""
+    if not _hay_color():
+        return 0
+    forzado = os.getenv("REAPER_COLOR", "").strip().lower()
+    if forzado in ("24", "truecolor", "24bit"):
+        return 24
+    if forzado in ("8", "256"):
+        return 8
+    if forzado in ("4", "16", "basico", "básico"):
+        return 4
+    colorterm = os.getenv("COLORTERM", "").lower()
+    if "truecolor" in colorterm or "24bit" in colorterm:
+        return 24
+    # Termux soporta truecolor aunque no siempre exporte COLORTERM.
+    if "com.termux" in os.getenv("PREFIX", "") or os.getenv("TERMUX_VERSION"):
+        return 24
+    term = os.getenv("TERM", "")
+    if "256" in term or term.startswith(("xterm", "screen", "tmux", "rxvt")):
+        return 8
+    return 4
+
+
+_USAR_COLOR = _hay_color()
+PROFUNDIDAD_COLOR = _profundidad_color()
+
+
+def _c(codigo: str) -> str:
+    return codigo if _USAR_COLOR else ""
+
+
+def _rgb_a_256(r: int, g: int, b: int) -> int:
+    if r == g == b:
+        if r < 8:
+            return 16
+        if r > 248:
+            return 231
+        return round(((r - 8) / 247) * 24) + 232
+    return 16 + 36 * round(r / 255 * 5) + 6 * round(g / 255 * 5) + round(b / 255 * 5)
+
+
+def _rgb_a_16(r: int, g: int, b: int) -> int:
+    brillo = max(r, g, b)
+    if brillo < 50:
+        return 30
+    base = 30 + ((1 if r > 127 else 0) | (2 if g > 127 else 0) | (4 if b > 127 else 0))
+    return base + 60 if brillo > 190 else base
+
+
+def rgb(r: int, g: int, b: int, fondo: bool = False) -> str:
+    """Código ANSI para un color RGB, degradado según lo que soporte la terminal."""
+    if not _USAR_COLOR:
+        return ""
+    if PROFUNDIDAD_COLOR >= 24:
+        return f"\033[{48 if fondo else 38};2;{r};{g};{b}m"
+    if PROFUNDIDAD_COLOR >= 8:
+        return f"\033[{48 if fondo else 38};5;{_rgb_a_256(r, g, b)}m"
+    codigo = _rgb_a_16(r, g, b)
+    return f"\033[{codigo + 10 if fondo else codigo}m"
+
+
+def hex_a_rgb(valor: str) -> tuple[int, int, int]:
+    valor = valor.strip().lstrip("#")
+    if len(valor) == 3:
+        valor = "".join(ch * 2 for ch in valor)
+    if len(valor) != 6 or any(ch not in string.hexdigits for ch in valor):
+        raise ValueError(f"color hex inválido: {valor!r}")
+    return int(valor[0:2], 16), int(valor[2:4], 16), int(valor[4:6], 16)
+
+
+def color_hex(valor: str, fondo: bool = False) -> str:
+    return rgb(*hex_a_rgb(valor), fondo=fondo)
+
+
+def sin_ansi(texto: str) -> str:
+    return _ANSI.sub("", texto or "")
+
+
+def ancho_visible(texto: str) -> int:
+    """Columnas que ocupa el texto en la terminal (sin ANSI, con anchos de Unicode)."""
+    total = 0
+    for ch in sin_ansi(texto):
+        if unicodedata.combining(ch):
+            continue
+        total += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+    return total
+
+
+def ancho_terminal(defecto: int = 80) -> int:
+    try:
+        columnas = shutil.get_terminal_size((defecto, 24)).columns
+    except (OSError, ValueError):
+        columnas = defecto
+    return max(30, min(columnas, 200))
+
+
+def ajustar(texto: str, ancho: int) -> str:
+    """Recorta o rellena con espacios hasta 'ancho' columnas visibles (respeta ANSI)."""
+    actual = ancho_visible(texto)
+    if actual <= ancho:
+        return texto + " " * (ancho - actual)
+    salida, usado = [], 0
+    pos = 0
+    while pos < len(texto) and usado < ancho - 1:
+        m = _ANSI.match(texto, pos)
+        if m:
+            salida.append(m.group(0))
+            pos = m.end()
+            continue
+        ch = texto[pos]
+        w = 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+        if usado + w > ancho - 1:
+            break
+        salida.append(ch)
+        usado += w
+        pos += 1
+    return "".join(salida) + "…" + (C.RESET if _USAR_COLOR else "") + " " * max(0, ancho - usado - 1)
+
+
+class C:
+    """Paleta activa. Los nombres básicos son los mismos de v6 para no romper nada."""
+
+    RESET = _c("\033[0m")
+    BOLD = _c("\033[1m")
+    DIM = _c("\033[2m")
+    ITALICA = _c("\033[3m")
+    SUBRAYADO = _c("\033[4m")
+    INVERSO = _c("\033[7m")
+    CYAN = _c("\033[96m")
+    VERDE = _c("\033[92m")
+    AMARILLO = _c("\033[93m")
+    ROJO = _c("\033[91m")
+    MAGENTA = _c("\033[95m")
+    AZUL = _c("\033[94m")
+    GRIS = _c("\033[90m")
+    BLANCO = _c("\033[97m")
+    # Colores del dragón (se recalculan con aplicar_tema).
+    NARANJA = rgb(255, 140, 40)
+    FUEGO = rgb(255, 90, 30)
+    ORO = rgb(255, 200, 60)
+    VIOLETA = rgb(170, 90, 230)
+    ROSA = rgb(255, 80, 140)
+    ESCAMA = rgb(110, 150, 230)
+    HIELO = rgb(170, 210, 255)
+
+
+TEMAS = {
+    "dragon": {
+        "titulo": (255, 140, 40), "info": (120, 200, 255), "ok": (90, 220, 120),
+        "aviso": (255, 200, 60), "error": (255, 85, 85), "tenue": (130, 130, 150),
+        "agente": (190, 110, 255), "herramienta": (110, 150, 230), "texto": (235, 235, 240),
+        "prompt": (255, 140, 40), "acento": (255, 80, 140),
+    },
+    "oceano": {
+        "titulo": (80, 200, 255), "info": (120, 220, 255), "ok": (80, 230, 170),
+        "aviso": (255, 220, 120), "error": (255, 110, 110), "tenue": (120, 140, 160),
+        "agente": (120, 160, 255), "herramienta": (90, 200, 220), "texto": (230, 240, 245),
+        "prompt": (80, 200, 255), "acento": (140, 120, 255),
+    },
+    "matrix": {
+        "titulo": (60, 255, 120), "info": (120, 255, 160), "ok": (60, 255, 120),
+        "aviso": (200, 255, 100), "error": (255, 90, 90), "tenue": (60, 140, 80),
+        "agente": (150, 255, 150), "herramienta": (90, 200, 120), "texto": (200, 255, 210),
+        "prompt": (60, 255, 120), "acento": (180, 255, 60),
+    },
+    "clasico": None,  # los 16 colores de v6
+    "mono": "mono",
+}
+
+
+class Tema:
+    """Colores semánticos usados por UI. Se pueden cambiar en caliente (/tema)."""
+
+    nombre = "dragon"
+    titulo = C.CYAN
+    info = C.CYAN
+    ok = C.VERDE
+    aviso = C.AMARILLO
+    error = C.ROJO
+    tenue = C.GRIS
+    agente = C.MAGENTA
+    herramienta = C.AZUL
+    texto = C.BLANCO
+    prompt = C.VERDE
+    acento = C.MAGENTA
+
+
+def aplicar_tema(nombre: str) -> str:
+    nombre = (nombre or "dragon").strip().lower()
+    if nombre not in TEMAS:
+        nombre = "dragon"
+    definicion = TEMAS[nombre]
+    Tema.nombre = nombre
+    if definicion == "mono" or not _USAR_COLOR:
+        for clave in ("titulo", "info", "ok", "aviso", "error", "tenue", "agente",
+                      "herramienta", "texto", "prompt", "acento"):
+            setattr(Tema, clave, "")
+        if definicion == "mono" and _USAR_COLOR:
+            Tema.titulo = C.BOLD
+            Tema.error = C.BOLD
+            Tema.tenue = C.DIM
+        return nombre
+    if definicion is None:
+        Tema.titulo, Tema.info, Tema.ok = C.CYAN, C.CYAN, C.VERDE
+        Tema.aviso, Tema.error, Tema.tenue = C.AMARILLO, C.ROJO, C.GRIS
+        Tema.agente, Tema.herramienta, Tema.texto = C.MAGENTA, C.AZUL, C.BLANCO
+        Tema.prompt, Tema.acento = C.VERDE, C.MAGENTA
+        return nombre
+    for clave, (r, g, b) in definicion.items():
+        setattr(Tema, clave, rgb(r, g, b))
+    return nombre
+
+
+aplicar_tema(os.getenv("REAPER_TEMA", "dragon"))
+
+SI = {"s", "si", "sí", "y", "yes", "dale", "ok", "1"}
+
+
+def recortar(texto: str, limite: int) -> str:
+    texto = texto or ""
+    if len(texto) <= limite:
+        return texto
+    mitad = max(1, limite // 2)
+    return texto[:mitad].rstrip() + "\n...[recortado]...\n" + texto[-mitad:].lstrip()
+
+
+def degradado(texto: str, desde: tuple, hasta: tuple) -> str:
+    """Pinta 'texto' con un degradado horizontal (si hay color)."""
+    if not _USAR_COLOR or not texto:
+        return texto
+    visibles = [ch for ch in texto]
+    n = max(1, len(visibles) - 1)
+    partes = []
+    for i, ch in enumerate(visibles):
+        t = i / n
+        r = int(desde[0] + (hasta[0] - desde[0]) * t)
+        g = int(desde[1] + (hasta[1] - desde[1]) * t)
+        b = int(desde[2] + (hasta[2] - desde[2]) * t)
+        partes.append(rgb(r, g, b) + ch)
+    return "".join(partes) + C.RESET
+
+
+def formatear_duracion(segundos: float) -> str:
+    segundos = max(0.0, float(segundos))
+    if segundos < 1:
+        return f"{int(segundos * 1000)}ms"
+    if segundos < 60:
+        return f"{segundos:.1f}s"
+    minutos, seg = divmod(int(segundos), 60)
+    if minutos < 60:
+        return f"{minutos}m{seg:02d}s"
+    horas, minutos = divmod(minutos, 60)
+    return f"{horas}h{minutos:02d}m"
+
+
+def formatear_numero(n: Union[int, float]) -> str:
+    n = float(n)
+    for umbral, sufijo in ((1e9, "G"), (1e6, "M"), (1e3, "k")):
+        if abs(n) >= umbral:
+            return f"{n / umbral:.1f}{sufijo}"
+    return str(int(n)) if n == int(n) else f"{n:.2f}"
+
+
+# ======================================================================
+# RESALTADO DE CÓDIGO (sin dependencias)
+# ======================================================================
+_PALABRAS = {
+    "python": set(keyword.kwlist) | {"self", "cls", "print", "len", "range", "True", "False", "None"},
+    "js": {
+        "await", "async", "break", "case", "catch", "class", "const", "continue", "default",
+        "delete", "do", "else", "export", "extends", "finally", "for", "from", "function", "if",
+        "import", "in", "instanceof", "let", "new", "null", "of", "return", "static", "super",
+        "switch", "this", "throw", "true", "false", "try", "typeof", "undefined", "var", "void",
+        "while", "yield", "interface", "type", "enum", "implements", "readonly", "public", "private",
+    },
+    "sh": {
+        "if", "then", "else", "elif", "fi", "for", "while", "do", "done", "case", "esac", "function",
+        "in", "return", "local", "export", "echo", "cd", "exit", "set", "source", "read",
+    },
+    "go": {
+        "break", "case", "chan", "const", "continue", "default", "defer", "else", "fallthrough",
+        "for", "func", "go", "goto", "if", "import", "interface", "map", "package", "range",
+        "return", "select", "struct", "switch", "type", "var", "nil", "true", "false",
+    },
+    "rust": {
+        "as", "break", "const", "continue", "crate", "else", "enum", "extern", "false", "fn", "for",
+        "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub", "ref", "return",
+        "self", "Self", "static", "struct", "super", "trait", "true", "type", "unsafe", "use",
+        "where", "while", "async", "await", "dyn",
+    },
+}
+
+_ALIAS_LENGUAJE = {
+    "py": "python", "python3": "python", "javascript": "js", "mjs": "js", "cjs": "js",
+    "ts": "js", "typescript": "js", "tsx": "js", "jsx": "js", "bash": "sh", "shell": "sh",
+    "zsh": "sh", "golang": "go", "rs": "rust", "json": "json", "html": "html", "css": "css",
+}
+
+_COMENTARIO_LINEA = {"python": "#", "sh": "#", "js": "//", "go": "//", "rust": "//", "css": None}
+
+
+def lenguaje_de(nombre_o_ext: str) -> str:
+    valor = (nombre_o_ext or "").strip().lower().lstrip(".")
+    if "/" in valor or "." in valor:
+        valor = valor.rsplit(".", 1)[-1]
+    return _ALIAS_LENGUAJE.get(valor, valor)
+
+
+def resaltar_codigo(codigo: str, lenguaje: str = "") -> str:
+    """Resaltado simple por tokens: palabras clave, strings, comentarios y números."""
+    if not _USAR_COLOR or not codigo:
+        return codigo
+    lang = lenguaje_de(lenguaje)
+    c_kw, c_str, c_com, c_num, c_fn = (
+        rgb(200, 120, 255), rgb(150, 220, 120), rgb(120, 120, 140), rgb(255, 170, 80), rgb(110, 180, 255)
+    )
+    if lang == "json":
+        patron = re.compile(r'("(?:\\.|[^"\\])*")(\s*:)?|(-?\b\d+(?:\.\d+)?(?:[eE][+-]?\d+)?\b)|\b(true|false|null)\b')
+
+        def json_tok(m: re.Match) -> str:
+            if m.group(1):
+                color = c_fn if m.group(2) else c_str
+                return color + m.group(1) + C.RESET + (m.group(2) or "")
+            if m.group(3):
+                return c_num + m.group(3) + C.RESET
+            return c_kw + m.group(4) + C.RESET
+        return patron.sub(json_tok, codigo)
+    if lang in ("html", "xml"):
+        codigo = re.sub(r"(<!--.*?-->)", lambda m: c_com + m.group(1) + C.RESET, codigo, flags=re.S)
+        codigo = re.sub(r"(</?)([\w-]+)", lambda m: m.group(1) + c_kw + m.group(2) + C.RESET, codigo)
+        return re.sub(r'(\s[\w-]+)(=)("[^"]*"|\'[^\']*\')',
+                      lambda m: c_fn + m.group(1) + C.RESET + m.group(2) + c_str + m.group(3) + C.RESET, codigo)
+    if lang == "css":
+        codigo = re.sub(r"(/\*.*?\*/)", lambda m: c_com + m.group(1) + C.RESET, codigo, flags=re.S)
+        return re.sub(r"([\w-]+)(\s*:)(?!:)", lambda m: c_fn + m.group(1) + C.RESET + m.group(2), codigo)
+
+    palabras = _PALABRAS.get(lang, _PALABRAS["python"] if not lang else set())
+    comentario = _COMENTARIO_LINEA.get(lang, "#")
+    partes = [r'(?P<str>"""[\s\S]*?"""|\'\'\'[\s\S]*?\'\'\'|"(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n])*\'|`(?:\\.|[^`\\])*`)']
+    if comentario:
+        partes.append(r"(?P<com>" + re.escape(comentario) + r"[^\n]*)")
+    if lang in ("js", "go", "rust", "css"):
+        partes.append(r"(?P<bloque>/\*[\s\S]*?\*/)")
+    partes.append(r"(?P<num>\b\d+(?:\.\d+)?\b)")
+    partes.append(r"(?P<pal>\b[A-Za-z_][\w]*\b)(?P<par>\s*\()?")
+    patron = re.compile("|".join(partes))
+
+    def tok(m: re.Match) -> str:
+        tipo = m.lastgroup
+        if m.group("str") is not None:
+            return c_str + m.group("str") + C.RESET
+        if comentario and m.groupdict().get("com") is not None:
+            return c_com + m.group("com") + C.RESET
+        if m.groupdict().get("bloque") is not None:
+            return c_com + m.group("bloque") + C.RESET
+        if m.group("num") is not None:
+            return c_num + m.group("num") + C.RESET
+        palabra = m.group("pal")
+        if palabra is not None:
+            sufijo = m.group("par") or ""
+            if palabra in palabras:
+                return c_kw + palabra + C.RESET + sufijo
+            if sufijo:
+                return c_fn + palabra + C.RESET + sufijo
+            return palabra
+        return m.group(0) if tipo else m.group(0)
+
+    return patron.sub(tok, codigo)
+
+
+# ======================================================================
+# CAJAS Y TABLAS
+# ======================================================================
+_BORDES = {
+    "redondo": ("╭", "╮", "╰", "╯", "─", "│"),
+    "doble": ("╔", "╗", "╚", "╝", "═", "║"),
+    "simple": ("┌", "┐", "└", "┘", "─", "│"),
+    "grueso": ("┏", "┓", "┗", "┛", "━", "┃"),
+    "ascii": ("+", "+", "+", "+", "-", "|"),
+}
+
+
+def caja(lineas: Sequence[str], titulo: str = "", color: str = "", estilo: str = "redondo",
+         ancho: Optional[int] = None, relleno: int = 1) -> str:
+    """Devuelve una caja dibujada con bordes alrededor de las líneas."""
+    tl, tr, bl, br, h, v = _BORDES.get(estilo, _BORDES["redondo"])
+    lineas = [l for bloque in lineas for l in str(bloque).split("\n")]
+    interior = max([ancho_visible(l) for l in lineas] + [ancho_visible(titulo) + 2, 10])
+    maximo = ancho_terminal() - 2 - 2 * relleno
+    if ancho:
+        interior = max(10, min(ancho - 2 - 2 * relleno, maximo))
+    else:
+        interior = min(interior, maximo)
+    reset = C.RESET if color else ""
+    pad = " " * relleno
+    if titulo:
+        t = f" {titulo} "
+        resto = interior + 2 * relleno - ancho_visible(t) - 1
+        arriba = f"{color}{tl}{h}{reset}{C.BOLD}{t}{C.RESET}{color}{h * max(0, resto)}{tr}{reset}"
+    else:
+        arriba = f"{color}{tl}{h * (interior + 2 * relleno)}{tr}{reset}"
+    cuerpo = [f"{color}{v}{reset}{pad}{ajustar(l, interior)}{pad}{color}{v}{reset}" for l in lineas]
+    abajo = f"{color}{bl}{h * (interior + 2 * relleno)}{br}{reset}"
+    return "\n".join([arriba] + cuerpo + [abajo])
+
+
+def tabla(filas: Sequence[Sequence[Any]], encabezados: Optional[Sequence[str]] = None,
+          alinear: str = "", color_encabezado: str = "") -> str:
+    """Tabla de texto simple. alinear: cadena con 'l'/'r'/'c' por columna."""
+    datos = [[str(c) for c in fila] for fila in filas]
+    if encabezados:
+        datos = [[str(e) for e in encabezados]] + datos
+    if not datos:
+        return ""
+    columnas = max(len(f) for f in datos)
+    for fila in datos:
+        fila.extend([""] * (columnas - len(fila)))
+    anchos = [max(ancho_visible(f[i]) for f in datos) for i in range(columnas)]
+    disponible = ancho_terminal() - 3 * (columnas - 1) - 2
+    while sum(anchos) > disponible and max(anchos) > 8:
+        mayor = anchos.index(max(anchos))
+        anchos[mayor] -= 1
+
+    def celda(texto: str, i: int) -> str:
+        modo = alinear[i] if i < len(alinear) else "l"
+        if ancho_visible(texto) > anchos[i]:
+            return ajustar(texto, anchos[i])
+        falta = anchos[i] - ancho_visible(texto)
+        if modo == "r":
+            return " " * falta + texto
+        if modo == "c":
+            return " " * (falta // 2) + texto + " " * (falta - falta // 2)
+        return texto + " " * falta
+
+    salida = []
+    for n, fila in enumerate(datos):
+        linea = " │ ".join(celda(c, i) for i, c in enumerate(fila))
+        if n == 0 and encabezados:
+            salida.append(f"{color_encabezado}{C.BOLD}{linea}{C.RESET}")
+            salida.append("─┼─".join("─" * a for a in anchos))
+        else:
+            salida.append(linea)
+    return "\n".join(salida)
+
+
+def barra(actual: float, total: float, ancho: int = 24, color: str = "") -> str:
+    total = total or 1
+    fraccion = max(0.0, min(1.0, actual / total))
+    llenos = fraccion * ancho
+    enteros = int(llenos)
+    parciales = " ▏▎▍▌▋▊▉"
+    resto = parciales[int((llenos - enteros) * 8)] if enteros < ancho else ""
+    cuerpo = "█" * enteros + resto
+    cuerpo += " " * (ancho - ancho_visible(cuerpo))
+    reset = C.RESET if color else ""
+    return f"{color}{cuerpo}{reset} {int(fraccion * 100):>3}%"
+
+
+# ======================================================================
+# MARKDOWN
+# ======================================================================
+def _markdown_en_linea(texto: str) -> str:
+    if not _USAR_COLOR:
+        return texto
+    texto = re.sub(r"`([^`\n]+)`", lambda m: rgb(255, 170, 80) + m.group(1) + C.RESET + Tema.texto, texto)
+    texto = re.sub(r"\*\*([^*\n]+)\*\*", lambda m: C.BOLD + m.group(1) + C.RESET + Tema.texto, texto)
+    texto = re.sub(r"(?<![\w*])\*([^*\n]+)\*(?![\w*])", lambda m: C.ITALICA + m.group(1) + C.RESET + Tema.texto, texto)
+    return texto
+
+
+def renderizar_markdown(texto: str) -> list[str]:
+    """Convierte markdown simple en líneas con color para la terminal."""
+    lineas: list[str] = []
+    en_codigo = False
+    lenguaje = ""
+    buffer: list[str] = []
+    ancho = min(ancho_terminal(), 100)
+    for linea in (texto or "").splitlines():
+        cerca = re.match(r"^\s*```\s*([\w+#.-]*)\s*$", linea)
+        if cerca:
+            if not en_codigo:
+                en_codigo, lenguaje, buffer = True, cerca.group(1), []
+            else:
+                etiqueta = f" {lenguaje or 'código'} "
+                lineas.append(f"{Tema.tenue}┌{etiqueta}{'─' * max(0, min(50, ancho - 4) - len(etiqueta))}{C.RESET}")
+                for l in resaltar_codigo("\n".join(buffer), lenguaje).split("\n"):
+                    lineas.append(f"{Tema.tenue}│{C.RESET} {l}")
+                lineas.append(f"{Tema.tenue}└{'─' * min(50, ancho - 4)}{C.RESET}")
+                en_codigo = False
+            continue
+        if en_codigo:
+            buffer.append(linea)
+            continue
+        m = re.match(r"^(#{1,6})\s+(.*)$", linea)
+        if m:
+            nivel = len(m.group(1))
+            color = Tema.titulo if nivel <= 2 else Tema.info
+            prefijo = "▌ " if nivel == 1 else ("▸ " if nivel == 2 else "· ")
+            lineas.append(f"{color}{C.BOLD}{prefijo}{m.group(2)}{C.RESET}")
+            continue
+        m = re.match(r"^(\s*)([-*+]|\d+[.)])\s+(.*)$", linea)
+        if m:
+            marca = "•" if m.group(2) in "-*+" else m.group(2)
+            casilla = re.match(r"^\[( |x|X)\]\s+(.*)$", m.group(3))
+            if casilla:
+                marca = f"{Tema.ok}✔{C.RESET}" if casilla.group(1).lower() == "x" else f"{Tema.tenue}☐{C.RESET}"
+                contenido = casilla.group(2)
+            else:
+                contenido = m.group(3)
+            lineas.append(f"{m.group(1)}{Tema.acento}{marca}{C.RESET} {Tema.texto}{_markdown_en_linea(contenido)}{C.RESET}")
+            continue
+        if re.match(r"^\s*(-{3,}|\*{3,}|_{3,})\s*$", linea):
+            lineas.append(f"{Tema.tenue}{'─' * min(60, ancho - 2)}{C.RESET}")
+            continue
+        if linea.startswith(">"):
+            lineas.append(f"{Tema.tenue}┃{C.RESET} {C.ITALICA}{linea[1:].strip()}{C.RESET}")
+            continue
+        lineas.append(f"{Tema.texto}{_markdown_en_linea(linea)}{C.RESET}" if linea.strip() else "")
+    if en_codigo and buffer:
+        for l in resaltar_codigo("\n".join(buffer), lenguaje).split("\n"):
+            lineas.append(f"{Tema.tenue}│{C.RESET} {l}")
+    return lineas
+
+
+# ======================================================================
+# SPINNER
+# ======================================================================
+_SPINNERS = {
+    "puntos": "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏",
+    "llama": "🔥🔥🔥🔥",
+    "barra": "▁▂▃▄▅▆▇█▇▆▅▄▃▂",
+    "ascii": "|/-\\",
+}
+
+
+class UI:
+    """
+    Toda la salida pasa por acá. En tests se usa UI(silencioso=True,
+    respuestas=[...]) para no imprimir y contestar confirmaciones.
+    """
+
+    def __init__(
+        self,
+        *,
+        silencioso: bool = False,
+        interactivo: bool = True,
+        respuestas: Optional[list] = None,
+        entrada: Optional[Callable[[str], str]] = None,
+        log: Optional[Path] = None,
+        detalle: int = 1,
+    ):
+        self.silencioso = silencioso
+        self.interactivo = interactivo
+        self._respuestas = list(respuestas or [])
+        self._entrada = entrada or input
+        self._lock = threading.RLock()
+        self._progreso_visible = False
+        self._ultimo_progreso = 0.0
+        self._inicio_progreso: Optional[float] = None
+        self._frame = 0
+        self.registro: list[str] = []
+        self.log = log
+        # 0 = mínimo (solo resultados), 1 = normal, 2 = detallado (razonamientos completos)
+        self.detalle = detalle
+        self.spinner = _SPINNERS["puntos"] if _USAR_COLOR else _SPINNERS["ascii"]
+
+    # ------------------------------------------------------------ básico
+    def _borrar_progreso(self) -> None:
+        if self._progreso_visible:
+            sys.stdout.write("\r\033[K" if _USAR_COLOR else "\r" + " " * 70 + "\r")
+            sys.stdout.flush()
+            self._progreso_visible = False
+
+    def _a_log(self, texto: str) -> None:
+        if not self.log:
+            return
+        try:
+            self.log.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.log, "a", encoding="utf-8") as f:
+                f.write(f"[{datetime.now():%H:%M:%S}] {sin_ansi(texto)}\n")
+        except OSError:
+            self.log = None
+
+    def linea(self, texto: str = "") -> None:
+        with self._lock:
+            self._a_log(texto)
+            if self.silencioso:
+                self.registro.append(texto)
+                return
+            self._borrar_progreso()
+            try:
+                print(texto, flush=True)
+            except UnicodeEncodeError:
+                print(texto.encode("ascii", "replace").decode("ascii"), flush=True)
+
+    def texto_registrado(self) -> str:
+        """Todo lo impreso en modo silencioso, sin códigos de color (útil en tests)."""
+        return sin_ansi("\n".join(self.registro))
+
+    def info(self, texto: str) -> None:
+        self.linea(f"{Tema.info}{texto}{C.RESET}")
+
+    def ok(self, texto: str) -> None:
+        self.linea(f"{Tema.ok}✓ {texto}{C.RESET}")
+
+    def aviso(self, texto: str) -> None:
+        self.linea(f"{Tema.aviso}{texto}{C.RESET}")
+
+    def error(self, texto: str) -> None:
+        self.linea(f"{Tema.error}✗ {texto}{C.RESET}")
+
+    def tenue(self, texto: str) -> None:
+        self.linea(f"{Tema.tenue}{texto}{C.RESET}")
+
+    def titulo(self, texto: str) -> None:
+        self.linea(f"\n{Tema.titulo}{C.BOLD}══ {texto} ══{C.RESET}")
+
+    def fase(self, numero: Union[int, str], texto: str) -> None:
+        ancho = min(ancho_terminal(), 72)
+        etiqueta = f" FASE {numero} · {texto} "
+        relleno = max(2, ancho - ancho_visible(etiqueta) - 4)
+        self.linea("")
+        self.linea(f"{Tema.titulo}{C.BOLD}━━{etiqueta}{'━' * relleno}{C.RESET}")
+
+    def separador(self, caracter: str = "─") -> None:
+        self.linea(f"{Tema.tenue}{caracter * min(ancho_terminal(), 72)}{C.RESET}")
+
+    def caja(self, lineas: Sequence[str], titulo: str = "", color: str = "", estilo: str = "redondo") -> None:
+        self.linea(caja(lineas, titulo, color or Tema.titulo, estilo))
+
+    def tabla(self, filas: Sequence[Sequence[Any]], encabezados: Optional[Sequence[str]] = None,
+              alinear: str = "") -> None:
+        self.linea(tabla(filas, encabezados, alinear, Tema.titulo))
+
+    def barra(self, etiqueta: str, actual: float, total: float) -> None:
+        self.linea(f"  {etiqueta} {barra(actual, total, color=Tema.acento)}")
+
+    def codigo(self, texto: str, lenguaje: str = "", numeros: bool = False, desde: int = 1) -> None:
+        resaltado = resaltar_codigo(texto, lenguaje).split("\n")
+        for i, l in enumerate(resaltado):
+            if numeros:
+                self.linea(f"{Tema.tenue}{desde + i:>5}│{C.RESET} {l}")
+            else:
+                self.linea(f"  {l}")
+
+    def markdown(self, texto: str) -> None:
+        for l in renderizar_markdown(texto):
+            self.linea(l)
+
+    # ------------------------------------------------------------ agentes
+    def agente(self, etiqueta: str, texto: str) -> None:
+        self.linea(f"{Tema.agente}{C.BOLD}[{etiqueta}]{C.RESET} {texto}")
+
+    def pensamiento(self, etiqueta: str, texto: str, limite: int = 700) -> None:
+        texto = (texto or "").strip()
+        if not texto or self.detalle <= 0:
+            return
+        if self.detalle >= 2:
+            limite = max(limite, 4000)
+        self.linea(f"{Tema.agente}[{etiqueta}]{C.RESET} {Tema.texto}{recortar(texto, limite)}{C.RESET}")
+
+    def herramienta(self, etiqueta: str, nombre: str, detalle: str = "") -> None:
+        detalle = detalle.replace("\n", " ")
+        maximo = max(30, ancho_terminal() - len(etiqueta) - len(nombre) - 12)
+        if len(detalle) > maximo:
+            detalle = detalle[:maximo - 3] + "..."
+        self.linea(f"{Tema.tenue}  [{etiqueta}]{C.RESET} {Tema.herramienta}⚙ {nombre}{C.RESET} {Tema.tenue}{detalle}{C.RESET}")
+
+    def resultado_herramienta(self, ok: bool, texto: str) -> None:
+        primera = (texto or "").strip().splitlines()[0] if (texto or "").strip() else ""
+        maximo = max(40, ancho_terminal() - 10)
+        if len(primera) > maximo:
+            primera = primera[:maximo - 3] + "..."
+        color = Tema.ok if ok else Tema.error
+        marca = "✓" if ok else "✗"
+        self.linea(f"      {color}{marca}{C.RESET} {Tema.tenue}{primera}{C.RESET}")
+
+    def diff(self, texto: str, max_lineas: int = 60) -> None:
+        lineas = (texto or "").splitlines()
+        for linea in lineas[:max_lineas]:
+            if linea.startswith("+") and not linea.startswith("+++"):
+                self.linea(f"      {Tema.ok}{linea}{C.RESET}")
+            elif linea.startswith("-") and not linea.startswith("---"):
+                self.linea(f"      {Tema.error}{linea}{C.RESET}")
+            elif linea.startswith("@@"):
+                self.linea(f"      {Tema.info}{linea}{C.RESET}")
+            else:
+                self.linea(f"      {Tema.tenue}{linea}{C.RESET}")
+        if len(lineas) > max_lineas:
+            self.tenue(f"      ... {len(lineas) - max_lineas} líneas más (/diff para ver todo)")
+
+    def progreso(self, etiqueta: str, caracteres: int) -> None:
+        if self.silencioso or not sys.stdout.isatty():
+            return
+        ahora = time.monotonic()
+        if self._inicio_progreso is None:
+            self._inicio_progreso = ahora
+        if ahora - self._ultimo_progreso < 0.12:
+            return
+        self._ultimo_progreso = ahora
+        self._frame = (self._frame + 1) % len(self.spinner)
+        transcurrido = ahora - self._inicio_progreso
+        velocidad = caracteres / transcurrido / CARACTERES_POR_TOKEN_UI if transcurrido > 0.5 else 0
+        extra = f" · {velocidad:.0f} tok/s" if velocidad else ""
+        with self._lock:
+            sys.stdout.write(
+                f"\r{Tema.acento}{self.spinner[self._frame]}{C.RESET} {Tema.tenue}[{etiqueta}] generando… "
+                f"{caracteres} car · {formatear_duracion(transcurrido)}{extra}{C.RESET}\033[K"
+            )
+            sys.stdout.flush()
+            self._progreso_visible = True
+
+    def esperando(self, etiqueta: str, texto: str = "pensando") -> None:
+        """Línea de estado antes de que llegue el primer token."""
+        if self.silencioso or not sys.stdout.isatty():
+            return
+        with self._lock:
+            sys.stdout.write(f"\r{Tema.acento}{self.spinner[0]}{C.RESET} {Tema.tenue}[{etiqueta}] {texto}…{C.RESET}\033[K")
+            sys.stdout.flush()
+            self._progreso_visible = True
+
+    def fin_progreso(self) -> None:
+        with self._lock:
+            self._borrar_progreso()
+            self._inicio_progreso = None
+
+    # ------------------------------------------------------------ entrada
+    def confirmar(self, pregunta: str, defecto: bool = False) -> bool:
+        if self._respuestas:
+            respuesta = self._respuestas.pop(0)
+            return bool(respuesta) if not isinstance(respuesta, str) else respuesta.strip().lower() in SI
+        if not self.interactivo:
+            return defecto
+        with self._lock:
+            self._borrar_progreso()
+            try:
+                opciones = "S/n" if defecto else "s/N"
+                texto = self._entrada(f"{Tema.aviso}{pregunta} ({opciones}) {C.RESET}")
+            except EOFError:
+                return defecto
+        texto = texto.strip().lower()
+        if not texto:
+            return defecto
+        return texto in SI
+
+    def preguntar(self, pregunta: str) -> str:
+        if self._respuestas:
+            return str(self._respuestas.pop(0))
+        if not self.interactivo:
+            return ""
+        with self._lock:
+            self._borrar_progreso()
+            try:
+                return self._entrada(f"{Tema.aviso}{pregunta}{C.RESET}\n{Tema.prompt}› {C.RESET}").strip()
+            except EOFError:
+                return ""
+
+    def elegir(self, pregunta: str, opciones: Sequence[str], defecto: int = 0) -> int:
+        """Menú numerado. Devuelve el índice elegido (o el defecto)."""
+        if self._respuestas:
+            valor = self._respuestas.pop(0)
+            try:
+                return max(0, min(len(opciones) - 1, int(valor)))
+            except (TypeError, ValueError):
+                return defecto
+        if not self.interactivo:
+            return defecto
+        self.linea(f"{Tema.aviso}{pregunta}{C.RESET}")
+        for i, op in enumerate(opciones, start=1):
+            marca = f"{Tema.acento}›{C.RESET}" if i - 1 == defecto else " "
+            self.linea(f"  {marca} {Tema.titulo}{i}{C.RESET}. {op}")
+        respuesta = self.preguntar(f"Número (Enter = {defecto + 1})")
+        if respuesta.isdigit() and 1 <= int(respuesta) <= len(opciones):
+            return int(respuesta) - 1
+        return defecto
+
+
+CARACTERES_POR_TOKEN_UI = 3.0
+
+
+def mostrar_markdown(ui: UI, texto: str) -> None:
+    ui.markdown(texto)
+
+
+# ======================================================================
+# MÓDULO: dragon
+# ======================================================================
+"""
+El dragón de REAPER: pixel art vectorial que se rasteriza al ancho de la terminal.
+
+En vez de guardar una imagen fija, el dragón está definido con formas
+(polígonos para las alas, cabeza y cola; trazos gruesos para cuerpo y patas;
+un cono para el fuego). Se rasteriza a la resolución exacta de la terminal y
+se dibuja con medios bloques '▀' (2 píxeles por celda) en truecolor, así se ve
+nítido tanto en un celular angosto como en una pantalla ancha.
+
+También sirve para animar: las alas aletean moviendo sus vértices y el fuego
+crece/titila cambiando el largo del cono y la semilla de las chispas.
+"""
+
+# Espacio de diseño: x 0..104, y 0..76 (proporción del dibujo original ~1.37:1).
+_DW, _DH = 104.0, 76.0
+
+_COLOR_CONTORNO = (22, 22, 64)
+_COLOR_HUESO = (88, 26, 104)
+
+# Ala izquierda (detrás de la cabeza), en orden horario. La raíz está en el hombro.
+_ALA_IZQ = [
+    (8.0, 1.0), (24.0, 6.5), (42.0, 14.0), (44.5, 22.0), (44.5, 37.5), (39.0, 36.5), (35.0, 35.0),
+    (32.0, 30.5), (27.5, 31.5), (25.0, 26.5), (20.5, 26.0), (18.0, 21.5), (13.0, 20.0),
+    (11.0, 12.0),
+]
+_ALA_IZQ_RAIZ = (41.0, 24.0)
+_ALA_IZQ_MUNECA = (41.5, 14.5)
+_ALA_IZQ_DEDOS = [(35.0, 35.0), (27.5, 31.5), (20.5, 26.0), (13.0, 20.0), (8.0, 1.0)]
+
+# Ala derecha (la más grande, arriba a la derecha).
+_ALA_DER = [
+    (58.0, 15.0), (80.0, 6.0), (101.0, 1.0), (99.5, 8.0), (100.5, 20.0), (94.0, 21.5),
+    (91.0, 24.5), (85.5, 24.5), (81.0, 29.5), (76.5, 29.5), (72.0, 35.5), (68.0, 34.0),
+    (64.0, 38.5), (61.0, 41.5), (55.5, 40.5), (56.5, 28.0),
+]
+_ALA_DER_RAIZ = (59.0, 27.0)
+_ALA_DER_MUNECA = (59.5, 15.5)
+_ALA_DER_DEDOS = [(64.0, 38.5), (72.0, 35.5), (81.0, 29.5), (91.0, 24.5), (100.5, 20.0), (101.0, 1.0)]
+
+# Cabeza mirando a la izquierda, con la boca abierta.
+_CABEZA = [
+    (25.5, 41.5), (29.5, 38.0), (33.5, 35.5), (37.5, 35.0), (40.5, 37.0), (40.0, 41.0),
+    (36.0, 43.5), (32.0, 44.0), (29.0, 43.6), (31.5, 45.0), (30.5, 47.0), (27.5, 46.5),
+    (26.0, 44.0),
+]
+_CUERNOS = [((35.5, 36.5), (41.0, 26.5), 1.1), ((38.0, 36.5), (44.5, 30.0), 1.0)]
+# Púas del lomo: (x, y) de la base de cada una.
+_PUAS = [(41.0, 36.4), (46.0, 36.0), (51.0, 36.6), (56.0, 38.6), (61.0, 42.4)]
+_COLOR_PUA = (40, 52, 115)
+_OJO = (32.6, 38.9)
+_DIENTES = [(27.4, 43.2), (28.6, 43.6), (28.0, 45.3)]
+
+# Cuello y cuerpo como trazo grueso: (x, y, grosor).
+_CUERPO = [(36.0, 40.5, 3.4), (42.0, 40.0, 4.2), (49.0, 40.8, 4.8), (55.0, 43.0, 5.0), (61.0, 46.5, 4.6),
+           (65.5, 49.0, 3.8)]
+_PECHO = (44.0, 43.0, 3.2)
+_PATAS = [
+    [(43.0, 43.5, 1.6), (41.5, 48.0, 1.4), (39.5, 51.0, 1.1)],
+    [(47.5, 44.0, 1.6), (47.0, 49.0, 1.4), (45.5, 52.0, 1.1)],
+    [(58.0, 47.0, 2.0), (57.0, 52.0, 1.7), (54.5, 55.5, 1.2)],
+    [(63.0, 49.5, 1.9), (63.5, 54.5, 1.6), (61.5, 57.5, 1.1)],
+]
+_GARRAS = [(39.0, 51.8), (45.0, 52.8), (54.0, 56.2), (61.0, 58.2)]
+
+# Cola: curva que baja, se arrastra a la derecha y sube en rulo.
+_COLA_CONTROL = [(65.0, 49.0), (71.0, 58.0), (75.0, 67.0), (84.0, 69.5), (91.5, 68.5), (94.5, 62.0), (93.0, 54.0)]
+_COLA_PUNTA = [(92.5, 43.5), (96.0, 48.5), (95.5, 53.0), (92.5, 54.5), (90.0, 50.5)]
+
+# Fuego: de la boca hacia abajo a la izquierda.
+_FUEGO_ORIGEN = (27.0, 46.0)
+_FUEGO_FIN = (2.5, 70.0)
+
+
+def _dentro_poligono(x: float, y: float, poligono: Sequence[tuple]) -> bool:
+    dentro = False
+    n = len(poligono)
+    j = n - 1
+    for i in range(n):
+        xi, yi = poligono[i]
+        xj, yj = poligono[j]
+        if (yi > y) != (yj > y):
+            cruce = (xj - xi) * (y - yi) / ((yj - yi) or 1e-9) + xi
+            if x < cruce:
+                dentro = not dentro
+        j = i
+    return dentro
+
+
+def _distancia_segmento(px: float, py: float, a: tuple, b: tuple) -> tuple[float, float]:
+    """(distancia, t) del punto al segmento ab, con t en [0, 1]."""
+    ax, ay = a[0], a[1]
+    bx, by = b[0], b[1]
+    dx, dy = bx - ax, by - ay
+    largo2 = dx * dx + dy * dy
+    if largo2 == 0:
+        return math.hypot(px - ax, py - ay), 0.0
+    t = max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / largo2))
+    cx, cy = ax + t * dx, ay + t * dy
+    return math.hypot(px - cx, py - cy), t
+
+
+def _dentro_trazo(x: float, y: float, trazo: Sequence[tuple], grosor_min: float = 0.0) -> Optional[float]:
+    """Si el punto cae en el trazo grueso devuelve la posición vertical relativa (-1 arriba, 1 abajo)."""
+    mejor = None
+    for a, b in zip(trazo, trazo[1:]):
+        d, t = _distancia_segmento(x, y, a, b)
+        grosor = max(grosor_min, a[2] + (b[2] - a[2]) * t)
+        if d <= grosor:
+            cy = a[1] + (b[1] - a[1]) * t
+            rel = (y - cy) / grosor
+            if mejor is None or abs(rel) < abs(mejor):
+                mejor = rel
+    return mejor
+
+
+def _bezier(puntos: Sequence[tuple], pasos: int = 40) -> list[tuple]:
+    """Curva Catmull-Rom que pasa por los puntos de control."""
+    if len(puntos) < 2:
+        return list(puntos)
+    pts = [puntos[0]] + list(puntos) + [puntos[-1]]
+    salida = []
+    for i in range(1, len(pts) - 2):
+        p0, p1, p2, p3 = pts[i - 1], pts[i], pts[i + 1], pts[i + 2]
+        for k in range(pasos):
+            t = k / pasos
+            t2, t3 = t * t, t * t * t
+            x = 0.5 * ((2 * p1[0]) + (-p0[0] + p2[0]) * t + (2 * p0[0] - 5 * p1[0] + 4 * p2[0] - p3[0]) * t2
+                       + (-p0[0] + 3 * p1[0] - 3 * p2[0] + p3[0]) * t3)
+            y = 0.5 * ((2 * p1[1]) + (-p0[1] + p2[1]) * t + (2 * p0[1] - 5 * p1[1] + 4 * p2[1] - p3[1]) * t2
+                       + (-p0[1] + 3 * p1[1] - 3 * p2[1] + p3[1]) * t3)
+            salida.append((x, y))
+    salida.append(puntos[-1])
+    return salida
+
+
+def _mezclar(c1: tuple, c2: tuple, t: float) -> tuple:
+    t = max(0.0, min(1.0, t))
+    return (int(c1[0] + (c2[0] - c1[0]) * t), int(c1[1] + (c2[1] - c1[1]) * t), int(c1[2] + (c2[2] - c1[2]) * t))
+
+
+def _degradado_ala(t: float) -> tuple:
+    """t=0 borde superior (magenta) → t=1 borde inferior (naranja claro)."""
+    paradas = [(0.0, (150, 40, 150)), (0.25, (205, 50, 130)), (0.55, (250, 105, 55)),
+               (0.8, (255, 145, 45)), (1.0, (255, 175, 85))]
+    for (t1, c1), (t2, c2) in zip(paradas, paradas[1:]):
+        if t <= t2:
+            return _mezclar(c1, c2, (t - t1) / ((t2 - t1) or 1))
+    return paradas[-1][1]
+
+
+def _aletear(poligono: Sequence[tuple], raiz: tuple, fase: float, amplitud: float) -> list[tuple]:
+    """Desplaza verticalmente los vértices según su distancia a la raíz (más lejos = más movimiento)."""
+    if not fase:
+        return list(poligono)
+    maximo = max(math.hypot(x - raiz[0], y - raiz[1]) for x, y in poligono) or 1.0
+    salida = []
+    for x, y in poligono:
+        peso = (math.hypot(x - raiz[0], y - raiz[1]) / maximo) ** 1.3
+        salida.append((x, y + fase * amplitud * peso))
+    return salida
+
+
+def _ruido(i: int, j: int, semilla: int) -> float:
+    h = (i * 374761393 + j * 668265263 + semilla * 2147483647) & 0xFFFFFFFF
+    h = (h ^ (h >> 13)) * 1274126177 & 0xFFFFFFFF
+    return ((h ^ (h >> 16)) & 0xFFFF) / 65535.0
+
+
+def pintar_dragon(ancho: int, alto: Optional[int] = None, alas: float = 0.0, fuego: float = 1.0,
+                  semilla: int = 7, contorno: bool = True) -> list[list[Optional[tuple]]]:
+    """
+    Devuelve una matriz alto×ancho de colores RGB (o None si es transparente).
+    alas: -1..1 (posición del aleteo). fuego: 0..1 (largo de la llamarada).
+    """
+    ancho = max(16, int(ancho))
+    if alto is None:
+        alto = max(8, int(round(ancho * _DH / _DW)))
+    sx, sy = _DW / ancho, _DH / alto
+
+    ala_izq = _aletear(_ALA_IZQ, _ALA_IZQ_RAIZ, alas, 7.0)
+    ala_der = _aletear(_ALA_DER, _ALA_DER_RAIZ, alas, 9.0)
+    dedos_izq = _aletear(_ALA_IZQ_DEDOS, _ALA_IZQ_RAIZ, alas, 7.0)
+    dedos_der = _aletear(_ALA_DER_DEDOS, _ALA_DER_RAIZ, alas, 9.0)
+    muneca_izq = _aletear([_ALA_IZQ_MUNECA], _ALA_IZQ_RAIZ, alas, 7.0)[0]
+    muneca_der = _aletear([_ALA_DER_MUNECA], _ALA_DER_RAIZ, alas, 9.0)[0]
+    ys_izq = [p[1] for p in ala_izq]
+    ys_der = [p[1] for p in ala_der]
+
+    cola_eje = _bezier(_COLA_CONTROL, 18)
+    n_cola = len(cola_eje)
+    cola = [(x, y, 3.6 - 2.2 * (k / max(1, n_cola - 1))) for k, (x, y) in enumerate(cola_eje)]
+
+    fx0, fy0 = _FUEGO_ORIGEN
+    fx1, fy1 = _FUEGO_FIN
+    largo_fuego = math.hypot(fx1 - fx0, fy1 - fy0)
+    ux, uy = (fx1 - fx0) / largo_fuego, (fy1 - fy0) / largo_fuego
+
+    pixeles: list[list[Optional[tuple]]] = [[None] * ancho for _ in range(alto)]
+    capas: list[list[int]] = [[0] * ancho for _ in range(alto)]
+    # capas: 0 vacío, 1 ala der, 2 ala izq, 3 cola, 4 cuerpo/patas, 5 cabeza, 6 fuego
+
+    tolerancia_hueso = max(0.35, 0.5 * sx)
+    con_huesos = ancho >= 36
+    grosor_min = 0.8 * sx  # a baja resolución los trazos finos no deben desaparecer
+    for j in range(alto):
+        y = (j + 0.5) * sy
+        for i in range(ancho):
+            x = (i + 0.5) * sx
+            color = None
+            capa = 0
+
+            if _dentro_poligono(x, y, ala_der):
+                t = (y - min(ys_der)) / ((max(ys_der) - min(ys_der)) or 1)
+                color, capa = _degradado_ala(t), 1
+                if con_huesos and any(_distancia_segmento(x, y, muneca_der, d)[0] < tolerancia_hueso
+                                      for d in dedos_der):
+                    color = _COLOR_HUESO
+            if _dentro_poligono(x, y, ala_izq):
+                t = (y - min(ys_izq)) / ((max(ys_izq) - min(ys_izq)) or 1)
+                color, capa = _degradado_ala(t), 2
+                if con_huesos and any(_distancia_segmento(x, y, muneca_izq, d)[0] < tolerancia_hueso
+                                      for d in dedos_izq):
+                    color = _COLOR_HUESO
+
+            rel = _dentro_trazo(x, y, cola, grosor_min)
+            if rel is not None or _dentro_poligono(x, y, _COLA_PUNTA):
+                if rel is None:
+                    color = (120, 165, 235) if x < 93.5 else (80, 115, 200)
+                else:
+                    color = (150, 190, 245) if rel < -0.35 else ((60, 90, 170) if rel > 0.45 else (90, 125, 205))
+                capa = 3
+
+            for pata in _PATAS:
+                rel_p = _dentro_trazo(x, y, pata, grosor_min)
+                if rel_p is not None:
+                    color = (70, 100, 180) if rel_p > 0 else (100, 140, 215)
+                    capa = 4
+            if any(math.hypot(x - gx, y - gy) < max(0.9, 0.8 * sx) for gx, gy in _GARRAS):
+                color, capa = (35, 35, 80), 4
+
+            for px_, py_ in _PUAS:
+                if _dentro_poligono(x, y, [(px_ - 1.4, py_ + 1.2), (px_ + 1.0, py_ - 2.2), (px_ + 1.6, py_ + 1.2)]):
+                    color, capa = _COLOR_PUA, 4
+            rel = _dentro_trazo(x, y, _CUERPO, grosor_min)
+            if rel is not None:
+                if rel < -0.45:
+                    color = (165, 200, 250)
+                elif rel < 0.1:
+                    color = (100, 138, 215)
+                else:
+                    color = (66, 96, 175)
+                d_pecho = math.hypot(x - _PECHO[0], y - _PECHO[1])
+                if d_pecho < _PECHO[2]:
+                    color = _mezclar((255, 235, 190), (255, 140, 60), d_pecho / _PECHO[2])
+                capa = 4
+
+            if _dentro_poligono(x, y, _CABEZA):
+                arriba = y < 39.5
+                color = (150, 190, 245) if arriba else (95, 130, 210)
+                capa = 5
+            for base, punta, grosor in _CUERNOS:
+                d, t = _distancia_segmento(x, y, base, punta)
+                if d < grosor * (1.0 - 0.6 * t) + 0.25 * sx:
+                    color, capa = (55, 70, 140), 5
+            if math.hypot(x - _OJO[0], y - _OJO[1]) < max(0.85, 0.7 * sx):
+                color, capa = (255, 245, 170), 5
+            if any(math.hypot(x - dx, y - dy) < max(0.6, 0.55 * sx) for dx, dy in _DIENTES):
+                color, capa = (250, 250, 255), 5
+
+            if fuego > 0:
+                vx, vy = x - fx0, y - fy0
+                u = (vx * ux + vy * uy) / largo_fuego
+                v = abs(-vx * uy + vy * ux)
+                if 0 <= u <= fuego:
+                    media = 1.0 + 9.5 * (u ** 0.8)
+                    ruido = _ruido(i, j, semilla)
+                    borde = media * (0.85 + 0.3 * ruido)
+                    if v <= borde:
+                        r = v / borde
+                        if r < 0.22 and u < fuego * 0.9:
+                            color = (255, 248, 215)
+                        elif r < 0.45:
+                            color = (255, 214, 80)
+                        elif r < 0.72:
+                            color = (255, 150, 40)
+                        else:
+                            color = (245, 70, 95) if ruido > 0.5 else (255, 95, 60)
+                        if u > fuego * 0.82 and ruido > 0.82:
+                            color = None if capa == 0 else color
+                        if color is not None:
+                            capa = 6
+                elif fuego <= u <= fuego + 0.22:
+                    media = 1.0 + 9.5 * (fuego ** 0.8)
+                    if v <= media * 1.5 and _ruido(i, j, semilla + 11) > 0.86:
+                        color = [(255, 90, 130), (255, 150, 40), (250, 60, 60)][int(_ruido(j, i, semilla) * 3) % 3]
+                        capa = 6
+
+            pixeles[j][i] = color
+            capas[j][i] = capa
+
+    if contorno:
+        salida = [fila[:] for fila in pixeles]
+        for j in range(alto):
+            for i in range(ancho):
+                capa = capas[j][i]
+                vecinas = []
+                for di, dj in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                    ni, nj = i + di, j + dj
+                    vecinas.append(capas[nj][ni] if 0 <= ni < ancho and 0 <= nj < alto else 0)
+                if capa == 0:
+                    # Contorno por fuera: el píxel vacío pegado a una forma (salvo el fuego) se oscurece.
+                    if any(v not in (0, 6) for v in vecinas):
+                        salida[j][i] = _COLOR_CONTORNO
+                elif capa in (1, 2) and ancho >= 40:
+                    # Borde entre ala y cuerpo/cabeza para separar las formas.
+                    if any(v in (3, 4, 5) for v in vecinas):
+                        salida[j][i] = _COLOR_CONTORNO
+        pixeles = salida
+    return pixeles
+
+
+def renderizar_pixeles(pixeles: list[list[Optional[tuple]]], margen: int = 0) -> list[str]:
+    """Convierte la matriz en líneas de terminal usando medios bloques (2 filas por línea)."""
+    lineas = []
+    alto = len(pixeles)
+    ancho = len(pixeles[0]) if pixeles else 0
+    reset = C.RESET
+    for j in range(0, alto, 2):
+        partes = [" " * margen]
+        arriba = pixeles[j]
+        abajo = pixeles[j + 1] if j + 1 < alto else [None] * ancho
+        for i in range(ancho):
+            a, b = arriba[i], abajo[i]
+            if a is None and b is None:
+                partes.append(" ")
+            elif a is not None and b is None:
+                partes.append(rgb(*a) + "▀" + reset)
+            elif a is None and b is not None:
+                partes.append(rgb(*b) + "▄" + reset)
+            elif a == b:
+                partes.append(rgb(*a) + "█" + reset)
+            else:
+                partes.append(rgb(*a) + rgb(*b, fondo=True) + "▀" + reset)
+        lineas.append("".join(partes).rstrip() if not _USAR_COLOR else "".join(partes))
+    return lineas
+
+
+_RAMPA_ASCII = " .:-=+*#%@"
+
+
+def renderizar_ascii(pixeles: list[list[Optional[tuple]]], margen: int = 0) -> list[str]:
+    """Versión sin color: un carácter por celda según el brillo promedio de dos píxeles."""
+    lineas = []
+    alto = len(pixeles)
+    for j in range(0, alto, 2):
+        fila = []
+        for i in range(len(pixeles[j])):
+            muestras = [p for p in (pixeles[j][i], pixeles[j + 1][i] if j + 1 < alto else None) if p]
+            if not muestras:
+                fila.append(" ")
+                continue
+            brillo = sum(0.3 * r + 0.59 * g + 0.11 * b for r, g, b in muestras) / len(muestras) / 255
+            fila.append(_RAMPA_ASCII[1 + min(len(_RAMPA_ASCII) - 2, int(brillo * (len(_RAMPA_ASCII) - 1)))])
+        lineas.append(" " * margen + "".join(fila).rstrip())
+    return lineas
+
+
+# Letras de bloque compactas (3 filas) para el logo.
+_LETRAS = {
+    "R": ["█▀▀▄", "█▄▄▀", "█  █"],
+    "E": ["█▀▀▀", "█▄▄ ", "█▄▄▄"],
+    "A": ["▄▀▀▄", "█▄▄█", "█  █"],
+    "P": ["█▀▀▄", "█▄▄▀", "█   "],
+    "V": ["█  █", "█  █", " ▀▀ "],
+    "7": ["▀▀▀█", "  █ ", " █  "],
+    " ": ["  ", "  ", "  "],
+}
+
+
+def logo_texto(texto: str = "REAPER") -> list[str]:
+    filas = ["", "", ""]
+    for letra in texto.upper():
+        dibujo = _LETRAS.get(letra, _LETRAS[" "])
+        for k in range(3):
+            filas[k] += dibujo[k] + " "
+    return [f.rstrip() for f in filas]
+
+
+def logo_reaper(margen: int = 0) -> list[str]:
+    filas = logo_texto("REAPER V7")
+    if not _USAR_COLOR:
+        return [" " * margen + f for f in filas]
+    return [" " * margen + degradado(f, (255, 150, 40), (200, 60, 220)) for f in filas]
+
+
+def ancho_dragon(columnas: Optional[int] = None) -> int:
+    columnas = columnas or ancho_terminal()
+    return max(28, min(72, columnas - 2))
+
+
+def banner_dragon(columnas: Optional[int] = None, subtitulo: str = "") -> str:
+    """Dragón + logo + subtítulo, listo para imprimir."""
+    columnas = columnas or ancho_terminal()
+    ancho = ancho_dragon(columnas)
+    margen = max(0, (columnas - ancho) // 2)
+    pixeles = pintar_dragon(ancho)
+    lineas = renderizar_pixeles(pixeles, margen) if _USAR_COLOR else renderizar_ascii(pixeles, margen)
+    logo = logo_reaper()
+    ancho_logo = max(ancho_visible(l) for l in logo)
+    margen_logo = max(0, (columnas - ancho_logo) // 2)
+    lineas.append("")
+    lineas.extend(" " * margen_logo + l for l in logo)
+    texto = subtitulo or f"agente autónomo de programación · v{__version__} «{__codename__}»"
+    margen_sub = max(0, (columnas - ancho_visible(texto)) // 2)
+    lineas.append(" " * margen_sub + f"{C.ESCAMA}{texto}{C.RESET}")
+    return "\n".join(lineas)
+
+
+def animar_intro(columnas: Optional[int] = None, salida=None, cuadros: int = 7, pausa: float = 0.07) -> bool:
+    """
+    Pequeña animación de arranque: el dragón aletea mientras la llamarada crece.
+    Devuelve False si no se pudo animar (sin TTY o sin color) para que se use el banner fijo.
+    """
+    salida = salida or sys.stdout
+    try:
+        es_tty = salida.isatty()
+    except (AttributeError, ValueError):
+        es_tty = False
+    if not (_USAR_COLOR and es_tty) or os.getenv("REAPER_SIN_ANIMACION"):
+        return False
+    columnas = columnas or ancho_terminal()
+    ancho = ancho_dragon(columnas)
+    margen = max(0, (columnas - ancho) // 2)
+    alto_lineas = None
+    try:
+        salida.write("\033[?25l")
+        for k in range(cuadros):
+            t = (k + 1) / cuadros
+            alas = math.sin(t * math.pi * 2.0) * 0.8
+            pixeles = pintar_dragon(ancho, alas=alas, fuego=min(1.0, 0.15 + t), semilla=7 + k)
+            lineas = renderizar_pixeles(pixeles, margen)
+            if alto_lineas is not None:
+                salida.write(f"\033[{alto_lineas}A")
+            salida.write("\n".join(l + "\033[K" for l in lineas) + "\n")
+            salida.flush()
+            alto_lineas = len(lineas)
+            time.sleep(pausa)
+        pixeles = pintar_dragon(ancho, alas=0.0, fuego=1.0, semilla=7)
+        salida.write(f"\033[{alto_lineas}A")
+        salida.write("\n".join(l + "\033[K" for l in renderizar_pixeles(pixeles, margen)) + "\n")
+        logo = logo_reaper()
+        ancho_logo = max(ancho_visible(l) for l in logo)
+        margen_logo = max(0, (columnas - ancho_logo) // 2)
+        salida.write("\n")
+        for l in logo:
+            salida.write(" " * margen_logo + l + "\n")
+            salida.flush()
+            time.sleep(pausa / 2)
+        texto = f"agente autónomo de programación · v{__version__} «{__codename__}»"
+        salida.write(" " * max(0, (columnas - ancho_visible(texto)) // 2) + f"{C.ESCAMA}{texto}{C.RESET}\n")
+    except (OSError, ValueError):
+        return False
+    finally:
+        try:
+            salida.write("\033[?25h")
+            salida.flush()
+        except (OSError, ValueError):
+            pass
+    return True
+
+
+def dragon_png(ruta: Path, ancho: int = 104, escala: int = 6, fondo: tuple = (255, 255, 255)) -> Path:
+    """Exporta el dragón como PNG (sin dependencias) para compartirlo o usarlo de ícono."""
+    import struct
+    import zlib
+
+    pixeles = pintar_dragon(ancho)
+    alto = len(pixeles)
+    filas = []
+    for fila in pixeles:
+        linea = bytearray([0])
+        for px in fila:
+            linea.extend(bytes(px or fondo) * escala)
+        filas.append(bytes(linea) * escala)
+    crudo = b"".join(filas)
+
+    def bloque(tipo: bytes, datos: bytes) -> bytes:
+        return struct.pack(">I", len(datos)) + tipo + datos + struct.pack(">I", zlib.crc32(tipo + datos) & 0xFFFFFFFF)
+
+    cabecera = struct.pack(">IIBBBBB", ancho * escala, alto * escala, 8, 2, 0, 0, 0)
+    datos = b"\x89PNG\r\n\x1a\n" + bloque(b"IHDR", cabecera) + bloque(b"IDAT", zlib.compress(crudo, 9)) + bloque(b"IEND", b"")
+    ruta = Path(ruta)
+    ruta.parent.mkdir(parents=True, exist_ok=True)
+    ruta.write_bytes(datos)
+    return ruta
+
+
+# ======================================================================
+# MÓDULO: config
+# ======================================================================
+"""Rutas, modelos, perfiles y configuración persistente de REAPER."""
+
+BASE_DIR = Path(os.getenv("REAPER_HOME") or (Path.home() / "reaper")).expanduser()
+PROJECTS_DIR = BASE_DIR / "proyectos"
+CHECKPOINTS_DIR = BASE_DIR / "checkpoints"
+SESIONES_DIR = BASE_DIR / "sesiones"
+LOGS_DIR = BASE_DIR / "logs"
+CACHE_DIR = BASE_DIR / "cache"
+PLANTILLAS_USUARIO_DIR = BASE_DIR / "plantillas"
+CONFIG_FILE = BASE_DIR / "config.json"
+ESTADO_FILE = BASE_DIR / "estado.json"
+LECCIONES_GLOBALES = BASE_DIR / "lecciones.md"
+HISTORIAL_FILE = BASE_DIR / "historial_repl.txt"
+ESTADISTICAS_FILE = BASE_DIR / "estadisticas.json"
+
+API_URL = os.getenv("REAPER_API_URL", "https://openrouter.ai/api/v1/chat/completions")
+
+PROVEEDORES = {
+    "openrouter": {
+        "url": "https://openrouter.ai/api/v1/chat/completions",
+        "clave": "OPENROUTER_API_KEY",
+        "nota": "por defecto; un solo key para cientos de modelos",
+    },
+    "venice": {
+        "url": "https://api.venice.ai/api/v1/chat/completions",
+        "clave": "VENICE_API_KEY",
+        "nota": "API directa de Venice (modelos con ids propios de Venice)",
+    },
+    "ollama": {
+        "url": "http://127.0.0.1:11434/v1/chat/completions",
+        "clave": "",
+        "nota": "modelos locales con Ollama (sin clave)",
+    },
+    "openai": {
+        "url": "https://api.openai.com/v1/chat/completions",
+        "clave": "OPENAI_API_KEY",
+        "nota": "cualquier API compatible con OpenAI (cambiá api_url)",
+    },
+}
+
+
+@dataclass(frozen=True)
+class InfoModelo:
+    id: str
+    contexto: int = 32768
+    nivel: str = "base"  # base | fuerte
+    nota: str = ""
+
+
+INFO_MODELOS = {
+    "venice": InfoModelo("cognitivecomputations/dolphin-mistral-24b-venice-edition", 32768, "base",
+                         "Venice 24B: el caballo de batalla de REAPER"),
+    "venice-free": InfoModelo("cognitivecomputations/dolphin-mistral-24b-venice-edition:free", 32768, "base",
+                              "gratis, con límite de solicitudes"),
+    "hermes": InfoModelo("nousresearch/hermes-3-llama-3.1-70b", 131072, "base", "70B, buen seguidor de formato"),
+    "qwen": InfoModelo("qwen/qwen-2.5-coder-32b-instruct", 32768, "fuerte", "programación, 32B"),
+    "qwen72": InfoModelo("qwen/qwen-2.5-72b-instruct", 32768, "fuerte", "general, 72B"),
+    "qwen3-coder": InfoModelo("qwen/qwen3-coder", 262144, "fuerte", "programación agéntica, contexto enorme"),
+    "deepseek": InfoModelo("deepseek/deepseek-chat", 65536, "fuerte", "muy bueno diagnosticando, barato"),
+    "deepseek-r1": InfoModelo("deepseek/deepseek-r1", 65536, "fuerte", "razonamiento largo (lento)"),
+    "devstral": InfoModelo("mistralai/devstral-small", 131072, "base", "24B entrenado para agentes de código"),
+    "llama70": InfoModelo("meta-llama/llama-3.3-70b-instruct", 131072, "base", "70B general"),
+}
+
+MODELOS = {alias: info.id for alias, info in INFO_MODELOS.items()}
+
+MODOS = ("confirmar", "auto-edicion", "auto")
+
+
+def resolver_modelo(nombre: str) -> str:
+    nombre = (nombre or "").strip()
+    return MODELOS.get(nombre.lower(), nombre)
+
+
+def info_modelo(nombre: str) -> InfoModelo:
+    real = resolver_modelo(nombre)
+    for info in INFO_MODELOS.values():
+        if info.id == real:
+            return info
+    return InfoModelo(real, 32768, "base", "")
+
+
+def es_modelo_gratis(nombre: str) -> bool:
+    return resolver_modelo(nombre).endswith(":free")
+
+
+@dataclass
+class Settings:
+    # Modelo principal y overrides por rol, p. ej. {"revisor": "qwen"}.
+    modelo: str = MODELOS["venice"]
+    modelos_rol: dict = field(default_factory=dict)
+    # Modelos de respaldo si el principal falla (404, 402, caídas persistentes).
+    fallbacks: list = field(default_factory=list)
+    proveedor: str = "openrouter"
+    api_url: str = ""
+
+    temperatura: float = 0.2
+    max_tokens: int = 6000
+    # Venice 24B tiene 32k de contexto: REAPER compacta antes de llegar al límite.
+    contexto_tokens: int = 32768
+    timeout: int = 180
+    reintentos: int = 4
+    # Solicitudes por minuto (0 = sin límite; con modelos :free se usa 16 si queda en 0).
+    rpm: int = 0
+
+    # confirmar: pregunta antes de editar y de correr comandos.
+    # auto-edicion: edita solo (con checkpoint para /deshacer), pregunta comandos.
+    # auto: todo automático salvo comandos bloqueados.
+    modo: str = "auto-edicion"
+
+    max_pasos: int = 40
+    max_pasos_sub: int = 25
+    max_profundidad: int = 1
+    max_llamadas_turno: int = 4
+    max_reparaciones: int = 3
+    max_revisiones: int = 2
+    max_tareas: int = 8
+    paralelo: int = 2
+    qa: bool = True
+
+    # --- v7: tests primero + torneo de implementadores ---------------
+    tests_primero: bool = True
+    torneo: bool = True
+    candidatos: int = 3
+    temperaturas: list = field(default_factory=lambda: [0.1, 0.4, 0.7])
+    # Con modelos :free conviene 2 por el límite de solicitudes.
+    paralelo_torneo: int = 2
+
+    # --- v7: escalada a un modelo más fuerte --------------------------
+    escalar: bool = True
+    modelo_fuerte: str = "deepseek"
+    umbral_escalada: int = 2
+
+    # --- v7: lecciones entre sesiones ---------------------------------
+    lecciones: bool = True
+    max_lecciones_prompt: int = 8
+
+    # --- v7: archivos largos sin romperse -----------------------------
+    continuar_cortes: bool = True
+    max_continuaciones: int = 8
+    lineas_por_bloque: int = 160
+    escritor_largo: bool = True
+
+    # --- v7: calidad automática ---------------------------------------
+    autofix: bool = True
+    autofix_ruff: bool = True
+    mapa_relevantes: bool = True
+    max_relevantes: int = 8
+    pistas_errores: bool = True
+    git_snapshots: bool = True
+    rama_git: str = "reaper/builds"
+
+    # --- v7: interfaz ---------------------------------------------------
+    tema: str = "dragon"
+    animacion: bool = True
+    detalle: int = 1
+    log: bool = True
+    costo_maximo: float = 0.0
+
+    exec_timeout: int = 90
+    tests_timeout: int = 300
+
+    def modelo_para(self, rol: str) -> str:
+        return resolver_modelo(self.modelos_rol.get(rol) or self.modelo)
+
+    def url_api(self) -> str:
+        if self.api_url.strip():
+            return self.api_url.strip()
+        if os.getenv("REAPER_API_URL"):
+            return os.environ["REAPER_API_URL"]
+        return PROVEEDORES.get(self.proveedor, PROVEEDORES["openrouter"])["url"]
+
+    def variable_clave(self) -> str:
+        return PROVEEDORES.get(self.proveedor, PROVEEDORES["openrouter"])["clave"]
+
+    def rpm_efectivo(self) -> int:
+        if self.rpm > 0:
+            return self.rpm
+        modelos = [self.modelo] + list(self.modelos_rol.values())
+        return 16 if any(es_modelo_gratis(m) for m in modelos) else 0
+
+    def temperatura_candidato(self, indice: int) -> float:
+        lista = [t for t in self.temperaturas if isinstance(t, (int, float))] or [0.1, 0.4, 0.7]
+        if indice < len(lista):
+            return float(lista[indice])
+        return round(min(1.0, lista[-1] + 0.15 * (indice - len(lista) + 1)), 2)
+
+    def validar(self) -> "Settings":
+        """Lleva cada valor a un rango sano (un config.json editado a mano no debe romper nada)."""
+        def acotar(nombre: str, minimo, maximo) -> None:
+            valor = getattr(self, nombre)
+            setattr(self, nombre, max(minimo, min(maximo, valor)))
+
+        acotar("temperatura", 0.0, 2.0)
+        acotar("max_tokens", 256, 64000)
+        acotar("contexto_tokens", 4096, 2_000_000)
+        acotar("timeout", 10, 1800)
+        acotar("reintentos", 0, 10)
+        acotar("rpm", 0, 600)
+        acotar("max_pasos", 3, 400)
+        acotar("max_pasos_sub", 3, 200)
+        acotar("max_profundidad", 0, 3)
+        acotar("max_llamadas_turno", 1, 10)
+        acotar("max_reparaciones", 0, 10)
+        acotar("max_revisiones", 0, 5)
+        acotar("max_tareas", 1, 30)
+        acotar("paralelo", 1, 8)
+        acotar("candidatos", 1, 6)
+        acotar("paralelo_torneo", 1, 6)
+        acotar("umbral_escalada", 1, 10)
+        acotar("max_lecciones_prompt", 0, 40)
+        acotar("max_continuaciones", 0, 40)
+        acotar("lineas_por_bloque", 40, 600)
+        acotar("max_relevantes", 0, 30)
+        acotar("detalle", 0, 2)
+        acotar("costo_maximo", 0.0, 10_000.0)
+        acotar("exec_timeout", 5, 3600)
+        acotar("tests_timeout", 10, 7200)
+        if self.modo not in MODOS:
+            self.modo = "auto-edicion"
+        if self.proveedor not in PROVEEDORES:
+            self.proveedor = "openrouter"
+        if self.tema not in TEMAS:
+            self.tema = "dragon"
+        self.temperaturas = [max(0.0, min(2.0, float(t))) for t in self.temperaturas
+                             if isinstance(t, (int, float)) and not isinstance(t, bool)] or [0.1, 0.4, 0.7]
+        return self
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def desde_dict(cls, data: dict) -> "Settings":
+        base = cls()
+        tipos = {f.name: type(getattr(base, f.name)) for f in fields(cls)}
+        valores = {}
+        for clave, valor in (data or {}).items():
+            tipo = tipos.get(clave)
+            if tipo is None:
+                continue
+            if tipo is float and isinstance(valor, int) and not isinstance(valor, bool):
+                valor = float(valor)
+            if isinstance(valor, tipo) and not (tipo is int and isinstance(valor, bool)):
+                valores[clave] = valor
+        return cls(**valores).validar()
+
+
+PERFILES = {
+    "gratis": {
+        "descripcion": "modelos :free, 2 candidatos, sin escalada paga, límite de 16 solicitudes/min",
+        "valores": {"modelo": MODELOS["venice-free"], "paralelo": 1, "paralelo_torneo": 1,
+                    "candidatos": 2, "rpm": 16, "escalar": False},
+    },
+    "rapido": {
+        "descripcion": "sin torneo ni tests previos: un intento por tarea (barato y veloz)",
+        "valores": {"torneo": False, "tests_primero": False, "max_revisiones": 1, "candidatos": 1},
+    },
+    "equilibrado": {
+        "descripcion": "tests primero + torneo de 2, escalada a deepseek (recomendado)",
+        "valores": {"torneo": True, "tests_primero": True, "candidatos": 2, "paralelo_torneo": 2,
+                    "escalar": True, "max_revisiones": 1},
+    },
+    "maximo": {
+        "descripcion": "torneo de 3 en paralelo, revisor, escalada y reparaciones extra",
+        "valores": {"torneo": True, "tests_primero": True, "candidatos": 3, "paralelo_torneo": 3,
+                    "escalar": True, "max_revisiones": 2, "max_reparaciones": 4},
+    },
+}
+
+
+def aplicar_perfil(settings: Settings, nombre: str) -> list[str]:
+    perfil = PERFILES.get((nombre or "").strip().lower())
+    if not perfil:
+        raise KeyError(nombre)
+    cambios = []
+    for clave, valor in perfil["valores"].items():
+        if getattr(settings, clave) != valor:
+            setattr(settings, clave, copy.deepcopy(valor))
+            cambios.append(f"{clave}={valor}")
+    settings.validar()
+    return cambios
+
+
+def asegurar_dirs() -> None:
+    for carpeta in (BASE_DIR, PROJECTS_DIR, CHECKPOINTS_DIR, SESIONES_DIR, LOGS_DIR, CACHE_DIR):
+        carpeta.mkdir(parents=True, exist_ok=True)
+
+
+def cargar_settings(ruta: Optional[Path] = None) -> Settings:
+    ruta = ruta or CONFIG_FILE
+    settings = Settings()
+    if ruta.exists():
+        try:
+            settings = Settings.desde_dict(json.loads(ruta.read_text(encoding="utf-8")))
+        except (OSError, ValueError, TypeError):
+            settings = Settings()
+
+    if os.getenv("MODEL_NAME"):
+        settings.modelo = resolver_modelo(os.environ["MODEL_NAME"])
+    if os.getenv("REAPER_MODO") in MODOS:
+        settings.modo = os.environ["REAPER_MODO"]
+    if os.getenv("REAPER_PROVEEDOR") in PROVEEDORES:
+        settings.proveedor = os.environ["REAPER_PROVEEDOR"]
+    if settings.modo not in MODOS:
+        settings.modo = "auto-edicion"
+    return settings.validar()
+
+
+def guardar_settings(settings: Settings, ruta: Optional[Path] = None) -> None:
+    ruta = ruta or CONFIG_FILE
+    ruta.parent.mkdir(parents=True, exist_ok=True)
+    tmp = ruta.with_suffix(".tmp")
+    tmp.write_text(json.dumps(settings.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, ruta)
+
+
+def settings_con_local(settings: Settings, local: dict) -> Settings:
+    """Copia de settings con los overrides de .reaper/config.json del proyecto (claves 'settings')."""
+    overrides = local.get("settings") if isinstance(local, dict) else None
+    if not isinstance(overrides, dict) or not overrides:
+        return settings
+    combinado = settings.to_dict()
+    combinado.update(overrides)
+    return Settings.desde_dict(combinado)
+
+
+def cargar_estado() -> dict:
+    try:
+        data = json.loads(ESTADO_FILE.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def guardar_estado(**valores) -> None:
+    data = cargar_estado()
+    data.update({k: v for k, v in valores.items()})
+    try:
+        ESTADO_FILE.parent.mkdir(parents=True, exist_ok=True)
+        ESTADO_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def obtener_clave_api(settings: Settings) -> Optional[str]:
+    """Clave del proveedor activo. Ollama no necesita clave."""
+    variable = settings.variable_clave()
+    if not variable:
+        return "sin-clave"
+    valor = os.getenv(variable) or (os.getenv("OPENROUTER_API_KEY") if settings.proveedor == "openrouter" else None)
+    if valor:
+        return valor.strip()
+    archivo = BASE_DIR / ".clave"
+    try:
+        texto = archivo.read_text(encoding="utf-8").strip()
+        return texto or None
+    except OSError:
+        return None
+
+
+# ======================================================================
+# MÓDULO: tokens
+# ======================================================================
+"""
+Estimación de tokens y presupuesto de contexto.
+
+Venice 24B tiene 32k tokens de contexto. Sin tokenizer real, REAPER estima
+con una heurística calibrada para código y español (≈3 caracteres por token
+en código, ≈3.6 en prosa). Es conservadora a propósito: es preferible
+compactar un poco antes que recibir un 400 por contexto excedido.
+"""
+
+CARACTERES_POR_TOKEN = 3.0
+_RE_PALABRA = re.compile(r"\w+|[^\w\s]", re.U)
+
+
+def estimar_tokens(texto: str) -> int:
+    """Estimación rápida: mezcla longitud en caracteres y cantidad de piezas léxicas."""
+    if not texto:
+        return 0
+    caracteres = len(texto)
+    if caracteres > 200_000:
+        return int(caracteres / CARACTERES_POR_TOKEN)
+    piezas = len(_RE_PALABRA.findall(texto))
+    # Las piezas cortas (símbolos de código) suelen ser 1 token; las palabras largas, 2 o más.
+    por_caracteres = caracteres / CARACTERES_POR_TOKEN
+    por_piezas = piezas * 1.15
+    return int(max(por_caracteres, por_piezas) * 0.92 + 4)
+
+
+def tokens_mensajes(mensajes: Sequence[dict]) -> int:
+    return sum(estimar_tokens(m.get("content", "")) + 4 for m in mensajes) + 2
+
+
+@dataclass
+class Presupuesto:
+    """Reparto del contexto entre system prompt, historial y respuesta."""
+
+    contexto: int
+    respuesta: int
+    margen: float = 0.12
+
+    @property
+    def entrada_maxima(self) -> int:
+        return max(1024, int((self.contexto - self.respuesta) * (1 - self.margen)))
+
+    def caracteres_maximos(self) -> int:
+        return int(self.entrada_maxima * CARACTERES_POR_TOKEN)
+
+    def cabe(self, mensajes: Sequence[dict]) -> bool:
+        return tokens_mensajes(mensajes) <= self.entrada_maxima
+
+    def respuesta_posible(self, mensajes: Sequence[dict]) -> int:
+        """Cuántos tokens de respuesta quedan disponibles para estos mensajes."""
+        libre = int(self.contexto * (1 - self.margen / 2)) - tokens_mensajes(mensajes)
+        return max(256, min(self.respuesta, libre))
+
+
+def recortar_a_tokens(texto: str, tokens: int, marca: str = "\n...[recortado]...\n") -> str:
+    if estimar_tokens(texto) <= tokens:
+        return texto
+    limite = int(tokens * CARACTERES_POR_TOKEN)
+    return recortar(texto, max(200, limite - len(marca)))
+
+
+# ======================================================================
+# MÓDULO: llm
+# ======================================================================
+"""
+Cliente LLM compatible con OpenAI/OpenRouter: streaming, reintentos con
+backoff, modelos de respaldo, límite de solicitudes por minuto, presupuesto
+de costo, ajuste automático de max_tokens y registro de uso por modelo.
+"""
+
+try:  # httpx es opcional: sin él se usa urllib (streaming igual).
+    import httpx
+except ImportError:  # pragma: no cover - depende del entorno
+    httpx = None
+
+
+class LLMError(RuntimeError):
+    def __init__(self, mensaje: str, *, probar_otro_modelo: bool = False, contexto_excedido: bool = False,
+                 presupuesto: bool = False):
+        super().__init__(mensaje)
+        self.probar_otro_modelo = probar_otro_modelo
+        self.contexto_excedido = contexto_excedido
+        self.presupuesto = presupuesto
+
+
+class _Transitorio(Exception):
+    """Error que vale la pena reintentar (429, 5xx, red, respuesta vacía)."""
+
+    def __init__(self, mensaje: str, espera: Optional[float] = None):
+        super().__init__(mensaje)
+        self.espera = espera
+
+
+@dataclass
+class Respuesta:
+    texto: str
+    finish_reason: Optional[str] = None
+    modelo: str = ""
+    tokens_entrada: int = 0
+    tokens_salida: int = 0
+    duracion: float = 0.0
+    primer_token: float = 0.0
+
+
+@dataclass
+class UsoModelo:
+    llamadas: int = 0
+    tokens_entrada: int = 0
+    tokens_salida: int = 0
+    costo: float = 0.0
+    segundos: float = 0.0
+
+
+@dataclass
+class Uso:
+    llamadas: int = 0
+    tokens_entrada: int = 0
+    tokens_salida: int = 0
+    costo: float = 0.0
+    reintentos: int = 0
+    errores: int = 0
+    respaldos: int = 0
+    por_modelo: dict = field(default_factory=dict)
+    por_rol: dict = field(default_factory=dict)
+
+    def resumen(self) -> str:
+        texto = (f"{self.llamadas} llamadas · {formatear_numero(self.tokens_entrada)} tokens entrada · "
+                 f"{formatear_numero(self.tokens_salida)} salida")
+        if self.costo:
+            texto += f" · ${self.costo:.4f}"
+        if self.reintentos:
+            texto += f" · {self.reintentos} reintentos"
+        return texto
+
+
+MENSAJES_HTTP = {
+    400: "Pedido rechazado por el proveedor (¿contexto demasiado largo?).",
+    401: "Clave API inválida, revocada o ausente.",
+    402: "La cuenta no tiene crédito suficiente para este modelo.",
+    403: "Acceso denegado por el proveedor (moderación o permisos).",
+    404: "Modelo o endpoint no disponible.",
+    408: "El proveedor tardó demasiado.",
+    413: "El pedido es demasiado grande.",
+    429: "Límite de solicitudes alcanzado.",
+}
+
+TRANSITORIOS = {408, 409, 425, 429, 500, 502, 503, 504, 520, 522, 524, 529}
+
+_RE_CONTEXTO = re.compile(
+    r"context(_| )length|maximum context|too many tokens|context window|prompt is too long|reduce the length",
+    re.I,
+)
+
+
+def _lanzar_http(status: int, cuerpo: str, retry_after: Optional[str]) -> None:
+    detalle = " ".join((cuerpo or "").split())[:400]
+    motivo = MENSAJES_HTTP.get(status, "Error HTTP del proveedor.")
+    if status in TRANSITORIOS:
+        espera = None
+        try:
+            espera = float(retry_after) if retry_after else None
+        except ValueError:
+            espera = None
+        raise _Transitorio(f"{motivo} HTTP {status}. {detalle}".strip(), espera)
+    excedido = status in (400, 413) and bool(_RE_CONTEXTO.search(cuerpo or ""))
+    raise LLMError(
+        f"{motivo} HTTP {status}. {detalle}".strip(),
+        probar_otro_modelo=status in (400, 402, 403, 404) and not excedido,
+        contexto_excedido=excedido,
+    )
+
+
+def _transporte_httpx(url: str, headers: dict, payload: dict, timeout: int) -> Iterator[str]:
+    try:
+        with httpx.stream(
+            "POST",
+            url,
+            headers=headers,
+            json=payload,
+            timeout=httpx.Timeout(timeout, connect=30),
+        ) as r:
+            if r.status_code >= 400:
+                # En streaming hay que leer el cuerpo antes de usarlo.
+                cuerpo = r.read().decode("utf-8", "replace")
+                _lanzar_http(r.status_code, cuerpo, r.headers.get("retry-after"))
+            for linea in r.iter_lines():
+                yield linea
+    except httpx.TimeoutException as e:
+        raise _Transitorio(f"El modelo no respondió dentro de {timeout}s.") from e
+    except httpx.RequestError as e:
+        raise _Transitorio(f"Error de red hablando con el proveedor: {e}") from e
+
+
+def _transporte_urllib(url: str, headers: dict, payload: dict, timeout: int) -> Iterator[str]:
+    datos = json.dumps(payload).encode("utf-8")
+    pedido = urllib.request.Request(url, data=datos, headers=headers, method="POST")
+    try:
+        respuesta = urllib.request.urlopen(pedido, timeout=timeout)
+    except urllib.error.HTTPError as e:
+        cuerpo = e.read().decode("utf-8", "replace") if e.fp else ""
+        _lanzar_http(e.code, cuerpo, e.headers.get("Retry-After") if e.headers else None)
+        return
+    except (urllib.error.URLError, socket.timeout, TimeoutError, ConnectionError) as e:
+        raise _Transitorio(f"Error de red hablando con el proveedor: {e}") from e
+
+    with respuesta:
+        try:
+            for crudo in respuesta:
+                yield crudo.decode("utf-8", "replace").rstrip("\r\n")
+        except (socket.timeout, TimeoutError, ConnectionError) as e:
+            raise _Transitorio(f"Se cortó el streaming: {e}") from e
+
+
+def parsear_linea_sse(linea: str):
+    """Devuelve dict del evento, la cadena 'DONE' o None si la línea no aporta nada."""
+    if not linea or not linea.startswith("data:"):
+        return None
+    datos = linea[5:].strip()
+    if datos == "[DONE]":
+        return "DONE"
+    try:
+        obj = json.loads(datos)
+    except json.JSONDecodeError:
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+Transporte = Callable[[str, dict, dict, int], Iterator[str]]
+
+
+class LimitadorTasa:
+    """Ventana deslizante de 60 s: como máximo 'rpm' solicitudes por minuto (thread-safe)."""
+
+    def __init__(self, rpm: int, reloj: Callable[[], float] = time.monotonic,
+                 dormir: Callable[[float], None] = time.sleep):
+        self.rpm = max(0, int(rpm))
+        self._reloj = reloj
+        self._dormir = dormir
+        self._marcas: collections.deque = collections.deque()
+        self._lock = threading.Lock()
+
+    def espera_necesaria(self) -> float:
+        if self.rpm <= 0:
+            return 0.0
+        with self._lock:
+            ahora = self._reloj()
+            while self._marcas and ahora - self._marcas[0] >= 60.0:
+                self._marcas.popleft()
+            if len(self._marcas) < self.rpm:
+                return 0.0
+            return max(0.0, 60.0 - (ahora - self._marcas[0]) + 0.05)
+
+    def adquirir(self, cancelado: Optional[Callable[[], bool]] = None) -> float:
+        """Bloquea hasta que haya lugar. Devuelve los segundos esperados."""
+        esperado = 0.0
+        while True:
+            espera = self.espera_necesaria()
+            if espera <= 0:
+                with self._lock:
+                    self._marcas.append(self._reloj())
+                return esperado
+            tramo = min(espera, 1.0)
+            if cancelado and cancelado():
+                raise LLMError("Cancelado mientras se esperaba el límite de solicitudes.")
+            self._dormir(tramo)
+            esperado += tramo
+
+
+class LLMClient:
+    def __init__(
+        self,
+        api_key: str,
+        settings: Settings,
+        url: Optional[str] = None,
+        transporte: Optional[Transporte] = None,
+    ):
+        self.api_key = api_key
+        self.settings = settings
+        self.url = url or settings.url_api()
+        self.uso = Uso()
+        self._lock = threading.Lock()
+        self._transporte = transporte or (_transporte_httpx if httpx else _transporte_urllib)
+        self.dormir = time.sleep
+        self.limitador = LimitadorTasa(settings.rpm_efectivo())
+        self.on_evento: Optional[Callable[[str], None]] = None
+
+    # ------------------------------------------------------------ API
+    def chat(
+        self,
+        mensajes: list[dict],
+        *,
+        modelo: Optional[str] = None,
+        temperatura: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        stop: Optional[list[str]] = None,
+        on_progress: Optional[Callable[[int], None]] = None,
+        rol: str = "",
+        sin_respaldo: bool = False,
+    ) -> Respuesta:
+        self._verificar_presupuesto()
+        principal = resolver_modelo(modelo or self.settings.modelo)
+        candidatos = [principal]
+        if not sin_respaldo:
+            for respaldo in self.settings.fallbacks:
+                respaldo = resolver_modelo(respaldo)
+                if respaldo and respaldo not in candidatos:
+                    candidatos.append(respaldo)
+
+        ultimo: Optional[LLMError] = None
+        for n, candidato in enumerate(candidatos):
+            try:
+                respuesta = self._con_reintentos(
+                    candidato, mensajes, temperatura, max_tokens, stop, on_progress
+                )
+                if n:
+                    with self._lock:
+                        self.uso.respaldos += 1
+                self._registrar_rol(rol, respuesta)
+                return respuesta
+            except LLMError as e:
+                ultimo = e
+                with self._lock:
+                    self.uso.errores += 1
+                if not e.probar_otro_modelo:
+                    raise
+                if self.on_evento and n + 1 < len(candidatos):
+                    self.on_evento(f"{candidato} falló ({e}); pruebo con {candidatos[n + 1]}")
+        assert ultimo is not None
+        raise ultimo
+
+    def chat_simple(self, prompt: str, *, sistema: str = "", modelo: Optional[str] = None,
+                    temperatura: float = 0.2, max_tokens: int = 1500, rol: str = "") -> str:
+        """Una pregunta y una respuesta, sin herramientas (diagnósticos, lecciones, resúmenes)."""
+        mensajes = []
+        if sistema:
+            mensajes.append({"role": "system", "content": sistema})
+        mensajes.append({"role": "user", "content": prompt})
+        return self.chat(mensajes, modelo=modelo, temperatura=temperatura, max_tokens=max_tokens, rol=rol).texto
+
+    # ------------------------------------------------------------ internos
+    def _verificar_presupuesto(self) -> None:
+        limite = self.settings.costo_maximo
+        if limite and self.uso.costo >= limite:
+            raise LLMError(
+                f"Se alcanzó el presupuesto de la sesión (${self.uso.costo:.4f} de ${limite:.2f}). "
+                "Subilo con /config costo_maximo <usd> o ponelo en 0.",
+                presupuesto=True,
+            )
+
+    def _payload(self, modelo, mensajes, temperatura, max_tokens, stop) -> dict:
+        info = info_modelo(modelo)
+        presupuesto = Presupuesto(min(self.settings.contexto_tokens, info.contexto) if info.contexto else
+                                  self.settings.contexto_tokens, max_tokens or self.settings.max_tokens)
+        payload = {
+            "model": modelo,
+            "messages": mensajes,
+            "temperature": self.settings.temperatura if temperatura is None else temperatura,
+            "max_tokens": presupuesto.respuesta_posible(mensajes),
+            "stream": True,
+        }
+        if self.settings.proveedor == "openrouter":
+            payload["usage"] = {"include": True}
+        elif self.settings.proveedor == "openai":
+            payload["stream_options"] = {"include_usage": True}
+        if stop:
+            payload["stop"] = stop[:4]
+        return payload
+
+    def _con_reintentos(self, modelo, mensajes, temperatura, max_tokens, stop, on_progress):
+        payload = self._payload(modelo, mensajes, temperatura, max_tokens, stop)
+        intentos = max(0, int(self.settings.reintentos))
+        for intento in range(intentos + 1):
+            try:
+                cancelado = (lambda: CANCELAR.is_set()) if "CANCELAR" in globals() else None
+                self.limitador.adquirir(cancelado)
+                return self._una_vez(modelo, payload, on_progress)
+            except _Transitorio as e:
+                with self._lock:
+                    self.uso.reintentos += 1
+                if intento >= intentos:
+                    raise LLMError(
+                        f"{e} (después de {intentos + 1} intentos)",
+                        probar_otro_modelo=True,
+                    ) from e
+                espera = e.espera
+                if espera is None:
+                    espera = min(60.0, 2.0 * (2 ** intento)) + random.uniform(0, 1)
+                if self.on_evento:
+                    self.on_evento(f"reintento {intento + 1}/{intentos} en {espera:.0f}s: {e}")
+                self.dormir(min(espera, 120.0))
+        raise LLMError("No se obtuvo respuesta del modelo.")  # pragma: no cover
+
+    def _headers(self) -> dict:
+        headers = {"Content-Type": "application/json"}
+        if self.api_key and self.api_key != "sin-clave":
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        if self.settings.proveedor == "openrouter":
+            headers["X-Title"] = "REAPER"
+            headers["HTTP-Referer"] = "https://github.com/reaper-termux"
+        return headers
+
+    def _una_vez(self, modelo: str, payload: dict, on_progress) -> Respuesta:
+        partes: list[str] = []
+        total = 0
+        finish = None
+        inicio = time.monotonic()
+        primer = 0.0
+        tokens_in = tokens_out = 0
+
+        for linea in self._transporte(self.url, self._headers(), payload, self.settings.timeout):
+            evento = parsear_linea_sse(linea)
+            if evento is None:
+                continue
+            if evento == "DONE":
+                break
+
+            if "error" in evento:
+                err = evento["error"]
+                mensaje = err.get("message", str(err)) if isinstance(err, dict) else str(err)
+                codigo = err.get("code") if isinstance(err, dict) else None
+                if _RE_CONTEXTO.search(mensaje or ""):
+                    raise LLMError(f"Contexto excedido: {mensaje}", contexto_excedido=True)
+                if codigo is None or codigo in TRANSITORIOS:
+                    raise _Transitorio(f"Error del proveedor durante el streaming: {mensaje}")
+                raise LLMError(f"Error del proveedor: {mensaje}", probar_otro_modelo=True)
+
+            uso = evento.get("usage")
+            if isinstance(uso, dict):
+                tokens_in = int(uso.get("prompt_tokens") or tokens_in or 0)
+                tokens_out = int(uso.get("completion_tokens") or tokens_out or 0)
+                self._registrar_uso(modelo, uso)
+
+            for choice in evento.get("choices") or []:
+                delta = choice.get("delta") or choice.get("message") or {}
+                contenido = delta.get("content")
+                if contenido:
+                    if not primer:
+                        primer = time.monotonic() - inicio
+                    partes.append(contenido)
+                    total += len(contenido)
+                    if on_progress:
+                        on_progress(total)
+                if choice.get("finish_reason"):
+                    finish = choice["finish_reason"]
+
+        duracion = time.monotonic() - inicio
+        with self._lock:
+            self.uso.llamadas += 1
+            por = self.uso.por_modelo.setdefault(modelo, UsoModelo())
+            por.llamadas += 1
+            por.segundos += duracion
+
+        texto = "".join(partes)
+        if not texto.strip():
+            raise _Transitorio("El modelo devolvió una respuesta vacía.")
+        if not tokens_out:
+            tokens_out = estimar_tokens(texto)
+        return Respuesta(texto=texto, finish_reason=finish, modelo=modelo, tokens_entrada=tokens_in,
+                         tokens_salida=tokens_out, duracion=duracion, primer_token=primer)
+
+    def _registrar_uso(self, modelo: str, uso: dict) -> None:
+        with self._lock:
+            entrada = int(uso.get("prompt_tokens") or 0)
+            salida = int(uso.get("completion_tokens") or 0)
+            self.uso.tokens_entrada += entrada
+            self.uso.tokens_salida += salida
+            por = self.uso.por_modelo.setdefault(modelo, UsoModelo())
+            por.tokens_entrada += entrada
+            por.tokens_salida += salida
+            try:
+                costo = float(uso.get("cost") or 0.0)
+            except (TypeError, ValueError):
+                costo = 0.0
+            self.uso.costo += costo
+            por.costo += costo
+
+    def _registrar_rol(self, rol: str, respuesta: Respuesta) -> None:
+        if not rol:
+            return
+        with self._lock:
+            datos = self.uso.por_rol.setdefault(rol, {"llamadas": 0, "tokens_salida": 0})
+            datos["llamadas"] += 1
+            datos["tokens_salida"] += respuesta.tokens_salida
+
+
+# ======================================================================
+# MÓDULO: protocol
+# ======================================================================
+"""
+Protocolo de herramientas en texto, estilo XML.
+
+Por qué texto y no "function calling" nativo: Venice 24B (y muchos modelos
+de OpenRouter) no soportan tools nativas de forma confiable. Las etiquetas
+XML no necesitan escapar comillas ni saltos de línea, así que el modelo puede
+escribir código crudo dentro de <content> sin romper nada.
+
+El parser es tolerante con todo lo que un modelo chico suele mezclar:
+  - alias de herramientas y de parámetros (cat → read_file, file → path)
+  - <tool name="x">, <invoke name="x"> con <parameter name="p">valor</parameter>
+  - atributos: <read_file path="a.py"/> o <write_to_file path="a.py">...
+  - <function=read_file>{"path": "a.py"}</function> (estilo Llama)
+  - un único parámetro sin etiqueta: <read_file>a.py</read_file>
+  - bloques ``` o CDATA alrededor del código
+  - como último recurso, un objeto JSON {"tool": ..., "args": {...}}
+"""
+
+# Nunca usar como alias nombres que coincidan con parámetros (task, path, diff...).
+ALIAS_HERRAMIENTAS = {
+    "read": "read_file",
+    "cat": "read_file",
+    "open_file": "read_file",
+    "view_file": "read_file",
+    "leer_archivo": "read_file",
+    "ls": "list_files",
+    "list_dir": "list_files",
+    "list_directory": "list_files",
+    "listar_archivos": "list_files",
+    "grep": "search_files",
+    "search": "search_files",
+    "buscar": "search_files",
+    "outline": "code_outline",
+    "repo_map": "code_outline",
+    "write_file": "write_to_file",
+    "create_file": "write_to_file",
+    "escribir_archivo": "write_to_file",
+    "edit_file": "replace_in_file",
+    "apply_diff": "replace_in_file",
+    "editar_archivo": "replace_in_file",
+    "run_command": "execute_command",
+    "bash": "execute_command",
+    "shell": "execute_command",
+    "ejecutar_comando": "execute_command",
+    "run_test": "run_tests",
+    "todo_write": "update_todo",
+    "spawn_agent": "delegate",
+    "subagent": "delegate",
+    "delegar": "delegate",
+    "finish": "attempt_completion",
+    "final_answer": "attempt_completion",
+    "complete": "attempt_completion",
+    "terminar": "attempt_completion",
+    "ask_followup_question": "ask_user",
+    "preguntar": "ask_user",
+}
+
+ALIAS_PARAMS = {
+    "path": ("file", "filepath", "file_path", "filename", "ruta", "archivo"),
+    "command": ("cmd", "comando"),
+    "content": ("contenido", "code", "codigo", "text"),
+    "regex": ("pattern", "query", "patron"),
+    "desde": ("start_line", "start", "linea_inicio"),
+    "hasta": ("end_line", "end", "linea_fin"),
+    "result": ("answer", "summary", "respuesta", "informe"),
+    "role": ("rol", "agent", "agente"),
+    "task": ("tarea", "prompt", "instrucciones"),
+    "files": ("archivos",),
+    "question": ("pregunta",),
+    "diff": ("diffs", "changes", "cambios", "edits"),
+    "items": ("todos", "lista"),
+    "paths": ("rutas",),
+}
+
+_CORTE_RESULTADO = re.compile(
+    r"<\s*(resultado|tool_result|observation|function_results?)\b", re.I
+)
+_FENCE = re.compile(r"\A\s*```[\w+#.-]*[ \t]*\r?\n(.*?)\r?\n?```\s*\Z", re.S)
+_CDATA = re.compile(r"\A\s*<!\[CDATA\[(.*)\]\]>\s*\Z", re.S)
+_RE_ATRIBUTO = re.compile(r"""([A-Za-z_][\w-]*)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>/]+))""")
+_RE_PARAMETER = re.compile(
+    r"<\s*parameter\s+name\s*=\s*[\"']?([A-Za-z_][\w-]*)[\"']?\s*>(.*?)(?:<\s*/\s*parameter\s*>|(?=<\s*parameter\b)|\Z)",
+    re.S | re.I,
+)
+
+
+@dataclass
+class Llamada:
+    nombre: str
+    params: dict = field(default_factory=dict)
+    completa: bool = True
+    crudo: str = ""
+
+
+@dataclass
+class Analisis:
+    llamadas: list
+    texto: str
+    respuesta_limpia: str
+
+
+# esquemas: {"write_to_file": [("path", False), ("content", True)], ...}
+Esquemas = dict
+
+
+def limpiar_largo(valor: str) -> str:
+    v = valor
+    if v.startswith("\r\n"):
+        v = v[2:]
+    elif v.startswith("\n"):
+        v = v[1:]
+    v = v.rstrip(" \t")
+    if v.endswith("\r\n"):
+        v = v[:-2]
+    elif v.endswith("\n"):
+        v = v[:-1]
+    for patron in (_CDATA, _FENCE):
+        m = patron.match(v)
+        if m:
+            v = m.group(1)
+    return v
+
+
+def _apertura(tag: str) -> re.Pattern:
+    return re.compile(r"<\s*" + re.escape(tag) + r"\s*>", re.I)
+
+
+def _cierre(tag: str) -> re.Pattern:
+    return re.compile(r"<\s*/\s*" + re.escape(tag) + r"\s*>", re.I)
+
+
+def _canonico_param(nombre: str) -> str:
+    nombre = nombre.lower()
+    for real, alias in ALIAS_PARAMS.items():
+        if nombre == real or nombre in alias:
+            return real
+    return nombre
+
+
+def _atributos(texto: str) -> dict:
+    salida = {}
+    for m in _RE_ATRIBUTO.finditer(texto or ""):
+        valor = next((g for g in m.groups()[1:] if g is not None), "")
+        salida[m.group(1)] = valor
+    return salida
+
+
+def _extraer_params(cuerpo: str, definicion: list) -> tuple[dict, bool]:
+    params: dict = {}
+    completa = True
+    enmascarado = cuerpo
+
+    # Estilo <parameter name="path">valor</parameter>.
+    if re.search(r"<\s*parameter\s+name\s*=", cuerpo, re.I):
+        largos = {n for n, l in definicion if l}
+        for m in _RE_PARAMETER.finditer(cuerpo):
+            nombre = _canonico_param(m.group(1))
+            valor = m.group(2)
+            params[nombre] = limpiar_largo(valor) if nombre in largos else valor.strip().strip("`'\"").strip()
+        if params:
+            return params, completa
+
+    # Primero los parámetros largos (código), y se enmascaran para que un
+    # "<path>" dentro del código no se confunda con el parámetro path.
+    ordenados = sorted(definicion, key=lambda d: not d[1])
+    for nombre, largo in ordenados:
+        for tag in (nombre, *ALIAS_PARAMS.get(nombre, ())):
+            ap = _apertura(tag).search(enmascarado)
+            if not ap:
+                continue
+            if largo:
+                cierres = list(_cierre(tag).finditer(enmascarado, ap.end()))
+                if cierres:
+                    fin_valor, fin_total = cierres[-1].start(), cierres[-1].end()
+                else:
+                    fin_valor = fin_total = len(enmascarado)
+                    completa = False
+                params[nombre] = limpiar_largo(cuerpo[ap.end():fin_valor])
+                enmascarado = (
+                    enmascarado[:ap.start()]
+                    + " " * (fin_total - ap.start())
+                    + enmascarado[fin_total:]
+                )
+            else:
+                c = _cierre(tag).search(enmascarado, ap.end())
+                if c:
+                    valor = cuerpo[ap.end():c.start()]
+                else:
+                    valor = cuerpo[ap.end():].split("\n", 1)[0]
+                params[nombre] = valor.strip().strip("`'\"").strip()
+            break
+
+    if not params and definicion and cuerpo.strip():
+        # Atajo: <read_file>app.py</read_file> o <attempt_completion>texto</attempt_completion>
+        nombre, largo = definicion[0]
+        if largo or not re.search(r"<\s*\w+\s*>", cuerpo):
+            params[nombre] = limpiar_largo(cuerpo) if largo else cuerpo.strip()
+        elif len([d for d in definicion if d[1]]) == 1 and len(definicion) >= 1:
+            # Un único parámetro largo y el resto vino como atributos.
+            largo_nombre = next(n for n, l in definicion if l)
+            params[largo_nombre] = limpiar_largo(cuerpo)
+
+    return params, completa
+
+
+def _objetos_json(texto: str) -> list[dict]:
+    candidatos = re.findall(r"```(?:json)?\s*\n(\{.*?\})\s*\n```", texto, re.S)
+    limpio = texto.strip()
+    if limpio.startswith("{") and limpio.endswith("}"):
+        candidatos.append(limpio)
+    objetos = []
+    for c in candidatos:
+        try:
+            obj = json.loads(c)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict):
+            objetos.append(obj)
+    return objetos
+
+
+def _params_json(args) -> dict:
+    if isinstance(args, str):
+        try:
+            args = json.loads(args)
+        except json.JSONDecodeError:
+            return {}
+    if not isinstance(args, dict):
+        return {}
+    return {_canonico_param(k): v if isinstance(v, str) else json.dumps(v, ensure_ascii=False)
+            for k, v in args.items()}
+
+
+_RE_FUNCION_LLAMA = re.compile(r"<\s*function\s*=\s*([A-Za-z_][\w-]*)\s*>(.*?)(?:<\s*/\s*function\s*>|\Z)", re.S | re.I)
+
+
+def analizar(texto: str, esquemas: Esquemas) -> Analisis:
+    limpio = texto or ""
+    corte = _CORTE_RESULTADO.search(limpio)
+    if corte:
+        # El modelo empezó a inventar el resultado de la herramienta: se descarta.
+        limpio = limpio[:corte.start()].rstrip()
+
+    nombres = {n.lower(): n for n in esquemas}
+    for alias, real in ALIAS_HERRAMIENTAS.items():
+        if real in esquemas:
+            nombres.setdefault(alias, real)
+
+    alternativas = "|".join(re.escape(n) for n in sorted(nombres, key=len, reverse=True))
+    apertura = re.compile(
+        r"<\s*(?:(?:tool|invoke)\s+name\s*=\s*[\"']?([A-Za-z_][\w-]*)[\"']?|(" + alternativas + r"))"
+        r"(?=[\s/>])([^<>]*?)(/?)\s*>",
+        re.I,
+    )
+
+    llamadas: list[Llamada] = []
+    fuera: list[str] = []
+    pos = 0
+    while True:
+        m = apertura.search(limpio, pos)
+        if not m:
+            fuera.append(limpio[pos:])
+            break
+        fuera.append(limpio[pos:m.start()])
+
+        generico = m.group(1) is not None
+        tag = m.group(1) or m.group(2)
+        real = nombres.get(tag.lower(), ALIAS_HERRAMIENTAS.get(tag.lower(), tag.lower()))
+        atributos = {} if generico else _atributos(m.group(3) or "")
+        autocerrada = bool(m.group(4))
+        etiqueta_cierre = ("invoke" if "invoke" in m.group(0).lower()[:10] else "tool") if generico else tag
+        cierre = _cierre(etiqueta_cierre)
+
+        if autocerrada:
+            cuerpo = ""
+            pos = m.end()
+        else:
+            c = cierre.search(limpio, m.end())
+            if c:
+                cuerpo = limpio[m.end():c.start()]
+                pos = c.end()
+            else:
+                siguiente = apertura.search(limpio, m.end())
+                fin = siguiente.start() if siguiente else len(limpio)
+                cuerpo = limpio[m.end():fin]
+                pos = fin
+
+        definicion = esquemas.get(real, [])
+        params, completa = _extraer_params(cuerpo, definicion) if cuerpo.strip() else ({}, True)
+        for clave, valor in atributos.items():
+            canon = _canonico_param(clave)
+            params.setdefault(canon, valor)
+        if not params and cuerpo.strip() and definicion:
+            completa = completa and True
+        llamadas.append(Llamada(real, params, completa, limpio[m.start():pos]))
+
+    if not llamadas:
+        for m in _RE_FUNCION_LLAMA.finditer(limpio):
+            nombre = m.group(1).lower()
+            real = nombres.get(nombre, ALIAS_HERRAMIENTAS.get(nombre, nombre))
+            cuerpo = m.group(2).strip()
+            params = _params_json(cuerpo) if cuerpo.startswith("{") else _extraer_params(cuerpo, esquemas.get(real, []))[0]
+            llamadas.append(Llamada(real, params, True, m.group(0)))
+        if llamadas:
+            fuera = [_RE_FUNCION_LLAMA.sub("", limpio)]
+
+    if not llamadas:
+        for obj in _objetos_json(limpio):
+            nombre = obj.get("tool") or obj.get("name") or obj.get("herramienta")
+            if not isinstance(nombre, str):
+                continue
+            args = obj.get("args") or obj.get("arguments") or obj.get("parameters") or obj.get("params")
+            if args is None or (not isinstance(args, (dict, str))):
+                args = {k: v for k, v in obj.items() if k not in ("tool", "name", "herramienta")}
+            real = ALIAS_HERRAMIENTAS.get(nombre.lower(), nombre.lower())
+            llamadas.append(Llamada(real, _params_json(args), True, json.dumps(obj, ensure_ascii=False)))
+        if llamadas:
+            fuera = []
+
+    return Analisis(llamadas=llamadas, texto="".join(fuera).strip(), respuesta_limpia=limpio)
+
+
+def contenido_parcial(llamada: Llamada, esquemas: Esquemas) -> Optional[tuple[str, str]]:
+    """
+    Si la llamada quedó cortada dentro de un parámetro largo (típico cuando el
+    modelo llega al límite de tokens escribiendo un archivo), devuelve
+    (nombre_parametro, texto_parcial) para poder continuar desde ahí.
+    """
+    if llamada.completa:
+        return None
+    for nombre, largo in esquemas.get(llamada.nombre, []):
+        if largo and nombre in llamada.params:
+            return nombre, llamada.params[nombre]
+    return None
+
+
+# ======================================================================
+# MÓDULO: edits
+# ======================================================================
+"""
+Motor de ediciones SEARCH/REPLACE tolerante.
+
+Para un modelo de 24B, reescribir archivos completos es la principal fuente
+de destrozos (se cortan, ponen "...resto igual", pierden funciones). Los
+bloques SEARCH/REPLACE solo tocan lo necesario y, si el texto no coincide,
+REAPER devuelve las líneas más parecidas para que el modelo corrija.
+
+Estrategia de coincidencia (en orden):
+1. texto exacto (debe ser único)
+2. línea por línea ignorando espacios al final
+3. línea por línea ignorando la indentación (y reindenta el reemplazo)
+4. si el REPLACE ya está en el archivo, se considera ya aplicado
+"""
+
+
+
+_INICIO = re.compile(r"^\s*<{5,}\s*(SEARCH|BUSCAR|ORIGINAL)\s*$", re.I)
+_SEPARADOR = re.compile(r"^\s*={5,}\s*$")
+_FIN = re.compile(r"^\s*>{5,}\s*(REPLACE|REEMPLAZAR|UPDATED)?\s*$", re.I)
+_NUMERO_LINEA = re.compile(r"^\s*\d+\s?[|│]\s?")
+
+_MARCADORES_PEREZOSOS = re.compile(
+    r"^\s*(#|//|/\*|<!--|--|;)?\s*(\.\.\.|…)\s*"
+    r"(resto|el resto|existing|rest of|previous|unchanged|same|sin cambios|"
+    r"c[oó]digo (anterior|existente|original)|igual|as before|remaining)"
+    r"|^\s*(#|//|/\*|<!--)\s*(\.\.\.\s*)?(el )?(resto del (c[oó]digo|archivo)|rest of (the )?(code|file))",
+    re.I | re.M,
+)
+
+
+class ErrorEdicion(ValueError):
+    pass
+
+
+@dataclass
+class Bloque:
+    buscar: str
+    reemplazar: str
+
+
+def tiene_marcadores_perezosos(texto: str) -> Optional[str]:
+    m = _MARCADORES_PEREZOSOS.search(texto or "")
+    return m.group(0).strip() if m else None
+
+
+def parsear_bloques(diff: str) -> list[Bloque]:
+    bloques: list[Bloque] = []
+    estado = None
+    buscar: list[str] = []
+    reemplazar: list[str] = []
+
+    for linea in (diff or "").splitlines(keepends=True):
+        sin_fin = linea.rstrip("\r\n")
+        if estado is None:
+            if _INICIO.match(sin_fin):
+                estado, buscar, reemplazar = "buscar", [], []
+            continue
+        if estado == "buscar":
+            if _SEPARADOR.match(sin_fin):
+                estado = "reemplazar"
+            elif _INICIO.match(sin_fin):
+                raise ErrorEdicion("Bloque mal formado: '<<<<<<< SEARCH' dos veces sin '======='.")
+            else:
+                buscar.append(linea)
+            continue
+        if estado == "reemplazar":
+            if _FIN.match(sin_fin):
+                bloques.append(Bloque("".join(buscar), "".join(reemplazar)))
+                estado = None
+            elif _INICIO.match(sin_fin):
+                # Faltó el cierre ">>>>>>> REPLACE": se acepta y empieza otro bloque.
+                bloques.append(Bloque("".join(buscar), "".join(reemplazar)))
+                estado, buscar, reemplazar = "buscar", [], []
+            else:
+                reemplazar.append(linea)
+
+    if estado == "reemplazar":
+        bloques.append(Bloque("".join(buscar), "".join(reemplazar)))
+    elif estado == "buscar":
+        raise ErrorEdicion("Bloque incompleto: falta '=======' y la parte REPLACE.")
+
+    if not bloques:
+        raise ErrorEdicion(
+            "No encontré bloques SEARCH/REPLACE. Formato obligatorio:\n"
+            "<<<<<<< SEARCH\n(texto exacto actual)\n=======\n(texto nuevo)\n>>>>>>> REPLACE"
+        )
+    return [_quitar_numeros_de_linea(b) for b in bloques]
+
+
+def _quitar_numeros_de_linea(bloque: Bloque) -> Bloque:
+    """Si el modelo copió las líneas con el prefijo '  12| ' de read_file, se quita."""
+
+    def limpiar(texto: str) -> str:
+        lineas = texto.splitlines(keepends=True)
+        no_vacias = [l for l in lineas if l.strip()]
+        if no_vacias and all(_NUMERO_LINEA.match(l) for l in no_vacias):
+            return "".join(_NUMERO_LINEA.sub("", l, count=1) if l.strip() else l for l in lineas)
+        return texto
+
+    return Bloque(limpiar(bloque.buscar), limpiar(bloque.reemplazar))
+
+
+def _sin_lineas_vacias_extremas(lineas: list[str]) -> list[str]:
+    inicio, fin = 0, len(lineas)
+    while inicio < fin and not lineas[inicio].strip():
+        inicio += 1
+    while fin > inicio and not lineas[fin - 1].strip():
+        fin -= 1
+    return lineas[inicio:fin]
+
+
+def _indent(linea: str) -> str:
+    return linea[: len(linea) - len(linea.lstrip())]
+
+
+def _reindentar(reemplazo: list[str], indent_buscar: str, indent_archivo: str) -> list[str]:
+    if indent_buscar == indent_archivo:
+        return reemplazo
+    if indent_archivo.startswith(indent_buscar):
+        extra = indent_archivo[len(indent_buscar):]
+        return [extra + l if l.strip() else l for l in reemplazo]
+    if indent_buscar.startswith(indent_archivo):
+        sobra = len(indent_buscar) - len(indent_archivo)
+        salida = []
+        for l in reemplazo:
+            quitar = min(sobra, len(_indent(l)))
+            salida.append(l[quitar:] if l.strip() else l)
+        return salida
+    return reemplazo
+
+
+def _buscar_ventanas(archivo: list[str], buscar: list[str], norm) -> list[int]:
+    n = len(buscar)
+    objetivo = [norm(l) for l in buscar]
+    normalizado = [norm(l) for l in archivo]
+    return [
+        i for i in range(0, len(archivo) - n + 1)
+        if normalizado[i:i + n] == objetivo
+    ]
+
+
+def lineas_parecidas(contenido: str, buscar: str, max_lineas: int = 18) -> str:
+    archivo = contenido.splitlines()
+    patron = _sin_lineas_vacias_extremas(buscar.splitlines())
+    if not archivo or not patron or len(archivo) > 8000:
+        return ""
+    n = len(patron)
+    objetivo = "\n".join(l.strip() for l in patron)
+    candidatos = []
+    for i in range(0, max(1, len(archivo) - n + 1)):
+        ventana = "\n".join(l.strip() for l in archivo[i:i + n])
+        sm = SequenceMatcher(None, objetivo, ventana, autojunk=False)
+        candidatos.append((sm.quick_ratio(), i, ventana))
+    candidatos.sort(reverse=True)
+    mejor_ratio, mejor_i = 0.0, 0
+    for _, i, ventana in candidatos[:25]:
+        r = SequenceMatcher(None, objetivo, ventana, autojunk=False).ratio()
+        if r > mejor_ratio:
+            mejor_ratio, mejor_i = r, i
+    if mejor_ratio < 0.35:
+        return ""
+    fin = min(len(archivo), mejor_i + max(n, 1))
+    fin = min(fin, mejor_i + max_lineas)
+    return "\n".join(f"{k + 1:>5}| {archivo[k]}" for k in range(mejor_i, fin))
+
+
+def _aplicar_uno(contenido: str, bloque: Bloque) -> tuple[str, Optional[str]]:
+    buscar, reemplazar = bloque.buscar, bloque.reemplazar
+
+    if not buscar.strip():
+        if not contenido.strip():
+            return reemplazar, None
+        raise ErrorEdicion(
+            "SEARCH vacío solo sirve para archivos nuevos o vacíos. "
+            "Para agregar texto, poné en SEARCH unas líneas existentes y repetilas en REPLACE junto con lo nuevo."
+        )
+
+    veces = contenido.count(buscar)
+    if veces == 1:
+        return contenido.replace(buscar, reemplazar, 1), None
+    if veces > 1:
+        raise ErrorEdicion(
+            f"El texto de SEARCH aparece {veces} veces. Agregá líneas de contexto vecinas para que sea único."
+        )
+
+    archivo = contenido.splitlines(keepends=True)
+    patron = _sin_lineas_vacias_extremas(buscar.splitlines())
+    reemplazo = reemplazar.splitlines()
+    if patron:
+        for norm, reindentar in ((str.rstrip, False), (str.strip, True)):
+            coincidencias = _buscar_ventanas(
+                [l.rstrip("\r\n") for l in archivo], patron, norm
+            )
+            if len(coincidencias) > 1:
+                raise ErrorEdicion(
+                    f"El texto de SEARCH coincide en {len(coincidencias)} lugares. "
+                    "Agregá contexto para hacerlo único."
+                )
+            if len(coincidencias) == 1:
+                i = coincidencias[0]
+                nuevas = reemplazo
+                if reindentar:
+                    j = next((k for k, l in enumerate(patron) if l.strip()), 0)
+                    nuevas = _reindentar(
+                        reemplazo, _indent(patron[j]), _indent(archivo[i + j].rstrip("\r\n"))
+                    )
+                fin = i + len(patron)
+                ultima_sin_salto = fin == len(archivo) and not archivo[-1].endswith("\n")
+                texto_nuevo = "".join(l + "\n" for l in nuevas)
+                if ultima_sin_salto and texto_nuevo.endswith("\n"):
+                    texto_nuevo = texto_nuevo[:-1]
+                nota = None if not reindentar else "coincidencia ignorando indentación"
+                return "".join(archivo[:i]) + texto_nuevo + "".join(archivo[fin:]), nota
+
+    # Reintento de una edición que ya se aplicó: el REPLACE ya está en el archivo.
+    # Solo con reemplazos suficientemente específicos para no dar falsos positivos.
+    especifico = len([l for l in reemplazo if l.strip()]) >= 2 or len(reemplazar.strip()) >= 40
+    if especifico and reemplazar.strip() in contenido:
+        return contenido, "ya estaba aplicado"
+
+    parecido = lineas_parecidas(contenido, buscar)
+    mensaje = "No encontré el texto de SEARCH en el archivo. Copiá el texto EXACTO actual (sin números de línea)."
+    if parecido:
+        mensaje += "\nLas líneas más parecidas del archivo son:\n" + parecido
+    else:
+        mensaje += " Volvé a leer el archivo con read_file."
+    raise ErrorEdicion(mensaje)
+
+
+def aplicar_bloques(contenido: str, bloques: list[Bloque]) -> tuple[str, list[str]]:
+    """Aplica todos los bloques o ninguno. Devuelve (nuevo_contenido, notas)."""
+    notas: list[str] = []
+    actual = contenido
+    for numero, bloque in enumerate(bloques, start=1):
+        try:
+            actual, nota = _aplicar_uno(actual, bloque)
+        except ErrorEdicion as e:
+            prefijo = f"Bloque {numero} de {len(bloques)}: " if len(bloques) > 1 else ""
+            raise ErrorEdicion(
+                f"{prefijo}{e}\n(No se aplicó ningún cambio de esta edición.)"
+            ) from None
+        if nota:
+            notas.append(f"bloque {numero}: {nota}")
+    return actual, notas
+
+
+# ======================================================================
+# v7: DIFF UNIFICADO, RANGOS DE LÍNEAS E INSERCIONES
+# ======================================================================
+_RE_HUNK = re.compile(r"^@@\s*-(\d+)(?:,(\d+))?\s+\+(\d+)(?:,(\d+))?\s*@@")
+
+
+def parece_diff_unificado(texto: str) -> bool:
+    lineas = (texto or "").splitlines()
+    return any(_RE_HUNK.match(l) for l in lineas) or (
+        any(l.startswith("--- ") for l in lineas) and any(l.startswith("+++ ") for l in lineas)
+    )
+
+
+@dataclass
+class Hunk:
+    viejo_inicio: int
+    contexto: list  # (tipo, texto) con tipo en " ", "-", "+"
+
+
+def parsear_diff_unificado(diff: str) -> list[Hunk]:
+    hunks: list[Hunk] = []
+    actual: Optional[Hunk] = None
+    for linea in (diff or "").splitlines():
+        if linea.startswith(("--- ", "+++ ", "diff ", "index ")):
+            continue
+        m = _RE_HUNK.match(linea)
+        if m:
+            actual = Hunk(int(m.group(1)), [])
+            hunks.append(actual)
+            continue
+        if linea.startswith("@@"):
+            # Hunk sin números ("@@ ... @@"): se ubica por contexto.
+            actual = Hunk(0, [])
+            hunks.append(actual)
+            continue
+        if actual is None:
+            continue
+        if linea.startswith("\\"):
+            continue  # "\ No newline at end of file"
+        tipo = linea[:1] if linea[:1] in (" ", "-", "+") else " "
+        texto = linea[1:] if linea[:1] in (" ", "-", "+") else linea
+        actual.contexto.append((tipo, texto))
+    if not hunks:
+        raise ErrorEdicion("No encontré hunks '@@ -a,b +c,d @@' en el diff.")
+    return hunks
+
+
+def aplicar_diff_unificado(contenido: str, diff: str) -> tuple[str, list[str]]:
+    """
+    Aplica un diff unificado tolerando números de línea incorrectos: cada hunk
+    se ubica buscando sus líneas de contexto+borrado (exacto, luego ignorando
+    espacios). Todo o nada.
+    """
+    hunks = parsear_diff_unificado(diff)
+    lineas = contenido.splitlines()
+    termina_con_salto = contenido.endswith("\n") or not contenido
+    notas: list[str] = []
+    desplazamiento = 0
+    for numero, hunk in enumerate(hunks, start=1):
+        viejas = [t for tipo, t in hunk.contexto if tipo in (" ", "-")]
+        nuevas = [t for tipo, t in hunk.contexto if tipo in (" ", "+")]
+        if not viejas:
+            # Solo agrega líneas: se insertan en la posición indicada (o al final).
+            pos = min(len(lineas), max(0, hunk.viejo_inicio - 1 + desplazamiento)) if hunk.viejo_inicio else len(lineas)
+            lineas[pos:pos] = nuevas
+            desplazamiento += len(nuevas)
+            continue
+        posicion = None
+        for norm in (lambda s: s, str.rstrip, str.strip):
+            objetivo = [norm(l) for l in viejas]
+            candidatos = [
+                i for i in range(0, len(lineas) - len(viejas) + 1)
+                if [norm(l) for l in lineas[i:i + len(viejas)]] == objetivo
+            ]
+            if len(candidatos) == 1:
+                posicion = candidatos[0]
+                break
+            if len(candidatos) > 1:
+                esperado = hunk.viejo_inicio - 1 + desplazamiento
+                posicion = min(candidatos, key=lambda i: abs(i - esperado))
+                notas.append(f"hunk {numero}: varias coincidencias, usé la más cercana a la línea {hunk.viejo_inicio}")
+                break
+        if posicion is None:
+            parecido = lineas_parecidas("\n".join(lineas), "\n".join(viejas))
+            mensaje = f"Hunk {numero}: no encontré sus líneas de contexto en el archivo."
+            if parecido:
+                mensaje += "\nLo más parecido:\n" + parecido
+            raise ErrorEdicion(mensaje + "\n(No se aplicó ningún cambio de esta edición.)")
+        lineas[posicion:posicion + len(viejas)] = nuevas
+        desplazamiento += len(nuevas) - len(viejas)
+    resultado = "\n".join(lineas)
+    if termina_con_salto and resultado:
+        resultado += "\n"
+    return resultado, notas
+
+
+def reemplazar_lineas(contenido: str, desde: int, hasta: int, nuevo: str) -> str:
+    """Reemplaza las líneas desde..hasta (1-indexadas, inclusive) por 'nuevo'."""
+    lineas = contenido.splitlines(keepends=True)
+    total = len(lineas)
+    if desde < 1 or hasta < desde - 1 or desde > total + 1:
+        raise ErrorEdicion(f"Rango inválido {desde}-{hasta} (el archivo tiene {total} líneas).")
+    hasta = min(hasta, total)
+    texto = nuevo
+    if texto and not texto.endswith("\n") and (hasta < total or contenido.endswith("\n")):
+        texto += "\n"
+    return "".join(lineas[:desde - 1]) + texto + "".join(lineas[hasta:])
+
+
+def insertar_despues(contenido: str, linea: int, texto: str) -> str:
+    """Inserta 'texto' después de la línea indicada (0 = al principio)."""
+    lineas = contenido.splitlines(keepends=True)
+    if linea < 0 or linea > len(lineas):
+        raise ErrorEdicion(f"Línea {linea} fuera de rango (el archivo tiene {len(lineas)} líneas).")
+    if lineas and linea == len(lineas) and not lineas[-1].endswith("\n"):
+        lineas[-1] += "\n"
+    if texto and not texto.endswith("\n"):
+        texto += "\n"
+    return "".join(lineas[:linea]) + texto + "".join(lineas[linea:])
+
+
+def agregar_al_final(contenido: str, texto: str) -> str:
+    if not contenido:
+        return texto if texto.endswith("\n") or not texto else texto + "\n"
+    base = contenido if contenido.endswith("\n") else contenido + "\n"
+    if texto and not texto.endswith("\n"):
+        texto += "\n"
+    return base + texto
+
+
+def solapamiento_final(existente: str, nuevo: str, minimo: int = 2) -> int:
+    """
+    Cuántas líneas del principio de 'nuevo' repiten el final de 'existente'.
+    Sirve para continuar un archivo cortado sin duplicar las últimas líneas
+    (los modelos suelen repetir 1-5 líneas al retomar).
+    """
+    viejas = existente.rstrip("\n").splitlines()
+    nuevas = nuevo.splitlines()
+    mejor = 0
+    for k in range(1, min(len(viejas), len(nuevas), 40) + 1):
+        if [l.rstrip() for l in viejas[-k:]] == [l.rstrip() for l in nuevas[:k]]:
+            mejor = k
+    if mejor < minimo and mejor:
+        # Una sola línea repetida solo cuenta si es no trivial.
+        if not viejas[-1].strip() or len(viejas[-1].strip()) < 12:
+            return 0
+    return mejor
+
+
+def unir_continuacion(existente: str, nuevo: str) -> tuple[str, int]:
+    """Pega 'nuevo' al final de 'existente' quitando la parte repetida. Devuelve (texto, repetidas)."""
+    repetidas = solapamiento_final(existente, nuevo)
+    nuevas = nuevo.splitlines(keepends=True)[repetidas:]
+    return agregar_al_final(existente, "".join(nuevas)) if nuevas else existente, repetidas
+
+
+def cortar_en_linea_completa(texto: str) -> str:
+    """Descarta la última línea si quedó a medias (respuesta cortada por longitud)."""
+    if not texto or texto.endswith("\n"):
+        return texto
+    corte = texto.rfind("\n")
+    return texto[:corte + 1] if corte >= 0 else ""
+
+
+# ======================================================================
+# MÓDULO: workspace
+# ======================================================================
+"""Workspace seguro: rutas confinadas, escritura atómica, listado y checkpoints con deshacer."""
+
+
+
+IGNORAR_DIRS = {
+    ".git", ".hg", ".svn", "__pycache__", ".pytest_cache", ".mypy_cache",
+    ".ruff_cache", ".venv", "venv", "env", "node_modules", "dist", "build",
+    ".next", ".cache", "coverage", ".idea", ".vscode", ".reaper", ".tox",
+    ".gradle", "target",
+}
+
+ARCHIVOS_SENSIBLES = {
+    ".env", ".env.local", ".env.production", ".env.development",
+    "id_rsa", "id_ed25519", "credentials.json", "secrets.json", ".netrc",
+}
+
+EXTENSIONES_TEXTO = {
+    ".py", ".sh", ".bash", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx",
+    ".json", ".toml", ".yaml", ".yml", ".md", ".txt", ".html", ".htm",
+    ".css", ".scss", ".sql", ".go", ".rs", ".java", ".kt", ".php", ".rb",
+    ".c", ".h", ".cpp", ".hpp", ".lua", ".ini", ".cfg", ".xml", ".svg",
+    ".webmanifest", ".csv", ".env.example", ".gitignore",
+}
+
+NOMBRES_TEXTO = {
+    "Makefile", "Dockerfile", "requirements.txt", "package.json",
+    "pyproject.toml", "setup.cfg", "tox.ini", "pytest.ini", "README",
+    "LICENSE", ".gitignore", "REAPER.md",
+}
+
+PATRONES_SECRETOS = [
+    re.compile(r"(?i)\b(api[_-]?key|token|secret|password|passwd)\b(\s*[:=]\s*)[\"']?([^\s\"']{6,})"),
+    re.compile(r"sk-[A-Za-z0-9_-]{16,}"),
+    re.compile(r"gh[pousr]_[A-Za-z0-9_]{20,}"),
+    re.compile(r"AKIA[0-9A-Z]{16}"),
+]
+
+MAX_BYTES_LECTURA = 1_000_000
+
+
+class ErrorRuta(ValueError):
+    pass
+
+
+def redactar_secretos(texto: str) -> str:
+    limpio = PATRONES_SECRETOS[0].sub(lambda m: f"{m.group(1)}{m.group(2)}[REDACTADO]", texto)
+    for patron in PATRONES_SECRETOS[1:]:
+        limpio = patron.sub("[REDACTADO]", limpio)
+    return limpio
+
+
+def escritura_atomica(ruta: Path, contenido: str) -> None:
+    ruta.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporal = tempfile.mkstemp(prefix=f".{ruta.name}.", suffix=".tmp", dir=str(ruta.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
+            f.write(contenido)
+            f.flush()
+            os.fsync(f.fileno())
+        if ruta.exists():
+            try:
+                shutil.copymode(ruta, temporal)
+            except OSError:
+                pass
+        os.replace(temporal, ruta)
+    except BaseException:
+        try:
+            os.unlink(temporal)
+        except OSError:
+            pass
+        raise
+
+
+def es_binario(ruta: Path) -> bool:
+    try:
+        with open(ruta, "rb") as f:
+            return b"\0" in f.read(2048)
+    except OSError:
+        return True
+
+
+def diff_unificado(antes: str, despues: str, rel: str) -> str:
+    return "".join(
+        difflib.unified_diff(
+            antes.splitlines(keepends=True),
+            despues.splitlines(keepends=True),
+            fromfile=f"a/{rel}",
+            tofile=f"b/{rel}",
+            n=2,
+        )
+    )
+
+
+class Workspace:
+    def __init__(self, raiz: Path, checkpoints_dir: Optional[Path] = None):
+        self.raiz = Path(raiz).expanduser().resolve()
+        if not self.raiz.is_dir():
+            raise ErrorRuta(f"No es una carpeta: {self.raiz}")
+        if checkpoints_dir is None:
+            checkpoints_dir = CHECKPOINTS_DIR
+        clave = hashlib.sha1(str(self.raiz).encode()).hexdigest()[:10]
+        self.checkpoints = Checkpoints(self, Path(checkpoints_dir) / f"{self.raiz.name}_{clave}")
+        self._ignorar: list[str] = []
+        self._gitignore_mtime: Optional[float] = None
+
+    # ------------------------------------------------------------ rutas
+    def ruta(self, rel: str, *, escribir: bool = False) -> Path:
+        if not isinstance(rel, str) or not rel.strip():
+            raise ErrorRuta("Ruta vacía.")
+        texto = rel.strip().strip("`'\"").strip()
+        if texto.startswith("./"):
+            texto = texto[2:]
+        candidato = Path(os.path.expandvars(texto)).expanduser()
+        if not candidato.is_absolute():
+            candidato = self.raiz / candidato
+        destino = candidato.resolve()
+        try:
+            relativa = destino.relative_to(self.raiz)
+        except ValueError:
+            raise ErrorRuta(f"Ruta fuera del workspace: {rel}") from None
+        if escribir:
+            if destino.name in ARCHIVOS_SENSIBLES:
+                raise ErrorRuta(f"Archivo sensible protegido: {rel}")
+            if relativa.parts and relativa.parts[0] == ".git":
+                raise ErrorRuta("No se escribe dentro de .git")
+            if destino == self.raiz:
+                raise ErrorRuta("La ruta apunta a la raíz del workspace, no a un archivo.")
+        return destino
+
+    def rel(self, ruta: Path) -> str:
+        try:
+            return Path(ruta).resolve().relative_to(self.raiz).as_posix()
+        except ValueError:
+            return str(ruta)
+
+    # ------------------------------------------------------------ lectura/escritura
+    def leer(self, rel: str) -> str:
+        ruta = self.ruta(rel)
+        if not ruta.is_file():
+            raise FileNotFoundError(rel)
+        if ruta.stat().st_size > MAX_BYTES_LECTURA:
+            raise ValueError(f"Archivo demasiado grande para leer entero ({ruta.stat().st_size} bytes).")
+        return ruta.read_text(encoding="utf-8", errors="replace")
+
+    def escribir(self, rel: str, contenido: str) -> Path:
+        ruta = self.ruta(rel, escribir=True)
+        if ruta.is_dir():
+            raise ErrorRuta(f"{rel} es una carpeta.")
+        self.checkpoints.registrar(self.rel(ruta))
+        escritura_atomica(ruta, contenido)
+        return ruta
+
+    def borrar(self, rel: str) -> Path:
+        """Borra un archivo guardando el original en el checkpoint (se recupera con /deshacer)."""
+        ruta = self.ruta(rel, escribir=True)
+        if ruta.is_dir():
+            raise ErrorRuta(f"{rel} es una carpeta: solo se borran archivos.")
+        if not ruta.is_file():
+            raise FileNotFoundError(rel)
+        self.checkpoints.registrar(self.rel(ruta))
+        ruta.unlink()
+        return ruta
+
+    def mover(self, origen: str, destino: str) -> Path:
+        desde = self.ruta(origen, escribir=True)
+        hacia = self.ruta(destino, escribir=True)
+        if not desde.is_file():
+            raise FileNotFoundError(origen)
+        if hacia.exists():
+            raise ErrorRuta(f"Ya existe {destino}.")
+        contenido = desde.read_text(encoding="utf-8", errors="replace")
+        self.escribir(self.rel(hacia), contenido)
+        self.borrar(self.rel(desde))
+        return hacia
+
+    def existe(self, rel: str) -> bool:
+        try:
+            return self.ruta(rel).is_file()
+        except ErrorRuta:
+            return False
+
+    def hash(self, rel: str) -> Optional[str]:
+        try:
+            return hashlib.sha1(self.ruta(rel).read_bytes()).hexdigest()
+        except (OSError, ErrorRuta):
+            return None
+
+    def carpeta_reaper(self) -> Path:
+        return self.raiz / ".reaper"
+
+    def notas(self, limite: int = 2500) -> str:
+        """Notas persistentes que dejaron los agentes (save_note) en .reaper/notas.md."""
+        ruta = self.carpeta_reaper() / "notas.md"
+        try:
+            return ruta.read_text(encoding="utf-8", errors="replace")[-limite:]
+        except OSError:
+            return ""
+
+    # ------------------------------------------------------------ listado
+    def _patrones_gitignore(self) -> list[str]:
+        """Se recarga si .gitignore cambia (el agente o el usuario pueden editarlo en la sesión)."""
+        archivo = self.raiz / ".gitignore"
+        try:
+            mtime = archivo.stat().st_mtime
+        except OSError:
+            self._ignorar, self._gitignore_mtime = [], None
+            return self._ignorar
+        if mtime != self._gitignore_mtime:
+            patrones = []
+            try:
+                for linea in archivo.read_text(encoding="utf-8").splitlines():
+                    linea = linea.strip()
+                    if linea and not linea.startswith(("#", "!")):
+                        patrones.append(linea)
+            except OSError:
+                pass
+            self._ignorar, self._gitignore_mtime = patrones, mtime
+        return self._ignorar
+
+    def ignorado(self, rel: str, es_dir: bool) -> bool:
+        nombre = rel.rsplit("/", 1)[-1]
+        if es_dir and nombre in IGNORAR_DIRS:
+            return True
+        for patron in self._patrones_gitignore():
+            solo_dir = patron.endswith("/")
+            p = patron.strip("/")
+            if solo_dir and not es_dir:
+                continue
+            if "/" in p:
+                if fnmatch.fnmatch(rel, p):
+                    return True
+            elif fnmatch.fnmatch(nombre, p):
+                return True
+        return False
+
+    def iterar(self, sub: str = ".", limite: int = 2000) -> Iterator[Path]:
+        base = self.ruta(sub) if sub not in ("", ".") else self.raiz
+        if base.is_file():
+            yield base
+            return
+        contador = 0
+        for actual, dirs, archivos in os.walk(base):
+            rel_actual = self.rel(Path(actual))
+            rel_actual = "" if rel_actual == "." else rel_actual
+            dirs[:] = sorted(
+                d for d in dirs
+                if not self.ignorado(f"{rel_actual}/{d}".lstrip("/"), True)
+            )
+            for nombre in sorted(archivos):
+                rel = f"{rel_actual}/{nombre}".lstrip("/")
+                if self.ignorado(rel, False):
+                    continue
+                yield Path(actual) / nombre
+                contador += 1
+                if contador >= limite:
+                    return
+
+    def es_texto(self, ruta: Path) -> bool:
+        if ruta.name in ARCHIVOS_SENSIBLES:
+            return False
+        return ruta.suffix.lower() in EXTENSIONES_TEXTO or ruta.name in NOMBRES_TEXTO
+
+    def archivos_codigo(self, limite: int = 400) -> list[str]:
+        return [self.rel(p) for p in self.iterar(limite=limite * 3) if self.es_texto(p)][:limite]
+
+    def arbol(self, limite: int = 120) -> str:
+        lineas = []
+        total = 0
+        for ruta in self.iterar(limite=5000):
+            total += 1
+            if len(lineas) < limite:
+                lineas.append(self.rel(ruta))
+        if not lineas:
+            return "(workspace vacío)"
+        if total > limite:
+            lineas.append(f"... y {total - limite} archivos más (usá list_files o search_files)")
+        return "\n".join(lineas)
+
+    def es_git(self) -> bool:
+        return (self.raiz / ".git").exists()
+
+    def memoria(self, limite: int = 4000) -> str:
+        for nombre in ("REAPER.md", "CLAUDE.md", "AGENTS.md"):
+            ruta = self.raiz / nombre
+            if ruta.is_file():
+                try:
+                    texto = ruta.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    continue
+                return f"({nombre})\n" + texto[:limite]
+        return ""
+
+    def config_local(self) -> dict:
+        ruta = self.raiz / ".reaper" / "config.json"
+        try:
+            data = json.loads(ruta.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+
+class Checkpoints:
+    """
+    Antes de cada escritura se guarda el original del archivo dentro del
+    checkpoint activo. Un checkpoint por pedido (o por tarea en /construir);
+    los checkpoints de una misma build comparten 'grupo' para deshacerla entera.
+    """
+
+    def __init__(self, ws: Workspace, carpeta: Path):
+        self.ws = ws
+        self.carpeta = carpeta
+        self.actual: Optional[int] = None
+        self._lock = threading.RLock()
+
+    def _dir(self, cid: int) -> Path:
+        return self.carpeta / f"{cid:05d}"
+
+    def _manifiesto(self, cid: int) -> dict:
+        try:
+            return json.loads((self._dir(cid) / "manifest.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {"id": cid, "etiqueta": "?", "grupo": cid, "fecha": "", "archivos": {}}
+
+    def _guardar(self, cid: int, manifiesto: dict) -> None:
+        destino = self._dir(cid) / "manifest.json"
+        destino.parent.mkdir(parents=True, exist_ok=True)
+        escritura_atomica(destino, json.dumps(manifiesto, ensure_ascii=False, indent=1))
+
+    def ids(self) -> list[int]:
+        if not self.carpeta.is_dir():
+            return []
+        return sorted(int(p.name) for p in self.carpeta.iterdir() if p.is_dir() and p.name.isdigit())
+
+    def iniciar(self, etiqueta: str, grupo: Optional[int] = None) -> int:
+        with self._lock:
+            existentes = self.ids()
+            cid = (existentes[-1] + 1) if existentes else 1
+            self._guardar(cid, {
+                "id": cid,
+                "etiqueta": etiqueta[:120],
+                "grupo": grupo if grupo is not None else cid,
+                "fecha": datetime.now().isoformat(timespec="seconds"),
+                "archivos": {},
+            })
+            self.actual = cid
+            return cid
+
+    def registrar(self, rel: str) -> None:
+        with self._lock:
+            if self.actual is None:
+                self.iniciar("cambios sueltos")
+            cid = self.actual
+            man = self._manifiesto(cid)
+            if rel in man["archivos"]:
+                return
+            origen = self.ws.raiz / rel
+            if origen.is_file():
+                copia = f"files/{len(man['archivos']):04d}"
+                destino = self._dir(cid) / copia
+                destino.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(origen, destino)
+                man["archivos"][rel] = {"nuevo": False, "copia": copia}
+            else:
+                man["archivos"][rel] = {"nuevo": True}
+            self._guardar(cid, man)
+
+    def descartar_si_vacio(self, cid: int) -> None:
+        with self._lock:
+            if cid in self.ids() and not self._manifiesto(cid)["archivos"]:
+                shutil.rmtree(self._dir(cid), ignore_errors=True)
+                if self.actual == cid:
+                    self.actual = None
+
+    def listar(self) -> list[dict]:
+        return [self._manifiesto(c) for c in self.ids()]
+
+    def archivos_desde(self, cid: int) -> list[str]:
+        vistos: dict[str, None] = {}
+        for c in self.ids():
+            if c >= cid:
+                for rel in self._manifiesto(c)["archivos"]:
+                    vistos.setdefault(rel, None)
+        return list(vistos)
+
+    def _origen(self, rel: str, desde: int) -> tuple[str, Optional[Path]]:
+        """('nuevo', None) si no existía, ('copia', ruta_backup) o ('sin_cambios', None)."""
+        for c in self.ids():
+            if c < desde:
+                continue
+            info = self._manifiesto(c)["archivos"].get(rel)
+            if info is None:
+                continue
+            if info.get("nuevo"):
+                return "nuevo", None
+            return "copia", self._dir(c) / info["copia"]
+        return "sin_cambios", None
+
+    def original(self, rel: str, desde: int) -> Optional[str]:
+        """Contenido de rel al inicio del checkpoint 'desde' (None si no existía)."""
+        tipo, copia = self._origen(rel, desde)
+        if tipo == "nuevo":
+            return None
+        ruta = copia if tipo == "copia" else self.ws.raiz / rel
+        try:
+            return ruta.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return None
+
+    def diff_desde(self, cid: int, rels: Optional[list[str]] = None) -> str:
+        partes = []
+        for rel in rels or self.archivos_desde(cid):
+            antes = self.original(rel, cid) or ""
+            ruta = self.ws.raiz / rel
+            despues = ruta.read_text(encoding="utf-8", errors="replace") if ruta.is_file() else ""
+            if antes != despues:
+                partes.append(diff_unificado(antes, despues, rel))
+        return "\n".join(partes)
+
+    def inicio_grupo(self, cid: Optional[int] = None) -> Optional[int]:
+        ids = self.ids()
+        if not ids:
+            return None
+        objetivo = cid if cid is not None else ids[-1]
+        grupo = self._manifiesto(objetivo).get("grupo", objetivo)
+        return min(c for c in ids if self._manifiesto(c).get("grupo", c) == grupo or c == objetivo)
+
+    def deshacer(self, cid: Optional[int] = None) -> list[str]:
+        """Restaura el estado previo a 'cid' (por defecto, el último grupo). Devuelve archivos tocados."""
+        with self._lock:
+            desde = cid if cid is not None else self.inicio_grupo()
+            if desde is None:
+                return []
+            tocados = []
+            for rel in self.archivos_desde(desde):
+                tipo, copia = self._origen(rel, desde)
+                ruta = self.ws.raiz / rel
+                if tipo == "nuevo":
+                    if ruta.is_file():
+                        ruta.unlink()
+                        tocados.append(rel)
+                elif tipo == "copia" and copia is not None and copia.is_file():
+                    if not ruta.is_file() or ruta.read_bytes() != copia.read_bytes():
+                        ruta.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(copia, ruta)
+                        tocados.append(rel)
+            for c in self.ids():
+                if c >= desde:
+                    shutil.rmtree(self._dir(c), ignore_errors=True)
+            self.actual = None
+            return tocados
+
+
+# ======================================================================
+# MÓDULO: sandbox
+# ======================================================================
+"""
+Copias aisladas del proyecto (sandbox) para que varios implementadores
+trabajen en paralelo sin pisarse.
+
+Cada candidato del torneo recibe una carpeta temporal con una copia del
+proyecto. Las carpetas pesadas de dependencias (node_modules, .venv...) no se
+copian: se enlazan con symlinks, así los tests corren igual sin gastar disco.
+Al terminar, solo los archivos que cambió el candidato ganador se aplican al
+workspace real (pasando por los checkpoints, así /deshacer sigue funcionando).
+
+Funciona sin git: compara huellas SHA-1 de los archivos antes y después.
+"""
+
+DIRS_ENLAZAR = {"node_modules", ".venv", "venv", "env", "vendor", ".bundle", "Pods"}
+# .reaper sí se copia (config local con el comando de tests), salvo sus subcarpetas pesadas.
+DIRS_NO_COPIAR = (IGNORAR_DIRS - DIRS_ENLAZAR - {".reaper"}) | {".git"}
+SUBDIRS_REAPER_NO_COPIAR = {"sandboxes", "informes", "planes", "logs", "cache"}
+MAX_BYTES_ARCHIVO_COPIA = 20_000_000
+MAX_BYTES_PROYECTO_COPIA = 400_000_000
+
+
+class ErrorSandbox(RuntimeError):
+    pass
+
+
+def _carpeta_temporal_base() -> Optional[Path]:
+    """En Termux $TMPDIR apunta a almacenamiento interno (soporta symlinks)."""
+    for candidato in (os.getenv("REAPER_TMP"), os.getenv("TMPDIR")):
+        if candidato and Path(candidato).is_dir() and os.access(candidato, os.W_OK):
+            return Path(candidato)
+    try:
+        destino = BASE_DIR / "tmp"
+        destino.mkdir(parents=True, exist_ok=True)
+        return destino
+    except OSError:
+        return None
+
+
+def tamano_proyecto(raiz: Path, limite: int = MAX_BYTES_PROYECTO_COPIA) -> int:
+    """Bytes que ocuparía la copia (corta en cuanto supera 'limite')."""
+    total = 0
+    for actual, dirs, archivos in os.walk(raiz):
+        rel = Path(actual).relative_to(raiz)
+        dirs[:] = [d for d in dirs if d not in DIRS_NO_COPIAR and d not in DIRS_ENLAZAR
+                   and not (rel.parts[:1] == (".reaper",) and d in SUBDIRS_REAPER_NO_COPIAR)]
+        for nombre in archivos:
+            try:
+                tam = (Path(actual) / nombre).stat().st_size
+            except OSError:
+                continue
+            if tam <= MAX_BYTES_ARCHIVO_COPIA:
+                total += tam
+            if total > limite:
+                return total
+    return total
+
+
+@dataclass
+class CambioArchivo:
+    rel: str
+    tipo: str  # nuevo | modificado | borrado
+    antes: Optional[str] = None
+    despues: Optional[str] = None
+
+    def lineas_cambiadas(self) -> int:
+        antes = (self.antes or "").splitlines()
+        despues = (self.despues or "").splitlines()
+        cambios = 0
+        for op, i1, i2, j1, j2 in SequenceMatcher(None, antes, despues, autojunk=False).get_opcodes():
+            if op != "equal":
+                cambios += max(i2 - i1, j2 - j1)
+        return cambios
+
+
+class Copia:
+    """Una copia aislada del workspace. Usar como context manager para limpiarla siempre."""
+
+    def __init__(self, origen: Workspace, etiqueta: str = "copia", base: Optional[Path] = None):
+        self.origen = origen
+        self.etiqueta = re.sub(r"[^\w.-]+", "_", etiqueta)[:40] or "copia"
+        self.base = base or _carpeta_temporal_base()
+        self.carpeta: Optional[Path] = None
+        self.raiz: Optional[Path] = None
+        self.ws: Optional[Workspace] = None
+        self.huella_inicial: dict[str, str] = {}
+        self.enlaces: list[str] = []
+
+    # ------------------------------------------------------------ ciclo de vida
+    def __enter__(self) -> "Copia":
+        self.crear()
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.limpiar()
+
+    def crear(self) -> "Copia":
+        tam = tamano_proyecto(self.origen.raiz)
+        if tam > MAX_BYTES_PROYECTO_COPIA:
+            raise ErrorSandbox(
+                f"El proyecto ocupa más de {MAX_BYTES_PROYECTO_COPIA // 1_000_000} MB sin dependencias; "
+                "no se crean copias aisladas (el torneo queda desactivado para este proyecto)."
+            )
+        try:
+            self.carpeta = Path(tempfile.mkdtemp(prefix=f"reaper_{self.etiqueta}_",
+                                                 dir=str(self.base) if self.base else None))
+        except OSError as e:
+            raise ErrorSandbox(f"No pude crear la carpeta temporal: {e}") from e
+        self.raiz = self.carpeta / self.origen.raiz.name
+        try:
+            self._copiar(self.origen.raiz, self.raiz)
+        except OSError as e:
+            self.limpiar()
+            raise ErrorSandbox(f"No pude copiar el proyecto: {e}") from e
+        self.ws = Workspace(self.raiz, checkpoints_dir=self.carpeta / "_checkpoints")
+        self.huella_inicial = self.huella()
+        return self
+
+    def limpiar(self) -> None:
+        if self.carpeta and self.carpeta.exists():
+            # Primero los symlinks, para que rmtree nunca siga un enlace hacia el proyecto real.
+            for rel in self.enlaces:
+                enlace = (self.raiz or self.carpeta) / rel
+                try:
+                    if enlace.is_symlink():
+                        enlace.unlink()
+                except OSError:
+                    pass
+            shutil.rmtree(self.carpeta, ignore_errors=True)
+        self.carpeta = None
+
+    # ------------------------------------------------------------ copia
+    def _copiar(self, origen: Path, destino: Path) -> None:
+        destino.mkdir(parents=True, exist_ok=True)
+        for actual, dirs, archivos in os.walk(origen):
+            actual_p = Path(actual)
+            rel = actual_p.relative_to(origen)
+            destino_dir = destino / rel
+            destino_dir.mkdir(parents=True, exist_ok=True)
+            conservar = []
+            for d in sorted(dirs):
+                if d in DIRS_ENLAZAR:
+                    enlace = destino_dir / d
+                    try:
+                        os.symlink(actual_p / d, enlace, target_is_directory=True)
+                        self.enlaces.append((rel / d).as_posix())
+                    except OSError:
+                        pass  # sin symlinks (algunos almacenamientos): los tests que dependan de esto fallarán igual en todos
+                    continue
+                if d in DIRS_NO_COPIAR:
+                    continue
+                if rel.parts[:1] == (".reaper",) or (rel == Path(".") and d == ".reaper"):
+                    if d in SUBDIRS_REAPER_NO_COPIAR:
+                        continue
+                if (actual_p / d).is_symlink():
+                    continue
+                conservar.append(d)
+            dirs[:] = conservar
+            for nombre in archivos:
+                fuente = actual_p / nombre
+                try:
+                    if fuente.is_symlink() or fuente.stat().st_size > MAX_BYTES_ARCHIVO_COPIA:
+                        continue
+                    shutil.copy2(fuente, destino_dir / nombre)
+                except OSError:
+                    continue
+
+    # ------------------------------------------------------------ comparación
+    def _archivos(self, ws: Workspace) -> list[Path]:
+        return [p for p in ws.iterar(limite=50_000) if not p.is_symlink()]
+
+    def huella(self) -> dict[str, str]:
+        assert self.ws is not None
+        salida = {}
+        for ruta in self._archivos(self.ws):
+            try:
+                salida[self.ws.rel(ruta)] = hashlib.sha1(ruta.read_bytes()).hexdigest()
+            except OSError:
+                continue
+        return salida
+
+    def cambios(self) -> list[CambioArchivo]:
+        """Archivos que el candidato creó, modificó o borró respecto del inicio de la copia."""
+        assert self.ws is not None and self.raiz is not None
+        actual = self.huella()
+        salida = []
+        for rel in sorted(set(actual) | set(self.huella_inicial)):
+            antes_h, despues_h = self.huella_inicial.get(rel), actual.get(rel)
+            if antes_h == despues_h:
+                continue
+            ruta_copia = self.raiz / rel
+            ruta_origen = self.origen.raiz / rel
+            if despues_h and es_binario(ruta_copia):
+                continue  # los agentes solo trabajan con texto; un binario nuevo suele ser basura de un test
+            antes = ruta_origen.read_text(encoding="utf-8", errors="replace") if antes_h and ruta_origen.is_file() else None
+            despues = ruta_copia.read_text(encoding="utf-8", errors="replace") if despues_h else None
+            tipo = "nuevo" if antes_h is None else ("borrado" if despues_h is None else "modificado")
+            salida.append(CambioArchivo(rel, tipo, antes, despues))
+        return salida
+
+    def diff(self, cambios: Optional[list[CambioArchivo]] = None) -> str:
+        partes = []
+        for c in cambios if cambios is not None else self.cambios():
+            partes.append(diff_unificado(c.antes or "", c.despues or "", c.rel))
+        return "\n".join(p for p in partes if p)
+
+    def forzar_contenidos(self, contenidos: dict[str, Optional[str]]) -> list[str]:
+        """
+        Pisa archivos de la copia con contenidos fijos (p. ej. los tests de la
+        especificación, para que un candidato no gane debilitándolos).
+        None = el archivo no debe existir.
+        """
+        assert self.raiz is not None
+        tocados = []
+        for rel, contenido in contenidos.items():
+            ruta = self.raiz / rel
+            try:
+                if contenido is None:
+                    if ruta.is_file():
+                        ruta.unlink()
+                        tocados.append(rel)
+                    continue
+                if not ruta.is_file() or ruta.read_text(encoding="utf-8", errors="replace") != contenido:
+                    escritura_atomica(ruta, contenido)
+                    tocados.append(rel)
+            except OSError:
+                continue
+        return tocados
+
+    def aplicar_a(self, destino: Workspace, cambios: Optional[list[CambioArchivo]] = None,
+                  excluir: Iterable[str] = ()) -> list[str]:
+        """Aplica los cambios de la copia al workspace real, registrando checkpoints."""
+        excluidos = set(excluir)
+        aplicados = []
+        for c in cambios if cambios is not None else self.cambios():
+            if c.rel in excluidos:
+                continue
+            try:
+                if c.tipo == "borrado":
+                    if destino.existe(c.rel):
+                        destino.borrar(c.rel)
+                        aplicados.append(c.rel)
+                elif c.despues is not None:
+                    destino.escribir(c.rel, c.despues)
+                    aplicados.append(c.rel)
+            except (ErrorRuta, OSError):
+                continue
+        return aplicados
+
+
+def copiar_contenidos(ws: Workspace, rels: Iterable[str]) -> dict[str, Optional[str]]:
+    """Foto de los contenidos actuales de unos archivos (None si no existen)."""
+    salida: dict[str, Optional[str]] = {}
+    for rel in rels:
+        try:
+            ruta = ws.ruta(rel)
+        except ErrorRuta:
+            continue
+        salida[ws.rel(ruta)] = ruta.read_text(encoding="utf-8", errors="replace") if ruta.is_file() else None
+    return salida
+
+
+def limpiar_sandboxes_viejos(horas: float = 12.0) -> int:
+    """Borra copias temporales huérfanas (por ejemplo, de una sesión interrumpida)."""
+    base = _carpeta_temporal_base()
+    if not base or not base.is_dir():
+        return 0
+    limite = time.time() - horas * 3600
+    borrados = 0
+    for carpeta in base.glob("reaper_*"):
+        try:
+            if carpeta.is_dir() and carpeta.stat().st_mtime < limite:
+                for enlace in carpeta.rglob("*"):
+                    if enlace.is_symlink():
+                        try:
+                            enlace.unlink()
+                        except OSError:
+                            pass
+                shutil.rmtree(carpeta, ignore_errors=True)
+                borrados += 1
+        except OSError:
+            continue
+    return borrados
+
+
+# ======================================================================
+# MÓDULO: validators
+# ======================================================================
+"""
+Validadores reales y ejecución de comandos/tests.
+
+Nada de "el modelo dice que anda": cada archivo que se escribe pasa por
+validadores concretos y el resultado real vuelve al agente.
+
+v7 agrega validaciones que atrapan los errores típicos de un modelo de 24B:
+  - nombres indefinidos en Python aunque no haya ruff ni pyflakes (análisis AST propio)
+  - `from modulo import X` donde el módulo del proyecto no define X
+  - imports locales de JS que apuntan a archivos o exports inexistentes
+  - HTML que referencia .js/.css que no existen
+  - funciones vacías (pass / ... / NotImplementedError) que quedaron sin implementar
+  - C/C++/Go/PHP/Ruby/Lua con su compilador si está instalado, y balance de llaves si no
+"""
+
+try:
+    from pyflakes import api as _pyflakes_api
+    from pyflakes import reporter as _pyflakes_reporter
+except ImportError:  # pragma: no cover - opcional
+    _pyflakes_api = None
+
+_ENV_SECRETO = re.compile(r"(KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL)", re.I)
+_CACHE_MODULOS: dict[str, bool] = {}
+_LOCK_IMPORTS = threading.Lock()
+MAX_SALIDA_PROCESO = 400_000
+
+
+@dataclass
+class Resultado:
+    ok: bool
+    comando: str
+    codigo: int = 0
+    stdout: str = ""
+    stderr: str = ""
+    timeout: bool = False
+    omitido: bool = False
+    archivo: str = ""
+    duracion: float = 0.0
+
+    def resumen(self, limite: int = 4000) -> str:
+        partes = [f"$ {self.comando}", f"exit code: {self.codigo}"]
+        if self.timeout:
+            partes.append("estado: TIMEOUT")
+        if self.stdout.strip():
+            partes.append("STDOUT:\n" + recortar(self.stdout.strip(), limite))
+        if self.stderr.strip():
+            partes.append("STDERR:\n" + recortar(self.stderr.strip(), limite))
+        return "\n".join(partes)
+
+    def linea(self) -> str:
+        if self.omitido:
+            return f"↷ {self.comando}: {(self.stdout or self.stderr).strip()[:120]}"
+        if self.ok:
+            return f"✓ {self.comando}"
+        detalle = (self.stderr or self.stdout).strip().splitlines()
+        return f"✗ {self.comando}: {detalle[-1][:160] if detalle else 'exit ' + str(self.codigo)}"
+
+
+def entorno_seguro() -> dict:
+    """Entorno para subprocesos sin claves API (el modelo nunca debe verlas)."""
+    env = {k: v for k, v in os.environ.items() if not _ENV_SECRETO.search(k)}
+    env["PYTHONIOENCODING"] = "utf-8"
+    env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
+    env.setdefault("NO_COLOR", "1")
+    env.setdefault("CI", "1")  # muchos runners de tests evitan modos interactivos con CI=1
+    return env
+
+
+def ejecutar(
+    cmd: Union[str, list],
+    *,
+    cwd: Path,
+    timeout: int = 60,
+    shell: bool = False,
+    entrada: Optional[str] = None,
+) -> Resultado:
+    etiqueta = cmd if isinstance(cmd, str) else " ".join(shlex.quote(str(c)) for c in cmd)
+    inicio = time.monotonic()
+    try:
+        proceso = subprocess.Popen(
+            cmd,
+            shell=shell,
+            executable=(shutil.which("bash") if shell else None),
+            cwd=str(cwd),
+            stdin=subprocess.PIPE if entrada is not None else subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=entorno_seguro(),
+            start_new_session=True,
+        )
+    except FileNotFoundError:
+        nombre = cmd.split()[0] if isinstance(cmd, str) else cmd[0]
+        return Resultado(False, etiqueta, 127, stderr=f"No existe el ejecutable: {nombre}")
+    except OSError as e:
+        return Resultado(False, etiqueta, 1, stderr=f"{type(e).__name__}: {e}")
+
+    try:
+        out, err = proceso.communicate(input=entrada, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proceso.pid, signal.SIGKILL)
+        except OSError:
+            proceso.kill()
+        out, err = proceso.communicate()
+        return Resultado(
+            False, etiqueta, 124, (out or "")[-MAX_SALIDA_PROCESO:],
+            (err or "")[-MAX_SALIDA_PROCESO:] + f"\nTiempo agotado después de {timeout}s (¿programa interactivo o servidor?).",
+            timeout=True, duracion=time.monotonic() - inicio,
+        )
+    return Resultado(proceso.returncode == 0, etiqueta, proceso.returncode,
+                     (out or "")[-MAX_SALIDA_PROCESO:], (err or "")[-MAX_SALIDA_PROCESO:],
+                     duracion=time.monotonic() - inicio)
+
+
+# ==================================================================
+# PYTHON: imports
+# ==================================================================
+def _nodos_protegidos(arbol: ast.AST) -> set[int]:
+    """Imports dentro de try/except ImportError o if TYPE_CHECKING no se exigen."""
+    protegidos: set[int] = set()
+    for nodo in ast.walk(arbol):
+        bloques = []
+        if isinstance(nodo, ast.Try):
+            for handler in nodo.handlers:
+                tipo = ast.unparse(handler.type) if handler.type is not None else ""
+                if not tipo or any(n in tipo for n in ("ImportError", "ModuleNotFoundError", "Exception")):
+                    bloques.append(nodo.body)
+                    break
+        elif isinstance(nodo, ast.If) and "TYPE_CHECKING" in ast.unparse(nodo.test):
+            bloques.append(nodo.body)
+        for bloque in bloques:
+            for sentencia in bloque:
+                for sub in ast.walk(sentencia):
+                    protegidos.add(id(sub))
+    return protegidos
+
+
+def _carpetas_import(ws: Workspace, ruta: Path) -> list[Path]:
+    carpetas = [ws.raiz, ws.raiz / "src"]
+    actual = ruta.parent
+    while True:
+        carpetas.append(actual)
+        if actual == ws.raiz or ws.raiz not in actual.parents:
+            break
+        actual = actual.parent
+    return carpetas
+
+
+def imports_faltantes(ws: Workspace, ruta: Path, arbol: ast.AST) -> list[str]:
+    protegidos = _nodos_protegidos(arbol)
+    modulos: set[str] = set()
+    for nodo in ast.walk(arbol):
+        if id(nodo) in protegidos:
+            continue
+        if isinstance(nodo, ast.Import):
+            for alias in nodo.names:
+                modulos.add(alias.name.split(".")[0])
+        elif isinstance(nodo, ast.ImportFrom) and nodo.level == 0 and nodo.module:
+            modulos.add(nodo.module.split(".")[0])
+
+    carpetas = _carpetas_import(ws, ruta)
+    estandar = set(getattr(sys, "stdlib_module_names", ())) | set(sys.builtin_module_names)
+    faltan = []
+    for modulo in sorted(modulos):
+        if modulo in estandar or modulo == "__future__":
+            continue
+        if any((d / f"{modulo}.py").is_file() or (d / modulo).is_dir() for d in carpetas):
+            continue
+        with _LOCK_IMPORTS:
+            if modulo not in _CACHE_MODULOS:
+                try:
+                    _CACHE_MODULOS[modulo] = importlib.util.find_spec(modulo) is not None
+                except (ImportError, ValueError):
+                    _CACHE_MODULOS[modulo] = False
+            if not _CACHE_MODULOS[modulo]:
+                faltan.append(modulo)
+    return faltan
+
+
+def _resolver_modulo_local(ws: Workspace, ruta: Path, modulo: str, nivel: int) -> Optional[Path]:
+    """Archivo .py del proyecto que corresponde a 'modulo' (o None si no es local)."""
+    partes = modulo.split(".") if modulo else []
+    if nivel:
+        base = ruta.parent
+        for _ in range(nivel - 1):
+            base = base.parent
+        bases = [base]
+    else:
+        bases = _carpetas_import(ws, ruta)
+    for base in bases:
+        destino = base.joinpath(*partes) if partes else base
+        if destino.with_suffix(".py").is_file() and partes:
+            return destino.with_suffix(".py")
+        if (destino / "__init__.py").is_file():
+            return destino / "__init__.py"
+    return None
+
+
+def nombres_exportados_python(texto: str) -> Optional[set[str]]:
+    """Nombres de primer nivel de un módulo. None si no se puede saber (import *, __getattr__...)."""
+    try:
+        arbol = ast.parse(texto)
+    except SyntaxError:
+        return None
+    nombres: set[str] = set()
+    for nodo in arbol.body:
+        nombres |= _nombres_definidos_en(nodo)
+        if isinstance(nodo, ast.ImportFrom) and any(a.name == "*" for a in nodo.names):
+            return None
+        if isinstance(nodo, (ast.FunctionDef, ast.AsyncFunctionDef)) and nodo.name == "__getattr__":
+            return None
+    return nombres
+
+
+def _nombres_definidos_en(nodo: ast.AST) -> set[str]:
+    """Nombres que una sentencia de primer nivel define (sin entrar en funciones/clases)."""
+    nombres: set[str] = set()
+    if isinstance(nodo, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        nombres.add(nodo.name)
+    elif isinstance(nodo, ast.Import):
+        for a in nodo.names:
+            nombres.add((a.asname or a.name).split(".")[0])
+    elif isinstance(nodo, ast.ImportFrom):
+        for a in nodo.names:
+            if a.name != "*":
+                nombres.add(a.asname or a.name)
+    elif isinstance(nodo, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+        objetivos = nodo.targets if isinstance(nodo, ast.Assign) else [nodo.target]
+        for objetivo in objetivos:
+            for sub in ast.walk(objetivo):
+                if isinstance(sub, ast.Name):
+                    nombres.add(sub.id)
+    elif isinstance(nodo, (ast.For, ast.AsyncFor, ast.While, ast.If, ast.With, ast.AsyncWith, ast.Try)):
+        for sub in ast.walk(nodo):
+            if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Store):
+                nombres.add(sub.id)
+            elif isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                nombres.add(sub.name)
+            elif isinstance(sub, (ast.Import, ast.ImportFrom)):
+                nombres |= _nombres_definidos_en(sub)
+    elif isinstance(nodo, ast.Expr) and isinstance(nodo.value, ast.NamedExpr):
+        nombres.add(nodo.value.target.id)
+    return nombres
+
+
+def imports_locales_rotos(ws: Workspace, ruta: Path, arbol: ast.AST) -> list[str]:
+    """`from modulo_del_proyecto import nombre` donde el módulo no define 'nombre'."""
+    protegidos = _nodos_protegidos(arbol)
+    problemas = []
+    cache: dict[Path, Optional[set[str]]] = {}
+    for nodo in ast.walk(arbol):
+        if not isinstance(nodo, ast.ImportFrom) or id(nodo) in protegidos:
+            continue
+        modulo = nodo.module or ""
+        destino = _resolver_modulo_local(ws, ruta, modulo, nodo.level)
+        if destino is None or destino.resolve() == ruta.resolve():
+            continue
+        if destino not in cache:
+            try:
+                cache[destino] = nombres_exportados_python(destino.read_text(encoding="utf-8", errors="replace"))
+            except OSError:
+                cache[destino] = None
+        exportados = cache[destino]
+        if exportados is None:
+            continue
+        carpeta_paquete = destino.parent if destino.name == "__init__.py" else None
+        for alias in nodo.names:
+            if alias.name == "*" or alias.name in exportados:
+                continue
+            if carpeta_paquete and ((carpeta_paquete / f"{alias.name}.py").is_file()
+                                    or (carpeta_paquete / alias.name / "__init__.py").is_file()):
+                continue  # from paquete import submodulo
+            rel = ws.rel(destino)
+            sugerencia = difflib.get_close_matches(alias.name, sorted(exportados), n=1)
+            extra = f" (¿quisiste decir '{sugerencia[0]}'?)" if sugerencia else ""
+            problemas.append(f"línea {nodo.lineno}: {rel} no define '{alias.name}'{extra}")
+    return problemas
+
+
+# ==================================================================
+# PYTHON: nombres indefinidos sin dependencias
+# ==================================================================
+_BUILTINS = set(dir(importlib.import_module("builtins")))
+_BUILTINS |= {"_", "__file__", "__name__", "__doc__", "__spec__", "__loader__", "__package__",
+              "__builtins__", "__path__", "__annotations__", "__dict__", "__module__", "__qualname__",
+              "__class__", "__debug__", "WindowsError", "reveal_type", "__version__"}
+
+
+class _Ambito:
+    def __init__(self, tipo: str, padre: Optional["_Ambito"] = None):
+        self.tipo = tipo  # modulo | funcion | clase | comprension
+        self.padre = padre
+        self.nombres: set[str] = set()
+        self.globales: set[str] = set()
+
+
+class _DetectorIndefinidos(ast.NodeVisitor):
+    """
+    Detector conservador: solo informa un nombre si no está definido en ningún
+    ámbito alcanzable ni en builtins. Si el módulo usa 'import *', exec,
+    globals() o locals(), no informa nada (no se puede saber).
+    """
+
+    def __init__(self, futuro_anotaciones: bool):
+        self.futuro = futuro_anotaciones
+        self.modulo = _Ambito("modulo")
+        self.actual = self.modulo
+        self.usos: list[tuple[str, int, _Ambito]] = []
+        self.dinamico = False
+
+    # ------------------------------------------------------------ definiciones previas
+    def _recolectar(self, cuerpo: Sequence[ast.AST], ambito: _Ambito) -> None:
+        for sentencia in cuerpo:
+            for sub in self._recorrer_sin_ambitos(sentencia):
+                if isinstance(sub, ast.Name) and isinstance(sub.ctx, (ast.Store, ast.Del)):
+                    ambito.nombres.add(sub.id)
+                elif isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    ambito.nombres.add(sub.name)
+                elif isinstance(sub, ast.Import):
+                    for a in sub.names:
+                        ambito.nombres.add((a.asname or a.name).split(".")[0])
+                elif isinstance(sub, ast.ImportFrom):
+                    for a in sub.names:
+                        if a.name == "*":
+                            self.dinamico = True
+                        else:
+                            ambito.nombres.add(a.asname or a.name)
+                elif isinstance(sub, ast.ExceptHandler) and sub.name:
+                    ambito.nombres.add(sub.name)
+                elif isinstance(sub, ast.Global):
+                    ambito.globales.update(sub.names)
+                    self.modulo.nombres.update(sub.names)
+                elif isinstance(sub, ast.Nonlocal):
+                    ambito.nombres.update(sub.names)
+                elif isinstance(sub, ast.arg):
+                    ambito.nombres.add(sub.arg)
+                elif sub.__class__.__name__ in ("MatchAs", "MatchStar") and getattr(sub, "name", None):
+                    ambito.nombres.add(sub.name)
+                elif sub.__class__.__name__ == "MatchMapping" and getattr(sub, "rest", None):
+                    ambito.nombres.add(sub.rest)
+
+    def _recorrer_sin_ambitos(self, nodo: ast.AST) -> Iterator[ast.AST]:
+        """Como ast.walk pero sin entrar al cuerpo de funciones, clases, lambdas ni comprensiones."""
+        pila = [nodo]
+        while pila:
+            actual = pila.pop()
+            yield actual
+            if isinstance(actual, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                pila.extend(actual.decorator_list)
+                pila.extend(d for d in actual.args.defaults if d is not None)
+                pila.extend(d for d in actual.args.kw_defaults if d is not None)
+                continue
+            if isinstance(actual, ast.ClassDef):
+                pila.extend(actual.decorator_list)
+                pila.extend(actual.bases)
+                pila.extend(k.value for k in actual.keywords)
+                continue
+            if isinstance(actual, (ast.Lambda, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+                if isinstance(actual, ast.Lambda):
+                    pila.extend(d for d in actual.args.defaults if d is not None)
+                else:
+                    pila.append(actual.generators[0].iter)
+                continue
+            # La variable de la walrus dentro de comprensiones se asigna al ámbito que la contiene.
+            pila.extend(ast.iter_child_nodes(actual))
+
+    # ------------------------------------------------------------ visitas
+    def analizar(self, arbol: ast.Module) -> list[tuple[str, int]]:
+        self._recolectar(arbol.body, self.modulo)
+        for sentencia in arbol.body:
+            self.visit(sentencia)
+        if self.dinamico:
+            return []
+        indefinidos = []
+        vistos = set()
+        for nombre, linea, ambito in self.usos:
+            if self._definido(nombre, ambito):
+                continue
+            if (nombre, linea) in vistos:
+                continue
+            vistos.add((nombre, linea))
+            indefinidos.append((nombre, linea))
+        return indefinidos
+
+    def _definido(self, nombre: str, ambito: _Ambito) -> bool:
+        if nombre in _BUILTINS:
+            return True
+        actual: Optional[_Ambito] = ambito
+        primero = True
+        while actual is not None:
+            # Los nombres de una clase solo se ven desde el cuerpo de la propia clase.
+            if actual.tipo != "clase" or primero:
+                if nombre in actual.nombres:
+                    return True
+            primero = False
+            actual = actual.padre
+        return False
+
+    def visit_Name(self, nodo: ast.Name) -> None:
+        if isinstance(nodo.ctx, ast.Load):
+            if nodo.id in ("globals", "locals", "vars", "exec", "eval", "__import__"):
+                self.dinamico = self.dinamico or nodo.id in ("exec", "globals", "locals")
+            self.usos.append((nodo.id, nodo.lineno, self.actual))
+
+    def _visitar_funcion(self, nodo: Union[ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda]) -> None:
+        if not isinstance(nodo, ast.Lambda):
+            for d in nodo.decorator_list:
+                self.visit(d)
+        argumentos = nodo.args
+        for d in list(argumentos.defaults) + [d for d in argumentos.kw_defaults if d is not None]:
+            self.visit(d)
+        con_tipos = bool(getattr(nodo, "type_params", None))
+        if not isinstance(nodo, ast.Lambda) and not self.futuro and not con_tipos:
+            for a in argumentos.args + argumentos.posonlyargs + argumentos.kwonlyargs:
+                if a.annotation is not None:
+                    self.visit(a.annotation)
+            if nodo.returns is not None:
+                self.visit(nodo.returns)
+        ambito = _Ambito("funcion", self.actual)
+        todos = argumentos.args + argumentos.posonlyargs + argumentos.kwonlyargs
+        for a in todos:
+            ambito.nombres.add(a.arg)
+        if argumentos.vararg:
+            ambito.nombres.add(argumentos.vararg.arg)
+        if argumentos.kwarg:
+            ambito.nombres.add(argumentos.kwarg.arg)
+        cuerpo = [nodo.body] if isinstance(nodo, ast.Lambda) else nodo.body
+        if isinstance(nodo, ast.Lambda):
+            cuerpo = [ast.Expr(nodo.body)]
+        self._recolectar(cuerpo, ambito)
+        anterior, self.actual = self.actual, ambito
+        for sentencia in cuerpo:
+            self.visit(sentencia)
+        self.actual = anterior
+
+    visit_FunctionDef = _visitar_funcion
+    visit_AsyncFunctionDef = _visitar_funcion
+    visit_Lambda = _visitar_funcion
+
+    def visit_ClassDef(self, nodo: ast.ClassDef) -> None:
+        for d in nodo.decorator_list:
+            self.visit(d)
+        if not getattr(nodo, "type_params", None):
+            for b in nodo.bases:
+                self.visit(b)
+            for k in nodo.keywords:
+                self.visit(k.value)
+        ambito = _Ambito("clase", self.actual)
+        self._recolectar(nodo.body, ambito)
+        anterior, self.actual = self.actual, ambito
+        for sentencia in nodo.body:
+            self.visit(sentencia)
+        self.actual = anterior
+
+    def _visitar_comprension(self, nodo) -> None:
+        ambito = _Ambito("comprension", self.actual)
+        for gen in nodo.generators:
+            for sub in ast.walk(gen.target):
+                if isinstance(sub, ast.Name):
+                    ambito.nombres.add(sub.id)
+        # El primer iterable se evalúa en el ámbito de afuera.
+        self.visit(nodo.generators[0].iter)
+        anterior, self.actual = self.actual, ambito
+        for k, gen in enumerate(nodo.generators):
+            if k:
+                self.visit(gen.iter)
+            for condicion in gen.ifs:
+                self.visit(condicion)
+        for sub in ast.walk(nodo):
+            if isinstance(sub, ast.NamedExpr):
+                anterior.nombres.add(sub.target.id)
+        if isinstance(nodo, ast.DictComp):
+            self.visit(nodo.key)
+            self.visit(nodo.value)
+        else:
+            self.visit(nodo.elt)
+        self.actual = anterior
+
+    visit_ListComp = _visitar_comprension
+    visit_SetComp = _visitar_comprension
+    visit_GeneratorExp = _visitar_comprension
+    visit_DictComp = _visitar_comprension
+
+    def visit_AnnAssign(self, nodo: ast.AnnAssign) -> None:
+        if not self.futuro and self.actual.tipo != "funcion":
+            self.visit(nodo.annotation)
+        if nodo.value is not None:
+            self.visit(nodo.value)
+        self.visit(nodo.target)
+
+    def visit_arg(self, nodo: ast.arg) -> None:
+        return
+
+    def visit_Constant(self, nodo: ast.Constant) -> None:
+        return
+
+
+def nombres_indefinidos_python(texto: str) -> list[tuple[str, int]]:
+    try:
+        arbol = ast.parse(texto)
+    except SyntaxError:
+        return []
+    futuro = any(
+        isinstance(n, ast.ImportFrom) and n.module == "__future__" and any(a.name == "annotations" for a in n.names)
+        for n in arbol.body
+    )
+    detector = _DetectorIndefinidos(futuro)
+    try:
+        return detector.analizar(arbol)
+    except RecursionError:
+        return []
+
+
+def _nombres_indefinidos(ws: Workspace, rel: str, texto: str) -> Optional[Resultado]:
+    ruff = shutil.which("ruff")
+    if ruff:
+        r = ejecutar(
+            [ruff, "check", "--isolated", "--no-cache", "--select", "E9,F63,F7,F82",
+             "--output-format", "concise", rel],
+            cwd=ws.raiz,
+            timeout=30,
+        )
+        if r.codigo in (0, 1):
+            r.comando = f"ruff (nombres indefinidos) {rel}"
+            r.archivo = rel
+            if r.ok:
+                r.stdout = ""
+            return r
+    if _pyflakes_api is not None:
+        salida, errores = io.StringIO(), io.StringIO()
+        _pyflakes_api.check(texto, rel, _pyflakes_reporter.Reporter(salida, errores))
+        graves = [
+            l for l in salida.getvalue().splitlines()
+            if "undefined name" in l or "undefined local" in l
+        ]
+        return Resultado(not graves, f"pyflakes (nombres indefinidos) {rel}",
+                         0 if not graves else 1, stderr="\n".join(graves), archivo=rel)
+    indefinidos = nombres_indefinidos_python(texto)
+    lineas = [f"{rel}:{linea}: nombre indefinido '{nombre}'" for nombre, linea in indefinidos[:30]]
+    return Resultado(not lineas, f"ast (nombres indefinidos) {rel}", 0 if not lineas else 1,
+                     stderr="\n".join(lineas), archivo=rel)
+
+
+def funciones_vacias_python(texto: str) -> list[tuple[str, int]]:
+    """Funciones cuyo cuerpo es solo pass / ... / raise NotImplementedError (sin ser abstractas)."""
+    try:
+        arbol = ast.parse(texto)
+    except SyntaxError:
+        return []
+    vacias = []
+    for nodo in ast.walk(arbol):
+        if not isinstance(nodo, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        decoradores = " ".join(ast.unparse(d) for d in nodo.decorator_list)
+        if "abstract" in decoradores or "overload" in decoradores:
+            continue
+        cuerpo = list(nodo.body)
+        if cuerpo and isinstance(cuerpo[0], ast.Expr) and isinstance(getattr(cuerpo[0], "value", None), ast.Constant) \
+                and isinstance(cuerpo[0].value.value, str):
+            cuerpo = cuerpo[1:]
+        if not cuerpo:
+            vacias.append((nodo.name, nodo.lineno))
+            continue
+        if len(cuerpo) != 1:
+            continue
+        s = cuerpo[0]
+        if isinstance(s, ast.Pass) or (isinstance(s, ast.Expr) and isinstance(s.value, ast.Constant) and s.value.value is Ellipsis):
+            vacias.append((nodo.name, nodo.lineno))
+        elif isinstance(s, ast.Raise) and s.exc is not None and "NotImplementedError" in ast.unparse(s.exc):
+            vacias.append((nodo.name, nodo.lineno))
+    return vacias
+
+
+def advertencias_python(texto: str) -> list[str]:
+    """Problemas que no rompen la compilación pero casi siempre son bugs de un modelo chico."""
+    try:
+        arbol = ast.parse(texto)
+    except SyntaxError:
+        return []
+    avisos = []
+    vistos: dict[str, int] = {}
+    for nodo in arbol.body:
+        if isinstance(nodo, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            if nodo.name in vistos:
+                avisos.append(f"'{nodo.name}' se define dos veces (líneas {vistos[nodo.name]} y {nodo.lineno}): "
+                              "la segunda pisa a la primera")
+            vistos[nodo.name] = nodo.lineno
+    for nodo in ast.walk(arbol):
+        if isinstance(nodo, ast.ClassDef):
+            metodos: dict[str, int] = {}
+            for sub in nodo.body:
+                if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    decoradores = " ".join(ast.unparse(d) for d in sub.decorator_list)
+                    if sub.name in metodos and "setter" not in decoradores and "overload" not in decoradores:
+                        avisos.append(f"el método {nodo.name}.{sub.name} se define dos veces (líneas "
+                                      f"{metodos[sub.name]} y {sub.lineno})")
+                    metodos[sub.name] = sub.lineno
+        if isinstance(nodo, ast.ExceptHandler) and nodo.type is None:
+            if len(nodo.body) == 1 and isinstance(nodo.body[0], ast.Pass):
+                avisos.append(f"línea {nodo.lineno}: 'except: pass' oculta todos los errores")
+    for nombre, linea in funciones_vacias_python(texto)[:8]:
+        avisos.append(f"línea {linea}: la función '{nombre}' está vacía (pass/.../NotImplementedError)")
+    return avisos
+
+
+def _validar_python(ws: Workspace, ruta: Path, rel: str) -> list[Resultado]:
+    texto = ruta.read_text(encoding="utf-8", errors="replace")
+    try:
+        arbol = ast.parse(texto, filename=rel)
+        compile(arbol, rel, "exec", dont_inherit=True)
+    except SyntaxError as e:
+        detalle = f"{type(e).__name__}: {e.msg} (línea {e.lineno}, columna {e.offset})"
+        if e.text:
+            detalle += f"\n    {e.text.rstrip()}\n    {' ' * max(0, (e.offset or 1) - 1)}^"
+        pista = pista_sintaxis_python(texto, e)
+        if pista:
+            detalle += f"\nPista: {pista}"
+        return [Resultado(False, f"py_compile {rel}", 1, stderr=detalle, archivo=rel)]
+    except ValueError as e:
+        return [Resultado(False, f"py_compile {rel}", 1, stderr=str(e), archivo=rel)]
+
+    resultados = [Resultado(True, f"py_compile {rel}", 0, archivo=rel)]
+    indefinidos = _nombres_indefinidos(ws, rel, texto)
+    if indefinidos is not None:
+        resultados.append(indefinidos)
+    faltan = imports_faltantes(ws, ruta, arbol)
+    resultados.append(Resultado(
+        not faltan,
+        f"imports {rel}",
+        0 if not faltan else 1,
+        stderr=("Módulos no instalados ni presentes en el proyecto: " + ", ".join(faltan)
+                + "\n(Instalalos con pip o usá la librería estándar.)") if faltan else "",
+        archivo=rel,
+    ))
+    rotos = imports_locales_rotos(ws, ruta, arbol)
+    if rotos:
+        resultados.append(Resultado(False, f"imports-locales {rel}", 1, stderr="\n".join(rotos), archivo=rel))
+    return resultados
+
+
+def pista_sintaxis_python(texto: str, error: SyntaxError) -> str:
+    """Pistas concretas para los errores de sintaxis más comunes de un modelo chico."""
+    msg = (error.msg or "").lower()
+    lineas = texto.splitlines()
+    linea = lineas[error.lineno - 1] if error.lineno and 0 < error.lineno <= len(lineas) else ""
+    if "unterminated triple-quoted" in msg or "eof while scanning triple" in msg:
+        return "hay un docstring o string triple sin cerrar; buscá un \"\"\" o ''' sin pareja."
+    if "unexpected eof" in msg or "was never closed" in msg:
+        return "falta cerrar un paréntesis/corchete/llave abierto antes de esa línea, o el archivo quedó cortado."
+    if "unindent does not match" in msg or "unexpected indent" in msg:
+        return "mezcla de indentaciones: usá 4 espacios en todo el archivo (sin tabs)."
+    if "expected an indented block" in msg:
+        return "después de una línea que termina en ':' tiene que venir un bloque indentado (al menos 'pass')."
+    if "invalid character" in msg and any(ord(ch) > 127 for ch in linea):
+        return "hay un carácter Unicode raro (comillas tipográficas “ ” o un guion largo); reemplazalo por ASCII."
+    if "f-string" in msg:
+        return "revisá las llaves y comillas dentro del f-string (no reutilices el mismo tipo de comilla adentro)."
+    if "invalid syntax" in msg and linea.strip().startswith(("<<<<<<<", "=======", ">>>>>>>")):
+        return "quedaron marcadores SEARCH/REPLACE dentro del archivo; borralos."
+    if "invalid syntax" in msg and re.search(r"^\s*(\.\.\.|…)\s*$", linea):
+        return "hay un '...' suelto: el código quedó incompleto."
+    return ""
+
+
+# ==================================================================
+# JS / HTML / OTROS
+# ==================================================================
+_ERRORES_ESM = ("Cannot use import statement outside a module", "Unexpected token 'export'",
+                "await is only valid", "Cannot use 'import.meta' outside a module")
+
+
+def _node_check_texto(ws: Workspace, codigo: str, sufijo: str) -> Resultado:
+    with tempfile.TemporaryDirectory() as tmp:
+        destino = Path(tmp) / f"check{sufijo}"
+        destino.write_text(codigo, encoding="utf-8")
+        return ejecutar(["node", "--check", str(destino)], cwd=ws.raiz, timeout=30)
+
+
+_RE_IMPORT_JS = re.compile(
+    r"""(?:^|[;\n])\s*import\s+(?:(?P<que>[\w$*{}\s,]+?)\s+from\s+)?["'](?P<ruta>\.{1,2}/[^"']+)["']"""
+    r"""|require\(\s*["'](?P<req>\.{1,2}/[^"']+)["']\s*\)""",
+    re.M,
+)
+_EXTENSIONES_JS = (".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".json")
+
+
+def _resolver_js(base: Path, ruta: str) -> Optional[Path]:
+    destino = (base / ruta)
+    candidatos = [destino] + [destino.with_name(destino.name + ext) for ext in _EXTENSIONES_JS]
+    candidatos += [destino / f"index{ext}" for ext in _EXTENSIONES_JS]
+    for c in candidatos:
+        if c.is_file():
+            return c
+    return None
+
+
+def exports_js(texto: str) -> Optional[set[str]]:
+    if re.search(r"export\s*\*\s*from", texto) or "module.exports" in texto or "exports." in texto:
+        return None
+    nombres = set(re.findall(r"export\s+(?:default\s+)?(?:async\s+)?(?:function\*?|class|const|let|var)\s+([\w$]+)", texto))
+    for grupo in re.findall(r"export\s*\{([^}]*)\}", texto):
+        for parte in grupo.split(","):
+            parte = parte.strip()
+            if not parte:
+                continue
+            nombres.add(re.split(r"\s+as\s+", parte)[-1].strip())
+    if re.search(r"export\s+default\b", texto):
+        nombres.add("default")
+    return nombres
+
+
+def imports_js_rotos(ws: Workspace, ruta: Path, texto: str) -> list[str]:
+    problemas = []
+    sin_comentarios = re.sub(r"/\*.*?\*/", "", texto, flags=re.S)
+    sin_comentarios = re.sub(r"(^|[^:\"'])//[^\n]*", r"\1", sin_comentarios)
+    for m in _RE_IMPORT_JS.finditer(sin_comentarios):
+        destino_txt = m.group("ruta") or m.group("req")
+        linea = sin_comentarios.count("\n", 0, m.start()) + 1
+        destino = _resolver_js(ruta.parent, destino_txt)
+        if destino is None:
+            problemas.append(f"línea ~{linea}: no existe el archivo importado '{destino_txt}'")
+            continue
+        que = (m.group("que") or "").strip()
+        llaves = re.search(r"\{([^}]*)\}", que)
+        if not llaves or destino.suffix == ".json":
+            continue
+        try:
+            exportados = exports_js(destino.read_text(encoding="utf-8", errors="replace"))
+        except OSError:
+            continue
+        if exportados is None:
+            continue
+        for parte in llaves.group(1).split(","):
+            nombre = re.split(r"\s+as\s+", parte.strip())[0].strip()
+            if nombre and nombre not in exportados:
+                problemas.append(f"línea ~{linea}: {ws.rel(destino)} no exporta '{nombre}'")
+    return problemas
+
+
+def _validar_js(ws: Workspace, ruta: Path, rel: str) -> list[Resultado]:
+    resultados = []
+    if not shutil.which("node"):
+        resultados.append(Resultado(True, f"node --check {rel}", 0, omitido=True,
+                                    stdout="node no está instalado (pkg install nodejs)", archivo=rel))
+        balance = balance_llaves(ruta.read_text(encoding="utf-8", errors="replace"), "js")
+        if balance:
+            resultados.append(Resultado(False, f"llaves {rel}", 1, stderr=balance, archivo=rel))
+    else:
+        r = ejecutar(["node", "--check", rel], cwd=ws.raiz, timeout=30)
+        if not r.ok and any(m in r.stderr for m in _ERRORES_ESM) and ruta.suffix == ".js":
+            # JS de navegador con import/export: se revalida como módulo ES.
+            r2 = _node_check_texto(ws, ruta.read_text(encoding="utf-8", errors="replace"), ".mjs")
+            r2.stderr = r2.stderr.replace(r2.comando.split()[-1], rel)
+            r = r2
+        r.comando = f"node --check {rel}"
+        r.archivo = rel
+        resultados.append(r)
+    rotos = imports_js_rotos(ws, ruta, ruta.read_text(encoding="utf-8", errors="replace"))
+    if rotos:
+        resultados.append(Resultado(False, f"imports-js {rel}", 1, stderr="\n".join(rotos), archivo=rel))
+    return resultados
+
+
+_SCRIPT_HTML = re.compile(r"<script(?![^>]*\bsrc\s*=)([^>]*)>(.*?)</script\s*>", re.S | re.I)
+_RECURSOS_HTML = re.compile(r"""<(?:script|link|img|source)\b[^>]*?\b(?:src|href)\s*=\s*["']([^"'#?]+)""", re.I)
+
+
+def recursos_html_faltantes(ws: Workspace, ruta: Path, texto: str) -> list[str]:
+    faltan = []
+    for m in _RECURSOS_HTML.finditer(texto):
+        destino = m.group(1).strip()
+        if not destino or re.match(r"^(https?:|//|data:|mailto:|tel:|javascript:|\{\{|\$\{)", destino):
+            continue
+        if destino.startswith("/"):
+            candidato = ws.raiz / destino.lstrip("/")
+        else:
+            candidato = ruta.parent / destino
+        if not candidato.exists():
+            linea = texto.count("\n", 0, m.start()) + 1
+            faltan.append(f"línea {linea}: referencia a '{destino}' que no existe")
+    return faltan
+
+
+def _validar_html(ws: Workspace, ruta: Path, rel: str) -> list[Resultado]:
+    texto = ruta.read_text(encoding="utf-8", errors="replace")
+    resultados = []
+    faltan = recursos_html_faltantes(ws, ruta, texto)
+    if faltan:
+        resultados.append(Resultado(False, f"recursos-html {rel}", 1, stderr="\n".join(faltan), archivo=rel))
+    if not shutil.which("node"):
+        return resultados
+    for numero, m in enumerate(_SCRIPT_HTML.finditer(texto), start=1):
+        atributos, codigo = m.group(1).lower(), m.group(2)
+        tipo = re.search(r"type\s*=\s*[\"']?([\w/+-]+)", atributos)
+        tipo = tipo.group(1) if tipo else ""
+        if tipo and tipo not in ("module", "text/javascript", "application/javascript"):
+            continue
+        if not codigo.strip():
+            continue
+        linea_inicio = texto.count("\n", 0, m.start(2))
+        # Se rellena con saltos de línea para que los números de línea coincidan con el HTML.
+        r = _node_check_texto(ws, "\n" * linea_inicio + codigo, ".mjs" if tipo == "module" else ".js")
+        if not r.ok and any(e in r.stderr for e in _ERRORES_ESM):
+            r = _node_check_texto(ws, "\n" * linea_inicio + codigo, ".mjs")
+        r.comando = f"node --check <script #{numero}> {rel}"
+        r.archivo = rel
+        resultados.append(r)
+    return resultados
+
+
+def _validar_css(ruta: Path, rel: str) -> list[Resultado]:
+    texto = re.sub(r"/\*.*?\*/", "", ruta.read_text(encoding="utf-8", errors="replace"), flags=re.S)
+    texto = re.sub(r"\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'", "", texto)
+    nivel = 0
+    for numero, linea in enumerate(texto.splitlines(), start=1):
+        for ch in linea:
+            if ch == "{":
+                nivel += 1
+            elif ch == "}":
+                nivel -= 1
+                if nivel < 0:
+                    return [Resultado(False, f"css-llaves {rel}", 1,
+                                      stderr=f"'}}' sin abrir en la línea {numero}", archivo=rel)]
+    if nivel:
+        return [Resultado(False, f"css-llaves {rel}", 1,
+                          stderr=f"Faltan {nivel} '}}' de cierre", archivo=rel)]
+    return [Resultado(True, f"css-llaves {rel}", 0, archivo=rel)]
+
+
+_PARES = {")": "(", "]": "[", "}": "{"}
+
+
+def balance_llaves(texto: str, lenguaje: str = "c") -> str:
+    """
+    Verifica que (), [] y {} estén balanceados ignorando strings y comentarios.
+    Devuelve "" si está bien o una descripción del primer problema.
+    """
+    pila: list[tuple[str, int]] = []
+    i, n, linea = 0, len(texto), 1
+    comentario_linea = "#" if lenguaje in ("py", "sh", "rb") else "//"
+    while i < n:
+        ch = texto[i]
+        if ch == "\n":
+            linea += 1
+            i += 1
+            continue
+        if texto.startswith(comentario_linea, i):
+            fin = texto.find("\n", i)
+            i = n if fin < 0 else fin
+            continue
+        if lenguaje not in ("py", "sh", "rb") and texto.startswith("/*", i):
+            fin = texto.find("*/", i + 2)
+            if fin < 0:
+                return f"comentario /* sin cerrar desde la línea {linea}"
+            linea += texto.count("\n", i, fin)
+            i = fin + 2
+            continue
+        if ch in "\"'`":
+            j = i + 1
+            while j < n and texto[j] != ch:
+                if texto[j] == "\\":
+                    j += 1
+                elif texto[j] == "\n" and ch != "`":
+                    break
+                j += 1
+            linea += texto.count("\n", i, j)
+            i = j + 1
+            continue
+        if ch in "([{":
+            pila.append((ch, linea))
+        elif ch in ")]}":
+            if not pila:
+                return f"'{ch}' sin abrir en la línea {linea}"
+            abierto, linea_abierto = pila.pop()
+            if abierto != _PARES[ch]:
+                return f"'{ch}' en la línea {linea} cierra '{abierto}' abierto en la línea {linea_abierto}"
+        i += 1
+    if pila:
+        abierto, linea_abierto = pila[-1]
+        return f"'{abierto}' abierto en la línea {linea_abierto} nunca se cierra ({len(pila)} sin cerrar en total)"
+    return ""
+
+
+_COMPILADORES = {
+    ".c": [("clang", ["-fsyntax-only"]), ("gcc", ["-fsyntax-only"])],
+    ".h": [("clang", ["-fsyntax-only"]), ("gcc", ["-fsyntax-only"])],
+    ".cpp": [("clang++", ["-fsyntax-only", "-std=c++17"]), ("g++", ["-fsyntax-only", "-std=c++17"])],
+    ".hpp": [("clang++", ["-fsyntax-only", "-std=c++17"]), ("g++", ["-fsyntax-only", "-std=c++17"])],
+    ".cc": [("clang++", ["-fsyntax-only", "-std=c++17"]), ("g++", ["-fsyntax-only", "-std=c++17"])],
+    ".go": [("gofmt", ["-e", "-l"])],
+    ".php": [("php", ["-l"])],
+    ".rb": [("ruby", ["-c"])],
+    ".lua": [("luac", ["-p"]), ("luac5.4", ["-p"])],
+}
+
+
+def _validar_compilado(ws: Workspace, ruta: Path, rel: str) -> list[Resultado]:
+    sufijo = ruta.suffix.lower()
+    for ejecutable, args in _COMPILADORES.get(sufijo, []):
+        if shutil.which(ejecutable):
+            r = ejecutar([ejecutable, *args, rel], cwd=ws.raiz, timeout=60)
+            if ejecutable == "gofmt":
+                r.ok = r.codigo == 0 and "expected" not in r.stderr
+                r.stdout = ""
+            r.comando = f"{ejecutable} {rel}"
+            r.archivo = rel
+            return [r]
+    lenguaje = {".rb": "rb", ".lua": "lua"}.get(sufijo, "c")
+    if lenguaje == "lua":
+        return []
+    problema = balance_llaves(ruta.read_text(encoding="utf-8", errors="replace"), lenguaje)
+    return [Resultado(not problema, f"llaves {rel}", 0 if not problema else 1, stderr=problema, archivo=rel)]
+
+
+def _validar_yaml(ruta: Path, rel: str) -> list[Resultado]:
+    try:
+        import yaml  # type: ignore
+    except ImportError:
+        return []
+    try:
+        list(yaml.safe_load_all(ruta.read_text(encoding="utf-8")))
+        return [Resultado(True, f"yaml {rel}", 0, archivo=rel)]
+    except Exception as e:  # yaml.YAMLError y errores de decodificación
+        return [Resultado(False, f"yaml {rel}", 1, stderr=f"YAML inválido: {e}", archivo=rel)]
+
+
+def validar_archivo(ws: Workspace, rel: str) -> list[Resultado]:
+    try:
+        ruta = ws.ruta(rel)
+    except ValueError as e:
+        return [Resultado(False, f"validar {rel}", 2, stderr=str(e), archivo=rel)]
+    rel = ws.rel(ruta)
+    if not ruta.is_file():
+        return [Resultado(False, f"validar {rel}", 2, stderr="El archivo no existe.", archivo=rel)]
+
+    sufijo = ruta.suffix.lower()
+    try:
+        if sufijo == ".py":
+            return _validar_python(ws, ruta, rel)
+        if sufijo in (".sh", ".bash"):
+            r = ejecutar(["bash", "-n", rel], cwd=ws.raiz, timeout=20)
+            r.archivo = rel
+            return [r]
+        if sufijo in (".js", ".mjs", ".cjs", ".jsx"):
+            return _validar_js(ws, ruta, rel)
+        if sufijo in (".ts", ".tsx"):
+            problema = balance_llaves(ruta.read_text(encoding="utf-8", errors="replace"), "js")
+            resultados = [Resultado(not problema, f"llaves {rel}", 0 if not problema else 1, stderr=problema, archivo=rel)]
+            rotos = imports_js_rotos(ws, ruta, ruta.read_text(encoding="utf-8", errors="replace"))
+            if rotos:
+                resultados.append(Resultado(False, f"imports-ts {rel}", 1, stderr="\n".join(rotos), archivo=rel))
+            return resultados
+        if sufijo in (".html", ".htm"):
+            return _validar_html(ws, ruta, rel)
+        if sufijo == ".css":
+            return _validar_css(ruta, rel)
+        if sufijo in (".json", ".webmanifest"):
+            try:
+                json.loads(ruta.read_text(encoding="utf-8"))
+                return [Resultado(True, f"json {rel}", 0, archivo=rel)]
+            except json.JSONDecodeError as e:
+                return [Resultado(False, f"json {rel}", 1,
+                                  stderr=f"JSON inválido: {e.msg} (línea {e.lineno}, columna {e.colno})", archivo=rel)]
+            except (ValueError, UnicodeDecodeError) as e:
+                return [Resultado(False, f"json {rel}", 1, stderr=f"JSON inválido: {e}", archivo=rel)]
+        if sufijo == ".toml":
+            try:
+                import tomllib
+            except ImportError:
+                return []
+            try:
+                tomllib.loads(ruta.read_text(encoding="utf-8"))
+                return [Resultado(True, f"toml {rel}", 0, archivo=rel)]
+            except (ValueError, UnicodeDecodeError) as e:
+                return [Resultado(False, f"toml {rel}", 1, stderr=f"TOML inválido: {e}", archivo=rel)]
+        if sufijo in (".yaml", ".yml"):
+            return _validar_yaml(ruta, rel)
+        if sufijo in _COMPILADORES or sufijo in (".java", ".kt", ".rs", ".swift", ".dart", ".cs"):
+            return _validar_compilado(ws, ruta, rel)
+    except OSError as e:
+        return [Resultado(False, f"validar {rel}", 1, stderr=f"{type(e).__name__}: {e}", archivo=rel)]
+    return []
+
+
+def validar_archivos(ws: Workspace, rels: list[str]) -> list[Resultado]:
+    resultados = []
+    for rel in rels:
+        if (ws.raiz / rel).is_file():
+            resultados.extend(validar_archivo(ws, rel))
+    return resultados
+
+
+def fallos(resultados: list[Resultado]) -> list[Resultado]:
+    return [r for r in resultados if not r.ok]
+
+
+def resumen_validacion(resultados: list[Resultado], limite: int = 3000) -> str:
+    if not resultados:
+        return "sin validadores aplicables"
+    malos = fallos(resultados)
+    if not malos:
+        return "OK (" + ", ".join(r.comando.split(" ")[0] for r in resultados if not r.omitido) + ")"
+    return "\n\n".join(r.resumen(limite) for r in malos)
+
+
+# ==================================================================
+# TESTS
+# ==================================================================
+def detectar_comando_tests(ws: Workspace, completo: bool = False) -> Optional[tuple[str, str]]:
+    """
+    Comando de la suite de tests. completo=True no corta en el primer fallo
+    (sirve para contar cuántos tests pasan, p. ej. en el torneo).
+    """
+    raiz = ws.raiz
+    local = ws.config_local().get("comando_tests")
+    if isinstance(local, str) and local.strip():
+        return local.strip(), "config .reaper"
+
+    py = shlex.quote(sys.executable)
+    hay_tests_py = (
+        (raiz / "tests").is_dir() and any((raiz / "tests").rglob("*.py"))
+        or (raiz / "test").is_dir() and any((raiz / "test").rglob("*.py"))
+        or any(raiz.glob("test_*.py"))
+        or any(raiz.glob("*_test.py"))
+    )
+    if hay_tests_py:
+        if importlib.util.find_spec("pytest") is not None:
+            corte = "" if completo else " -x"
+            return f"{py} -m pytest -q{corte} --tb=short -p no:cacheprovider", "pytest"
+        for carpeta in ("tests", "test"):
+            if (raiz / carpeta).is_dir():
+                if (raiz / carpeta / "__init__.py").is_file():
+                    return f"{py} -m unittest discover -s {carpeta} -t .", "unittest"
+                return f"{py} -m unittest discover -s {carpeta}", "unittest"
+        return f"{py} -m unittest discover", "unittest"
+
+    paquete = raiz / "package.json"
+    if paquete.is_file():
+        try:
+            datos = json.loads(paquete.read_text(encoding="utf-8"))
+            script = (datos.get("scripts") or {}).get("test")
+            if script and "no test specified" not in script and shutil.which("npm"):
+                return "npm test --silent", "npm test"
+        except (OSError, ValueError):
+            pass
+    if shutil.which("node") and any((raiz / d).is_dir() for d in ("tests", "test")):
+        js = [p for d in ("tests", "test") for p in (raiz / d).glob("*.test.*js")]
+        if js:
+            return "node --test " + " ".join(shlex.quote(ws.rel(p)) for p in sorted(js)), "node --test"
+    if (raiz / "go.mod").is_file() and shutil.which("go"):
+        return "go test ./...", "go test"
+    if (raiz / "Cargo.toml").is_file() and shutil.which("cargo"):
+        return "cargo test", "cargo test"
+    makefile = raiz / "Makefile"
+    if makefile.is_file() and shutil.which("make"):
+        try:
+            if re.search(r"^test\s*:", makefile.read_text(encoding="utf-8"), re.M):
+                return "make test", "make test"
+        except OSError:
+            pass
+    return None
+
+
+def ejecutar_tests(ws: Workspace, timeout: int = 300, completo: bool = False) -> Optional[Resultado]:
+    detectado = detectar_comando_tests(ws, completo=completo)
+    if not detectado:
+        return None
+    comando, _nombre = detectado
+    r = ejecutar(comando, cwd=ws.raiz, timeout=timeout, shell=True)
+    combinado = r.stdout + r.stderr
+    if r.codigo == 5 or "NO TESTS RAN" in combinado or re.search(r"\bRan 0 tests?\b", combinado):
+        r.ok, r.omitido = True, True
+        r.stdout = "No se encontraron tests para ejecutar. " + r.stdout
+    return r
+
+
+def es_crash_real(r: Resultado) -> bool:
+    """Un exit != 0 controlado (uso incorrecto, validación) no es un bug a reparar."""
+    if r.timeout or r.codigo in (126, 127) or r.codigo < 0:
+        return True
+    combinado = f"{r.stdout}\n{r.stderr}"
+    patrones = (
+        "Traceback (most recent call last)", "SyntaxError", "IndentationError",
+        "ModuleNotFoundError", "ImportError", "NameError", "UnboundLocalError",
+        "AttributeError", "TypeError:", "RecursionError", "ReferenceError",
+        "Segmentation fault",
+    )
+    return any(p in combinado for p in patrones)
+
+
+# ======================================================================
+# MÓDULO: testparse
+# ======================================================================
+"""
+Lectura de la salida de las suites de tests: cuántos pasaron, fallaron, con
+error u omitidos, y cuáles fallaron.
+
+El torneo necesita un número ("pasa más tests") y el reparador necesita el
+detalle de los primeros fallos, sin el ruido del resto de la salida.
+Soporta pytest, unittest, node --test (TAP y spec), jest, vitest, mocha,
+go test y cargo test. Si no reconoce nada, usa el código de salida.
+"""
+
+
+@dataclass
+class ConteoTests:
+    pasados: int = 0
+    fallados: int = 0
+    errores: int = 0
+    omitidos: int = 0
+    fuente: str = "desconocido"
+    nombres_fallados: list = field(default_factory=list)
+    reconocido: bool = False
+
+    @property
+    def total(self) -> int:
+        return self.pasados + self.fallados + self.errores + self.omitidos
+
+    @property
+    def ok(self) -> bool:
+        return self.fallados == 0 and self.errores == 0
+
+    @property
+    def ejecutados(self) -> int:
+        return self.pasados + self.fallados + self.errores
+
+    def proporcion(self) -> float:
+        return self.pasados / self.ejecutados if self.ejecutados else 0.0
+
+    def texto(self) -> str:
+        if not self.reconocido:
+            return "sin conteo (se usa el código de salida)"
+        partes = [f"{self.pasados} pasaron"]
+        if self.fallados:
+            partes.append(f"{self.fallados} fallaron")
+        if self.errores:
+            partes.append(f"{self.errores} con error")
+        if self.omitidos:
+            partes.append(f"{self.omitidos} omitidos")
+        return ", ".join(partes) + f" ({self.fuente})"
+
+
+_RE_PYTEST_RESUMEN = re.compile(
+    r"(\d+)\s+(passed|failed|errors?|skipped|xfailed|xpassed|deselected)", re.I
+)
+_RE_PYTEST_LINEA = re.compile(r"^=*\s*(?:\d+\s+\w+(?:,\s*)?)+.*\bin\s+[\d.]+s", re.M)
+_RE_PYTEST_FALLO = re.compile(r"^(?:FAILED|ERROR)\s+(\S+)", re.M)
+_RE_UNITTEST_RAN = re.compile(r"^Ran (\d+) tests? in", re.M)
+_RE_UNITTEST_FAILED = re.compile(r"^FAILED \(([^)]*)\)", re.M)
+_RE_UNITTEST_OK = re.compile(r"^OK(?: \(([^)]*)\))?\s*$", re.M)
+_RE_UNITTEST_NOMBRE = re.compile(r"^(?:FAIL|ERROR): (\S+)(?: \(([^)]+)\))?", re.M)
+_RE_TAP_RESUMEN = re.compile(r"^[#ℹ]\s*(tests|pass|fail|skipped|todo|cancelled)\s+(\d+)", re.M)
+_RE_TAP_NOT_OK = re.compile(r"^\s*not ok \d+ - (.+)$", re.M)
+_RE_SPEC_FALLO = re.compile(r"^\s*✖\s+(.+?)(?:\s+\([\d.]+m?s\))?$", re.M)
+_RE_JEST = re.compile(r"^Tests:\s+(.*?)(\d+)\s+total", re.M)
+_RE_VITEST = re.compile(r"^\s*Tests\s+(.*)\((\d+)\)", re.M)
+_RE_MOCHA = re.compile(r"^\s*(\d+)\s+(passing|failing|pending)", re.M)
+_RE_GO_CASO = re.compile(r"^\s*--- (PASS|FAIL|SKIP): (\S+)", re.M)
+_RE_GO_PAQUETE = re.compile(r"^(ok|FAIL|\?)\s+\S+", re.M)
+_RE_CARGO = re.compile(r"test result: \w+\. (\d+) passed; (\d+) failed; (\d+) ignored")
+_RE_CARGO_FALLO = re.compile(r"^test (\S+) \.\.\. FAILED", re.M)
+
+
+def _pytest(salida: str) -> Optional[ConteoTests]:
+    lineas = [l for l in salida.splitlines() if re.search(r"\b(passed|failed|errors?)\b", l) and re.search(r"\bin\s+[\d.]+s", l)]
+    if not lineas:
+        if "no tests ran" in salida.lower():
+            return ConteoTests(fuente="pytest", reconocido=True)
+        return None
+    c = ConteoTests(fuente="pytest", reconocido=True)
+    for cantidad, tipo in _RE_PYTEST_RESUMEN.findall(lineas[-1]):
+        n = int(cantidad)
+        tipo = tipo.lower()
+        if tipo in ("passed", "xpassed"):
+            c.pasados += n
+        elif tipo == "failed":
+            c.fallados += n
+        elif tipo.startswith("error"):
+            c.errores += n
+        elif tipo in ("skipped", "xfailed", "deselected"):
+            c.omitidos += n
+    c.nombres_fallados = _RE_PYTEST_FALLO.findall(salida)[:50]
+    return c
+
+
+def _unittest(salida: str) -> Optional[ConteoTests]:
+    ran = _RE_UNITTEST_RAN.findall(salida)
+    if not ran:
+        return None
+    total = sum(int(n) for n in ran)
+    c = ConteoTests(fuente="unittest", reconocido=True)
+    fallos = errores = omitidos = 0
+    for detalle in _RE_UNITTEST_FAILED.findall(salida) + [g for g in _RE_UNITTEST_OK.findall(salida) if g]:
+        for clave, valor in re.findall(r"(\w+)=(\d+)", detalle):
+            if clave == "failures":
+                fallos += int(valor)
+            elif clave == "errors":
+                errores += int(valor)
+            elif clave in ("skipped", "expected_failures"):
+                omitidos += int(valor)
+            elif clave == "unexpected_successes":
+                fallos += int(valor)
+    c.fallados, c.errores, c.omitidos = fallos, errores, omitidos
+    c.pasados = max(0, total - fallos - errores - omitidos)
+    nombres = []
+    for metodo, clase in _RE_UNITTEST_NOMBRE.findall(salida):
+        nombres.append(f"{clase}.{metodo}" if clase and metodo not in clase else (clase or metodo))
+    c.nombres_fallados = nombres[:50]
+    return c
+
+
+def _tap(salida: str) -> Optional[ConteoTests]:
+    datos = {k: int(v) for k, v in _RE_TAP_RESUMEN.findall(salida)}
+    if "pass" not in datos and "fail" not in datos:
+        return None
+    c = ConteoTests(fuente="node --test", reconocido=True)
+    c.pasados = datos.get("pass", 0)
+    c.fallados = datos.get("fail", 0) + datos.get("cancelled", 0)
+    c.omitidos = datos.get("skipped", 0) + datos.get("todo", 0)
+    nombres = [n.strip() for n in _RE_TAP_NOT_OK.findall(salida)]
+    if not nombres:
+        nombres = [n.strip() for n in _RE_SPEC_FALLO.findall(salida)]
+    c.nombres_fallados = [n for n in nombres if not n.endswith(".mjs") and not n.endswith(".js")][:50] or nombres[:50]
+    return c
+
+
+def _jest(salida: str) -> Optional[ConteoTests]:
+    m = None
+    for m in _RE_JEST.finditer(salida):
+        pass
+    if not m:
+        return None
+    c = ConteoTests(fuente="jest", reconocido=True)
+    for cantidad, tipo in re.findall(r"(\d+)\s+(passed|failed|skipped|todo|pending)", m.group(1)):
+        n = int(cantidad)
+        if tipo == "passed":
+            c.pasados += n
+        elif tipo == "failed":
+            c.fallados += n
+        else:
+            c.omitidos += n
+    c.nombres_fallados = re.findall(r"^\s*●\s+(.+)$", salida, re.M)[:50]
+    return c
+
+
+def _vitest(salida: str) -> Optional[ConteoTests]:
+    m = None
+    for m in _RE_VITEST.finditer(salida):
+        pass
+    if not m or "|" not in m.group(1) and not re.search(r"\d+\s+(passed|failed)", m.group(1)):
+        return None
+    c = ConteoTests(fuente="vitest", reconocido=True)
+    for cantidad, tipo in re.findall(r"(\d+)\s+(passed|failed|skipped|todo)", m.group(1)):
+        n = int(cantidad)
+        if tipo == "passed":
+            c.pasados += n
+        elif tipo == "failed":
+            c.fallados += n
+        else:
+            c.omitidos += n
+    return c if c.total else None
+
+
+def _mocha(salida: str) -> Optional[ConteoTests]:
+    datos = {t: int(n) for n, t in _RE_MOCHA.findall(salida)}
+    if "passing" not in datos and "failing" not in datos:
+        return None
+    return ConteoTests(datos.get("passing", 0), datos.get("failing", 0), 0, datos.get("pending", 0),
+                       "mocha", re.findall(r"^\s*\d+\)\s+(.+)$", salida, re.M)[:50], True)
+
+
+def _go(salida: str) -> Optional[ConteoTests]:
+    casos = _RE_GO_CASO.findall(salida)
+    if casos:
+        c = ConteoTests(fuente="go test", reconocido=True)
+        for estado, nombre in casos:
+            if estado == "PASS":
+                c.pasados += 1
+            elif estado == "FAIL":
+                c.fallados += 1
+                c.nombres_fallados.append(nombre)
+            else:
+                c.omitidos += 1
+        return c
+    paquetes = _RE_GO_PAQUETE.findall(salida)
+    if not paquetes:
+        return None
+    return ConteoTests(paquetes.count("ok"), paquetes.count("FAIL"), 0, paquetes.count("?"), "go test (paquetes)",
+                       [], True)
+
+
+def _cargo(salida: str) -> Optional[ConteoTests]:
+    resultados = _RE_CARGO.findall(salida)
+    if not resultados:
+        return None
+    c = ConteoTests(fuente="cargo test", reconocido=True)
+    for p, f, i in resultados:
+        c.pasados += int(p)
+        c.fallados += int(f)
+        c.omitidos += int(i)
+    c.nombres_fallados = _RE_CARGO_FALLO.findall(salida)[:50]
+    return c
+
+
+_PARSERS = (_pytest, _unittest, _jest, _vitest, _tap, _mocha, _cargo, _go)
+
+
+def contar_tests(salida: str, codigo: Optional[int] = None) -> ConteoTests:
+    """Conteo de tests a partir de la salida combinada (stdout + stderr)."""
+    texto = sin_ansi(salida or "")
+    for parser in _PARSERS:
+        try:
+            conteo = parser(texto)
+        except (ValueError, IndexError):
+            conteo = None
+        if conteo is not None:
+            if codigo not in (None, 0) and conteo.ok and conteo.total and not conteo.fallados:
+                # El runner dijo que todo pasó pero salió con error (p. ej. crash al final): cuenta como error.
+                conteo.errores += 1
+            return conteo
+    if codigo is None:
+        return ConteoTests()
+    if codigo == 0:
+        return ConteoTests(pasados=1, fuente="código de salida")
+    return ConteoTests(fallados=1, fuente="código de salida")
+
+
+def conteo_de_resultado(r: Optional["Resultado"]) -> ConteoTests:
+    if r is None:
+        return ConteoTests(fuente="sin suite")
+    if r.omitido:
+        return ConteoTests(fuente="sin tests", reconocido=True)
+    if r.timeout:
+        return ConteoTests(errores=1, fuente="timeout", reconocido=True)
+    return contar_tests(f"{r.stdout}\n{r.stderr}", r.codigo)
+
+
+_RE_SECCION_PYTEST = re.compile(r"^_{3,}\s+(.+?)\s+_{3,}$", re.M)
+_RE_SECCION_UNITTEST = re.compile(r"^={20,}\n(?:FAIL|ERROR): .*$", re.M)
+
+
+def fallos_relevantes(salida: str, maximo: int = 3, limite: int = 3500) -> str:
+    """
+    Extrae solo el detalle de los primeros fallos (sin la parte que pasó) para
+    dárselo al reparador: menos ruido = mejor diagnóstico de un modelo chico.
+    """
+    texto = sin_ansi(salida or "")
+    bloques: list[str] = []
+    secciones = list(_RE_SECCION_PYTEST.finditer(texto))
+    if secciones:
+        for k, m in enumerate(secciones[:maximo]):
+            fin = secciones[k + 1].start() if k + 1 < len(secciones) else texto.find("short test summary", m.end())
+            if fin < 0:
+                fin = len(texto)
+            bloques.append(texto[m.start():fin].strip())
+    else:
+        secciones = list(_RE_SECCION_UNITTEST.finditer(texto))
+        for k, m in enumerate(secciones[:maximo]):
+            fin = secciones[k + 1].start() if k + 1 < len(secciones) else texto.find("\n----------------------------------------------------------------------\nRan", m.end())
+            if fin < 0:
+                fin = len(texto)
+            bloques.append(texto[m.start():fin].strip())
+    if not bloques:
+        tap = re.split(r"^(?=not ok \d+)", texto, flags=re.M)
+        bloques = [b.strip() for b in tap if b.startswith("not ok")][:maximo]
+    if not bloques:
+        return recortar(texto.strip(), limite)
+    por_bloque = max(400, limite // len(bloques))
+    return "\n\n".join(recortar(b, por_bloque) for b in bloques)
+
+
+# ======================================================================
+# MÓDULO: autofix
+# ======================================================================
+"""
+Arreglos automáticos sin gastar llamadas al modelo.
+
+Después de cada edición, REAPER corrige solo lo trivial y seguro:
+  - espacios al final de línea y salto de línea final
+  - tabs mezclados con espacios en Python (TabError)
+  - comillas tipográficas / guiones Unicode que rompen la sintaxis
+  - imports de la librería estándar que faltan (os, re, json, Path, dataclass, Optional...)
+  - comas finales en JSON
+  - `ruff check --fix` con reglas seguras (si ruff está instalado)
+  - chmod +x a scripts con shebang
+
+Cada arreglo se aplica solo si deja el archivo compilando (o igual de bien
+que antes) y se informa al agente qué se cambió.
+"""
+
+MODULOS_STDLIB_COMUNES = {
+    "os", "re", "sys", "json", "math", "random", "time", "subprocess", "shutil", "itertools",
+    "functools", "hashlib", "base64", "uuid", "logging", "argparse", "csv", "sqlite3", "threading",
+    "asyncio", "textwrap", "string", "tempfile", "glob", "io", "copy", "heapq", "bisect",
+    "statistics", "decimal", "fractions", "socket", "struct", "zlib", "gzip", "zipfile", "tarfile",
+    "unittest", "inspect", "traceback", "platform", "signal", "getpass", "secrets", "operator",
+    "enum", "abc", "dataclasses", "contextlib", "pprint", "queue", "calendar", "locale",
+    "unicodedata", "difflib", "fnmatch", "shlex", "configparser", "pickle", "weakref", "types",
+    "warnings", "collections", "typing", "pathlib", "codecs", "html", "http", "urllib", "email",
+    "xml", "concurrent", "multiprocessing", "select", "ssl", "datetime", "builtins", "gc", "atexit",
+    "array", "binascii", "colorsys", "keyword", "numbers", "timeit", "cmath", "mimetypes", "ipaddress",
+}
+
+NOMBRES_STDLIB = {
+    "Path": "from pathlib import Path",
+    "PurePath": "from pathlib import PurePath",
+    "dataclass": "from dataclasses import dataclass",
+    "field": "from dataclasses import field",
+    "asdict": "from dataclasses import asdict",
+    "astuple": "from dataclasses import astuple",
+    "Optional": "from typing import Optional",
+    "List": "from typing import List",
+    "Dict": "from typing import Dict",
+    "Tuple": "from typing import Tuple",
+    "Set": "from typing import Set",
+    "Any": "from typing import Any",
+    "Union": "from typing import Union",
+    "Callable": "from typing import Callable",
+    "Iterable": "from typing import Iterable",
+    "Iterator": "from typing import Iterator",
+    "Sequence": "from typing import Sequence",
+    "Mapping": "from typing import Mapping",
+    "TypeVar": "from typing import TypeVar",
+    "Generic": "from typing import Generic",
+    "NamedTuple": "from typing import NamedTuple",
+    "TypedDict": "from typing import TypedDict",
+    "Literal": "from typing import Literal",
+    "defaultdict": "from collections import defaultdict",
+    "Counter": "from collections import Counter",
+    "deque": "from collections import deque",
+    "namedtuple": "from collections import namedtuple",
+    "OrderedDict": "from collections import OrderedDict",
+    "Enum": "from enum import Enum",
+    "IntEnum": "from enum import IntEnum",
+    "auto": "from enum import auto",
+    "ABC": "from abc import ABC",
+    "abstractmethod": "from abc import abstractmethod",
+    "partial": "from functools import partial",
+    "lru_cache": "from functools import lru_cache",
+    "wraps": "from functools import wraps",
+    "reduce": "from functools import reduce",
+    "cached_property": "from functools import cached_property",
+    "contextmanager": "from contextlib import contextmanager",
+    "suppress": "from contextlib import suppress",
+    "timedelta": "from datetime import timedelta",
+    "timezone": "from datetime import timezone",
+    "date": "from datetime import date",
+    "uuid4": "from uuid import uuid4",
+    "deepcopy": "from copy import deepcopy",
+    "dedent": "from textwrap import dedent",
+    "Decimal": "from decimal import Decimal",
+    "Fraction": "from fractions import Fraction",
+    "ThreadPoolExecutor": "from concurrent.futures import ThreadPoolExecutor",
+    "sleep": None,  # ambiguo (time.sleep / asyncio.sleep): no se agrega solo
+}
+
+_TIPOGRAFICOS = {"“": '"', "”": '"', "„": '"', "‘": "'", "’": "'", "‚": "'", "–": "-", "—": "-",
+                 " ": " ", "​": "", "﻿": ""}
+
+REGLAS_RUFF_SEGURAS = "W291,W292,W293,F541,E703,E711"
+
+
+@dataclass
+class ReporteAutofix:
+    rel: str
+    cambios: list = field(default_factory=list)
+    contenido: Optional[str] = None
+
+    @property
+    def cambio(self) -> bool:
+        return bool(self.cambios)
+
+    def texto(self) -> str:
+        return "; ".join(self.cambios)
+
+
+def _compila(texto: str) -> bool:
+    try:
+        compile(texto, "<autofix>", "exec", dont_inherit=True)
+        return True
+    except (SyntaxError, ValueError):
+        return False
+
+
+def quitar_espacios_finales(texto: str, markdown: bool = False) -> str:
+    lineas = texto.split("\n")
+    if markdown:
+        # En Markdown dos espacios al final son un salto de línea: solo se quitan tabs y espacios sueltos.
+        salida = [l.rstrip("\t") if not l.endswith("  ") else l.rstrip(" \t") + "  " for l in lineas]
+    else:
+        salida = [l.rstrip(" \t") for l in lineas]
+    return "\n".join(salida)
+
+
+def asegurar_salto_final(texto: str) -> str:
+    if not texto:
+        return texto
+    texto = texto.rstrip("\n") + "\n"
+    return texto
+
+
+def arreglar_tabs_python(texto: str) -> Optional[str]:
+    """Convierte la indentación con tabs a 4 espacios si eso hace compilar el archivo."""
+    if "\t" not in texto or _compila(texto):
+        return None
+    salida = []
+    for linea in texto.split("\n"):
+        cuerpo = linea.lstrip(" \t")
+        indent = linea[: len(linea) - len(cuerpo)]
+        salida.append(indent.expandtabs(4) + cuerpo)
+    nuevo = "\n".join(salida)
+    return nuevo if _compila(nuevo) else None
+
+
+def arreglar_tipograficos(texto: str, es_python: bool = True) -> Optional[str]:
+    """Reemplaza comillas tipográficas fuera de strings cuando rompen la sintaxis."""
+    if not any(ch in texto for ch in _TIPOGRAFICOS):
+        return None
+    if es_python and _compila(texto):
+        return None
+    nuevo = texto
+    for malo, bueno in _TIPOGRAFICOS.items():
+        nuevo = nuevo.replace(malo, bueno)
+    if es_python and not _compila(nuevo):
+        return None
+    return nuevo
+
+
+def _linea_insercion_imports(arbol: ast.Module, texto: str) -> int:
+    """Número de línea (0-indexado) donde insertar un import nuevo."""
+    ultima = 0
+    cuerpo = arbol.body
+    k = 0
+    if cuerpo and isinstance(cuerpo[0], ast.Expr) and isinstance(getattr(cuerpo[0], "value", None), ast.Constant) \
+            and isinstance(cuerpo[0].value.value, str):
+        ultima = cuerpo[0].end_lineno or cuerpo[0].lineno
+        k = 1
+    while k < len(cuerpo) and isinstance(cuerpo[k], (ast.Import, ast.ImportFrom)):
+        ultima = cuerpo[k].end_lineno or cuerpo[k].lineno
+        k += 1
+    if ultima == 0:
+        lineas = texto.split("\n")
+        while ultima < len(lineas) and lineas[ultima].startswith("#"):
+            ultima += 1
+    return ultima
+
+
+def _usos_como_modulo(arbol: ast.AST, nombre: str) -> tuple[bool, set[str]]:
+    """(se usa como nombre.attr, atributos usados)."""
+    atributos = set()
+    for nodo in ast.walk(arbol):
+        if isinstance(nodo, ast.Attribute) and isinstance(nodo.value, ast.Name) and nodo.value.id == nombre:
+            atributos.add(nodo.attr)
+    return bool(atributos), atributos
+
+
+def imports_stdlib_faltantes(texto: str) -> list[str]:
+    """Sentencias import de la stdlib que faltan para nombres usados y no definidos."""
+    try:
+        arbol = ast.parse(texto)
+    except SyntaxError:
+        return []
+    indefinidos = {n for n, _ in nombres_indefinidos_python(texto)}
+    sentencias: list[str] = []
+    for nombre in sorted(indefinidos):
+        if nombre == "datetime":
+            como_modulo, atributos = _usos_como_modulo(arbol, nombre)
+            if atributos & {"datetime", "date", "timedelta", "timezone", "time", "MINYEAR", "MAXYEAR"}:
+                sentencias.append("import datetime")
+            else:
+                sentencias.append("from datetime import datetime")
+            continue
+        if nombre == "urllib":
+            _, atributos = _usos_como_modulo(arbol, nombre)
+            for sub in sorted(atributos & {"request", "parse", "error"}):
+                sentencias.append(f"import urllib.{sub}")
+            continue
+        if nombre in ("concurrent", "xml", "email", "http"):
+            continue  # necesitan el submódulo exacto; mejor que lo decida el modelo
+        if nombre in MODULOS_STDLIB_COMUNES:
+            como_modulo, _ = _usos_como_modulo(arbol, nombre)
+            if como_modulo:
+                sentencias.append(f"import {nombre}")
+            continue
+        sentencia = NOMBRES_STDLIB.get(nombre)
+        if sentencia:
+            sentencias.append(sentencia)
+    return sentencias
+
+
+def agregar_imports(texto: str, sentencias: Sequence[str]) -> Optional[str]:
+    if not sentencias:
+        return None
+    try:
+        arbol = ast.parse(texto)
+    except SyntaxError:
+        return None
+    linea = _linea_insercion_imports(arbol, texto)
+    lineas = texto.split("\n")
+    nuevas = [s for s in sentencias if s not in lineas]
+    if not nuevas:
+        return None
+    resultado = "\n".join(lineas[:linea] + list(nuevas) + lineas[linea:])
+    if linea == 0 and lineas and lineas[0].strip():
+        resultado = "\n".join(list(nuevas) + [""] + lineas)
+    return resultado if _compila(resultado) else None
+
+
+def quitar_comas_finales_json(texto: str) -> Optional[str]:
+    try:
+        json.loads(texto)
+        return None
+    except ValueError:
+        pass
+    salida = []
+    i, n = 0, len(texto)
+    en_string = False
+    while i < n:
+        ch = texto[i]
+        if en_string:
+            salida.append(ch)
+            if ch == "\\" and i + 1 < n:
+                salida.append(texto[i + 1])
+                i += 2
+                continue
+            if ch == '"':
+                en_string = False
+            i += 1
+            continue
+        if ch == '"':
+            en_string = True
+            salida.append(ch)
+            i += 1
+            continue
+        if ch == ",":
+            j = i + 1
+            while j < n and texto[j] in " \t\r\n":
+                j += 1
+            if j < n and texto[j] in "}]":
+                i += 1
+                continue
+        salida.append(ch)
+        i += 1
+    nuevo = "".join(salida)
+    try:
+        json.loads(nuevo)
+        return nuevo
+    except ValueError:
+        return None
+
+
+def _ruff_fix(ws: Workspace, rel: str) -> bool:
+    ruff = shutil.which("ruff")
+    if not ruff:
+        return False
+    antes = ws.hash(rel)
+    ejecutar([ruff, "check", "--fix", "--isolated", "--no-cache", "--select", REGLAS_RUFF_SEGURAS,
+              "--quiet", rel], cwd=ws.raiz, timeout=30)
+    return ws.hash(rel) != antes
+
+
+def autoarreglar_texto(rel: str, texto: str) -> ReporteAutofix:
+    """Arreglos puros sobre el texto (sin tocar disco). Útil también en tests."""
+    reporte = ReporteAutofix(rel)
+    sufijo = Path(rel).suffix.lower()
+    nombre = Path(rel).name
+    actual = texto
+
+    if sufijo not in (".md", ".markdown", ".diff", ".patch") and nombre != "Makefile":
+        limpio = quitar_espacios_finales(actual)
+        if limpio != actual:
+            actual = limpio
+            reporte.cambios.append("quité espacios al final de línea")
+    elif sufijo in (".md", ".markdown"):
+        actual = quitar_espacios_finales(actual, markdown=True)
+    con_salto = asegurar_salto_final(actual)
+    if con_salto != actual:
+        if actual.endswith("\n"):
+            reporte.cambios.append("quité líneas vacías al final")
+        else:
+            reporte.cambios.append("agregué el salto de línea final")
+        actual = con_salto
+
+    if sufijo == ".py":
+        tabs = arreglar_tabs_python(actual)
+        if tabs is not None:
+            actual = tabs
+            reporte.cambios.append("convertí tabs de indentación a 4 espacios")
+        tipograficos = arreglar_tipograficos(actual)
+        if tipograficos is not None:
+            actual = tipograficos
+            reporte.cambios.append("reemplacé comillas/guiones tipográficos por ASCII")
+        faltantes = imports_stdlib_faltantes(actual)
+        con_imports = agregar_imports(actual, faltantes)
+        if con_imports is not None:
+            actual = con_imports
+            reporte.cambios.append("agregué imports de la librería estándar: " + ", ".join(faltantes))
+    elif sufijo in (".json", ".webmanifest") and nombre not in ("tsconfig.json", "jsconfig.json"):
+        sin_comas = quitar_comas_finales_json(actual)
+        if sin_comas is not None:
+            actual = sin_comas
+            reporte.cambios.append("quité comas finales inválidas del JSON")
+
+    if actual != texto:
+        reporte.contenido = actual
+    return reporte
+
+
+def autoarreglar(ws: Workspace, rel: str, usar_ruff: bool = True) -> ReporteAutofix:
+    """Aplica los arreglos sobre el archivo real. Devuelve qué cambió."""
+    try:
+        ruta = ws.ruta(rel)
+    except ErrorRuta:
+        return ReporteAutofix(rel)
+    rel = ws.rel(ruta)
+    if not ruta.is_file() or es_binario(ruta) or not ws.es_texto(ruta) and ruta.suffix:
+        return ReporteAutofix(rel)
+    try:
+        texto = ruta.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return ReporteAutofix(rel)
+    reporte = autoarreglar_texto(rel, texto)
+    if reporte.contenido is not None:
+        try:
+            ws.escribir(rel, reporte.contenido)
+        except (ErrorRuta, OSError):
+            return ReporteAutofix(rel)
+    if usar_ruff and ruta.suffix == ".py" and _compila(ruta.read_text(encoding="utf-8", errors="replace")):
+        if _ruff_fix(ws, rel):
+            reporte.cambios.append("ruff --fix (reglas seguras)")
+    if ruta.suffix in (".sh", ".bash", ".py") or not ruta.suffix:
+        try:
+            primera = ruta.read_text(encoding="utf-8", errors="replace").split("\n", 1)[0]
+            modo = ruta.stat().st_mode
+            if primera.startswith("#!") and not modo & 0o100:
+                os.chmod(ruta, modo | 0o755)
+                reporte.cambios.append("marqué el script como ejecutable (chmod +x)")
+        except OSError:
+            pass
+    return reporte
+
+
+# ======================================================================
+# MÓDULO: symbols
+# ======================================================================
+"""
+Índice de símbolos: funciones, clases y métodos con su rango exacto de líneas.
+
+Para un modelo de 24B, leer un archivo entero de 1500 líneas para cambiar una
+función es la forma más rápida de llenar el contexto y equivocarse. Con este
+índice REAPER puede:
+  - read_symbol: leer solo `Cliente.guardar` (con números de línea)
+  - replace_symbol: reemplazar una función entera por nombre (más robusto que SEARCH/REPLACE)
+  - find_references: encontrar dónde se usa un nombre
+  - armar el mapa de archivos relevantes para un pedido
+
+Python usa el AST real. JS/TS/Go/Rust/Java/C/C++/C#/PHP/Kotlin/Swift/Dart
+usan detección de cabeceras + un tokenizador que salta strings, comentarios,
+template literals y regex para encontrar la llave de cierre correcta.
+Shell, Ruby y Lua tienen detectores propios.
+"""
+
+
+@dataclass
+class Simbolo:
+    nombre: str
+    tipo: str  # funcion | clase | metodo | variable | tipo | interfaz | modulo
+    archivo: str
+    inicio: int
+    fin: int
+    firma: str = ""
+    padre: str = ""
+    indent: str = ""
+
+    @property
+    def nombre_completo(self) -> str:
+        return f"{self.padre}.{self.nombre}" if self.padre else self.nombre
+
+    @property
+    def lineas(self) -> int:
+        return self.fin - self.inicio + 1
+
+    def describir(self) -> str:
+        return f"{self.archivo}:{self.inicio}-{self.fin} {self.tipo} {self.nombre_completo}{self.firma}"
+
+
+LENGUAJES_LLAVES = {
+    ".js": "js", ".mjs": "js", ".cjs": "js", ".jsx": "js", ".ts": "js", ".tsx": "js",
+    ".java": "java", ".kt": "kotlin", ".kts": "kotlin", ".cs": "java", ".scala": "java",
+    ".go": "go", ".rs": "rust", ".c": "c", ".h": "c", ".cpp": "c", ".hpp": "c", ".cc": "c",
+    ".cxx": "c", ".swift": "swift", ".php": "php", ".dart": "java",
+}
+
+
+# ======================================================================
+# PYTHON
+# ======================================================================
+def _firma_python(nodo: Union[ast.FunctionDef, ast.AsyncFunctionDef]) -> str:
+    try:
+        args = ast.unparse(nodo.args)
+    except (AttributeError, ValueError):
+        args = "..."
+    retorno = ""
+    if nodo.returns is not None:
+        try:
+            retorno = " -> " + ast.unparse(nodo.returns)
+        except (AttributeError, ValueError):
+            retorno = ""
+    return f"({args}){retorno}"
+
+
+def simbolos_python(texto: str, archivo: str = "") -> list[Simbolo]:
+    try:
+        arbol = ast.parse(texto)
+    except SyntaxError:
+        return simbolos_python_regex(texto, archivo)
+    lineas = texto.splitlines()
+    salida: list[Simbolo] = []
+
+    def indent_de(linea: int) -> str:
+        if 0 < linea <= len(lineas):
+            l = lineas[linea - 1]
+            return l[: len(l) - len(l.lstrip())]
+        return ""
+
+    def visitar(cuerpo, padre: str, en_clase: bool) -> None:
+        for nodo in cuerpo:
+            if isinstance(nodo, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                inicio = min([d.lineno for d in nodo.decorator_list] + [nodo.lineno])
+                tipo = "metodo" if en_clase else "funcion"
+                pref = "async " if isinstance(nodo, ast.AsyncFunctionDef) else ""
+                salida.append(Simbolo(nodo.name, tipo, archivo, inicio, nodo.end_lineno or nodo.lineno,
+                                      (pref and " async") + _firma_python(nodo), padre, indent_de(inicio)))
+                # Funciones anidadas: se indexan con el padre para poder leerlas también.
+                visitar(nodo.body, f"{padre}.{nodo.name}" if padre else nodo.name, False)
+            elif isinstance(nodo, ast.ClassDef):
+                inicio = min([d.lineno for d in nodo.decorator_list] + [nodo.lineno])
+                bases = ", ".join(ast.unparse(b) for b in nodo.bases) if nodo.bases else ""
+                salida.append(Simbolo(nodo.name, "clase", archivo, inicio, nodo.end_lineno or nodo.lineno,
+                                      f"({bases})" if bases else "", padre, indent_de(inicio)))
+                visitar(nodo.body, f"{padre}.{nodo.name}" if padre else nodo.name, True)
+            elif isinstance(nodo, (ast.Assign, ast.AnnAssign)) and not padre:
+                objetivos = nodo.targets if isinstance(nodo, ast.Assign) else [nodo.target]
+                for t in objetivos:
+                    if isinstance(t, ast.Name) and (t.id.isupper() or t.id[:1].isupper()):
+                        salida.append(Simbolo(t.id, "variable", archivo, nodo.lineno, nodo.end_lineno or nodo.lineno,
+                                              "", "", indent_de(nodo.lineno)))
+            elif isinstance(nodo, (ast.If, ast.Try)) and not padre:
+                # Definiciones condicionales de primer nivel (try: import ... / if TYPE_CHECKING:)
+                internos = list(nodo.body) + list(getattr(nodo, "orelse", []))
+                for h in getattr(nodo, "handlers", []):
+                    internos.extend(h.body)
+                visitar([n for n in internos if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))],
+                        padre, en_clase)
+
+    visitar(arbol.body, "", False)
+    return salida
+
+
+_RE_PY_DEF = re.compile(r"^(\s*)(async\s+def|def|class)\s+([A-Za-z_]\w*)\s*(\([^)]*\)?)?")
+
+
+def simbolos_python_regex(texto: str, archivo: str = "") -> list[Simbolo]:
+    """Respaldo para archivos Python con errores de sintaxis: rangos por indentación."""
+    lineas = texto.splitlines()
+    salida: list[Simbolo] = []
+    pila: list[tuple[int, str]] = []
+    for i, linea in enumerate(lineas, start=1):
+        m = _RE_PY_DEF.match(linea)
+        if not m:
+            continue
+        indent = len(m.group(1).expandtabs(4))
+        while pila and pila[-1][0] >= indent:
+            pila.pop()
+        padre = ".".join(n for _, n in pila)
+        fin = i
+        for j in range(i, len(lineas)):
+            sig = lineas[j]
+            if sig.strip() and len(sig) - len(sig.lstrip()) <= indent and not sig.lstrip().startswith(("#", ")", "]")):
+                break
+            fin = j + 1
+        tipo = "clase" if m.group(2) == "class" else ("metodo" if pila and any(True for _ in pila) else "funcion")
+        salida.append(Simbolo(m.group(3), tipo, archivo, i, max(i, fin), m.group(4) or "", padre, m.group(1)))
+        pila.append((indent, m.group(3)))
+    return salida
+
+
+# ======================================================================
+# LENGUAJES CON LLAVES
+# ======================================================================
+def _saltar_hasta_llave_cierre(texto: str, inicio: int, lenguaje: str) -> Optional[int]:
+    """
+    Desde la posición de una '{' devuelve la posición de su '}' de cierre,
+    saltando strings, comentarios, template literals y regex (aprox.).
+    """
+    nivel = 0
+    i, n = inicio, len(texto)
+    previo_significativo = ""
+    while i < n:
+        ch = texto[i]
+        sig = texto[i + 1] if i + 1 < n else ""
+        if ch == "/" and sig == "/":
+            fin = texto.find("\n", i)
+            i = n if fin < 0 else fin
+            continue
+        if ch == "/" and sig == "*":
+            fin = texto.find("*/", i + 2)
+            i = n if fin < 0 else fin + 2
+            continue
+        if ch == "#" and lenguaje == "php":
+            fin = texto.find("\n", i)
+            i = n if fin < 0 else fin
+            continue
+        if ch in "\"`" or (ch == "'" and lenguaje != "rust"):
+            j = i + 1
+            while j < n and texto[j] != ch:
+                if texto[j] == "\\":
+                    j += 1
+                elif texto[j] == "\n" and ch != "`" and lenguaje not in ("go",):
+                    break
+                j += 1
+            i = j + 1
+            previo_significativo = ch
+            continue
+        if ch == "'" and lenguaje == "rust":
+            m = re.match(r"'(?:\\.|[^\\'])'", texto[i:i + 6])
+            if m:
+                i += len(m.group(0))
+                continue
+        if ch == "/" and lenguaje == "js" and previo_significativo in ("", "(", ",", "=", ":", "[", "!", "&", "|", "?", "{", "}", ";"):
+            j = i + 1
+            en_clase = False
+            while j < n and texto[j] != "\n":
+                c = texto[j]
+                if c == "\\":
+                    j += 2
+                    continue
+                if c == "[":
+                    en_clase = True
+                elif c == "]":
+                    en_clase = False
+                elif c == "/" and not en_clase:
+                    break
+                j += 1
+            if j < n and texto[j] == "/":
+                i = j + 1
+                previo_significativo = "/"
+                continue
+        if ch == "{":
+            nivel += 1
+        elif ch == "}":
+            nivel -= 1
+            if nivel == 0:
+                return i
+        if not ch.isspace():
+            previo_significativo = ch
+        i += 1
+    return None
+
+
+_CABECERAS = {
+    "js": [
+        (re.compile(r"^(\s*)(?:export\s+(?:default\s+)?)?(?:async\s+)?function\s*\*?\s*([\w$]+)\s*(\([^)]*\))?"), "funcion"),
+        (re.compile(r"^(\s*)(?:export\s+(?:default\s+)?)?(?:abstract\s+)?class\s+([\w$]+)"), "clase"),
+        (re.compile(r"^(\s*)(?:export\s+)?interface\s+([\w$]+)"), "interfaz"),
+        (re.compile(r"^(\s*)(?:export\s+)?(?:const\s+)?enum\s+([\w$]+)"), "tipo"),
+        (re.compile(r"^(\s*)(?:export\s+)?type\s+([\w$]+)\s*(?:<[^=]*>)?\s*="), "tipo"),
+        (re.compile(r"^(\s*)(?:export\s+)?(?:const|let|var)\s+([\w$]+)\s*(?::[^=]+)?=\s*(?:async\s+)?(?:function\b|\([^)]*\)\s*(?::[^=]+)?=>|[\w$]+\s*=>)"), "funcion"),
+        (re.compile(r"^(\s*)(?:(?:public|private|protected|static|readonly|override|async|get|set)\s+)*(#?[\w$]+)\s*(\([^)]*\))\s*(?::\s*[^{]+)?\{\s*$"), "metodo"),
+    ],
+    "java": [
+        (re.compile(r"^(\s*)(?:(?:public|private|protected|static|final|abstract|sealed|partial|internal|open|data)\s+)*(?:class|interface|enum|record|struct|object)\s+([\w$]+)"), "clase"),
+        (re.compile(r"^(\s*)(?:(?:public|private|protected|static|final|abstract|synchronized|override|async|virtual|internal|suspend|open)\s+)*(?:fun\s+)?(?:<[^>]+>\s+)?(?:[\w<>\[\],.?]+\s+)?([\w$]+)\s*(\([^)]*\))\s*(?::\s*[\w<>?,. ]+)?\s*(?:throws\s+[\w., ]+)?\s*\{?\s*$"), "metodo"),
+    ],
+    "kotlin": [
+        (re.compile(r"^(\s*)(?:(?:public|private|protected|internal|open|abstract|sealed|data|enum|inner)\s+)*(?:class|interface|object)\s+([\w$]+)"), "clase"),
+        (re.compile(r"^(\s*)(?:(?:public|private|protected|internal|open|override|suspend|inline)\s+)*fun\s+(?:<[^>]+>\s+)?(?:[\w.]+\.)?([\w$]+)\s*(\([^)]*\))"), "funcion"),
+    ],
+    "go": [
+        (re.compile(r"^()func\s+\(\s*\w+\s+\*?([\w]+)\s*\)\s+([\w]+)\s*(\([^)]*\))"), "metodo_go"),
+        (re.compile(r"^()func\s+([\w]+)\s*(\([^)]*\))"), "funcion"),
+        (re.compile(r"^()type\s+([\w]+)\s+(?:struct|interface)"), "tipo"),
+    ],
+    "rust": [
+        (re.compile(r"^(\s*)(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?(?:unsafe\s+)?(?:const\s+)?fn\s+([\w]+)\s*(?:<[^>]*>)?\s*(\([^)]*\))?"), "funcion"),
+        (re.compile(r"^(\s*)(?:pub(?:\([^)]*\))?\s+)?(?:struct|enum|trait|union)\s+([\w]+)"), "tipo"),
+        (re.compile(r"^(\s*)impl(?:<[^>]*>)?\s+(?:[\w:<>, ]+\s+for\s+)?([\w]+)"), "clase"),
+        (re.compile(r"^(\s*)(?:pub\s+)?mod\s+([\w]+)\s*\{"), "modulo"),
+    ],
+    "c": [
+        (re.compile(r"^()(?:struct|class|union|enum)\s+([\w]+)\s*(?::[^{]*)?\{?\s*$"), "clase"),
+        (re.compile(r"^(\s*)(?:(?:static|inline|extern|virtual|const|unsigned|signed|long|short|struct)\s+)*[\w:<>*&]+[\s*&]+(?:[\w]+::)?([\w~]+)\s*(\([^;]*\))\s*(?:const)?\s*(?:override)?\s*\{?\s*$"), "funcion"),
+    ],
+    "swift": [
+        (re.compile(r"^(\s*)(?:(?:public|private|fileprivate|internal|open|final)\s+)*(?:class|struct|enum|protocol|extension|actor)\s+([\w]+)"), "clase"),
+        (re.compile(r"^(\s*)(?:(?:public|private|fileprivate|internal|open|static|override|mutating|final)\s+)*func\s+([\w]+)\s*(\([^)]*\))?"), "funcion"),
+    ],
+    "php": [
+        (re.compile(r"^(\s*)(?:(?:abstract|final)\s+)?(?:class|interface|trait|enum)\s+([\w]+)"), "clase"),
+        (re.compile(r"^(\s*)(?:(?:public|private|protected|static|abstract|final)\s+)*function\s+&?([\w]+)\s*(\([^)]*\))?"), "funcion"),
+    ],
+}
+
+_NO_SON_METODOS = {"if", "for", "while", "switch", "catch", "function", "return", "else", "do", "try",
+                   "with", "new", "typeof", "await", "yield", "constructor_", "super", "this", "elif", "sizeof"}
+
+
+def _offsets_lineas(texto: str) -> list[int]:
+    offsets = [0]
+    for m in re.finditer("\n", texto):
+        offsets.append(m.end())
+    return offsets
+
+
+def _linea_de_offset(offsets: list[int], pos: int) -> int:
+    lo, hi = 0, len(offsets) - 1
+    while lo < hi:
+        medio = (lo + hi + 1) // 2
+        if offsets[medio] <= pos:
+            lo = medio
+        else:
+            hi = medio - 1
+    return lo + 1
+
+
+def simbolos_llaves(texto: str, archivo: str, lenguaje: str) -> list[Simbolo]:
+    patrones = _CABECERAS.get(lenguaje, [])
+    lineas = texto.splitlines()
+    offsets = _offsets_lineas(texto)
+    salida: list[Simbolo] = []
+    contenedores: list[Simbolo] = []
+    i = 0
+    while i < len(lineas):
+        linea = lineas[i]
+        despojada = linea.strip()
+        if not despojada or despojada.startswith(("//", "/*", "*", "#", "import ", "package ", "using ")):
+            i += 1
+            continue
+        for patron, tipo in patrones:
+            m = patron.match(linea)
+            if not m:
+                continue
+            if tipo == "metodo_go":
+                indent, receptor, nombre = m.group(1), m.group(2), m.group(3)
+                firma = m.group(4) or ""
+                padre_forzado = receptor
+                tipo_real = "metodo"
+            else:
+                indent, nombre = m.group(1), m.group(2)
+                firma = m.group(3) if m.lastindex and m.lastindex >= 3 and m.group(3) else ""
+                padre_forzado = None
+                tipo_real = tipo
+            if tipo == "metodo" and (nombre in _NO_SON_METODOS or keyword.iskeyword(nombre)):
+                break
+            if tipo == "metodo" and lenguaje == "js" and not contenedores:
+                break  # un "metodo" suelto fuera de clase suele ser una llamada o un if
+            if tipo == "metodo" and lenguaje in ("java",) and re.match(r"^\s*(return|new|else|throw)\b", linea):
+                break
+            # Buscar la llave de apertura en esta línea o las 3 siguientes (firmas partidas).
+            pos_linea = offsets[i]
+            limite = offsets[min(len(offsets) - 1, i + 4)] if i + 4 < len(offsets) else len(texto)
+            abre = -1
+            for k in range(pos_linea + len(indent), limite):
+                c = texto[k]
+                if c == "{":
+                    abre = k
+                    break
+                if c == ";" and tipo_real not in ("tipo",):
+                    break
+                if c == "=" and lenguaje == "js" and tipo_real == "funcion" and "=>" not in texto[k:k + 2] \
+                        and texto[k:k + 2] != "==" and "function" not in linea and "=>" not in linea:
+                    break
+            if abre < 0:
+                # Función flecha de una sola expresión o declaración sin cuerpo.
+                fin_linea = i + 1
+                if lenguaje == "js" and "=>" in linea and not linea.rstrip().endswith((";", ")")):
+                    j = i + 1
+                    while j < len(lineas) and lineas[j].strip() and not lineas[j].rstrip().endswith(";"):
+                        j += 1
+                    fin_linea = min(len(lineas), j + 1)
+                salida.append(Simbolo(nombre, tipo_real, archivo, i + 1, fin_linea, firma,
+                                      padre_forzado or (contenedores[-1].nombre if contenedores else ""), indent))
+                break
+            cierre = _saltar_hasta_llave_cierre(texto, abre, lenguaje)
+            fin = _linea_de_offset(offsets, cierre) if cierre is not None else len(lineas)
+            while contenedores and contenedores[-1].fin < i + 1:
+                contenedores.pop()
+            padre = padre_forzado or (contenedores[-1].nombre if contenedores else "")
+            if tipo_real == "metodo" and not padre and lenguaje in ("java", "c"):
+                tipo_real = "funcion"
+            simbolo = Simbolo(nombre, tipo_real, archivo, i + 1, fin, firma, padre, indent)
+            salida.append(simbolo)
+            if tipo_real in ("clase", "interfaz", "modulo") or (tipo_real == "tipo" and lenguaje in ("rust", "go")):
+                contenedores.append(simbolo)
+            break
+        i += 1
+    return salida
+
+
+# ======================================================================
+# SHELL, RUBY, LUA
+# ======================================================================
+_RE_SH_FUNC = re.compile(r"^(\s*)(?:function\s+([\w:-]+)\s*(?:\(\s*\))?|([\w:-]+)\s*\(\s*\))\s*\{?")
+
+
+def simbolos_shell(texto: str, archivo: str) -> list[Simbolo]:
+    salida = []
+    lineas = texto.splitlines()
+    offsets = _offsets_lineas(texto)
+    for i, linea in enumerate(lineas):
+        m = _RE_SH_FUNC.match(linea)
+        if not m or linea.strip().startswith("#"):
+            continue
+        nombre = m.group(2) or m.group(3)
+        abre = texto.find("{", offsets[i], offsets[min(len(offsets) - 1, i + 2)] if i + 2 < len(offsets) else len(texto))
+        if abre < 0:
+            continue
+        cierre = _saltar_hasta_llave_cierre(texto, abre, "sh")
+        fin = _linea_de_offset(offsets, cierre) if cierre is not None else len(lineas)
+        salida.append(Simbolo(nombre, "funcion", archivo, i + 1, fin, "()", "", m.group(1)))
+    return salida
+
+
+_RE_RB = re.compile(r"^(\s*)(def|class|module)\s+([\w.:?!=]+)")
+_RE_RB_ABRE = re.compile(r"^\s*(def|class|module|if|unless|while|until|case|begin|for)\b|\bdo(\s*\|[^|]*\|)?\s*$")
+_RE_LUA = re.compile(r"^(\s*)(?:local\s+)?function\s+([\w.:]+)\s*(\([^)]*\))")
+_RE_LUA_ABRE = re.compile(r"\b(function|do|then|repeat)\b")
+
+
+def simbolos_end(texto: str, archivo: str, lenguaje: str) -> list[Simbolo]:
+    """Ruby y Lua: bloques que terminan con 'end' (conteo de aperturas/cierres por línea)."""
+    lineas = texto.splitlines()
+    salida = []
+    patron = _RE_RB if lenguaje == "ruby" else _RE_LUA
+    for i, linea in enumerate(lineas):
+        m = patron.match(linea)
+        if not m:
+            continue
+        nivel = 0
+        fin = len(lineas)
+        for j in range(i, len(lineas)):
+            l = re.sub(r"#.*$" if lenguaje == "ruby" else r"--.*$", "", lineas[j])
+            l = re.sub(r"\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'", "", l)
+            if lenguaje == "ruby":
+                if _RE_RB_ABRE.search(l) and not re.search(r"\bend\s*$", l.strip()) or (j == i):
+                    nivel += 1
+            else:
+                nivel += len(_RE_LUA_ABRE.findall(l))
+            nivel -= len(re.findall(r"\bend\b", l))
+            if lenguaje == "lua":
+                nivel -= len(re.findall(r"\buntil\b", l))
+            if nivel <= 0 and j >= i:
+                fin = j + 1
+                break
+        if lenguaje == "ruby":
+            tipo = "funcion" if m.group(2) == "def" else "clase"
+            nombre = m.group(3)
+            firma = ""
+        else:
+            tipo, nombre, firma = "funcion", m.group(2), m.group(3)
+        padre = ""
+        if "." in nombre or ":" in nombre:
+            padre, nombre = re.split(r"[.:]", nombre, maxsplit=1)[0], re.split(r"[.:]", nombre)[-1]
+        salida.append(Simbolo(nombre, tipo, archivo, i + 1, fin, firma, padre, m.group(1)))
+    return salida
+
+
+# ======================================================================
+# API
+# ======================================================================
+def extraer_simbolos(ruta: Path, texto: Optional[str] = None, archivo: str = "") -> list[Simbolo]:
+    if texto is None:
+        try:
+            texto = ruta.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return []
+    archivo = archivo or ruta.name
+    sufijo = ruta.suffix.lower()
+    try:
+        if sufijo == ".py":
+            return simbolos_python(texto, archivo)
+        if sufijo in LENGUAJES_LLAVES:
+            return simbolos_llaves(texto, archivo, LENGUAJES_LLAVES[sufijo])
+        if sufijo in (".sh", ".bash", ".zsh"):
+            return simbolos_shell(texto, archivo)
+        if sufijo == ".rb":
+            return simbolos_end(texto, archivo, "ruby")
+        if sufijo == ".lua":
+            return simbolos_end(texto, archivo, "lua")
+    except RecursionError:
+        return []
+    return []
+
+
+def elegir_simbolo(simbolos: Sequence[Simbolo], nombre: str) -> tuple[list[Simbolo], list[str]]:
+    """
+    Encuentra el símbolo pedido: 'Clase.metodo', 'metodo' o 'clase'. Devuelve
+    (coincidencias, sugerencias si no hay ninguna).
+    """
+    nombre = (nombre or "").strip().strip("`'\"").strip()
+    nombre = re.sub(r"\(.*\)$", "", nombre).strip()
+    nombre = nombre.replace("::", ".").replace("#", ".")
+    for prefijo in ("def ", "class ", "function ", "func ", "fn "):
+        if nombre.startswith(prefijo):
+            nombre = nombre[len(prefijo):]
+    if not nombre:
+        return [], []
+    exactos = [s for s in simbolos if s.nombre_completo == nombre]
+    if not exactos:
+        exactos = [s for s in simbolos if s.nombre_completo.endswith("." + nombre) or s.nombre == nombre]
+    if not exactos:
+        bajo = nombre.lower()
+        exactos = [s for s in simbolos if s.nombre_completo.lower() == bajo or s.nombre.lower() == bajo]
+    if exactos:
+        return exactos, []
+    nombres = sorted({s.nombre_completo for s in simbolos} | {s.nombre for s in simbolos})
+    return [], difflib.get_close_matches(nombre, nombres, n=4, cutoff=0.55)
+
+
+def texto_de_simbolo(texto: str, simbolo: Simbolo, numerar: bool = True) -> str:
+    lineas = texto.splitlines()
+    tramo = lineas[simbolo.inicio - 1: simbolo.fin]
+    if not numerar:
+        return "\n".join(tramo)
+    return "\n".join(f"{simbolo.inicio + k:>5}| {l}" for k, l in enumerate(tramo))
+
+
+def _indent_minimo(lineas: Sequence[str]) -> str:
+    indents = [l[: len(l) - len(l.lstrip())] for l in lineas if l.strip()]
+    if not indents:
+        return ""
+    return min(indents, key=len)
+
+
+def reemplazar_simbolo(texto: str, simbolo: Simbolo, nuevo: str) -> str:
+    """
+    Reemplaza el rango del símbolo por 'nuevo', reindentándolo para que quede
+    al nivel del símbolo original (el modelo suele escribir métodos sin indentar).
+    """
+    lineas = texto.splitlines(keepends=True)
+    nuevas = nuevo.rstrip("\n").split("\n")
+    actual = _indent_minimo(nuevas)
+    objetivo = simbolo.indent
+    if actual != objetivo:
+        ajustadas = []
+        for l in nuevas:
+            if not l.strip():
+                ajustadas.append("")
+            elif l.startswith(actual):
+                ajustadas.append(objetivo + l[len(actual):])
+            else:
+                ajustadas.append(objetivo + l.lstrip())
+        nuevas = ajustadas
+    bloque = "\n".join(nuevas) + "\n"
+    termina_sin_salto = simbolo.fin >= len(lineas) and lineas and not lineas[-1].endswith("\n")
+    if termina_sin_salto:
+        bloque = bloque[:-1]
+    return "".join(lineas[: simbolo.inicio - 1]) + bloque + "".join(lineas[simbolo.fin:])
+
+
+def insertar_tras_simbolo(texto: str, simbolo: Simbolo, nuevo: str, separacion: int = 2) -> str:
+    """Inserta 'nuevo' después del símbolo (con líneas en blanco de separación y su indentación)."""
+    lineas = texto.splitlines(keepends=True)
+    nuevas = nuevo.rstrip("\n").split("\n")
+    actual = _indent_minimo(nuevas)
+    if actual != simbolo.indent:
+        nuevas = [(simbolo.indent + l[len(actual):]) if l.strip() and l.startswith(actual) else
+                  (simbolo.indent + l.lstrip() if l.strip() else "") for l in nuevas]
+    separador = "\n" * (separacion if not simbolo.indent else 1)
+    previo = "".join(lineas[: simbolo.fin])
+    if previo and not previo.endswith("\n"):
+        previo += "\n"
+    return previo + separador + "\n".join(nuevas) + "\n" + "".join(lineas[simbolo.fin:])
+
+
+class IndiceSimbolos:
+    """Índice perezoso de símbolos del workspace con caché por (mtime, tamaño)."""
+
+    def __init__(self, ws: Workspace):
+        self.ws = ws
+        self._cache: dict[str, tuple[float, int, list[Simbolo]]] = {}
+        self._lock = threading.Lock()
+
+    def de_archivo(self, rel: str) -> list[Simbolo]:
+        try:
+            ruta = self.ws.ruta(rel)
+            st = ruta.stat()
+        except (ErrorRuta, OSError):
+            return []
+        rel = self.ws.rel(ruta)
+        with self._lock:
+            cache = self._cache.get(rel)
+            if cache and cache[0] == st.st_mtime and cache[1] == st.st_size:
+                return cache[2]
+        if st.st_size > 2_000_000:
+            return []
+        simbolos = extraer_simbolos(ruta, archivo=rel)
+        with self._lock:
+            self._cache[rel] = (st.st_mtime, st.st_size, simbolos)
+        return simbolos
+
+    def archivos(self, limite: int = 1500) -> list[str]:
+        return [r for r in self.ws.archivos_codigo(limite=limite)
+                if Path(r).suffix.lower() in (".py", ".sh", ".bash", ".rb", ".lua", *LENGUAJES_LLAVES)]
+
+    def todos(self, limite: int = 1500) -> list[Simbolo]:
+        salida = []
+        for rel in self.archivos(limite):
+            salida.extend(self.de_archivo(rel))
+        return salida
+
+    def buscar(self, nombre: str, archivo: Optional[str] = None) -> tuple[list[Simbolo], list[str]]:
+        simbolos = self.de_archivo(archivo) if archivo else self.todos()
+        return elegir_simbolo(simbolos, nombre)
+
+    def referencias(self, nombre: str, limite: int = 60) -> list[str]:
+        """Líneas donde aparece el nombre como palabra completa (excluye su propia definición)."""
+        corto = nombre.split(".")[-1]
+        if not corto:
+            return []
+        patron = re.compile(r"(?<![\w$])" + re.escape(corto) + r"(?![\w$])")
+        definiciones = {(s.archivo, s.inicio) for s in self.todos() if s.nombre == corto}
+        hallazgos = []
+        for rel in self.ws.archivos_codigo(limite=2000):
+            ruta = self.ws.raiz / rel
+            try:
+                if ruta.stat().st_size > 600_000:
+                    continue
+                texto = ruta.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            if corto not in texto:
+                continue
+            for n, linea in enumerate(texto.splitlines(), start=1):
+                if (rel, n) in definiciones:
+                    continue
+                if patron.search(linea):
+                    hallazgos.append(f"{rel}:{n}: {linea.strip()[:160]}")
+                    if len(hallazgos) >= limite:
+                        return hallazgos
+        return hallazgos
+
+    def invalidar(self, rel: Optional[str] = None) -> None:
+        with self._lock:
+            if rel is None:
+                self._cache.clear()
+            else:
+                self._cache.pop(rel, None)
+
+
+_INDICES: dict[str, IndiceSimbolos] = {}
+_LOCK_INDICES = threading.Lock()
+
+
+def indice_de(ws: Workspace) -> IndiceSimbolos:
+    clave = str(ws.raiz)
+    with _LOCK_INDICES:
+        if clave not in _INDICES or _INDICES[clave].ws is not ws:
+            _INDICES[clave] = IndiceSimbolos(ws)
+        return _INDICES[clave]
+
+
+# ======================================================================
+# MÓDULO: repomap
+# ======================================================================
+"""
+Mapa de archivos relevantes para un pedido.
+
+Un modelo de 24B explora mal: abre archivos al azar y se queda sin contexto.
+REAPER le da resuelto, ANTES de empezar, qué archivos y funciones tocan el
+pedido. Cruza las palabras del pedido (normalizadas, sin tildes, con
+traducción español→inglés de conceptos de programación frecuentes) con:
+  - la ruta del archivo (peso alto)
+  - los nombres de funciones/clases (peso medio)
+  - los identificadores del contenido (peso bajo, con IDF)
+y después propaga relevancia por el grafo de imports (si a.py importa b.py
+y a.py es muy relevante, b.py también sube un poco).
+"""
+
+PALABRAS_VACIAS = {
+    # español
+    "que", "con", "para", "por", "los", "las", "una", "uno", "unos", "unas", "del", "al", "el", "la", "de",
+    "en", "y", "o", "a", "se", "su", "sus", "lo", "le", "les", "mas", "más", "como", "cuando", "donde",
+    "este", "esta", "esto", "estos", "estas", "ese", "esa", "eso", "hay", "tiene", "tener", "hacer", "haga",
+    "hace", "quiero", "necesito", "podes", "puedes", "favor", "agrega", "agregá", "agregar", "agregue",
+    "crea", "creá", "crear", "cree", "modifica", "modificá", "modificar", "cambia", "cambiá", "cambiar",
+    "arregla", "arreglá", "arreglar", "implementa", "implementá", "implementar", "nuevo", "nueva",
+    "nuevos", "nuevas", "todo", "toda", "todos", "todas", "sea", "sean", "ser", "esta", "están", "estan",
+    "algo", "cada", "entre", "sobre", "sin", "pero", "tambien", "también", "muy", "ya", "solo", "sólo",
+    "archivo", "archivos", "codigo", "código", "funcion", "función", "funciones", "programa", "proyecto",
+    "mi", "mis", "tu", "tus", "me", "te", "nos", "hola", "gracias", "bien", "mal", "usar", "usando",
+    # inglés
+    "the", "and", "for", "with", "that", "this", "from", "into", "add", "create", "make", "fix", "update",
+    "change", "implement", "new", "file", "files", "code", "function", "please", "should", "would", "use",
+    "using", "all", "some", "any", "can", "will", "not", "are", "was", "has", "have",
+}
+
+TRADUCCIONES = {
+    "usuario": ["user"], "usuarios": ["user", "users"], "contrasena": ["password", "pass"],
+    "clave": ["password", "key"], "carrito": ["cart"], "producto": ["product", "item"],
+    "productos": ["product", "products", "item"], "pedido": ["order", "request"], "pedidos": ["order", "orders"],
+    "factura": ["invoice", "bill"], "fecha": ["date", "time"], "fechas": ["date", "dates"],
+    "buscar": ["search", "find", "query"], "busqueda": ["search", "query"], "guardar": ["save", "store", "write"],
+    "borrar": ["delete", "remove"], "eliminar": ["delete", "remove"], "sesion": ["session", "login"],
+    "ingreso": ["login", "signin"], "correo": ["email", "mail"], "precio": ["price", "cost"],
+    "cliente": ["client", "customer"], "clientes": ["client", "customer"], "nota": ["note"], "notas": ["note", "notes"],
+    "tarea": ["task", "todo"], "tareas": ["task", "tasks", "todo"], "lista": ["list"], "listar": ["list"],
+    "base": ["db", "database"], "datos": ["data", "db"], "prueba": ["test"], "pruebas": ["test", "tests"],
+    "configuracion": ["config", "settings"], "ajustes": ["settings", "config"], "juego": ["game"],
+    "puntaje": ["score"], "puntos": ["score", "points"], "jugador": ["player"], "mensaje": ["message", "msg"],
+    "mensajes": ["message", "messages"], "pagina": ["page"], "boton": ["button", "btn"], "imagen": ["image", "img"],
+    "tabla": ["table"], "reporte": ["report"], "informe": ["report"], "inventario": ["inventory", "stock"],
+    "venta": ["sale", "sales"], "ventas": ["sale", "sales"], "compra": ["purchase", "buy"], "pago": ["payment", "pay"],
+    "pagos": ["payment", "payments"], "cuenta": ["account"], "registro": ["register", "signup", "log"],
+    "autenticacion": ["auth", "authentication"], "permiso": ["permission", "role"], "rol": ["role"],
+    "archivo": ["file"], "carpeta": ["folder", "dir"], "ruta": ["path", "route"], "rutas": ["route", "routes", "path"],
+    "servidor": ["server"], "peticion": ["request"], "respuesta": ["response"], "error": ["error", "exception"],
+    "errores": ["error", "errors"], "validar": ["validate", "validation"], "validacion": ["validation", "validate"],
+    "formulario": ["form"], "menu": ["menu"], "ventana": ["window"], "pantalla": ["screen"], "vista": ["view"],
+    "modelo": ["model"], "plantilla": ["template"], "estilo": ["style", "css"], "estilos": ["style", "styles", "css"],
+    "calculadora": ["calculator", "calc"], "calcular": ["calculate", "compute"], "suma": ["sum", "add"],
+    "resta": ["subtract", "sub"], "total": ["total", "sum"], "promedio": ["average", "mean", "avg"],
+    "ordenar": ["sort"], "filtrar": ["filter"], "exportar": ["export"], "importar": ["import"], "leer": ["read", "load"],
+    "escribir": ["write"], "cargar": ["load"], "enviar": ["send"], "recibir": ["receive"], "descargar": ["download"],
+    "subir": ["upload"], "imprimir": ["print"], "mostrar": ["show", "display", "render"], "dibujar": ["draw", "render"],
+    "cache": ["cache"], "registrar": ["log", "register"], "bitacora": ["log"], "historial": ["history"],
+    "comando": ["command", "cmd"], "comandos": ["command", "commands", "cli"], "consola": ["console", "cli", "terminal"],
+    "red": ["network", "net"], "conexion": ["connection", "connect"], "hilo": ["thread"], "cola": ["queue"],
+    "evento": ["event"], "eventos": ["event", "events"], "temporizador": ["timer"], "reloj": ["clock", "timer"],
+    "alarma": ["alarm"], "clima": ["weather"], "moneda": ["currency", "coin"], "dinero": ["money"], "banco": ["bank"],
+    "libro": ["book"], "libros": ["book", "books"], "biblioteca": ["library"], "autor": ["author"], "contacto": ["contact"],
+    "contactos": ["contact", "contacts"], "agenda": ["agenda", "contacts", "calendar"], "calendario": ["calendar"],
+    "chat": ["chat"], "bot": ["bot"], "api": ["api"], "token": ["token", "auth"], "cifrar": ["encrypt"],
+    "descifrar": ["decrypt"], "hash": ["hash"], "migracion": ["migration"], "esquema": ["schema"],
+}
+
+_RE_IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]{2,}")
+_RE_CAMEL = re.compile(r"[A-Z]?[a-z0-9]+|[A-Z]+(?![a-z])")
+
+
+def sin_tildes(texto: str) -> str:
+    normal = unicodedata.normalize("NFKD", texto)
+    return "".join(ch for ch in normal if not unicodedata.combining(ch))
+
+
+def partir_identificador(nombre: str) -> list[str]:
+    """'guardarUsuario_v2' → ['guardar', 'usuario', 'v2']"""
+    partes = []
+    for trozo in re.split(r"[_\W]+", nombre):
+        if not trozo:
+            continue
+        partes.extend(p.lower() for p in _RE_CAMEL.findall(trozo) or [trozo])
+    return [p for p in partes if p]
+
+
+def _raiz(palabra: str) -> str:
+    """Stemming mínimo (plurales y algunas terminaciones) para que 'usuarios' encuentre 'usuario'."""
+    p = palabra
+    for sufijo in ("ciones", "cion", "mente", "es", "s"):
+        if len(p) > len(sufijo) + 3 and p.endswith(sufijo):
+            p = p[: -len(sufijo)]
+            break
+    return p
+
+
+def tokens_pedido(pedido: str) -> dict[str, float]:
+    """Tokens del pedido con peso (las traducciones pesan un poco menos que la palabra original)."""
+    texto = sin_tildes(pedido or "").lower()
+    pesos: dict[str, float] = {}
+    crudos = re.findall(r"[a-z_][a-z0-9_.]{1,}", texto)
+    for crudo in crudos:
+        # nombres de archivo mencionados explícitamente valen mucho
+        if "." in crudo and re.search(r"\.(py|js|ts|mjs|html|css|json|sh|go|rs|java|md)$", crudo):
+            pesos[crudo] = pesos.get(crudo, 0) + 6.0
+        for parte in partir_identificador(crudo):
+            if len(parte) < 3 or parte in PALABRAS_VACIAS:
+                continue
+            raiz = _raiz(parte)
+            pesos[raiz] = pesos.get(raiz, 0) + 1.0
+            for traduccion in TRADUCCIONES.get(parte, []) + TRADUCCIONES.get(raiz, []):
+                pesos[_raiz(traduccion)] = max(pesos.get(_raiz(traduccion), 0), 0.8)
+    return pesos
+
+
+@dataclass
+class DocumentoArchivo:
+    rel: str
+    ruta_tokens: set
+    simbolos: list
+    simbolo_tokens: dict  # token → [nombres de símbolos]
+    contenido: collections.Counter
+    imports: set
+    lineas: int
+
+
+def _imports_archivo(ws: Workspace, rel: str, texto: str) -> set[str]:
+    destino: set[str] = set()
+    ruta = ws.raiz / rel
+    if rel.endswith(".py"):
+        for m in re.finditer(r"^\s*(?:from\s+(\.*)([\w.]*)\s+import\s+([\w, ]+)|import\s+([\w.]+))", texto, re.M):
+            puntos, modulo, nombres, simple = m.group(1) or "", m.group(2) or "", m.group(3) or "", m.group(4)
+            candidatos = []
+            if simple:
+                candidatos.append((0, simple))
+            else:
+                candidatos.append((len(puntos), modulo))
+                for n in nombres.split(","):
+                    n = n.strip()
+                    if n:
+                        candidatos.append((len(puntos), f"{modulo}.{n}" if modulo else n))
+            for nivel, mod in candidatos:
+                base = ruta.parent if nivel else ws.raiz
+                for _ in range(max(0, nivel - 1)):
+                    base = base.parent
+                partes = [p for p in mod.split(".") if p]
+                if not partes:
+                    continue
+                for raiz in ([base] if nivel else [ws.raiz, ws.raiz / "src", ruta.parent]):
+                    archivo = raiz.joinpath(*partes)
+                    for c in (archivo.with_suffix(".py"), archivo / "__init__.py"):
+                        if c.is_file():
+                            destino.add(ws.rel(c))
+                            break
+    elif Path(rel).suffix in (".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".html"):
+        for m in re.finditer(r"""(?:from\s+|require\(\s*|import\s*\(\s*|src=)["'](\.{1,2}/[^"']+|[\w./-]+\.(?:js|mjs|css))["']""", texto):
+            resuelto = _resolver_js(ruta.parent, m.group(1)) if m.group(1).startswith(".") else (ruta.parent / m.group(1))
+            if resuelto and Path(resuelto).is_file():
+                destino.add(ws.rel(Path(resuelto)))
+    return destino
+
+
+class MapaRepositorio:
+    """Índice ligero para rankear archivos según un pedido."""
+
+    def __init__(self, ws: Workspace, max_archivos: int = 1200):
+        self.ws = ws
+        self.max_archivos = max_archivos
+        self.documentos: dict[str, DocumentoArchivo] = {}
+        self._firma: Optional[tuple] = None
+
+    def _firma_actual(self) -> tuple:
+        firma = []
+        for rel in self.ws.archivos_codigo(limite=self.max_archivos):
+            try:
+                st = (self.ws.raiz / rel).stat()
+                firma.append((rel, st.st_mtime, st.st_size))
+            except OSError:
+                continue
+        return tuple(firma)
+
+    def construir(self) -> "MapaRepositorio":
+        firma = self._firma_actual()
+        if firma == self._firma:
+            return self
+        indice = indice_de(self.ws)
+        documentos = {}
+        for rel, _mtime, tam in firma:
+            if tam > 400_000:
+                continue
+            try:
+                texto = (self.ws.raiz / rel).read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            ruta_tokens = set()
+            for parte in Path(rel).with_suffix("").parts:
+                ruta_tokens.update(_raiz(sin_tildes(p)) for p in partir_identificador(parte))
+            ruta_tokens.add(Path(rel).name.lower())
+            simbolos = indice.de_archivo(rel)
+            simbolo_tokens: dict[str, list] = {}
+            for s in simbolos:
+                for p in partir_identificador(s.nombre):
+                    simbolo_tokens.setdefault(_raiz(sin_tildes(p)), []).append(s)
+            contenido = collections.Counter()
+            for ident in _RE_IDENT.findall(texto[:200_000]):
+                for p in partir_identificador(ident):
+                    if len(p) >= 3:
+                        contenido[_raiz(sin_tildes(p))] += 1
+            for palabra in re.findall(r"[a-záéíóúñ]{4,}", sin_tildes(texto[:100_000]).lower()):
+                contenido[_raiz(palabra)] += 1
+            documentos[rel] = DocumentoArchivo(rel, ruta_tokens, simbolos, simbolo_tokens, contenido,
+                                               _imports_archivo(self.ws, rel, texto), texto.count("\n") + 1)
+        self.documentos = documentos
+        self._firma = firma
+        return self
+
+    def rankear(self, pedido: str, maximo: int = 8) -> list[tuple[str, float, list]]:
+        self.construir()
+        tokens = tokens_pedido(pedido)
+        if not tokens or not self.documentos:
+            return []
+        n = len(self.documentos)
+        df = collections.Counter()
+        for doc in self.documentos.values():
+            presentes = set(doc.contenido) | doc.ruta_tokens | set(doc.simbolo_tokens)
+            for t in tokens:
+                if t in presentes:
+                    df[t] += 1
+        puntajes: dict[str, float] = {}
+        coincidencias: dict[str, list] = {}
+        menciona_tests = any(t.startswith("test") or t.startswith("prueb") for t in tokens)
+        for rel, doc in self.documentos.items():
+            puntaje = 0.0
+            simbolos_hit: list = []
+            for token, peso in tokens.items():
+                idf = math.log(1 + n / (1 + df.get(token, 0)))
+                if token == Path(rel).name.lower() or (("." in token) and rel.endswith(token)):
+                    puntaje += 12 * peso
+                    continue
+                if token in doc.ruta_tokens or any(t.startswith(token) and len(token) >= 4 for t in doc.ruta_tokens):
+                    puntaje += 4.0 * peso * idf
+                if token in doc.simbolo_tokens:
+                    puntaje += 2.5 * peso * idf
+                    simbolos_hit.extend(doc.simbolo_tokens[token][:4])
+                frecuencia = doc.contenido.get(token, 0)
+                if frecuencia:
+                    puntaje += min(3.0, 1 + math.log(frecuencia)) * 0.6 * peso * idf
+            es_test = "test" in rel.lower()
+            if es_test and not menciona_tests:
+                puntaje *= 0.6
+            if puntaje > 0:
+                puntajes[rel] = puntaje
+                coincidencias[rel] = simbolos_hit
+        # Propagación por imports (un salto, en ambos sentidos).
+        propagado = dict(puntajes)
+        for rel, puntaje in puntajes.items():
+            for vecino in self.documentos[rel].imports:
+                if vecino in self.documentos:
+                    propagado[vecino] = propagado.get(vecino, 0) + puntaje * 0.25
+        for rel, doc in self.documentos.items():
+            for importado in doc.imports:
+                if importado in puntajes:
+                    propagado[rel] = propagado.get(rel, 0) + puntajes[importado] * 0.15
+        orden = sorted(propagado.items(), key=lambda kv: (-kv[1], kv[0]))[:maximo]
+        if not orden:
+            return []
+        maximo_puntaje = orden[0][1] or 1
+        return [(rel, round(p / maximo_puntaje, 3), coincidencias.get(rel, [])) for rel, p in orden
+                if p / maximo_puntaje >= 0.08]
+
+    def texto(self, pedido: str, maximo: int = 8) -> str:
+        ranking = self.rankear(pedido, maximo)
+        if not ranking:
+            return ""
+        lineas = ["ARCHIVOS PROBABLEMENTE RELEVANTES PARA EL PEDIDO (calculado por REAPER, verificalo leyendo):"]
+        for k, (rel, puntaje, simbolos) in enumerate(ranking, start=1):
+            doc = self.documentos.get(rel)
+            vistos, detalle = set(), []
+            for s in simbolos:
+                if s.nombre_completo in vistos:
+                    continue
+                vistos.add(s.nombre_completo)
+                detalle.append(f"{s.nombre_completo} L{s.inicio}-{s.fin}")
+                if len(detalle) >= 5:
+                    break
+            if not detalle and doc:
+                detalle = [f"{s.nombre_completo} L{s.inicio}" for s in doc.simbolos if s.tipo in ("clase", "funcion")][:4]
+            lineas_txt = f" ({doc.lineas} líneas)" if doc else ""
+            lineas.append(f"{k}. {rel}{lineas_txt}" + (f" — {', '.join(detalle)}" if detalle else ""))
+        lineas.append("Tip: usá read_symbol para leer solo la función que necesitás.")
+        return "\n".join(lineas)
+
+
+_MAPAS: dict[str, MapaRepositorio] = {}
+_LOCK_MAPAS = threading.Lock()
+
+
+def mapa_de(ws: Workspace) -> MapaRepositorio:
+    clave = str(ws.raiz)
+    with _LOCK_MAPAS:
+        if clave not in _MAPAS or _MAPAS[clave].ws is not ws:
+            _MAPAS[clave] = MapaRepositorio(ws)
+        return _MAPAS[clave]
+
+
+def mapa_relevante(ws: Workspace, pedido: str, maximo: int = 8) -> str:
+    try:
+        return mapa_de(ws).texto(pedido, maximo)
+    except (OSError, RecursionError, ValueError):
+        return ""
+
+
+# ======================================================================
+# MÓDULO: knowledge
+# ======================================================================
+"""
+Base de conocimiento: pistas concretas para errores frecuentes y guías
+cortas por lenguaje.
+
+Cuando una herramienta devuelve un error real (traceback, salida de tests,
+error de npm/pip...), REAPER le agrega al agente 1-3 pistas específicas en
+español. Un modelo de 24B suele saber arreglar el error si alguien le dice
+qué significa: esto ahorra pasos de "probar cosas al azar".
+"""
+
+
+@dataclass(frozen=True)
+class Pista:
+    patron: str
+    texto: str
+    categoria: str = "general"
+
+    @functools.cached_property
+    def regex(self) -> re.Pattern:
+        return re.compile(self.patron, re.I | re.M)
+
+
+PISTAS: list[Pista] = [
+    # ------------------------------------------------------------ Python: imports y módulos
+    Pista(r"ModuleNotFoundError: No module named '(requests|flask|numpy|pandas|bs4|yaml|dotenv|rich|colorama)'",
+          "El módulo externo no está instalado. En Termux: `pip install <modulo>`. Si es para un script simple, "
+          "preferí la librería estándar (urllib.request en vez de requests, json/csv en vez de pandas).", "python"),
+    Pista(r"ModuleNotFoundError: No module named '([\w.]+)'",
+          "Python no encuentra ese módulo. Si es un archivo del proyecto, revisá el nombre exacto, que exista "
+          "un __init__.py en la carpeta del paquete y que el comando se ejecute desde la raíz del proyecto.", "python"),
+    Pista(r"ImportError: cannot import name '(\w+)' from '([\w.]+)'",
+          "El módulo existe pero no define ese nombre: revisá cómo se llama realmente la función/clase en el "
+          "módulo (usá read_symbol o search_files) o si hay un import circular entre los dos archivos.", "python"),
+    Pista(r"ImportError: attempted relative import with no known parent package",
+          "Import relativo (from .x import y) en un archivo ejecutado como script. Ejecutalo con "
+          "`python3 -m paquete.modulo` desde la raíz o usá imports absolutos.", "python"),
+    Pista(r"partially initialized module .* \(most likely due to a circular import\)",
+          "Import circular: dos módulos se importan entre sí al cargar. Mové el import adentro de la función que "
+          "lo usa o extraé lo compartido a un tercer módulo.", "python"),
+    # ------------------------------------------------------------ Python: nombres y tipos
+    Pista(r"NameError: name '(\w+)' is not defined",
+          "Se usa un nombre que no existe en ese ámbito: falta un import, la variable se define más abajo, "
+          "está mal escrita o es un atributo que necesita `self.`.", "python"),
+    Pista(r"UnboundLocalError: (?:local variable|cannot access local variable) '(\w+)'",
+          "La función asigna esa variable en algún lugar, entonces Python la considera local en TODA la función. "
+          "Inicializala al principio o usá `global`/`nonlocal` si querías la de afuera.", "python"),
+    Pista(r"AttributeError: 'NoneType' object has no attribute '(\w+)'",
+          "Algo que se esperaba un objeto vale None: una función que no hace `return`, un `.get()` que no "
+          "encontró la clave o un `re.match` sin coincidencia. Buscá de dónde sale ese valor.", "python"),
+    Pista(r"AttributeError: '(\w+)' object has no attribute '(\w+)'",
+          "El objeto no tiene ese atributo/método: revisá el nombre exacto en la clase (read_symbol) y que el "
+          "atributo se inicialice en __init__ antes de usarse.", "python"),
+    Pista(r"AttributeError: module '(\w+)' has no attribute '(\w+)'",
+          "El módulo no tiene ese atributo. Ojo con archivos del proyecto que se llaman igual que un módulo "
+          "estándar (random.py, json.py, test.py): lo tapan.", "python"),
+    Pista(r"TypeError: (\w+)\(\) missing (\d+) required positional argument",
+          "Se llama a la función con menos argumentos de los que define. Si es un método, revisá que se llame "
+          "sobre una instancia (obj.metodo()) y no sobre la clase.", "python"),
+    Pista(r"TypeError: (\w+)\(\) takes (\d+) positional arguments? but (\d+) (?:was|were) given",
+          "Sobran argumentos. En métodos, el primer parámetro debe ser `self`; si falta, Python cuenta la "
+          "instancia como argumento extra.", "python"),
+    Pista(r"TypeError: (\w+)\(\) got an unexpected keyword argument '(\w+)'",
+          "La función no acepta ese parámetro con nombre: revisá su firma real con read_symbol.", "python"),
+    Pista(r"TypeError: unsupported operand type\(s\) for ([+\-*/]): '(\w+)' and '(\w+)'",
+          "Operación entre tipos incompatibles (p. ej. str + int). Convertí explícitamente con int(), float() "
+          "o str(); los valores de input() y de archivos siempre llegan como texto.", "python"),
+    Pista(r"TypeError: can only concatenate str \(not \"(\w+)\"\) to str",
+          "Concatenación de texto con un número: usá f-strings (f\"{valor}\") o str(valor).", "python"),
+    Pista(r"TypeError: '(\w+)' object is not subscriptable",
+          "Se usa [ ] sobre algo que no es lista/dict (a menudo None o una función sin llamar: f en vez de f()).",
+          "python"),
+    Pista(r"TypeError: '(\w+)' object is not callable",
+          "Se está llamando con () a algo que no es función: una variable pisó el nombre de una función o "
+          "builtin (p. ej. `list = [...]` y después `list(x)`).", "python"),
+    Pista(r"TypeError: '(\w+)' object is not iterable",
+          "Se itera algo que no es iterable (un int o None). Revisá el valor que llega al for / al unpacking.",
+          "python"),
+    Pista(r"TypeError: Object of type (\w+) is not JSON serializable",
+          "json.dumps no sabe convertir ese tipo: pasá a dict con asdict()/vars(), datetime con .isoformat(), "
+          "set con list(), o usá default=str.", "python"),
+    Pista(r"KeyError: ",
+          "Se accede a una clave que no existe en el diccionario: usá .get(clave, defecto) o verificá con "
+          "`if clave in d`. Revisá también mayúsculas y espacios en la clave.", "python"),
+    Pista(r"IndexError: list index out of range",
+          "Índice fuera de rango: la lista tiene menos elementos de lo esperado (¿lista vacía?). Verificá len() "
+          "antes de acceder o recorré con for.", "python"),
+    Pista(r"ValueError: invalid literal for int\(\) with base 10: '(.*?)'",
+          "int() recibió texto que no es un número (vacío, con espacios o decimales). Usá .strip(), validá "
+          "con .isdigit() o atrapá ValueError y mostrá un mensaje claro.", "python"),
+    Pista(r"ValueError: too many values to unpack|ValueError: not enough values to unpack",
+          "El desempaquetado no coincide con la cantidad de elementos (a, b = x). Revisá la forma real del dato.",
+          "python"),
+    Pista(r"ZeroDivisionError",
+          "División por cero: validá el divisor antes (if total == 0) y decidí qué devolver en ese caso.", "python"),
+    Pista(r"RecursionError: maximum recursion depth exceeded",
+          "Recursión infinita: falta el caso base o una propiedad/método se llama a sí mismo (p. ej. un "
+          "@property que usa self.nombre en vez de self._nombre).", "python"),
+    Pista(r"FileNotFoundError: \[Errno 2\] No such file or directory: '(.*?)'",
+          "El archivo no existe en esa ruta relativa al directorio actual. Construí la ruta desde el archivo: "
+          "Path(__file__).parent / 'datos.json', y creá carpetas con mkdir(parents=True, exist_ok=True).", "python"),
+    Pista(r"PermissionError: \[Errno 13\] Permission denied",
+          "Sin permisos: en Termux usá rutas dentro de $HOME o, para /sdcard, corré `termux-setup-storage`. "
+          "No se puede escribir en /usr ni /system.", "python"),
+    Pista(r"IsADirectoryError", "Se intentó abrir una carpeta como archivo: revisá la ruta.", "python"),
+    Pista(r"UnicodeDecodeError: 'utf-8' codec can't decode",
+          "El archivo no está en UTF-8: abrilo con encoding='utf-8', errors='replace' o con el encoding correcto "
+          "(latin-1).", "python"),
+    Pista(r"json\.decoder\.JSONDecodeError|JSONDecodeError: Expecting",
+          "El texto no es JSON válido (vacío, con comas finales o comillas simples). Si el archivo puede estar "
+          "vacío o no existir, manejá ese caso y devolvé un valor por defecto.", "python"),
+    Pista(r"sqlite3\.OperationalError: no such table",
+          "La tabla no existe: ejecutá el CREATE TABLE IF NOT EXISTS al iniciar la conexión.", "python"),
+    Pista(r"sqlite3\.OperationalError: database is locked",
+          "Otra conexión dejó la base bloqueada: cerrá conexiones con `with`, hacé commit() y no compartas una "
+          "conexión entre hilos.", "python"),
+    Pista(r"IndentationError|TabError",
+          "Error de indentación: usá 4 espacios en todo el archivo (sin tabs) y revisá que los bloques "
+          "después de ':' estén indentados.", "python"),
+    Pista(r"SyntaxError: f-string",
+          "Error dentro de un f-string: no reutilices el mismo tipo de comilla adentro y cerrá todas las llaves.",
+          "python"),
+    Pista(r"SyntaxError: '(\(|\[|\{)' was never closed|SyntaxError: unexpected EOF",
+          "Falta cerrar un paréntesis/corchete/llave, o el archivo quedó cortado: revisá el final del archivo.",
+          "python"),
+    Pista(r"EOFError: EOF when reading a line",
+          "El programa pidió input() pero no hay entrada (tests o ejecución automática). Para probarlo pasale "
+          "argumentos por línea de comandos, o en tests usá unittest.mock.patch('builtins.input').", "python"),
+    Pista(r"AssertionError",
+          "Un assert de test falló. Compará el valor esperado y el obtenido que muestra el test: decidí si el "
+          "bug está en el código (lo normal) o si el test espera algo distinto a lo pedido.", "tests"),
+    Pista(r"RuntimeError: dictionary changed size during iteration",
+          "Se modifica un dict mientras se lo recorre: iterá sobre list(d.items()) o armá uno nuevo.", "python"),
+    Pista(r"RuntimeWarning: coroutine '(\w+)' was never awaited",
+          "Se llamó a una función async sin await: usá `await f()` dentro de async o asyncio.run(f()).", "python"),
+    Pista(r"OSError: \[Errno 98\] Address already in use|address already in use",
+          "El puerto ya está ocupado (otra instancia del servidor). Usá otro puerto o terminá el proceso anterior.",
+          "red"),
+    Pista(r"ConnectionRefusedError|Connection refused",
+          "No hay nada escuchando en ese host/puerto: el servidor no está corriendo o el puerto es otro.", "red"),
+    Pista(r"urllib\.error\.URLError|getaddrinfo failed|Temporary failure in name resolution|Name or service not known",
+          "Sin conexión o DNS fallando. Los tests no deben depender de la red: simulá las respuestas con "
+          "unittest.mock.", "red"),
+    Pista(r"ssl\.SSLCertVerificationError|CERTIFICATE_VERIFY_FAILED",
+          "Error de certificados. En Termux: `pkg install ca-certificates`. No desactives la verificación SSL.",
+          "red"),
+    # ------------------------------------------------------------ unittest / pytest
+    Pista(r"Ran 0 tests|no tests ran|collected 0 items",
+          "No se encontró ningún test: los archivos deben llamarse test_*.py, las clases heredar de "
+          "unittest.TestCase y los métodos empezar con test_.", "tests"),
+    Pista(r"ImportError while importing test module|ERROR collecting",
+          "El test ni siquiera se pudo importar: el error está en un import del test o del código que importa. "
+          "Corregí eso primero (mirá el traceback de la colección).", "tests"),
+    Pista(r"fixture '(\w+)' not found",
+          "pytest no encuentra ese fixture: definilo en el mismo archivo o en conftest.py, o quitalo de la firma.",
+          "tests"),
+    Pista(r"AssertionError: (\d+(?:\.\d+)?) != (\d+(?:\.\d+)?)",
+          "Diferencia numérica: si son floats usá assertAlmostEqual / pytest.approx; si son enteros, el cálculo "
+          "del código está mal.", "tests"),
+    Pista(r"TypeError: .*NoneType.* (?:test_|assert)",
+          "El test recibió None: la función probada probablemente no tiene `return`.", "tests"),
+    # ------------------------------------------------------------ JavaScript / Node
+    Pista(r"SyntaxError: Cannot use import statement outside a module",
+          "Node trata el archivo como CommonJS. Renombralo a .mjs, agregá \"type\": \"module\" a package.json, "
+          "o usá require().", "js"),
+    Pista(r"ReferenceError: require is not defined",
+          "El archivo es un módulo ES (.mjs o type=module): usá `import x from 'y'` en vez de require().", "js"),
+    Pista(r"ReferenceError: (\w+) is not defined",
+          "Variable o función no declarada en ese ámbito: falta importarla/declararla, o es un global del "
+          "navegador (document, window, localStorage) usado en Node.", "js"),
+    Pista(r"ReferenceError: (document|window|localStorage|navigator|alert) is not defined",
+          "Código de navegador ejecutado en Node. Para testear en Node separá la lógica pura en un módulo sin "
+          "DOM, o verificá `typeof document !== 'undefined'`.", "js"),
+    Pista(r"TypeError: Cannot read propert(?:y|ies) of (undefined|null)",
+          "Se accede a un atributo de algo undefined/null: un elemento del DOM que no existe (selector mal "
+          "escrito o script cargado antes del HTML), o un dato que todavía no llegó. Usá ?. o verificá antes.",
+          "js"),
+    Pista(r"TypeError: (\w+(?:\.\w+)*) is not a function",
+          "Se llama a algo que no es función: nombre mal escrito, import con/sin llaves equivocado "
+          "(default vs nombrado) o el objeto no tiene ese método.", "js"),
+    Pista(r"TypeError: Assignment to constant variable",
+          "Se reasigna una variable declarada con const: usá let si de verdad cambia.", "js"),
+    Pista(r"SyntaxError: Unexpected token",
+          "Token inesperado: falta una llave/paréntesis/coma, hay una coma de más o JSON mal formado.", "js"),
+    Pista(r"SyntaxError: Identifier '(\w+)' has already been declared",
+          "Se declaró dos veces la misma variable con let/const en el mismo ámbito.", "js"),
+    Pista(r"SyntaxError: The requested module '(.+?)' does not provide an export named '(\w+)'",
+          "Ese módulo no exporta ese nombre: revisá si es export default (import x from) o nombrado "
+          "(import { x } from) y el nombre exacto.", "js"),
+    Pista(r"Error \[ERR_MODULE_NOT_FOUND\]|Cannot find module '(.+?)'",
+          "Node no encuentra el módulo: en ESM los imports relativos necesitan la extensión ('./util.js'); si es "
+          "un paquete, falta `npm install`.", "js"),
+    Pista(r"ERR_REQUIRE_ESM",
+          "Se hace require() de un paquete que solo es ESM: usá import dinámico o convertí el archivo a .mjs.", "js"),
+    Pista(r"UnhandledPromiseRejection|Unhandled promise rejection",
+          "Una promesa falló sin catch: agregá try/catch alrededor del await o .catch().", "js"),
+    Pista(r"npm ERR! missing script: test|npm error Missing script: \"test\"",
+          "package.json no tiene script de test: agregá \"test\": \"node --test\" en \"scripts\".", "js"),
+    Pista(r"npm ERR! code ENOENT|npm error code ENOENT",
+          "npm no encuentra package.json: ejecutá el comando en la carpeta del proyecto o creá uno con npm init -y.",
+          "js"),
+    Pista(r"EACCES: permission denied",
+          "Sin permisos: en Termux no uses `npm install -g` con sudo; instalá local al proyecto.", "js"),
+    Pista(r"# fail [1-9]|✖ failing tests",
+          "Hay tests de node:test fallando: leé el 'not ok' y el detalle del assert (expected vs actual).", "tests"),
+    Pista(r"AssertionError \[ERR_ASSERTION\]",
+          "Falló un assert de node: compará 'expected' y 'actual'; para objetos usá assert.deepStrictEqual.", "tests"),
+    # ------------------------------------------------------------ Shell / Termux
+    Pista(r"command not found|: not found$",
+          "El comando no existe en este entorno. En Termux se instala con `pkg install <paquete>`; no hay sudo "
+          "ni apt-get directo (usá pkg).", "termux"),
+    Pista(r"sudo: (?:command )?not found|sudo: not found",
+          "Termux no usa sudo: todo corre como tu usuario. Quitá sudo del comando.", "termux"),
+    Pista(r"/usr/bin/(env|python|bash)|#!/usr/bin/python",
+          "En Termux /usr/bin no existe: usá shebang `#!/usr/bin/env python3` (termux-exec lo resuelve) o "
+          "ejecutá con `python3 script.py`.", "termux"),
+    Pista(r"Permission denied.*(/sdcard|/storage/emulated)",
+          "Para acceder al almacenamiento compartido corré `termux-setup-storage` y usá ~/storage/shared.", "termux"),
+    Pista(r"systemctl|systemd",
+          "Termux no tiene systemd. Para servicios usá termux-services (sv) o simplemente correlo en otra sesión.",
+          "termux"),
+    Pista(r"bash: .*: Permission denied",
+          "El script no tiene permiso de ejecución: `chmod +x script.sh` o ejecutalo con `bash script.sh`.", "shell"),
+    Pista(r"syntax error near unexpected token",
+          "Error de sintaxis de bash: revisá comillas sin cerrar, `then`/`fi`/`done` faltantes y que no haya "
+          "CRLF (\\r) en el archivo.", "shell"),
+    Pista(r"\$'\\r': command not found|\\r: command not found",
+          "El script tiene finales de línea de Windows (CRLF): convertilo con `sed -i 's/\\r$//' script.sh`.", "shell"),
+    Pista(r"Tiempo agotado después de \d+s",
+          "El comando no terminó: probablemente espera input() o es un servidor. Para probarlo pasá argumentos, "
+          "usá un modo de prueba, o testeá las funciones directamente.", "general"),
+    # ------------------------------------------------------------ pip / dependencias
+    Pista(r"error: externally-managed-environment",
+          "pip se niega a instalar en el Python del sistema: usá un venv (`python3 -m venv .venv`) o "
+          "`pip install --user`.", "pip"),
+    Pista(r"Failed building wheel for (\w+)|error: command '(?:gcc|clang)' failed",
+          "El paquete necesita compilarse. En Termux: `pkg install clang make pkg-config` (y libs como "
+          "libxml2, libjpeg-turbo según el paquete) o buscá una alternativa pura en Python.", "pip"),
+    Pista(r"No matching distribution found for",
+          "Ese paquete/versión no existe para esta plataforma o versión de Python: revisá el nombre o quitá la "
+          "versión fija.", "pip"),
+    # ------------------------------------------------------------ git
+    Pista(r"fatal: not a git repository", "La carpeta no es un repositorio git: `git init` para crearlo.", "git"),
+    Pista(r"Please tell me who you are",
+          "Git no tiene identidad configurada: `git config user.name \"Nombre\"` y `git config user.email \"mail\"`.",
+          "git"),
+    Pista(r"CONFLICT \(content\)|Automatic merge failed",
+          "Conflicto de merge: editá los archivos marcados con <<<<<<< ======= >>>>>>> y hacé commit.", "git"),
+    # ------------------------------------------------------------ HTML/CSS/web
+    Pista(r"recursos-html|referencia a '.*' que no existe",
+          "El HTML apunta a un archivo que no existe: creá ese archivo o corregí la ruta del src/href "
+          "(relativa a la carpeta del HTML).", "web"),
+    Pista(r"css-llaves",
+          "Llaves desbalanceadas en el CSS: buscá un bloque sin cerrar (la línea indicada o la regla anterior).",
+          "web"),
+    # ------------------------------------------------------------ Go / Rust / C
+    Pista(r"declared and not used|declared but not used",
+          "Go no permite variables sin usar: usala o reemplazala por _.", "go"),
+    Pista(r"imported and not used", "Go no permite imports sin usar: quitalo.", "go"),
+    Pista(r"cannot find package|no required module provides package",
+          "Falta el módulo: corré `go mod init <nombre>` y `go mod tidy`.", "go"),
+    Pista(r"error\[E0382\]: borrow of moved value|use of moved value",
+          "Rust: el valor se movió antes. Usá una referencia (&x), .clone(), o reorganizá el orden.", "rust"),
+    Pista(r"error\[E0502\]|cannot borrow .* as mutable because it is also borrowed as immutable",
+          "Rust: préstamos mutable e inmutable al mismo tiempo. Acotá el alcance de la referencia inmutable.", "rust"),
+    Pista(r"undefined reference to `(\w+)'",
+          "C/C++: la función está declarada pero no se compiló/enlazó su definición: agregá el .c al comando o "
+          "la librería con -l.", "c"),
+    Pista(r"implicit declaration of function '(\w+)'",
+          "C: falta el #include del header que declara esa función (o su prototipo).", "c"),
+    Pista(r"segmentation fault|Segmentation fault",
+          "Acceso inválido a memoria: puntero NULL, índice fuera de rango o recursión infinita.", "c"),
+    # ------------------------------------------------------------ REAPER
+    Pista(r"No encontré el texto de SEARCH",
+          "El SEARCH no coincide con el archivo actual. Releé el tramo con read_file (o read_symbol) y copiá "
+          "las líneas EXACTAS; o usá replace_symbol para reemplazar la función completa por nombre.", "reaper"),
+    Pista(r"aparece \d+ veces|coincide en \d+ lugares",
+          "El SEARCH es ambiguo: agregá 2-3 líneas vecinas únicas (la firma de la función, un comentario).",
+          "reaper"),
+    Pista(r"llamada .* quedó incompleta|se cortó tu respuesta",
+          "Tu mensaje se cortó por longitud. Escribí archivos largos en partes: write_to_file con la primera "
+          "parte y append_to_file para el resto (máx ~150 líneas por mensaje).", "reaper"),
+    Pista(r"marcador de código omitido|código omitido",
+          "Nunca uses '...' ni 'resto igual': escribí el código real o editá solo el tramo con replace_in_file "
+          "/ replace_symbol.", "reaper"),
+    Pista(r"está vacía \(pass/\.\.\./NotImplementedError\)",
+          "Quedaron funciones sin implementar: completalas (replace_symbol con el cuerpo real) antes de terminar.",
+          "reaper"),
+    Pista(r"no define '(\w+)'",
+          "Se importa un nombre que el módulo del proyecto no define: corregí el nombre (mirá la sugerencia) o "
+          "agregá esa función al módulo.", "reaper"),
+    Pista(r"no exporta '(\w+)'",
+          "El módulo JS no exporta ese nombre: agregá `export` a la declaración o corregí el import.", "reaper"),
+]
+
+
+def pistas_para(texto: str, maximo: int = 3) -> list[str]:
+    """Pistas aplicables a una salida de error, sin repetir y priorizando las más específicas."""
+    if not texto:
+        return []
+    salida: list[str] = []
+    for pista in PISTAS:
+        if pista.regex.search(texto):
+            if pista.texto not in salida:
+                salida.append(pista.texto)
+            if len(salida) >= maximo:
+                break
+    return salida
+
+
+def anexar_pistas(texto: str, maximo: int = 2) -> str:
+    pistas = pistas_para(texto, maximo)
+    if not pistas:
+        return texto
+    return texto + "\n\nPISTAS DE REAPER:\n" + "\n".join(f"- {p}" for p in pistas)
+
+
+GUIAS_LENGUAJE = {
+    "python": """PYTHON
+- Librería estándar primero (json, sqlite3, pathlib, argparse, unittest, urllib). Nada de pip si no hace falta.
+- Rutas: Path(__file__).resolve().parent / "datos.json"; crear carpetas con mkdir(parents=True, exist_ok=True).
+- Lógica en funciones puras testeables; input()/print() solo en main(). Siempre `if __name__ == "__main__": main()`.
+- Tests (unittest): tests/test_<modulo>.py
+    import unittest
+    from <modulo> import <funcion>
+    class Test<Algo>(unittest.TestCase):
+        def test_caso(self):
+            self.assertEqual(<funcion>(2, 3), 5)
+    if __name__ == "__main__":
+        unittest.main()
+- Archivos temporales en tests: tempfile.TemporaryDirectory(); input simulado: unittest.mock.patch("builtins.input").""",
+    "js": """JAVASCRIPT
+- Node moderno: módulos ES (.mjs o "type": "module"), imports relativos CON extensión ('./util.js').
+- Separá la lógica pura (sin DOM) en un módulo exportado: así se testea con node:test.
+- Tests: tests/<modulo>.test.mjs
+    import { test } from 'node:test';
+    import assert from 'node:assert/strict';
+    import { suma } from '../src/suma.js';
+    test('suma dos números', () => { assert.equal(suma(2, 3), 5); });
+- En el navegador: <script type="module" src="app.js"></script> y esperá el DOM (defer o DOMContentLoaded).""",
+    "web": """WEB (HTML/CSS/JS)
+- index.html enlaza style.css y app.js con rutas relativas que EXISTAN.
+- Sin frameworks ni CDN si no se pidieron; funciona abriendo el archivo o con `python3 -m http.server`.
+- Mobile first: <meta name="viewport" content="width=device-width, initial-scale=1">.
+- Guardar datos del usuario: localStorage con JSON.stringify/parse y valores por defecto.""",
+    "sh": """BASH
+- Primera línea `#!/usr/bin/env bash` y `set -euo pipefail`.
+- Comillas en todas las variables ("$var"); funciones pequeñas; `command -v x` para chequear herramientas.
+- Termux: sin sudo ni systemd; paquetes con `pkg install`; $PREFIX en lugar de /usr.""",
+    "go": """GO
+- go.mod obligatorio (go mod init nombre). Tests en *_test.go con func TestX(t *testing.T).
+- Sin variables ni imports sin usar (no compila). Errores como valores: if err != nil { return err }.""",
+    "rust": """RUST
+- cargo new; tests con #[cfg(test)] mod tests { use super::*; #[test] fn caso() { assert_eq!(..) } }.
+- Preferí &str en parámetros, String en structs; .clone() si el borrow checker se pone difícil.""",
+}
+
+_EXTENSIONES_GUIA = {
+    ".py": "python", ".js": "js", ".mjs": "js", ".cjs": "js", ".ts": "js", ".jsx": "js", ".tsx": "js",
+    ".html": "web", ".htm": "web", ".css": "web", ".sh": "sh", ".bash": "sh", ".go": "go", ".rs": "rust",
+}
+
+
+def guias_para(archivos: Iterable[str], pedido: str = "") -> str:
+    claves: list[str] = []
+    for a in archivos:
+        clave = _EXTENSIONES_GUIA.get(Path(a).suffix.lower())
+        if clave and clave not in claves:
+            claves.append(clave)
+    texto = (pedido or "").lower()
+    for palabra, clave in (("python", "python"), ("html", "web"), ("web", "web"), ("javascript", "js"),
+                           ("node", "js"), ("bash", "sh"), ("script", "sh"), ("golang", "go"), (" go ", "go"),
+                           ("rust", "rust")):
+        if palabra in texto and clave not in claves:
+            claves.append(clave)
+    if not claves:
+        return ""
+    return "\n\n".join(GUIAS_LENGUAJE[c] for c in claves[:3])
+
+
+# ======================================================================
+# MÓDULO: lessons
+# ======================================================================
+"""
+Lecciones que se acumulan entre sesiones.
+
+Dos archivos Markdown editables a mano:
+  - <proyecto>/.reaper/lecciones.md   hechos del proyecto ("acá los tests se corren con X",
+                                       "content.js expone un objeto global, no un módulo")
+  - ~/reaper/lecciones.md             errores típicos del modelo ("en archivos largos se olvida
+                                       de cerrar </content>")
+
+Cómo se llenan:
+  1. Cada vez que el reparador arregla un fallo REAL (la verificación pasa de
+     fallar a pasar), REAPER le pide al modelo una lección de una línea sobre
+     la causa y la guarda (deduplicada: si ya existe una parecida, suma +1).
+  2. REAPER cuenta los tropiezos del modelo (llamadas cortadas, SEARCH que no
+     coincide, '...' perezosos). Cuando un tropiezo se repite, se convierte
+     solo en una lección general, sin gastar llamadas.
+
+Cómo se usan: las lecciones más relevantes para la tarea (por palabras en
+común y por cuántas veces se confirmaron) entran en el system prompt.
+"""
+
+_RE_LECCION = re.compile(r"^\s*[-*]\s*(?:\[(\d+)\]\s*)?(.+?)\s*(?:<!--\s*(\S+)\s*-->)?\s*$")
+MAX_LECCIONES_PROYECTO = 60
+MAX_LECCIONES_GLOBALES = 40
+
+
+@dataclass
+class Leccion:
+    texto: str
+    veces: int = 1
+    fecha: str = ""
+
+    def linea(self) -> str:
+        fecha = f"  <!-- {self.fecha} -->" if self.fecha else ""
+        return f"- [{self.veces}] {self.texto}{fecha}"
+
+
+def normalizar_leccion(texto: str) -> str:
+    texto = " ".join((texto or "").replace("\n", " ").split())
+    texto = texto.strip(" -*•\"'")
+    texto = re.sub(r"^(lecci[oó]n|proyecto|general)\s*:\s*", "", texto, flags=re.I)
+    if len(texto) > 220:
+        texto = texto[:217].rstrip() + "..."
+    return texto
+
+
+def _tokens_leccion(texto: str) -> set[str]:
+    return {_raiz(t) for t in re.findall(r"[a-z0-9_./-]{3,}", sin_tildes(texto.lower())) if t not in PALABRAS_VACIAS}
+
+
+def similitud_lecciones(a: str, b: str) -> float:
+    ta, tb = _tokens_leccion(a), _tokens_leccion(b)
+    if not ta or not tb:
+        return SequenceMatcher(None, a.lower(), b.lower()).ratio()
+    jaccard = len(ta & tb) / len(ta | tb)
+    return max(jaccard, SequenceMatcher(None, a.lower(), b.lower()).ratio() * 0.9)
+
+
+_RE_GENERICA = re.compile(
+    r"^(siempre|nunca|es importante|hay que|recordar|asegurarse|asegurate)\b.{0,40}"
+    r"(verific|revis|test|prob|cuidado|atenci|bien|correct)", re.I)
+
+
+def es_leccion_util(texto: str) -> bool:
+    """Descarta lecciones vacías de contenido ("siempre verificar el código")."""
+    texto = normalizar_leccion(texto)
+    if len(texto) < 15 or texto.upper() in ("NINGUNA", "NINGUNO", "N/A", "NADA"):
+        return False
+    if "```" in texto:
+        return False
+    especifico = bool(re.search(r"[`/_.()<>=]|--|\b[A-Z][a-z]+[A-Z]\w*|\b\w+\.\w{1,4}\b|\d", texto))
+    if _RE_GENERICA.search(texto) and not especifico:
+        return False
+    return len(_tokens_leccion(texto)) >= 3
+
+
+class ArchivoLecciones:
+    def __init__(self, ruta: Path, titulo: str, maximo: int):
+        self.ruta = ruta
+        self.titulo = titulo
+        self.maximo = maximo
+        self._lock = threading.Lock()
+
+    def cargar(self) -> list[Leccion]:
+        try:
+            texto = self.ruta.read_text(encoding="utf-8")
+        except OSError:
+            return []
+        lecciones = []
+        for linea in texto.splitlines():
+            if not linea.strip().startswith(("-", "*")):
+                continue
+            m = _RE_LECCION.match(linea)
+            if not m:
+                continue
+            contenido = normalizar_leccion(m.group(2))
+            if contenido:
+                lecciones.append(Leccion(contenido, int(m.group(1) or 1), m.group(3) or ""))
+        return lecciones
+
+    def guardar(self, lecciones: list[Leccion]) -> None:
+        cabecera = (f"# {self.titulo}\n\n"
+                    "<!-- Una lección por línea. REAPER las agrega y ordena solo; podés editarlas o borrarlas.\n"
+                    "     El número entre corchetes es cuántas veces se confirmó. -->\n\n")
+        cuerpo = "\n".join(l.linea() for l in lecciones)
+        try:
+            escritura_atomica(self.ruta, cabecera + cuerpo + "\n")
+        except OSError:
+            pass
+
+    def agregar(self, texto: str) -> Optional[str]:
+        """Agrega o refuerza una lección. Devuelve 'nueva', 'reforzada' o None si se descartó."""
+        texto = normalizar_leccion(texto)
+        if not es_leccion_util(texto):
+            return None
+        with self._lock:
+            lecciones = self.cargar()
+            for l in lecciones:
+                if similitud_lecciones(l.texto, texto) >= 0.72:
+                    l.veces += 1
+                    l.fecha = datetime.now().strftime("%Y-%m-%d")
+                    if len(texto) > len(l.texto) and l.veces <= 2:
+                        l.texto = texto  # la versión más específica gana mientras la lección es joven
+                    self.guardar(self._ordenar(lecciones))
+                    return "reforzada"
+            lecciones.append(Leccion(texto, 1, datetime.now().strftime("%Y-%m-%d")))
+            self.guardar(self._ordenar(lecciones))
+            return "nueva"
+
+    def borrar(self, indice: int) -> Optional[Leccion]:
+        with self._lock:
+            lecciones = self.cargar()
+            if 0 <= indice < len(lecciones):
+                quitada = lecciones.pop(indice)
+                self.guardar(lecciones)
+                return quitada
+        return None
+
+    def _ordenar(self, lecciones: list[Leccion]) -> list[Leccion]:
+        orden = sorted(lecciones, key=lambda l: (-l.veces, l.fecha or ""), reverse=False)
+        if len(orden) > self.maximo:
+            # Se descartan las menos confirmadas y más viejas.
+            conservar = sorted(orden, key=lambda l: (l.veces, l.fecha or ""), reverse=True)[: self.maximo]
+            orden = [l for l in orden if l in conservar]
+        return orden
+
+
+def ranking_lecciones(lecciones: Sequence[Leccion], consulta: str, k: int) -> list[Leccion]:
+    if k <= 0 or not lecciones:
+        return []
+    tokens = _tokens_leccion(consulta or "")
+    puntuadas = []
+    for orden, l in enumerate(lecciones):
+        comunes = len(tokens & _tokens_leccion(l.texto)) if tokens else 0
+        puntaje = comunes * 2.0 + math.log(1 + l.veces) - orden * 0.01
+        puntuadas.append((puntaje, orden, l))
+    puntuadas.sort(key=lambda t: (-t[0], t[1]))
+    return [l for _, _, l in puntuadas[:k]]
+
+
+TROPIEZOS = {
+    "llamada_incompleta": (3, "En archivos largos escribí por partes (write_to_file con ~150 líneas y después "
+                              "append_to_file) y cerrá siempre </content> y la etiqueta de la herramienta."),
+    "search_fallido": (3, "Antes de replace_in_file releé el tramo exacto con read_file; para cambiar una función "
+                          "entera usá replace_symbol en vez de SEARCH/REPLACE."),
+    "marcador_perezoso": (2, "Nunca escribas '...', '# resto igual' ni código omitido: el contenido va completo o se "
+                             "edita solo el tramo con replace_in_file."),
+    "sin_herramienta": (3, "Cada respuesta lleva una herramienta en XML (o attempt_completion); no pegues código "
+                           "suelto en el chat porque no se guarda en ningún archivo."),
+    "import_inexistente": (2, "Antes de importar algo de un módulo del proyecto verificá que exista con read_symbol o "
+                              "search_files (el validador 'imports-locales' lo rechaza)."),
+    "funcion_vacia": (2, "No dejes funciones con pass/... al terminar: implementá el cuerpo real con replace_symbol."),
+    "cierre_rechazado": (3, "Antes de attempt_completion corré validate y run_tests y corregí lo que fallen."),
+}
+
+
+class MemoriaLecciones:
+    """Las dos fuentes de lecciones (proyecto + general) más el contador de tropiezos."""
+
+    def __init__(self, ws: Workspace, ruta_global: Optional[Path] = None):
+        self.ws = ws
+        self.proyecto = ArchivoLecciones(ws.raiz / ".reaper" / "lecciones.md",
+                                         f"Lecciones de REAPER · {ws.raiz.name}", MAX_LECCIONES_PROYECTO)
+        self.general = ArchivoLecciones(ruta_global or LECCIONES_GLOBALES,
+                                        "Lecciones generales de REAPER (errores típicos del modelo)",
+                                        MAX_LECCIONES_GLOBALES)
+        self._ruta_tropiezos = (ruta_global or LECCIONES_GLOBALES).with_name("tropiezos.json")
+        self._lock = threading.Lock()
+
+    def para_prompt(self, consulta: str, k: int = 8) -> str:
+        if k <= 0:
+            return ""
+        proyecto = ranking_lecciones(self.proyecto.cargar(), consulta, max(1, k * 5 // 8))
+        general = ranking_lecciones(self.general.cargar(), consulta, max(1, k - len(proyecto)))
+        partes = []
+        if proyecto:
+            partes.append("De este proyecto:\n" + "\n".join(f"- {l.texto}" for l in proyecto))
+        if general:
+            partes.append("Errores que ya cometiste antes (no los repitas):\n" + "\n".join(f"- {l.texto}" for l in general))
+        return "\n".join(partes)
+
+    def registrar(self, proyecto: Iterable[str] = (), general: Iterable[str] = ()) -> list[str]:
+        hechos = []
+        for texto in proyecto:
+            estado = self.proyecto.agregar(texto)
+            if estado:
+                hechos.append(f"proyecto ({estado}): {normalizar_leccion(texto)}")
+        for texto in general:
+            estado = self.general.agregar(texto)
+            if estado:
+                hechos.append(f"general ({estado}): {normalizar_leccion(texto)}")
+        return hechos
+
+    def tropiezo(self, tipo: str) -> Optional[str]:
+        """Cuenta un tropiezo del modelo; al llegar al umbral se convierte en lección general."""
+        if tipo not in TROPIEZOS:
+            return None
+        umbral, leccion = TROPIEZOS[tipo]
+        with self._lock:
+            try:
+                datos = json.loads(self._ruta_tropiezos.read_text(encoding="utf-8"))
+                if not isinstance(datos, dict):
+                    datos = {}
+            except (OSError, ValueError):
+                datos = {}
+            datos[tipo] = int(datos.get(tipo, 0)) + 1
+            try:
+                self._ruta_tropiezos.parent.mkdir(parents=True, exist_ok=True)
+                self._ruta_tropiezos.write_text(json.dumps(datos, indent=1), encoding="utf-8")
+            except OSError:
+                pass
+            alcanzado = datos[tipo] % umbral == 0
+        if alcanzado:
+            return self.general.agregar(leccion)
+        return None
+
+
+PROMPT_LECCION = """Un agente de programación tuvo un fallo REAL y otro agente lo reparó. Escribí la lección que
+evitaría repetirlo, en UNA línea concreta (máximo 25 palabras), con nombres reales de archivos, comandos o
+funciones. Separá:
+- PROYECTO: un hecho de ESTE proyecto (cómo se testea, una convención, cómo está armado un archivo).
+- GENERAL: un error típico del modelo que vale para cualquier proyecto.
+Si no hay nada específico que aprender en alguna de las dos, escribí NINGUNA. Nada de consejos genéricos como
+"verificar bien el código".
+
+FALLO ORIGINAL:
+{diagnostico}
+
+CAMBIO QUE LO ARREGLÓ:
+{diff}
+
+INFORME DEL REPARADOR:
+{informe}
+
+Respondé EXACTAMENTE con este formato:
+PROYECTO: ...
+GENERAL: ..."""
+
+
+def parsear_lecciones(texto: str) -> tuple[list[str], list[str]]:
+    proyecto, general = [], []
+    for linea in (texto or "").splitlines():
+        m = re.match(r"^\s*[-*]?\s*\**\s*(PROYECTO|GENERAL)\s*\**\s*:\s*(.+)$", linea.strip(), re.I)
+        if not m:
+            continue
+        contenido = normalizar_leccion(m.group(2))
+        if not es_leccion_util(contenido):
+            continue
+        (proyecto if m.group(1).upper() == "PROYECTO" else general).append(contenido)
+    return proyecto[:1], general[:1]
+
+
+def lecciones_heuristicas(diagnostico: str, ws: Optional[Workspace] = None) -> tuple[list[str], list[str]]:
+    """Lecciones que se pueden deducir sin modelo a partir del error real."""
+    proyecto, general = [], []
+    texto = diagnostico or ""
+    m = re.search(r"ModuleNotFoundError: No module named '([\w.]+)'", texto)
+    if m:
+        modulo = m.group(1).split(".")[0]
+        if ws and ((ws.raiz / f"{modulo}.py").exists() or (ws.raiz / modulo).is_dir()):
+            proyecto.append(f"El módulo local `{modulo}` se importa desde la raíz: los comandos se corren desde la raíz del proyecto.")
+        else:
+            proyecto.append(f"`{modulo}` no está instalado en este entorno: usar la librería estándar o instalarlo con pip.")
+    if re.search(r"Cannot use import statement outside a module", texto):
+        proyecto.append("Los .js de este proyecto se ejecutan como CommonJS: usar .mjs o \"type\": \"module\" para import/export.")
+    if re.search(r"(document|window|localStorage) is not defined", texto):
+        general.append("La lógica de los .js del navegador va en un módulo sin DOM para poder testearla con node:test.")
+    m = re.search(r"imports-locales .*?: .*? no define '(\w+)'", texto, re.S)
+    if m:
+        general.append(f"Verificar con read_symbol que una función existe antes de importarla (pasó con `{m.group(1)}`).")
+    return proyecto, general
+
+
+def extraer_lecciones(llm, modelo: str, diagnostico: str, diff: str, informe: str,
+                      ws: Optional[Workspace] = None) -> tuple[list[str], list[str]]:
+    """Pide al modelo una lección (barato: una llamada corta) y completa con heurísticas."""
+    proyecto_h, general_h = lecciones_heuristicas(diagnostico, ws)
+    try:
+        respuesta = llm.chat_simple(
+            PROMPT_LECCION.format(diagnostico=recortar(diagnostico, 2500), diff=recortar(diff, 2500),
+                                  informe=recortar(informe, 1200)),
+            modelo=modelo, temperatura=0.1, max_tokens=220, rol="lecciones",
+        )
+        proyecto, general = parsear_lecciones(respuesta)
+    except (LLMError, AttributeError):
+        proyecto, general = [], []
+    return (proyecto or proyecto_h)[:1], (general or general_h)[:1]
+
+
+# ======================================================================
+# MÓDULO: tools
+# ======================================================================
+"""Herramientas que los agentes usan para trabajar sobre el workspace real."""
+
+
+
+
+MAX_LINEAS_LECTURA = 400
+MAX_SALIDA = 9000
+
+
+class ErrorHerramienta(Exception):
+    pass
+
+
+@dataclass
+class Contexto:
+    ws: Workspace
+    settings: Settings
+    ui: UI
+    etiqueta: str = "agente"
+    cambios: set = field(default_factory=set)
+    todo: list = field(default_factory=list)
+    cid_inicio: Optional[int] = None
+    # v7
+    memoria: Optional["MemoriaLecciones"] = None
+    parciales: dict = field(default_factory=dict)   # rel → líneas escritas (archivo en construcción)
+    leidos: dict = field(default_factory=dict)      # rel → hash del archivo cuando se leyó
+    protegidos: set = field(default_factory=set)    # archivos que este agente no puede tocar (tests de la especificación)
+    notas_autofix: list = field(default_factory=list)
+    permitidos: tuple = ()                          # globs de rutas escribibles (vacío = todas)
+    llm: Any = None                                 # cliente del modelo (lo usa write_large_file)
+
+    def tropiezo(self, tipo: str) -> None:
+        if self.memoria is not None:
+            try:
+                self.memoria.tropiezo(tipo)
+            except OSError:
+                pass
+
+
+@dataclass
+class Param:
+    nombre: str
+    descripcion: str
+    requerido: bool = True
+    largo: bool = False
+
+
+@dataclass
+class Herramienta:
+    nombre: str
+    descripcion: str
+    params: list
+    ejemplo: str
+    fn: Optional[Callable] = None
+    escribe: bool = False
+
+
+REGISTRO: dict[str, Herramienta] = {}
+
+
+def herramienta(nombre: str, descripcion: str, params: list, ejemplo: str, escribe: bool = False):
+    def decorador(fn):
+        REGISTRO[nombre] = Herramienta(nombre, descripcion, params, ejemplo.strip(), fn, escribe)
+        return fn
+    return decorador
+
+
+def esquemas(nombres: Optional[list] = None) -> dict:
+    return {
+        n: [(p.nombre, p.largo) for p in h.params]
+        for n, h in REGISTRO.items()
+        if nombres is None or n in nombres
+    }
+
+
+def documentacion(nombres: list) -> str:
+    partes = []
+    for nombre in nombres:
+        h = REGISTRO.get(nombre)
+        if not h:
+            continue
+        params = ", ".join(
+            f"{p.nombre}{'' if p.requerido else ' (opcional)'}: {p.descripcion}" for p in h.params
+        ) or "sin parámetros"
+        partes.append(f"## {h.nombre}\n{h.descripcion}\nParámetros: {params}\n{h.ejemplo}")
+    return "\n\n".join(partes)
+
+
+# ==================================================================
+# HELPERS
+# ==================================================================
+def _sugerir_ruta(ctx: Contexto, rel: str) -> str:
+    nombre = Path(rel).name
+    archivos = ctx.ws.archivos_codigo(limite=800)
+    parecidos = difflib.get_close_matches(rel, archivos, n=3, cutoff=0.5)
+    parecidos += [a for a in archivos if Path(a).name == nombre and a not in parecidos][:3]
+    return f" ¿Quisiste decir: {', '.join(parecidos)}?" if parecidos else ""
+
+
+def _entero(valor, defecto: Optional[int]) -> Optional[int]:
+    try:
+        return int(str(valor).strip()) if str(valor or "").strip() else defecto
+    except ValueError:
+        return defecto
+
+
+def _permiso_edicion(ctx: Contexto, rel: str, diff: str, nuevo: bool) -> None:
+    if ctx.settings.modo != "confirmar":
+        return
+    ctx.ui.aviso(f"  {ctx.etiqueta} quiere {'crear' if nuevo else 'modificar'} {rel}:")
+    ctx.ui.diff(diff, max_lineas=40)
+    if not ctx.ui.confirmar("  ¿Aplicar este cambio?"):
+        raise ErrorHerramienta(
+            f"El usuario rechazó el cambio en {rel}. No insistas con lo mismo: "
+            "preguntá qué prefiere (ask_user) o seguí con otra parte."
+        )
+
+
+def _escribir(ctx: Contexto, rel: str, contenido: str) -> None:
+    if rel in ctx.protegidos:
+        raise ErrorHerramienta(
+            f"{rel} es parte de la especificación (tests escritos antes de implementar) y no se puede modificar "
+            "en esta tarea. Cambiá el código para que esos tests pasen."
+        )
+    if ctx.permitidos and not any(fnmatch.fnmatch(rel, patron) for patron in ctx.permitidos):
+        raise ErrorHerramienta(
+            f"En este rol solo podés escribir archivos que coincidan con: {', '.join(ctx.permitidos)}. "
+            f"{rel} no está permitido."
+        )
+    try:
+        ctx.ws.escribir(rel, contenido)
+    except (ErrorRuta, IsADirectoryError, PermissionError) as e:
+        raise ErrorHerramienta(f"No pude escribir {rel}: {e}")
+    try:
+        indice_de(ctx.ws).invalidar(rel)
+    except (OSError, ValueError):
+        pass
+
+
+def _post_escritura(ctx: Contexto, rel: str, antes: Optional[str], despues: str, notas: list,
+                    accion: Optional[str] = None, mostrar_diff: bool = True) -> str:
+    ctx.cambios.add(rel)
+    diff = diff_unificado(antes or "", despues, rel)
+    lineas = despues.count("\n") + (0 if despues.endswith("\n") or not despues else 1)
+    if antes is None:
+        ctx.ui.tenue(f"      + {rel} (nuevo, {lineas} líneas)")
+    elif mostrar_diff:
+        ctx.ui.diff(diff, max_lineas=24)
+
+    en_construccion = rel in ctx.parciales
+    if ctx.settings.autofix and not en_construccion:
+        reporte = autoarreglar(ctx.ws, rel, usar_ruff=ctx.settings.autofix_ruff)
+        if reporte.cambio:
+            notas = list(notas) + [f"autofix: {reporte.texto()}"]
+            ctx.notas_autofix.append(f"{rel}: {reporte.texto()}")
+            try:
+                despues = ctx.ws.leer(rel)
+            except (OSError, ValueError, ErrorRuta):
+                pass
+            lineas = despues.count("\n") + (0 if despues.endswith("\n") or not despues else 1)
+
+    resultados = validar_archivo(ctx.ws, rel)
+    malos = fallos(resultados)
+    accion = accion or ("Creé" if antes is None else "Modifiqué")
+    texto = f"{accion} {rel} ({lineas} líneas)."
+    if notas:
+        texto += " Notas: " + "; ".join(notas) + "."
+    if antes is not None and diff and mostrar_diff:
+        texto += "\nDiff aplicado:\n" + recortar(diff, 2500)
+    if en_construccion:
+        texto += ("\nARCHIVO EN CONSTRUCCIÓN: seguí agregando el resto con append_to_file (desde donde quedó). "
+                  "Cuando esté completo, el último append valida todo.")
+        if malos:
+            texto += "\n(Validación parcial: " + (malos[0].stderr or malos[0].stdout).strip().splitlines()[0][:160] + ")"
+        return texto
+    if not resultados:
+        texto += "\nValidación: no hay validador automático para este tipo de archivo."
+    elif malos:
+        detalle = resumen_validacion(resultados)
+        texto += "\nVALIDACIÓN FALLÓ (corregilo antes de seguir):\n" + detalle
+        if ctx.settings.pistas_errores:
+            texto = anexar_pistas(texto, 2)
+        if any("imports-locales" in r.comando or "imports-js" in r.comando for r in malos):
+            ctx.tropiezo("import_inexistente")
+    else:
+        texto += "\nValidación: " + resumen_validacion(resultados)
+    if rel.endswith(".py") and not malos:
+        avisos = advertencias_python(despues)
+        if avisos:
+            texto += "\nAdvertencias:\n" + "\n".join(f"- {a}" for a in avisos[:6])
+    return texto
+
+
+# ==================================================================
+# LECTURA
+# ==================================================================
+@herramienta(
+    "read_file",
+    "Lee un archivo de texto. Devuelve las líneas numeradas ('  12| código'); los números NO son parte del archivo.",
+    [Param("path", "ruta relativa al workspace"),
+     Param("desde", "primera línea a mostrar", requerido=False),
+     Param("hasta", "última línea a mostrar", requerido=False)],
+    "<read_file>\n<path>src/app.py</path>\n</read_file>",
+)
+def read_file(ctx: Contexto, p: dict) -> str:
+    rel = p["path"]
+    try:
+        ruta = ctx.ws.ruta(rel)
+    except ErrorRuta as e:
+        raise ErrorHerramienta(str(e))
+    if ruta.is_dir():
+        raise ErrorHerramienta(f"{rel} es una carpeta. Usá list_files.")
+    if not ruta.is_file():
+        raise ErrorHerramienta(f"No existe {rel}.{_sugerir_ruta(ctx, rel)}")
+    if ruta.name in (".env", "id_rsa", "id_ed25519"):
+        raise ErrorHerramienta("Archivo sensible: no se lee.")
+    if es_binario(ruta):
+        raise ErrorHerramienta(f"{rel} es binario ({ruta.stat().st_size} bytes).")
+    try:
+        lineas = ctx.ws.leer(rel).splitlines()
+    except ValueError as e:
+        raise ErrorHerramienta(str(e))
+    total = len(lineas)
+    if total == 0:
+        return f"{ctx.ws.rel(ruta)} está vacío."
+    desde = max(1, _entero(p.get("desde"), 1))
+    hasta = min(total, _entero(p.get("hasta"), desde + MAX_LINEAS_LECTURA - 1))
+    hasta = min(hasta, desde + MAX_LINEAS_LECTURA - 1)
+    cuerpo = "\n".join(f"{i:>5}| {lineas[i - 1]}" for i in range(desde, hasta + 1))
+    ctx.leidos[ctx.ws.rel(ruta)] = ctx.ws.hash(ctx.ws.rel(ruta))
+    pie = ""
+    if desde > 1 or hasta < total:
+        pie = f"\n(mostrando líneas {desde}-{hasta} de {total}; usá desde/hasta para ver el resto)"
+        if total > MAX_LINEAS_LECTURA and not p.get("desde"):
+            simbolos = indice_de(ctx.ws).de_archivo(ctx.ws.rel(ruta))
+            if simbolos:
+                mapa = ", ".join(f"{s.nombre_completo} L{s.inicio}-{s.fin}" for s in simbolos
+                                 if s.tipo in ("clase", "funcion", "metodo"))[:900]
+                pie += f"\nArchivo grande: para no gastar contexto usá read_symbol. Símbolos: {mapa}"
+    return f"{ctx.ws.rel(ruta)} ({total} líneas)\n{cuerpo}{pie}"
+
+
+@herramienta(
+    "list_files",
+    "Lista archivos del workspace (ignora .git, node_modules, venv, etc.).",
+    [Param("path", "carpeta relativa (por defecto la raíz)", requerido=False),
+     Param("recursive", "true/false (por defecto true)", requerido=False)],
+    "<list_files>\n<path>.</path>\n</list_files>",
+)
+def list_files(ctx: Contexto, p: dict) -> str:
+    rel = p.get("path") or "."
+    try:
+        base = ctx.ws.ruta(rel) if rel not in (".", "") else ctx.ws.raiz
+    except ErrorRuta as e:
+        raise ErrorHerramienta(str(e))
+    if base.is_file():
+        raise ErrorHerramienta(f"{rel} es un archivo. Usá read_file.")
+    if not base.is_dir():
+        raise ErrorHerramienta(f"No existe la carpeta {rel}.{_sugerir_ruta(ctx, rel)}")
+    recursivo = str(p.get("recursive", "true")).strip().lower() not in ("false", "no", "0")
+    if not recursivo:
+        entradas = []
+        for hijo in sorted(base.iterdir()):
+            r = ctx.ws.rel(hijo)
+            if ctx.ws.ignorado(r, hijo.is_dir()):
+                continue
+            entradas.append(r + ("/" if hijo.is_dir() else ""))
+        return "\n".join(entradas) or "(carpeta vacía)"
+    rutas = [ctx.ws.rel(x) for x in ctx.ws.iterar(rel, limite=301)]
+    if not rutas:
+        return "(sin archivos)"
+    extra = "\n... (más de 300 archivos; filtrá con path o usá search_files)" if len(rutas) > 300 else ""
+    return "\n".join(rutas[:300]) + extra
+
+
+@herramienta(
+    "search_files",
+    "Busca una expresión regular (Python) en los archivos de texto. Devuelve archivo:línea: texto.",
+    [Param("regex", "expresión a buscar, p. ej. def procesar|class Cliente"),
+     Param("path", "carpeta o archivo donde buscar (opcional)", requerido=False),
+     Param("file_pattern", "filtro de nombre tipo *.py (opcional)", requerido=False)],
+    "<search_files>\n<regex>def guardar_</regex>\n<file_pattern>*.py</file_pattern>\n</search_files>",
+)
+def search_files(ctx: Contexto, p: dict) -> str:
+    patron_txt = p["regex"]
+    nota = ""
+    try:
+        patron = re.compile(patron_txt)
+    except re.error:
+        patron = re.compile(re.escape(patron_txt))
+        nota = "(regex inválida: se buscó como texto literal)\n"
+    filtro = (p.get("file_pattern") or "").strip()
+
+    def buscar(rx: re.Pattern) -> list[str]:
+        hallazgos = []
+        for ruta in ctx.ws.iterar(p.get("path") or ".", limite=3000):
+            if filtro and not Path(ruta.name).match(filtro):
+                continue
+            if not ctx.ws.es_texto(ruta) or ruta.stat().st_size > 400_000:
+                continue
+            try:
+                texto = ruta.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            for n, linea in enumerate(texto.splitlines(), start=1):
+                if rx.search(linea):
+                    hallazgos.append(f"{ctx.ws.rel(ruta)}:{n}: {linea.strip()[:200]}")
+                    if len(hallazgos) >= 80:
+                        return hallazgos
+        return hallazgos
+
+    try:
+        hallazgos = buscar(patron)
+        if not hallazgos and not nota:
+            hallazgos = buscar(re.compile(patron.pattern, re.I))
+            if hallazgos:
+                nota = "(sin coincidencias exactas; resultados ignorando mayúsculas)\n"
+    except ErrorRuta as e:
+        raise ErrorHerramienta(str(e))
+    if not hallazgos:
+        return nota + "Sin coincidencias."
+    extra = "\n... (hay más; afiná la búsqueda)" if len(hallazgos) >= 80 else ""
+    return nota + "\n".join(hallazgos) + extra
+
+
+def _outline_python(texto: str) -> list[str]:
+    try:
+        arbol = ast.parse(texto)
+    except SyntaxError as e:
+        return [f"(error de sintaxis en línea {e.lineno}: {e.msg})"]
+    salida = []
+    for nodo in arbol.body:
+        if isinstance(nodo, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            pref = "async def" if isinstance(nodo, ast.AsyncFunctionDef) else "def"
+            salida.append(f"{nodo.lineno}: {pref} {nodo.name}({ast.unparse(nodo.args)})")
+        elif isinstance(nodo, ast.ClassDef):
+            salida.append(f"{nodo.lineno}: class {nodo.name}")
+            for sub in nodo.body:
+                if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    salida.append(f"{sub.lineno}:     def {sub.name}({ast.unparse(sub.args)})")
+        elif isinstance(nodo, ast.Assign):
+            for t in nodo.targets:
+                if isinstance(t, ast.Name) and t.id.isupper():
+                    salida.append(f"{nodo.lineno}: {t.id} = ...")
+    return salida
+
+
+_JS_SIMBOLOS = re.compile(
+    r"^\s*(export\s+(default\s+)?)?(async\s+)?(function\*?\s+[\w$]+\s*\([^)]*\)|class\s+[\w$]+"
+    r"|(const|let|var)\s+[\w$]+\s*=\s*(async\s*)?(\([^)]*\)|[\w$]+)\s*=>"
+    r"|(const|let|var)\s+[\w$]+\s*=\s*(async\s+)?function)"
+)
+
+
+def outline(ruta: Path) -> list[str]:
+    try:
+        texto = ruta.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    if ruta.suffix == ".py":
+        return _outline_python(texto)
+    if ruta.suffix in (".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx"):
+        return [f"{n}: {l.strip()[:120]}" for n, l in enumerate(texto.splitlines(), 1) if _JS_SIMBOLOS.match(l)]
+    return []
+
+
+@herramienta(
+    "code_outline",
+    "Mapa rápido de un archivo o carpeta: clases, funciones y firmas con número de línea. Más barato que leer todo.",
+    [Param("path", "archivo o carpeta (por defecto la raíz)", requerido=False)],
+    "<code_outline>\n<path>src</path>\n</code_outline>",
+)
+def code_outline(ctx: Contexto, p: dict) -> str:
+    rel = p.get("path") or "."
+    try:
+        objetivo = ctx.ws.ruta(rel) if rel not in (".", "") else ctx.ws.raiz
+    except ErrorRuta as e:
+        raise ErrorHerramienta(str(e))
+    if not objetivo.exists():
+        raise ErrorHerramienta(f"No existe {rel}.{_sugerir_ruta(ctx, rel)}")
+    rutas = [objetivo] if objetivo.is_file() else list(ctx.ws.iterar(rel, limite=600))
+    partes, total = [], 0
+    for ruta in rutas:
+        simbolos = outline(ruta)
+        if not simbolos:
+            continue
+        bloque = ctx.ws.rel(ruta) + "\n" + "\n".join("  " + s for s in simbolos[:40])
+        if len(simbolos) > 40:
+            bloque += f"\n  ... {len(simbolos) - 40} símbolos más"
+        partes.append(bloque)
+        total += len(bloque)
+        if total > MAX_SALIDA:
+            partes.append("... (salida recortada; pedí una carpeta más específica)")
+            break
+    return "\n".join(partes) or "No encontré símbolos (solo se analizan .py y .js/.ts)."
+
+
+# ==================================================================
+# ESCRITURA
+# ==================================================================
+@herramienta(
+    "write_to_file",
+    "Crea un archivo o lo reemplaza ENTERO. Para archivos existentes preferí replace_in_file. "
+    "El contenido debe ser COMPLETO: prohibido '...' o 'resto igual'.",
+    [Param("path", "ruta relativa"), Param("content", "contenido completo del archivo", largo=True),
+     Param("partial", "true si es la PRIMERA PARTE de un archivo largo (el resto va con append_to_file)",
+           requerido=False)],
+    "<write_to_file>\n<path>utils/fechas.py</path>\n<content>\nfrom datetime import date\n\n\n"
+    "def hoy() -> str:\n    return date.today().isoformat()\n</content>\n</write_to_file>",
+    escribe=True,
+)
+def write_to_file(ctx: Contexto, p: dict) -> str:
+    rel, contenido = p["path"], p["content"]
+    try:
+        ruta = ctx.ws.ruta(rel, escribir=True)
+    except ErrorRuta as e:
+        raise ErrorHerramienta(str(e))
+    rel = ctx.ws.rel(ruta)
+    antes = None
+    if ruta.is_file():
+        antes = ruta.read_text(encoding="utf-8", errors="replace")
+        marcador = tiene_marcadores_perezosos(contenido)
+        if marcador and not tiene_marcadores_perezosos(antes):
+            ctx.tropiezo("marcador_perezoso")
+            raise ErrorHerramienta(
+                f"El contenido tiene un marcador de código omitido ('{marcador}'). "
+                "Eso borraría código real. Usá replace_in_file para cambiar solo una parte, "
+                "o escribí el archivo COMPLETO."
+            )
+    if contenido and not contenido.endswith("\n"):
+        contenido += "\n"
+    if antes == contenido:
+        return f"{rel} ya tenía exactamente ese contenido; no hubo cambios."
+
+    notas = []
+    if antes is not None:
+        viejas, nuevas = antes.count("\n"), contenido.count("\n")
+        if viejas >= 40 and nuevas < viejas * 0.4:
+            notas.append(f"ATENCIÓN: el archivo pasó de {viejas} a {nuevas} líneas; verificá que no se perdió código")
+    _permiso_edicion(ctx, rel, diff_unificado(antes or "", contenido, rel), antes is None)
+    if str(p.get("partial", "")).strip().lower() in ("true", "si", "sí", "1", "yes"):
+        ctx.parciales[rel] = contenido.count("\n")
+    else:
+        ctx.parciales.pop(rel, None)
+    _escribir(ctx, rel, contenido)
+    return _post_escritura(ctx, rel, antes, contenido, notas)
+
+
+@herramienta(
+    "replace_in_file",
+    "Edita partes de un archivo existente con uno o más bloques SEARCH/REPLACE. "
+    "SEARCH debe copiar el texto actual EXACTO (sin números de línea) y ser único; incluí 2-3 líneas de contexto. "
+    "Se aplican todos los bloques o ninguno.",
+    [Param("path", "ruta relativa"), Param("diff", "bloques SEARCH/REPLACE", largo=True)],
+    "<replace_in_file>\n<path>app.py</path>\n<diff>\n<<<<<<< SEARCH\ndef total(items):\n    return sum(items)\n"
+    "=======\ndef total(items):\n    return sum(i.precio for i in items)\n>>>>>>> REPLACE\n</diff>\n</replace_in_file>",
+    escribe=True,
+)
+def replace_in_file(ctx: Contexto, p: dict) -> str:
+    rel = p["path"]
+    try:
+        ruta = ctx.ws.ruta(rel, escribir=True)
+    except ErrorRuta as e:
+        raise ErrorHerramienta(str(e))
+    rel = ctx.ws.rel(ruta)
+    existe = ruta.is_file()
+    try:
+        bloques = parsear_bloques(p["diff"])
+    except ErrorEdicion as e:
+        if existe and parece_diff_unificado(p["diff"]):
+            antes = ruta.read_text(encoding="utf-8", errors="replace")
+            try:
+                despues, notas = aplicar_diff_unificado(antes, p["diff"])
+            except ErrorEdicion as e2:
+                ctx.tropiezo("search_fallido")
+                raise ErrorHerramienta(str(e2))
+            if despues == antes:
+                return f"Sin cambios en {rel} (el diff no modificó nada)."
+            _permiso_edicion(ctx, rel, diff_unificado(antes, despues, rel), False)
+            _escribir(ctx, rel, despues)
+            return _post_escritura(ctx, rel, antes, despues, notas + ["apliqué un diff unificado"])
+        raise ErrorHerramienta(str(e))
+    if not existe and not (len(bloques) == 1 and not bloques[0].buscar.strip()):
+        raise ErrorHerramienta(f"No existe {rel}. Para crearlo usá write_to_file.{_sugerir_ruta(ctx, rel)}")
+    antes = ruta.read_text(encoding="utf-8", errors="replace") if existe else ""
+    for b in bloques:
+        marcador = tiene_marcadores_perezosos(b.reemplazar)
+        if marcador and marcador not in antes:
+            ctx.tropiezo("marcador_perezoso")
+            raise ErrorHerramienta(
+                f"El REPLACE contiene '{marcador}' (código omitido). Escribí el código real completo."
+            )
+    try:
+        despues, notas = aplicar_bloques(antes, bloques)
+    except ErrorEdicion as e:
+        ctx.tropiezo("search_fallido")
+        raise ErrorHerramienta(str(e))
+    if despues == antes:
+        return f"Sin cambios en {rel} ({'; '.join(notas) or 'el contenido ya era ese'})."
+    _permiso_edicion(ctx, rel, diff_unificado(antes, despues, rel), not existe)
+    _escribir(ctx, rel, despues)
+    return _post_escritura(ctx, rel, antes if existe else None, despues, notas)
+
+
+# ==================================================================
+# EJECUCIÓN Y VERIFICACIÓN
+# ==================================================================
+_BLOQUEADOS = [
+    re.compile(p) for p in (
+        r"\bsudo\b", r"(^|[;&|]\s*)su(\s|$)", r"\bmkfs", r"\bdd\s+if=", r":\(\)\s*\{",
+        r"\b(shutdown|reboot|poweroff|halt)\b",
+        r"\brm\s+(-\w+\s+)*(/|~|\$HOME|\*|\.)/?\*?(\s|$)",
+        r"(curl|wget)\b[^|;]*\|\s*(ba|z|da)?sh\b", r">\s*/dev/(sd|block|mmc)",
+        r"\bchmod\s+(-R\s+)?777\s+/", r"\bgit\s+push\b.*(--force|-f\b)",
+        r"\bgit\s+(reset\s+--hard|clean\s+-\w*f)",
+        r"\b(printenv|env)\s*($|[|;>])", r"\bcat\s+[^|;]*\.env\b",
+    )
+]
+
+_SEGUROS = (
+    "ls", "pwd", "cat ", "head ", "tail ", "wc ", "tree", "file ", "stat ", "du ",
+    "grep ", "rg ", "which ", "echo ", "python -m py_compile", "python3 -m py_compile",
+    "python -m pytest", "python3 -m pytest", "python -m unittest", "python3 -m unittest",
+    "pytest", "node --check", "node --test", "npm test", "ruff check", "git status",
+    "git diff", "git log", "git show", "pip list", "pip show", "python --version",
+    "python3 --version", "node --version",
+)
+
+
+def comando_bloqueado(comando: str) -> Optional[str]:
+    for patron in _BLOQUEADOS:
+        if patron.search(comando):
+            return patron.pattern
+    return None
+
+
+def comando_seguro(comando: str) -> bool:
+    c = comando.strip()
+    if any(s in c for s in (";", "&&", "||", "|", ">", "<", "`", "$(")):
+        return False
+    return any(c == s.strip() or c.startswith(s) for s in _SEGUROS)
+
+
+@herramienta(
+    "execute_command",
+    "Ejecuta un comando de shell (bash) en la raíz del workspace, sin entrada interactiva. "
+    "Para tests preferí run_tests. Servidores o programas interactivos se cortan por timeout.",
+    [Param("command", "comando a ejecutar"),
+     Param("timeout", "segundos (opcional, máx 600)", requerido=False)],
+    "<execute_command>\n<command>python3 main.py --ayuda</command>\n</execute_command>",
+)
+def execute_command(ctx: Contexto, p: dict) -> str:
+    comando = p["command"].strip()
+    if not comando:
+        raise ErrorHerramienta("Comando vacío.")
+    patron = comando_bloqueado(comando)
+    if patron:
+        raise ErrorHerramienta(f"Comando bloqueado por seguridad (coincide con {patron}).")
+    if ctx.settings.modo != "auto" and not comando_seguro(comando):
+        ctx.ui.aviso(f"  {ctx.etiqueta} quiere ejecutar: {comando}")
+        if not ctx.ui.confirmar("  ¿Ejecutar?"):
+            raise ErrorHerramienta(
+                "El usuario no aprobó el comando (o no hay usuario para aprobarlo). "
+                "Seguí sin él o usá run_tests / validate."
+            )
+    timeout = min(600, _entero(p.get("timeout"), ctx.settings.exec_timeout) or ctx.settings.exec_timeout)
+    r = ejecutar(comando, cwd=ctx.ws.raiz, timeout=timeout, shell=True)
+    texto = r.resumen(limite=MAX_SALIDA // 2)
+    if not r.ok and ctx.settings.pistas_errores:
+        texto = anexar_pistas(texto, 2)
+    return texto
+
+
+@herramienta(
+    "run_tests",
+    "Detecta y ejecuta la suite de tests del proyecto (pytest, unittest, npm test, node --test...).",
+    [],
+    "<run_tests>\n</run_tests>",
+)
+def run_tests(ctx: Contexto, p: dict) -> str:
+    detectado = detectar_comando_tests(ctx.ws)
+    if not detectado:
+        return (
+            "No hay tests detectados. Para Python creá tests/test_<modulo>.py con unittest "
+            "(librería estándar); para JS, tests/*.test.mjs con node:test."
+        )
+    r = ejecutar_tests(ctx.ws, timeout=ctx.settings.tests_timeout, completo=True)
+    assert r is not None
+    estado = "SIN TESTS" if r.omitido else ("PASARON" if r.ok else "FALLARON")
+    conteo = conteo_de_resultado(r)
+    cabecera = f"Tests {estado} ({detectado[1]})" + (f": {conteo.texto()}" if conteo.reconocido else "") + "."
+    if r.ok or r.omitido:
+        return cabecera + "\n" + r.resumen(limite=1500)
+    combinado = f"{r.stdout}\n{r.stderr}"
+    detalle = fallos_relevantes(combinado, maximo=3, limite=MAX_SALIDA // 2)
+    texto = f"{cabecera}\n$ {r.comando}\nexit code: {r.codigo}\n"
+    if conteo.nombres_fallados:
+        texto += "Fallaron: " + ", ".join(conteo.nombres_fallados[:10]) + "\n"
+    texto += "DETALLE DE LOS PRIMEROS FALLOS:\n" + detalle
+    if ctx.settings.pistas_errores:
+        texto = anexar_pistas(texto, 2)
+    return texto
+
+
+@herramienta(
+    "validate",
+    "Corre los validadores reales (sintaxis, imports, nombres indefinidos, node --check, JSON) "
+    "sobre archivos. Sin paths valida lo que cambiaste en esta tarea.",
+    [Param("paths", "rutas separadas por coma (opcional)", requerido=False)],
+    "<validate>\n<paths>app.py, utils.py</paths>\n</validate>",
+)
+def validate(ctx: Contexto, p: dict) -> str:
+    texto = p.get("paths") or ""
+    rels = [r.strip() for r in re.split(r"[,\n]", texto) if r.strip()] or sorted(ctx.cambios)
+    if not rels:
+        return "No cambiaste archivos todavía; indicá paths para validar."
+    resultados = validar_archivos(ctx.ws, rels)
+    if not resultados:
+        return "Ninguno de esos archivos tiene validador automático (o no existen)."
+    return "\n".join(r.linea() for r in resultados) + (
+        "\n\nDETALLE DE FALLOS:\n" + resumen_validacion(resultados) if fallos(resultados) else ""
+    )
+
+
+@herramienta(
+    "view_diff",
+    "Muestra el diff real de los cambios hechos desde que empezó la tarea actual.",
+    [],
+    "<view_diff>\n</view_diff>",
+)
+def view_diff(ctx: Contexto, p: dict) -> str:
+    cid = ctx.cid_inicio if ctx.cid_inicio is not None else ctx.ws.checkpoints.actual
+    if cid is None:
+        return "No hay cambios registrados."
+    diff = ctx.ws.checkpoints.diff_desde(cid)
+    return recortar(diff, MAX_SALIDA) if diff.strip() else "No hay cambios todavía."
+
+
+# ==================================================================
+# PLANIFICACIÓN, SUBAGENTES Y CIERRE (los maneja el bucle del agente)
+# ==================================================================
+@herramienta(
+    "update_todo",
+    "Mantiene tu lista de tareas. Mandá la lista COMPLETA cada vez: '[x]' hecho, '[ ]' pendiente, '[>]' en curso.",
+    [Param("items", "una tarea por línea", largo=True)],
+    "<update_todo>\n<items>\n[x] Leer la estructura\n[>] Agregar validación de email\n[ ] Escribir tests\n</items>\n</update_todo>",
+)
+def update_todo(ctx: Contexto, p: dict) -> str:
+    items = []
+    for linea in (p.get("items") or "").splitlines():
+        linea = re.sub(r"^\s*([-*]|\d+[.)])\s*", "", linea).strip()
+        if not linea:
+            continue
+        m = re.match(r"^\[(.)\]\s*(.+)$", linea)
+        estado, texto = (m.group(1).lower(), m.group(2)) if m else (" ", linea)
+        estado = {"x": "x", "✓": "x", ">": ">", "~": ">"}.get(estado, " ")
+        items.append((estado, texto))
+    ctx.todo[:] = items
+    for estado, texto in items:
+        marca = {"x": "✓", ">": "▸"}.get(estado, "○")
+        ctx.ui.tenue(f"      {marca} {texto}")
+    hechos = sum(1 for e, _ in items if e == "x")
+    return f"Lista actualizada: {hechos}/{len(items)} hechas."
+
+
+@herramienta(
+    "delegate",
+    "Lanza un SUBAGENTE con contexto limpio para una tarea acotada. Roles: explorador (investiga, solo lectura), "
+    "implementador (escribe código), revisor (revisa, solo lectura), qa (tests), reparador (arregla fallos). "
+    "Varios <delegate> de solo lectura en el MISMO mensaje corren EN PARALELO. Devuelve el informe del subagente.",
+    [Param("role", "explorador | implementador | revisor | qa | reparador"),
+     Param("task", "instrucciones completas y autocontenidas", largo=True),
+     Param("files", "archivos relevantes separados por coma (opcional)", requerido=False)],
+    "<delegate>\n<role>explorador</role>\n<task>Encontrá dónde se valida el login y qué funciones lo llaman.</task>\n</delegate>",
+)
+def delegate(ctx: Contexto, p: dict) -> str:  # pragma: no cover - lo intercepta el agente
+    raise ErrorHerramienta("delegate solo puede usarlo un agente con permiso para delegar.")
+
+
+@herramienta(
+    "ask_user",
+    "Hace una pregunta al usuario cuando falta información imprescindible. No la uses para pedir permiso.",
+    [Param("question", "pregunta concreta")],
+    "<ask_user>\n<question>¿Querés guardar los datos en JSON o en SQLite?</question>\n</ask_user>",
+)
+def ask_user(ctx: Contexto, p: dict) -> str:
+    if not ctx.ui.interactivo:
+        return "El usuario no está disponible. Elegí la opción más simple y segura, y dejala anotada en el informe."
+    respuesta = ctx.ui.preguntar(f"  [{ctx.etiqueta}] {p['question']}")
+    return f"Respuesta del usuario: {respuesta or '(sin respuesta)'}"
+
+
+@herramienta(
+    "attempt_completion",
+    "Termina la tarea. Solo cuando verificaste el resultado. REAPER valida los archivos cambiados antes de aceptar.",
+    [Param("result", "informe final: qué hiciste, archivos, cómo se verificó, pendientes", largo=True)],
+    "<attempt_completion>\n<result>\nAgregué hoy() en utils/fechas.py y su test. run_tests: 3 tests pasaron.\n</result>\n</attempt_completion>",
+)
+def attempt_completion(ctx: Contexto, p: dict) -> str:  # pragma: no cover - lo intercepta el agente
+    return p.get("result", "")
+
+
+def resumen_params(nombre: str, params: dict) -> str:
+    if nombre in ("read_symbol", "replace_symbol", "insert_after_symbol"):
+        return f"{params.get('path', '')} :: {params.get('symbol', '')}".strip(" :")
+    if nombre in ("append_to_file", "insert_lines", "replace_lines", "delete_file"):
+        extra = ""
+        if params.get("line") or params.get("desde"):
+            extra = f" @{params.get('line') or params.get('desde')}"
+        return params.get("path", "") + extra
+    if nombre == "move_file":
+        return f"{params.get('path', '')} → {params.get('new_path', '')}"
+    if nombre == "find_references":
+        return params.get("symbol", "")
+    if nombre in ("save_note", "learn_lesson"):
+        return recortar(params.get("note", "") or params.get("lesson", ""), 70)
+    if nombre in ("read_file", "write_to_file", "replace_in_file", "code_outline", "list_files"):
+        detalle = params.get("path", "")
+        if nombre == "read_file" and (params.get("desde") or params.get("hasta")):
+            detalle += f" [{params.get('desde', '')}-{params.get('hasta', '')}]"
+        return detalle
+    if nombre == "search_files":
+        return f"/{params.get('regex', '')}/ {params.get('file_pattern', '')}"
+    if nombre == "execute_command":
+        return params.get("command", "")
+    if nombre == "delegate":
+        return f"{params.get('role', '?')}: {params.get('task', '')[:70]}"
+    if nombre == "validate":
+        return params.get("paths", "(cambios)")
+    return ""
+
+
+# ======================================================================
+# MÓDULO: tools_extra
+# ======================================================================
+"""
+Herramientas nuevas de v7, pensadas para que un modelo de 24B no se rompa
+con archivos grandes:
+
+  read_symbol / replace_symbol / insert_after_symbol   trabajar por función o clase
+  append_to_file                                       escribir archivos largos por partes
+  insert_lines / replace_lines                         ediciones por número de línea (verificadas)
+  find_references                                      dónde se usa un nombre
+  delete_file / move_file / revert_file                manejo de archivos con checkpoint
+  save_note / learn_lesson                             memoria persistente
+  project_map                                          archivos relevantes para un tema
+  run_python                                           probar un fragmento de Python
+"""
+
+ALIAS_HERRAMIENTAS.update({
+    "read_function": "read_symbol", "show_symbol": "read_symbol", "get_symbol": "read_symbol",
+    "leer_simbolo": "read_symbol", "leer_funcion": "read_symbol", "view_symbol": "read_symbol",
+    "replace_function": "replace_symbol", "edit_symbol": "replace_symbol", "reemplazar_simbolo": "replace_symbol",
+    "reemplazar_funcion": "replace_symbol", "rewrite_function": "replace_symbol",
+    "add_after": "insert_after_symbol", "insert_function": "insert_after_symbol", "add_method": "insert_after_symbol",
+    "append_file": "append_to_file", "append_content": "append_to_file", "agregar_al_final": "append_to_file",
+    "continue_file": "append_to_file", "continuar_archivo": "append_to_file",
+    "insert_code": "insert_lines", "insertar_lineas": "insert_lines", "insert_at_line": "insert_lines",
+    "edit_lines": "replace_lines", "reemplazar_lineas": "replace_lines",
+    "references": "find_references", "find_usages": "find_references", "usages": "find_references",
+    "buscar_referencias": "find_references",
+    "remove_file": "delete_file", "rm": "delete_file", "borrar_archivo": "delete_file",
+    "rename_file": "move_file", "mv": "move_file", "mover_archivo": "move_file",
+    "restore_file": "revert_file", "restaurar_archivo": "revert_file",
+    "remember": "save_note", "note": "save_note", "guardar_nota": "save_note",
+    "lesson": "learn_lesson", "aprender": "learn_lesson",
+    "relevant_files": "project_map", "mapa": "project_map",
+    "python": "run_python", "exec_python": "run_python", "ejecutar_python": "run_python",
+})
+
+ALIAS_PARAMS.update({
+    "symbol": ("name", "nombre", "simbolo", "símbolo", "function", "funcion", "función", "class", "clase",
+               "method", "metodo", "método", "symbol_name"),
+    "line": ("linea", "línea", "after_line", "despues_de", "line_number", "after"),
+    "new_path": ("to", "destino", "dest", "nuevo_path", "nueva_ruta", "destination"),
+    "note": ("nota",),
+    "lesson": ("leccion", "lección"),
+    "scope": ("ambito", "ámbito", "alcance"),
+    "last": ("final", "ultimo", "último", "done", "is_last"),
+    "topic": ("tema", "pedido", "consulta", "about"),
+})
+
+ESCRITURA_V7 = ("replace_symbol", "insert_after_symbol", "append_to_file", "insert_lines", "replace_lines")
+LECTURA_V7 = ("read_symbol", "find_references", "project_map")
+
+
+def _ruta_existente(ctx: Contexto, rel: str, escribir: bool = False) -> tuple[Path, str]:
+    try:
+        ruta = ctx.ws.ruta(rel, escribir=escribir)
+    except ErrorRuta as e:
+        raise ErrorHerramienta(str(e))
+    if ruta.is_dir():
+        raise ErrorHerramienta(f"{rel} es una carpeta.")
+    if not ruta.is_file():
+        raise ErrorHerramienta(f"No existe {rel}.{_sugerir_ruta(ctx, rel)}")
+    return ruta, ctx.ws.rel(ruta)
+
+
+def _verificar_lectura_vigente(ctx: Contexto, rel: str) -> None:
+    """Para ediciones por número de línea: el archivo no puede haber cambiado desde la última lectura."""
+    leido = ctx.leidos.get(rel)
+    if leido is None:
+        raise ErrorHerramienta(
+            f"Para editar {rel} por número de línea primero leelo con read_file (los números tienen que ser los actuales)."
+        )
+    if leido != ctx.ws.hash(rel):
+        raise ErrorHerramienta(
+            f"{rel} cambió desde tu última lectura y los números de línea ya no son válidos. Releelo con read_file."
+        )
+
+
+def _chequear_perezoso(ctx: Contexto, texto: str, antes: str = "") -> None:
+    marcador = tiene_marcadores_perezosos(texto)
+    if marcador and marcador not in antes:
+        ctx.tropiezo("marcador_perezoso")
+        raise ErrorHerramienta(f"El contenido tiene '{marcador}' (código omitido). Escribí el código real completo.")
+
+
+def _simbolo_unico(ctx: Contexto, rel: Optional[str], nombre: str) -> Simbolo:
+    indice = indice_de(ctx.ws)
+    encontrados, sugerencias = indice.buscar(nombre, rel)
+    if not encontrados:
+        donde = f" en {rel}" if rel else " en el proyecto"
+        extra = f" ¿Quisiste decir: {', '.join(sugerencias)}?" if sugerencias else ""
+        if rel and not indice.de_archivo(rel):
+            extra += f" (No detecté símbolos en {rel}: usá read_file.)"
+        raise ErrorHerramienta(f"No encontré el símbolo '{nombre}'{donde}.{extra}")
+    if len(encontrados) > 1:
+        lista = "\n".join("  " + s.describir() for s in encontrados[:12])
+        raise ErrorHerramienta(
+            f"'{nombre}' es ambiguo ({len(encontrados)} coincidencias). Usá 'Clase.metodo' y/o indicá path:\n{lista}"
+        )
+    return encontrados[0]
+
+
+# ==================================================================
+# LECTURA POR SÍMBOLO
+# ==================================================================
+@herramienta(
+    "read_symbol",
+    "Lee SOLO una función, clase o método por nombre (con números de línea). Mucho más barato que read_file en "
+    "archivos grandes. Formato del nombre: 'funcion', 'Clase' o 'Clase.metodo'. path es opcional.",
+    [Param("symbol", "nombre: funcion | Clase | Clase.metodo"),
+     Param("path", "archivo donde buscar (opcional: si falta busca en todo el proyecto)", requerido=False)],
+    "<read_symbol>\n<path>app/carrito.py</path>\n<symbol>Carrito.total</symbol>\n</read_symbol>",
+)
+def read_symbol(ctx: Contexto, p: dict) -> str:
+    rel = (p.get("path") or "").strip() or None
+    if rel:
+        _ruta, rel = _ruta_existente(ctx, rel)
+    indice = indice_de(ctx.ws)
+    encontrados, sugerencias = indice.buscar(p["symbol"], rel)
+    if not encontrados:
+        extra = f" ¿Quisiste decir: {', '.join(sugerencias)}?" if sugerencias else ""
+        raise ErrorHerramienta(f"No encontré '{p['symbol']}'{' en ' + rel if rel else ''}.{extra}")
+    partes = []
+    for s in encontrados[:3]:
+        try:
+            texto = ctx.ws.leer(s.archivo)
+        except (OSError, ValueError, ErrorRuta) as e:
+            raise ErrorHerramienta(str(e))
+        cuerpo = texto_de_simbolo(texto, s)
+        if s.lineas > 300:
+            lineas = cuerpo.splitlines()
+            cuerpo = "\n".join(lineas[:300]) + (
+                f"\n(símbolo de {s.lineas} líneas: mostrando las primeras 300; usá read_file con desde/hasta "
+                "o pedí sus métodos uno por uno)")
+        partes.append(f"{s.describir()}\n{cuerpo}")
+        ctx.leidos[s.archivo] = ctx.ws.hash(s.archivo)
+    if len(encontrados) > 3:
+        partes.append("Otras coincidencias:\n" + "\n".join("  " + s.describir() for s in encontrados[3:12]))
+    return "\n\n".join(partes)
+
+
+@herramienta(
+    "find_references",
+    "Busca dónde se usa un nombre (función, clase, variable) en todo el proyecto, sin contar su definición.",
+    [Param("symbol", "nombre a buscar")],
+    "<find_references>\n<symbol>calcular_total</symbol>\n</find_references>",
+)
+def find_references(ctx: Contexto, p: dict) -> str:
+    nombre = p["symbol"].strip()
+    indice = indice_de(ctx.ws)
+    definiciones, _ = indice.buscar(nombre)
+    usos = indice.referencias(nombre)
+    partes = []
+    if definiciones:
+        partes.append("Definido en:\n" + "\n".join("  " + s.describir() for s in definiciones[:8]))
+    partes.append((f"Usos ({len(usos)}{'+' if len(usos) >= 60 else ''}):\n" + "\n".join("  " + u for u in usos))
+                  if usos else "Sin usos fuera de su definición.")
+    return "\n".join(partes)
+
+
+@herramienta(
+    "project_map",
+    "Archivos y funciones del proyecto más relacionados con un tema (ranking por nombres, símbolos e imports).",
+    [Param("topic", "de qué se trata lo que buscás (palabras clave)")],
+    "<project_map>\n<topic>login de usuarios y contraseñas</topic>\n</project_map>",
+)
+def project_map(ctx: Contexto, p: dict) -> str:
+    texto = mapa_relevante(ctx.ws, p["topic"], maximo=max(4, ctx.settings.max_relevantes))
+    return texto or "No encontré archivos relacionados (¿proyecto vacío o palabras muy genéricas?). Probá con search_files."
+
+
+# ==================================================================
+# ESCRITURA POR SÍMBOLO
+# ==================================================================
+@herramienta(
+    "replace_symbol",
+    "Reemplaza una función, método o clase ENTERA por nombre. Escribí la definición completa nueva (con su "
+    "línea def/function/class); REAPER la reindenta al nivel correcto. Más robusto que SEARCH/REPLACE.",
+    [Param("path", "archivo"), Param("symbol", "funcion | Clase | Clase.metodo"),
+     Param("content", "definición completa nueva", largo=True)],
+    "<replace_symbol>\n<path>app/carrito.py</path>\n<symbol>Carrito.total</symbol>\n<content>\n"
+    "def total(self):\n    return sum(i.precio * i.cantidad for i in self.items)\n</content>\n</replace_symbol>",
+    escribe=True,
+)
+def replace_symbol(ctx: Contexto, p: dict) -> str:
+    ruta, rel = _ruta_existente(ctx, p["path"], escribir=True)
+    nuevo = p["content"]
+    if not nuevo.strip():
+        raise ErrorHerramienta("content vacío: para borrar una función usá replace_in_file.")
+    antes = ruta.read_text(encoding="utf-8", errors="replace")
+    _chequear_perezoso(ctx, nuevo, antes)
+    simbolo = _simbolo_unico(ctx, rel, p["symbol"])
+    if simbolo.nombre not in nuevo.split("\n", 3)[0] + "\n".join(nuevo.split("\n")[:4]):
+        raise ErrorHerramienta(
+            f"El content no empieza con la definición de '{simbolo.nombre}'. Escribí la definición completa "
+            f"(p. ej. 'def {simbolo.nombre}(...)'). Para agregar algo nuevo usá insert_after_symbol."
+        )
+    despues = reemplazar_simbolo(antes, simbolo, nuevo)
+    if despues == antes:
+        return f"Sin cambios: {simbolo.nombre_completo} ya tenía exactamente ese contenido."
+    if rel.endswith(".py"):
+        try:
+            compile(despues, rel, "exec", dont_inherit=True)
+        except SyntaxError as e:
+            raise ErrorHerramienta(
+                f"El reemplazo deja {rel} con error de sintaxis: {e.msg} (línea {e.lineno}). No se aplicó. "
+                "Revisá la indentación y que la definición esté completa."
+            )
+    _permiso_edicion(ctx, rel, diff_unificado(antes, despues, rel), False)
+    _escribir(ctx, rel, despues)
+    return _post_escritura(ctx, rel, antes, despues, [f"reemplacé {simbolo.nombre_completo} "
+                                                      f"(líneas {simbolo.inicio}-{simbolo.fin})"])
+
+
+@herramienta(
+    "insert_after_symbol",
+    "Inserta código nuevo (una función, método o clase) justo DESPUÉS de un símbolo existente. Si el símbolo es "
+    "una clase, el código se agrega al FINAL de la clase como método.",
+    [Param("path", "archivo"), Param("symbol", "símbolo de referencia (funcion | Clase | Clase.metodo)"),
+     Param("content", "código nuevo completo", largo=True)],
+    "<insert_after_symbol>\n<path>app/carrito.py</path>\n<symbol>Carrito</symbol>\n<content>\n"
+    "def vaciar(self):\n    self.items.clear()\n</content>\n</insert_after_symbol>",
+    escribe=True,
+)
+def insert_after_symbol(ctx: Contexto, p: dict) -> str:
+    ruta, rel = _ruta_existente(ctx, p["path"], escribir=True)
+    nuevo = p["content"]
+    antes = ruta.read_text(encoding="utf-8", errors="replace")
+    _chequear_perezoso(ctx, nuevo, antes)
+    simbolo = _simbolo_unico(ctx, rel, p["symbol"])
+    if simbolo.tipo == "clase":
+        miembros = [s for s in indice_de(ctx.ws).de_archivo(rel)
+                    if s.padre == simbolo.nombre_completo and s.inicio > simbolo.inicio and s.fin <= simbolo.fin]
+        if miembros:
+            ultimo = max(miembros, key=lambda s: s.fin)
+            despues = insertar_tras_simbolo(antes, ultimo, nuevo, separacion=1)
+        else:
+            lineas = antes.splitlines()
+            cuerpo = [l for l in lineas[simbolo.inicio: simbolo.fin] if l.strip()]
+            indent_miembro = (cuerpo[0][: len(cuerpo[0]) - len(cuerpo[0].lstrip())] if cuerpo
+                              else simbolo.indent + "    ")
+            falso = Simbolo("_", "metodo", rel, simbolo.inicio, simbolo.fin if rel.endswith(".py") else simbolo.fin - 1,
+                            "", simbolo.nombre, indent_miembro)
+            despues = insertar_tras_simbolo(antes, falso, nuevo, separacion=1)
+    else:
+        despues = insertar_tras_simbolo(antes, simbolo, nuevo)
+    if rel.endswith(".py"):
+        try:
+            compile(despues, rel, "exec", dont_inherit=True)
+        except SyntaxError as e:
+            raise ErrorHerramienta(f"La inserción deja {rel} con error de sintaxis: {e.msg} (línea {e.lineno}). "
+                                   "No se aplicó.")
+    _permiso_edicion(ctx, rel, diff_unificado(antes, despues, rel), False)
+    _escribir(ctx, rel, despues)
+    return _post_escritura(ctx, rel, antes, despues, [f"inserté código después de {simbolo.nombre_completo}"])
+
+
+# ==================================================================
+# ARCHIVOS LARGOS Y EDICIÓN POR LÍNEAS
+# ==================================================================
+@herramienta(
+    "append_to_file",
+    "Agrega contenido al FINAL de un archivo. Es la forma de escribir archivos largos por partes: primero "
+    "write_to_file (con partial=true) y después varios append_to_file de ~150 líneas. Si repetís las últimas "
+    "líneas, REAPER las detecta y no las duplica. En la última parte poné last=true.",
+    [Param("path", "archivo"), Param("content", "contenido a agregar", largo=True),
+     Param("last", "true si es la última parte del archivo", requerido=False)],
+    "<append_to_file>\n<path>juego.py</path>\n<content>\n\ndef main():\n    Juego().correr()\n\n\n"
+    "if __name__ == \"__main__\":\n    main()\n</content>\n<last>true</last>\n</append_to_file>",
+    escribe=True,
+)
+def append_to_file(ctx: Contexto, p: dict) -> str:
+    try:
+        ruta = ctx.ws.ruta(p["path"], escribir=True)
+    except ErrorRuta as e:
+        raise ErrorHerramienta(str(e))
+    rel = ctx.ws.rel(ruta)
+    nuevo = p["content"]
+    if not nuevo.strip():
+        raise ErrorHerramienta("content vacío.")
+    antes = ruta.read_text(encoding="utf-8", errors="replace") if ruta.is_file() else ""
+    _chequear_perezoso(ctx, nuevo, antes)
+    despues, repetidas = unir_continuacion(antes, nuevo)
+    if despues == antes:
+        return f"Sin cambios en {rel}: ese contenido ya estaba al final del archivo."
+    ultima = str(p.get("last", "")).strip().lower() in ("true", "si", "sí", "1", "yes")
+    if ultima:
+        ctx.parciales.pop(rel, None)
+    elif rel in ctx.parciales:
+        ctx.parciales[rel] = despues.count("\n")
+    notas = [f"agregué {nuevo.count(chr(10)) + 1 - repetidas} líneas al final"]
+    if repetidas:
+        notas.append(f"omití {repetidas} líneas repetidas del final anterior")
+    _permiso_edicion(ctx, rel, diff_unificado(antes, despues, rel), not ruta.is_file())
+    _escribir(ctx, rel, despues)
+    texto = _post_escritura(ctx, rel, antes if antes else None, despues, notas, accion="Extendí",
+                            mostrar_diff=False)
+    if rel in ctx.parciales:
+        ultimas = "\n".join(f"{n:>5}| {l}" for n, l in
+                            enumerate(despues.splitlines()[-6:], start=max(1, despues.count("\n") - 5)))
+        texto += f"\nÚltimas líneas actuales (seguí desde acá):\n{ultimas}"
+    return texto
+
+
+@herramienta(
+    "insert_lines",
+    "Inserta líneas nuevas DESPUÉS de la línea N (0 = al principio). Requiere haber leído el archivo actual con "
+    "read_file (los números deben ser los vigentes).",
+    [Param("path", "archivo"), Param("line", "insertar después de esta línea (0 = inicio)"),
+     Param("content", "líneas a insertar", largo=True)],
+    "<insert_lines>\n<path>config.py</path>\n<line>3</line>\n<content>\nDEBUG = False\n</content>\n</insert_lines>",
+    escribe=True,
+)
+def insert_lines(ctx: Contexto, p: dict) -> str:
+    ruta, rel = _ruta_existente(ctx, p["path"], escribir=True)
+    _verificar_lectura_vigente(ctx, rel)
+    linea = _entero(p.get("line"), None)
+    if linea is None:
+        raise ErrorHerramienta("line debe ser un número (0 = al principio del archivo).")
+    antes = ruta.read_text(encoding="utf-8", errors="replace")
+    _chequear_perezoso(ctx, p["content"], antes)
+    try:
+        despues = insertar_despues(antes, linea, p["content"])
+    except ErrorEdicion as e:
+        raise ErrorHerramienta(str(e))
+    _permiso_edicion(ctx, rel, diff_unificado(antes, despues, rel), False)
+    _escribir(ctx, rel, despues)
+    ctx.leidos[rel] = ctx.ws.hash(rel)
+    return _post_escritura(ctx, rel, antes, despues, [f"inserté después de la línea {linea}"])
+
+
+@herramienta(
+    "replace_lines",
+    "Reemplaza el rango de líneas desde..hasta (inclusive) por contenido nuevo. Requiere haber leído el archivo "
+    "actual con read_file. Útil cuando SEARCH/REPLACE no coincide.",
+    [Param("path", "archivo"), Param("desde", "primera línea a reemplazar"), Param("hasta", "última línea a reemplazar"),
+     Param("content", "contenido nuevo para ese rango", largo=True)],
+    "<replace_lines>\n<path>app.py</path>\n<desde>10</desde>\n<hasta>12</hasta>\n<content>\n"
+    "    total = calcular(items)\n    return total\n</content>\n</replace_lines>",
+    escribe=True,
+)
+def replace_lines(ctx: Contexto, p: dict) -> str:
+    ruta, rel = _ruta_existente(ctx, p["path"], escribir=True)
+    _verificar_lectura_vigente(ctx, rel)
+    desde, hasta = _entero(p.get("desde"), None), _entero(p.get("hasta"), None)
+    if desde is None or hasta is None:
+        raise ErrorHerramienta("desde y hasta deben ser números de línea.")
+    antes = ruta.read_text(encoding="utf-8", errors="replace")
+    _chequear_perezoso(ctx, p["content"], antes)
+    if hasta - desde > 200:
+        raise ErrorHerramienta("Rango demasiado grande (más de 200 líneas): usá write_to_file o replace_symbol.")
+    try:
+        despues = reemplazar_lineas(antes, desde, hasta, p["content"])
+    except ErrorEdicion as e:
+        raise ErrorHerramienta(str(e))
+    if despues == antes:
+        return f"Sin cambios en {rel}."
+    _permiso_edicion(ctx, rel, diff_unificado(antes, despues, rel), False)
+    _escribir(ctx, rel, despues)
+    ctx.leidos[rel] = ctx.ws.hash(rel)
+    return _post_escritura(ctx, rel, antes, despues, [f"reemplacé las líneas {desde}-{hasta}"])
+
+
+# ==================================================================
+# MANEJO DE ARCHIVOS
+# ==================================================================
+@herramienta(
+    "delete_file",
+    "Borra un archivo del proyecto (queda guardado en el checkpoint: se recupera con /deshacer).",
+    [Param("path", "archivo a borrar")],
+    "<delete_file>\n<path>viejo/no_se_usa.py</path>\n</delete_file>",
+    escribe=True,
+)
+def delete_file(ctx: Contexto, p: dict) -> str:
+    ruta, rel = _ruta_existente(ctx, p["path"], escribir=True)
+    if rel in ctx.protegidos:
+        raise ErrorHerramienta(f"{rel} es parte de la especificación y no se puede borrar.")
+    if ctx.settings.modo == "confirmar":
+        ctx.ui.aviso(f"  {ctx.etiqueta} quiere BORRAR {rel}")
+        if not ctx.ui.confirmar("  ¿Borrar?"):
+            raise ErrorHerramienta("El usuario no aprobó borrar el archivo.")
+    try:
+        ctx.ws.borrar(rel)
+    except (ErrorRuta, OSError) as e:
+        raise ErrorHerramienta(f"No pude borrar {rel}: {e}")
+    ctx.cambios.add(rel)
+    indice_de(ctx.ws).invalidar(rel)
+    referencias = indice_de(ctx.ws).referencias(Path(rel).stem, limite=8)
+    texto = f"Borré {rel} (recuperable con /deshacer)."
+    if referencias:
+        texto += "\nOjo, el nombre todavía aparece en:\n" + "\n".join("  " + r for r in referencias)
+    return texto
+
+
+@herramienta(
+    "move_file",
+    "Mueve o renombra un archivo (con checkpoint). No actualiza imports: revisalos con find_references.",
+    [Param("path", "archivo actual"), Param("new_path", "ruta nueva")],
+    "<move_file>\n<path>utils.py</path>\n<new_path>app/utils.py</new_path>\n</move_file>",
+    escribe=True,
+)
+def move_file(ctx: Contexto, p: dict) -> str:
+    _ruta, rel = _ruta_existente(ctx, p["path"], escribir=True)
+    destino = (p.get("new_path") or "").strip()
+    if not destino:
+        raise ErrorHerramienta("Falta new_path.")
+    if rel in ctx.protegidos:
+        raise ErrorHerramienta(f"{rel} es parte de la especificación y no se puede mover.")
+    try:
+        nueva = ctx.ws.mover(rel, destino)
+    except (ErrorRuta, OSError) as e:
+        raise ErrorHerramienta(f"No pude mover {rel}: {e}")
+    nuevo_rel = ctx.ws.rel(nueva)
+    ctx.cambios.update({rel, nuevo_rel})
+    indice_de(ctx.ws).invalidar()
+    referencias = indice_de(ctx.ws).referencias(Path(rel).stem, limite=10)
+    texto = f"Moví {rel} → {nuevo_rel}."
+    if referencias:
+        texto += "\nActualizá estas referencias al nombre viejo:\n" + "\n".join("  " + r for r in referencias)
+    return texto
+
+
+@herramienta(
+    "revert_file",
+    "Devuelve un archivo al estado que tenía al empezar esta tarea (si lo rompiste y querés volver a empezar).",
+    [Param("path", "archivo")],
+    "<revert_file>\n<path>app.py</path>\n</revert_file>",
+    escribe=True,
+)
+def revert_file(ctx: Contexto, p: dict) -> str:
+    try:
+        ruta = ctx.ws.ruta(p["path"], escribir=True)
+    except ErrorRuta as e:
+        raise ErrorHerramienta(str(e))
+    rel = ctx.ws.rel(ruta)
+    cid = ctx.cid_inicio if ctx.cid_inicio is not None else ctx.ws.checkpoints.actual
+    if cid is None:
+        raise ErrorHerramienta("No hay checkpoint de esta tarea para restaurar.")
+    tipo, _copia = ctx.ws.checkpoints._origen(rel, cid)
+    if tipo == "sin_cambios":
+        return f"{rel} no cambió en esta tarea: no hay nada que revertir."
+    original = ctx.ws.checkpoints.original(rel, cid)
+    if original is None:
+        if ruta.is_file():
+            ctx.ws.borrar(rel)
+        ctx.cambios.discard(rel)
+        ctx.parciales.pop(rel, None)
+        return f"{rel} no existía al empezar la tarea: lo borré."
+    actual = ruta.read_text(encoding="utf-8", errors="replace") if ruta.is_file() else ""
+    if actual == original:
+        return f"{rel} ya está como al empezar la tarea."
+    _escribir(ctx, rel, original)
+    ctx.parciales.pop(rel, None)
+    return f"Restauré {rel} al estado del inicio de la tarea ({original.count(chr(10))} líneas). Releelo antes de editarlo."
+
+
+# ==================================================================
+# MEMORIA
+# ==================================================================
+@herramienta(
+    "save_note",
+    "Guarda una nota corta y duradera sobre el proyecto en .reaper/notas.md (la ven los próximos agentes). "
+    "Ej.: decisiones de diseño, comandos útiles, dónde está cada cosa.",
+    [Param("note", "nota de una o dos líneas")],
+    "<save_note>\n<note>Los precios se guardan en centavos (int) en data/productos.json</note>\n</save_note>",
+)
+def save_note(ctx: Contexto, p: dict) -> str:
+    nota = " ".join((p.get("note") or "").split())
+    if len(nota) < 8:
+        raise ErrorHerramienta("La nota es demasiado corta.")
+    ruta = ctx.ws.carpeta_reaper() / "notas.md"
+    try:
+        previo = ruta.read_text(encoding="utf-8") if ruta.is_file() else "# Notas de los agentes de REAPER\n\n"
+        if nota in previo:
+            return "Esa nota ya estaba guardada."
+        escritura_atomica(ruta, previo.rstrip("\n") + f"\n- {nota}  <!-- {datetime.now():%Y-%m-%d} -->\n")
+    except OSError as e:
+        raise ErrorHerramienta(f"No pude guardar la nota: {e}")
+    return "Nota guardada en .reaper/notas.md."
+
+
+@herramienta(
+    "learn_lesson",
+    "Registra una lección aprendida de un error real (una línea concreta). scope: proyecto (hecho de este "
+    "proyecto) o general (error típico tuyo que vale para cualquier proyecto).",
+    [Param("lesson", "lección de una línea, con nombres concretos"),
+     Param("scope", "proyecto | general", requerido=False)],
+    "<learn_lesson>\n<lesson>Los tests de este proyecto se corren con python3 -m unittest discover -s tests</lesson>\n"
+    "<scope>proyecto</scope>\n</learn_lesson>",
+)
+def learn_lesson(ctx: Contexto, p: dict) -> str:
+    if ctx.memoria is None or not ctx.settings.lecciones:
+        return "Las lecciones están desactivadas en esta sesión."
+    leccion = p.get("lesson") or ""
+    general = (p.get("scope") or "").strip().lower().startswith("gen")
+    hechos = ctx.memoria.registrar([] if general else [leccion], [leccion] if general else [])
+    if not hechos:
+        return "No guardé la lección: tiene que ser concreta (archivos, comandos o funciones reales), no un consejo genérico."
+    return "Lección registrada: " + hechos[0]
+
+
+# ==================================================================
+# PYTHON RÁPIDO
+# ==================================================================
+@herramienta(
+    "run_python",
+    "Ejecuta un fragmento corto de Python en la raíz del proyecto (para probar una función o inspeccionar datos). "
+    "Usa print() para ver resultados. Sin input(). Timeout 60 s.",
+    [Param("content", "código Python", largo=True)],
+    "<run_python>\n<content>\nfrom app.carrito import Carrito\nc = Carrito()\nprint(c.total())\n</content>\n</run_python>",
+)
+def run_python(ctx: Contexto, p: dict) -> str:
+    codigo = p.get("content") or ""
+    if not codigo.strip():
+        raise ErrorHerramienta("Falta el código.")
+    if re.search(r"\binput\s*\(", codigo):
+        raise ErrorHerramienta("El fragmento usa input(): no hay usuario para contestar. Pasá los valores directamente.")
+    for patron in _BLOQUEADOS:
+        if patron.search(codigo):
+            raise ErrorHerramienta(f"El código contiene algo bloqueado por seguridad ({patron.pattern}).")
+    if re.search(r"\b(shutil\.rmtree|os\.remove|os\.unlink|os\.rmdir|subprocess|os\.system)\b", codigo) \
+            and ctx.settings.modo != "auto":
+        ctx.ui.aviso(f"  {ctx.etiqueta} quiere ejecutar Python que borra archivos o lanza procesos:")
+        ctx.ui.codigo(recortar(codigo, 1200), "python")
+        if not ctx.ui.confirmar("  ¿Ejecutar?"):
+            raise ErrorHerramienta("El usuario no aprobó ejecutar ese código.")
+    with tempfile.NamedTemporaryFile("w", suffix=".py", prefix="reaper_snippet_", delete=False,
+                                     encoding="utf-8") as f:
+        f.write(codigo)
+        temporal = f.name
+    try:
+        r = ejecutar([sys.executable, temporal], cwd=ctx.ws.raiz, timeout=60)
+    finally:
+        try:
+            os.unlink(temporal)
+        except OSError:
+            pass
+    r.comando = "run_python"
+    texto = r.resumen(limite=MAX_SALIDA // 2).replace(temporal, "<fragmento>")
+    if not r.ok and ctx.settings.pistas_errores:
+        texto = anexar_pistas(texto, 2)
+    return texto
+
+
+# ======================================================================
+# MÓDULO: roles
+# ======================================================================
+"""Roles de agentes y construcción del system prompt."""
+
+LECTURA = ("read_file", "read_symbol", "list_files", "search_files", "code_outline", "find_references")
+ESCRITURA = ("write_to_file", "replace_in_file", "replace_symbol", "insert_after_symbol", "append_to_file",
+             "insert_lines", "replace_lines")
+VERIFICACION = ("validate", "run_tests")
+ARCHIVOS = ("delete_file", "move_file", "revert_file")
+
+PATRONES_TESTS = ("tests/*", "test/*", "tests/**", "test/**", "test_*.py", "*_test.py", "*/test_*.py",
+                  "*.test.js", "*.test.mjs", "*.test.cjs", "*.test.ts", "*.spec.js", "*.spec.ts", "*_test.go",
+                  "spec/*", "__tests__/*", "conftest.py", "*/conftest.py", "*/tests/*", "*/__tests__/*")
+
+
+@dataclass(frozen=True)
+class Rol:
+    nombre: str
+    mision: str
+    herramientas: tuple
+    temperatura: float
+    solo_lectura: bool = False
+    puede_delegar: bool = False
+    rutas_permitidas: tuple = ()
+    max_pasos: int = 0  # 0 = usar el de settings
+
+
+ROLES = {
+    "principal": Rol(
+        "principal",
+        """Sos el AGENTE PRINCIPAL. Resolvé el pedido del usuario de punta a punta: entender, explorar lo
+necesario, editar, verificar con herramientas reales y reportar.
+- Si el pedido es solo una pregunta que no requiere tocar archivos, respondé directo en texto, sin herramientas.
+- Para tareas de varios pasos, armá una lista con update_todo y mantenela al día.
+- REAPER ya te da los archivos probablemente relevantes: empezá por ahí con read_symbol / read_file.
+- Para entender un proyecto grande, delegá a subagentes 'explorador' EN PARALELO (varios <delegate> en el mismo
+  mensaje, cada uno con una pregunta distinta): así no llenás tu contexto leyendo archivos enteros.
+- Podés delegar una parte acotada a un 'implementador' o pedir una revisión a un 'revisor'.
+- Antes de terminar, corré validate y, si hay tests, run_tests.""",
+        LECTURA + ESCRITURA + VERIFICACION + ARCHIVOS
+        + ("execute_command", "run_python", "view_diff", "update_todo", "project_map", "save_note", "learn_lesson",
+           "write_large_file", "delegate", "ask_user", "attempt_completion"),
+        0.2,
+        puede_delegar=True,
+    ),
+    "explorador": Rol(
+        "explorador",
+        """Sos un EXPLORADOR (solo lectura). Investigá el código para responder la tarea, nada más.
+Sé eficiente: project_map, search_files, code_outline y read_symbol antes de leer archivos enteros.
+Tu attempt_completion es un INFORME para otro agente que no vio nada. Incluí:
+1. Archivos relevantes con rutas exactas y qué contiene cada uno.
+2. Funciones/clases clave con número de línea y cómo se conectan.
+3. Convenciones del proyecto (estilo, framework, cómo se testea, cómo se ejecuta).
+4. Riesgos o dudas.
+No escribas código nuevo largo.""",
+        LECTURA + ("project_map", "attempt_completion"),
+        0.2,
+        solo_lectura=True,
+    ),
+    "arquitecto": Rol(
+        "arquitecto",
+        """Sos el ARQUITECTO (solo lectura). Convertí el pedido en un plan de tareas pequeñas, concretas y
+verificables, ordenadas por dependencia. Cada tarea toca pocos archivos y la puede hacer un implementador
+que solo lee esa tarea. Verificá con herramientas qué existe antes de planificar cambios sobre ello.
+Definí la INTERFAZ pública (archivos, funciones/clases y firmas exactas): con ella se escriben los tests
+ANTES de implementar, así que tiene que ser precisa e importable.
+Si un archivo nuevo va a ser largo (más de ~250 líneas), dividilo en varios módulos o en varias tareas.
+Tu attempt_completion DEBE contener el plan EXACTAMENTE con este formato:
+<plan>
+<objetivo>una frase</objetivo>
+<interfaz>
+- ruta/modulo.py: def funcion(param: tipo) -> tipo  — qué devuelve
+- ruta/modulo.py: class Clase(args) con métodos metodo(x) -> tipo
+</interfaz>
+<tarea id="1" archivos="ruta/a.py, ruta/b.py">Qué hacer: funciones, firmas, comportamiento, casos borde.</tarea>
+<tarea id="2" archivos="ruta/c.py">...</tarea>
+<criterios>
+- criterio de aceptación comprobable con un test (función, entrada → salida esperada)
+</criterios>
+</plan>""",
+        LECTURA + ("project_map", "attempt_completion"),
+        0.3,
+        solo_lectura=True,
+    ),
+    "especificador": Rol(
+        "especificador",
+        """Sos el ESPECIFICADOR (QA antes de implementar). Escribí tests automáticos REALES que codifiquen la
+interfaz y los criterios de aceptación del plan. El código todavía NO existe (o no tiene esa funcionalidad):
+tus tests DEBEN fallar ahora y pasar cuando alguien implemente el plan correctamente.
+- Importá exactamente lo que dice la INTERFAZ del plan (mismos archivos, nombres y firmas).
+- Python: unittest de la librería estándar en tests/test_<modulo>.py (o pytest si el proyecto ya lo usa).
+- JavaScript: node:test en tests/<modulo>.test.mjs (o el runner que ya exista).
+- Un test por criterio, con valores concretos (entrada → salida esperada) y casos borde. Deterministas,
+  sin red, sin input(), rápidos; archivos temporales con tempfile.
+- NO implementes el código de la aplicación (solo podés escribir archivos de tests).
+- Corré run_tests: tienen que fallar por ImportError/AttributeError/assert (falta la implementación), NUNCA
+  por un error de sintaxis o un bug del propio test. Si el test está roto, arreglalo.
+Informe final: archivos de test, qué verifica cada test y la salida real de run_tests.""",
+        LECTURA + ESCRITURA + VERIFICACION + ("attempt_completion",),
+        0.2,
+        rutas_permitidas=PATRONES_TESTS,
+    ),
+    "implementador": Rol(
+        "implementador",
+        """Sos el IMPLEMENTADOR. Implementá SOLO la tarea asignada con código real, completo y funcionando.
+Flujo: leé los archivos involucrados (read_symbol para funciones puntuales) → editá → mirá la validación que
+devuelve cada edición y corregí errores → run_tests → attempt_completion.
+- Archivo existente: replace_symbol para reescribir una función entera; replace_in_file para cambios chicos;
+  insert_after_symbol para agregar funciones o métodos nuevos.
+- Archivo nuevo: write_to_file. Si va a tener más de ~150 líneas, escribilo POR PARTES: write_to_file con
+  partial=true y la primera parte, después append_to_file con el resto (la última con last=true).
+  Para un archivo Python/JS MUY grande (más de ~300 líneas) usá write_large_file con una spec detallada.
+- Si hay tests de especificación, son el objetivo: hacé que pasen SIN modificarlos.
+No toques archivos fuera de la tarea salvo que sea imprescindible (y decilo en el informe).
+Informe final: archivos tocados, qué hiciste, cómo lo verificaste (resultados reales).""",
+        LECTURA + ESCRITURA + VERIFICACION + ("execute_command", "run_python", "update_todo", "revert_file",
+                                              "write_large_file", "attempt_completion"),
+        0.15,
+    ),
+    "revisor": Rol(
+        "revisor",
+        """Sos el REVISOR senior (solo lectura). Revisá los cambios contra la tarea: bugs de lógica, imports,
+rutas, manejo de errores, casos borde, estado, seguridad de archivos, compatibilidad Termux y coherencia
+entre archivos. Confirmá leyendo el código real; no inventes problemas ni pidas cambios de estilo.
+Tu attempt_completion DEBE empezar con UNA de estas líneas:
+VEREDICTO: APROBADO
+VEREDICTO: CAMBIOS
+Si es CAMBIOS, seguí con una lista numerada: archivo, problema concreto, corrección exacta.""",
+        LECTURA + ("view_diff", "validate", "attempt_completion"),
+        0.2,
+        solo_lectura=True,
+    ),
+    "qa": Rol(
+        "qa",
+        """Sos QA. Escribí tests automáticos REALES que verifiquen los criterios de aceptación y ejecutalos.
+- Python: unittest de la librería estándar en tests/test_<modulo>.py (salvo que el proyecto ya use pytest).
+- JavaScript: el runner que ya exista o node:test en tests/<modulo>.test.mjs.
+- Tests deterministas, sin red, sin input() y rápidos; usá archivos temporales (tempfile) si hace falta.
+Ejecutalos con run_tests. Si falla porque el TEST está mal, corregí el test. Si falla porque el CÓDIGO tiene
+un bug, NO toques el código ni debilites el test: describilo en el informe con el error real.""",
+        LECTURA + ESCRITURA + VERIFICACION + ("execute_command", "attempt_completion"),
+        0.2,
+        rutas_permitidas=PATRONES_TESTS,
+    ),
+    "reparador": Rol(
+        "reparador",
+        """Sos el REPARADOR. Recibís diagnósticos REALES de validadores y tests. Leé el código, encontrá la
+causa raíz y corregila con el cambio mínimo. Nunca borres, saltees ni debilites tests para que pasen.
+Si recibís un DIAGNÓSTICO DE UN EXPERTO, seguilo: ya analizó el error con más capacidad que vos.
+Después de corregir, ejecutá validate y run_tests para confirmar.
+Informe: causa raíz, cambio hecho y resultado real de la verificación.""",
+        LECTURA + ESCRITURA + VERIFICACION + ("execute_command", "run_python", "revert_file", "learn_lesson",
+                                              "attempt_completion"),
+        0.15,
+    ),
+    "consultor": Rol(
+        "consultor",
+        """Sos el CONSULTOR EXPERTO (solo lectura). Otro modelo más chico intentó varias veces resolver una tarea
+y la verificación real sigue fallando. Tu trabajo NO es editar: es diagnosticar con precisión para que el
+otro modelo aplique el arreglo sin pensar.
+Leé el error real y el código involucrado (read_symbol/read_file) y respondé con attempt_completion:
+DIAGNÓSTICO: qué falla y por qué (la causa raíz, no el síntoma)
+ARREGLO: los cambios exactos, archivo por archivo. Para cada uno, la función/clase COMPLETA corregida en un
+bloque de código, o bloques SEARCH/REPLACE copiando el texto actual exacto.
+VERIFICACIÓN: qué test o comando debería pasar después.
+Sé concreto y breve. No propongas reescribir lo que funciona.""",
+        LECTURA + ("attempt_completion",),
+        0.1,
+        solo_lectura=True,
+        max_pasos=10,
+    ),
+    "escritor": Rol(
+        "escritor",
+        """Sos el ESCRITOR de archivos grandes. El archivo ya existe con un ESQUELETO (firmas y docstrings con
+cuerpos vacíos). Tu tarea es implementar SOLO las secciones que te asignan, una por una, con replace_symbol
+(definición completa: firma + cuerpo real). No cambies firmas ni toques otras secciones.
+Mirá la validación que devuelve cada replace_symbol y corregí lo que falle. Al terminar tus secciones,
+attempt_completion con la lista de funciones implementadas.""",
+        ("read_file", "read_symbol", "code_outline", "search_files", "replace_symbol", "insert_after_symbol",
+         "replace_in_file", "validate", "run_tests", "attempt_completion"),
+        0.15,
+    ),
+}
+
+ROLES_DELEGABLES = ("explorador", "implementador", "revisor", "qa", "reparador", "arquitecto", "especificador")
+
+BASE = """Sos REAPER, un agente de programación autónomo. Trabajás DENTRO de un workspace real usando
+herramientas: leés, editás y ejecutás de verdad. Respondés siempre en español.
+
+PRINCIPIOS
+1. Verificá, no supongas: leé antes de editar. No inventes archivos, APIs, paquetes, comandos ni resultados.
+2. Nunca afirmes que algo funciona o que un test pasó si no lo viste en un <resultado> real.
+3. Cambios mínimos y precisos; no reescribas lo que ya funciona.
+4. Manejá errores de forma explícita (nada de `except: pass`).
+5. Entorno Termux/Android: sin sudo, sin systemd, sin /usr/bin; preferí la librería estándar.
+6. Seguridad ofensiva solo en sistemas propios, laboratorios, CTF o con autorización explícita.
+
+CÓMO USAR LAS HERRAMIENTAS
+- Escribí la herramienta como etiquetas XML, igual que en los ejemplos. Podés poner 1-3 frases de
+  razonamiento antes.
+- Máximo {max_llamadas} herramientas por mensaje. Después FRENÁ: REAPER las ejecuta y te contesta con
+  <resultado ...>. NUNCA escribas <resultado> vos ni inventes su contenido.
+- Archivo existente: primero leé (read_symbol para una función, read_file para el resto) y después editá.
+  replace_in_file necesita el SEARCH copiado EXACTO (sin los números de línea "  12| ").
+- Archivo nuevo: write_to_file con el contenido COMPLETO. Prohibido "...", "resto igual" o similares.
+- ARCHIVOS LARGOS: nunca más de ~150 líneas por mensaje. Primera parte con write_to_file + partial=true,
+  el resto con append_to_file (la última con last=true). Si tu mensaje se corta, REAPER guarda lo escrito
+  y te pide que sigas.
+- Cada edición devuelve la validación real (y arreglos automáticos triviales). Si dice VALIDACIÓN FALLÓ,
+  corregí eso primero.
+- Al terminar usá attempt_completion con un informe concreto.
+
+EJEMPLO
+Pedido: agregá una función resta a calc.py
+Vos:
+Leo calc.py para ver su contenido.
+<read_file>
+<path>calc.py</path>
+</read_file>
+(REAPER contesta con <resultado> y el archivo; recién entonces seguís)
+Vos:
+<insert_after_symbol>
+<path>calc.py</path>
+<symbol>suma</symbol>
+<content>
+def resta(a, b):
+    return a - b
+</content>
+</insert_after_symbol>"""
+
+
+def _entorno() -> str:
+    termux = "com.termux" in os.getenv("PREFIX", "") or os.path.isdir("/data/data/com.termux")
+    sistema = "Termux en Android" if termux else f"{platform.system()} {platform.release()}"
+    herramientas = [n for n in ("node", "npm", "git", "ruff", "go", "cargo", "make", "clang", "php")
+                    if shutil.which(n)]
+    return (
+        f"- Sistema: {sistema}\n"
+        f"- Python: {sys.version.split()[0]} ({sys.executable})\n"
+        f"- Herramientas disponibles: {', '.join(herramientas) or 'solo python'}"
+    )
+
+
+def system_prompt(rol: Rol, ws: Workspace, max_llamadas: int = 4, arbol: bool = True,
+                  lecciones: str = "", extra: str = "") -> str:
+    partes = [
+        BASE.replace("{max_llamadas}", str(max_llamadas)),
+        f"\n# TU ROL: {rol.nombre.upper()}\n{rol.mision}",
+        "\n# HERRAMIENTAS DISPONIBLES\n" + documentacion(list(rol.herramientas)),
+        f"\n# ENTORNO\n- Workspace: {ws.raiz}\n{_entorno()}",
+    ]
+    if rol.rutas_permitidas:
+        partes.append("- Solo podés escribir archivos de tests (" + ", ".join(rol.rutas_permitidas[:6]) + " ...).")
+    memoria = ws.memoria()
+    if memoria:
+        partes.append(f"\n# MEMORIA DEL PROYECTO\n{memoria}")
+    notas = ws.notas()
+    if notas.strip():
+        partes.append(f"\n# NOTAS DE AGENTES ANTERIORES (.reaper/notas.md)\n{notas.strip()}")
+    if lecciones.strip():
+        partes.append(f"\n# LECCIONES APRENDIDAS (aplicalas)\n{lecciones.strip()}")
+    if extra.strip():
+        partes.append("\n" + extra.strip())
+    if arbol:
+        partes.append(f"\n# ARCHIVOS DEL WORKSPACE (parcial)\n{ws.arbol(limite=80)}")
+    return "\n".join(partes)
+
+
+# ======================================================================
+# MÓDULO: agent
+# ======================================================================
+"""
+Bucle de agente con herramientas (estilo Claude Code / Codex) y subagentes.
+
+Cada agente:
+  1. recibe una tarea y un system prompt con su rol, sus herramientas y las
+     lecciones relevantes
+  2. el modelo responde con razonamiento corto + llamadas a herramientas
+  3. REAPER ejecuta las herramientas de verdad y devuelve <resultado>
+  4. repite hasta attempt_completion, que solo se acepta si la validación
+     real de los archivos cambiados pasa
+
+Trucos para que un modelo de 24B rinda (v6 + v7):
+  - contexto chico por subagente (cada uno arranca limpio)
+  - mapa de archivos relevantes calculado ANTES de empezar
+  - stop en "<resultado" para que no invente resultados
+  - lecturas viejas se reemplazan cuando el archivo cambia (evita SEARCH obsoletos)
+  - compactación automática antes de llenar los 32k de contexto
+  - CONTINUACIÓN AUTOMÁTICA: si la respuesta se corta escribiendo un archivo,
+    se guarda lo escrito y el modelo sigue desde la última línea
+  - detección de atascos: si la misma verificación falla una y otra vez,
+    se consulta a un modelo más fuerte (escalada) y su diagnóstico entra al contexto
+  - detección de bucles, recordatorios de formato y pistas por tipo de error
+"""
+
+STOP = ["<resultado", "<tool_result"]
+MAX_OBSERVACION = 9000
+
+CANCELAR = threading.Event()
+
+ALIAS_ROLES = {
+    "explorer": "explorador", "explore": "explorador", "investigador": "explorador",
+    "implementer": "implementador", "coder": "implementador", "programador": "implementador",
+    "developer": "implementador", "reviewer": "revisor", "review": "revisor",
+    "tester": "qa", "test": "qa", "fixer": "reparador", "debugger": "reparador",
+    "architect": "arquitecto", "planner": "arquitecto", "planificador": "arquitecto",
+    "spec": "especificador", "tdd": "especificador", "tests_primero": "especificador",
+}
+
+RECORDATORIO = """No usaste ninguna herramienta (o el formato no se entendió). Escribí la herramienta con etiquetas XML, por ejemplo:
+<read_file>
+<path>archivo.py</path>
+</read_file>
+Para crear o cambiar archivos usá write_to_file, replace_in_file o replace_symbol (no pegues código suelto en el chat).
+Si ya terminaste:
+<attempt_completion>
+<result>tu informe</result>
+</attempt_completion>"""
+
+SUFIJO_SUBTAREA = (
+    "\n\nSos un subagente con contexto limpio: trabajá solo en esta tarea y terminá con "
+    "attempt_completion y un informe autocontenido (quien lo lea no vio tu trabajo)."
+)
+
+_RE_RESULTADO = re.compile(r'(<resultado herramienta="[^"]*"[^>]*>\n)(.*?)(\n</resultado>)', re.S)
+_RE_LARGO = re.compile(r"(<(content|diff)>)(.*?)(</\2>)", re.S)
+
+HERRAMIENTAS_CONTINUABLES = ("write_to_file", "append_to_file")
+
+
+class Cancelado(Exception):
+    pass
+
+
+@dataclass
+class ResultadoAgente:
+    ok: bool
+    resumen: str
+    cambios: list = field(default_factory=list)
+    pasos: int = 0
+    motivo: str = "completado"
+    rol: str = ""
+    contexto: str = ""  # último razonamiento suelto del modelo (por si dejó info fuera del informe)
+    errores: list = field(default_factory=list)  # últimos errores reales vistos (para escalar)
+    escalado: bool = False
+
+
+_contadores: dict = {}
+_lock_contadores = threading.Lock()
+
+
+def _etiqueta(rol: str) -> str:
+    with _lock_contadores:
+        contador = _contadores.setdefault(rol, itertools.count(1))
+        return f"{rol}#{next(contador)}"
+
+
+def _stub_resultado(m: re.Match) -> str:
+    cuerpo = m.group(2)
+    if len(cuerpo) <= 600:
+        return m.group(0)
+    cabeza = "\n".join(cuerpo.splitlines()[:6])[:400]
+    return (m.group(1) + cabeza
+            + "\n[... resultado recortado para ahorrar contexto; repetí la herramienta si lo necesitás]"
+            + m.group(3))
+
+
+def _stub_largo(m: re.Match) -> str:
+    if len(m.group(3)) <= 800:
+        return m.group(0)
+    return m.group(1) + "\n[... contenido omitido: ya fue procesado ...]\n" + m.group(4)
+
+
+def _firma_error(texto: str) -> str:
+    """Huella de un error para detectar que se repite (sin números de línea ni rutas temporales)."""
+    texto = re.sub(r"\d+", "N", texto or "")
+    texto = re.sub(r"/tmp/\S+|reaper_\w+", "TMP", texto)
+    lineas = [l.strip() for l in texto.splitlines() if l.strip()]
+    clave = " | ".join(l for l in lineas if re.search(r"Error|FAIL|falló|fallaron|✗|no define|not defined", l))[:600]
+    return hashlib.sha1((clave or texto[:400]).encode("utf-8", "replace")).hexdigest()[:12]
+
+
+class Agente:
+    def __init__(
+        self,
+        rol: str,
+        llm,
+        ws: Workspace,
+        settings: Settings,
+        ui: UI,
+        *,
+        profundidad: int = 0,
+        etiqueta: Optional[str] = None,
+        mostrar_progreso: bool = True,
+        cid_inicio: Optional[int] = None,
+        temperatura: Optional[float] = None,
+        modelo: Optional[str] = None,
+        memoria: Optional[MemoriaLecciones] = None,
+        protegidos: Iterable[str] = (),
+        extra_prompt: str = "",
+        max_pasos: Optional[int] = None,
+        on_atascado: Optional[Callable[[str], Optional[str]]] = None,
+    ):
+        self.rol = ROLES[rol]
+        self.llm = llm
+        self.ws = ws
+        self.settings = settings
+        self.ui = ui
+        self.profundidad = profundidad
+        self.etiqueta = etiqueta or _etiqueta(rol)
+        self.mostrar_progreso = mostrar_progreso
+        if memoria is None and settings.lecciones:
+            try:
+                memoria = MemoriaLecciones(ws)
+            except OSError:
+                memoria = None
+        self.memoria = memoria
+        self.ctx = Contexto(ws, settings, ui, self.etiqueta, set(), [], cid_inicio, memoria=memoria,
+                            protegidos=set(protegidos), permitidos=tuple(self.rol.rutas_permitidas), llm=llm)
+        base = settings.max_pasos if rol == "principal" else settings.max_pasos_sub
+        self.max_pasos = max_pasos or self.rol.max_pasos or base
+        self.temperatura = self.rol.temperatura if temperatura is None else temperatura
+        self.modelo = modelo
+        self.extra_prompt = extra_prompt
+        self.on_atascado = on_atascado
+        self.mensajes: list[dict] = []
+        # Se parsean TODAS las herramientas para poder decirle al modelo cuáles no tiene permitidas.
+        self._esquemas = esquemas()
+        self._lecturas: list[tuple[int, str]] = []
+        self._indice_tarea = 0
+        self._rechazos = 0
+        self._ultimo_texto = ""
+        self._continuaciones: dict[str, int] = {}
+        self._errores: collections.Counter = collections.Counter()
+        self._errores_texto: list[str] = []
+        self._escalado = False
+        self._fallos_por_herramienta: collections.Counter = collections.Counter()
+        self._factor_contexto = 1.0
+
+    # ------------------------------------------------------------ API
+    def ejecutar(self, tarea: str, cid_inicio: Optional[int] = None) -> ResultadoAgente:
+        if cid_inicio is not None:
+            self.ctx.cid_inicio = cid_inicio
+        lecciones = ""
+        if self.memoria is not None and self.settings.lecciones:
+            try:
+                lecciones = self.memoria.para_prompt(tarea, self.settings.max_lecciones_prompt)
+            except OSError:
+                lecciones = ""
+        prompt = system_prompt(self.rol, self.ws, self.settings.max_llamadas_turno,
+                               lecciones=lecciones, extra=self.extra_prompt)
+        if self.mensajes:
+            self.mensajes[0] = {"role": "system", "content": prompt}
+        else:
+            self.mensajes = [{"role": "system", "content": prompt}]
+        self._agregar_usuario(self._preparar_tarea(tarea))
+        self._indice_tarea = len(self.mensajes) - 1
+        self.ctx.cambios = set()
+        self.ctx.parciales = {}
+        self._rechazos = 0
+        self._continuaciones = {}
+        self._errores = collections.Counter()
+        self._errores_texto = []
+        self._escalado = False
+
+        sin_herramienta = 0
+        repeticiones: dict = {}
+        self._ultimo_texto = ""
+
+        for paso in range(1, self.max_pasos + 1):
+            if CANCELAR.is_set():
+                raise Cancelado()
+            self._compactar()
+            respuesta = self._llamar_con_recuperacion()
+            analisis = analizar(respuesta.texto, self._esquemas)
+            self.mensajes.append({
+                "role": "assistant",
+                "content": analisis.respuesta_limpia.strip() or "(respuesta vacía)",
+            })
+            if analisis.texto:
+                self._ultimo_texto = analisis.texto
+                self.ui.pensamiento(self.etiqueta, analisis.texto)
+
+            if not analisis.llamadas:
+                texto = analisis.texto.strip()
+                es_respuesta_directa = (
+                    self.rol.nombre == "principal"
+                    and texto
+                    and respuesta.finish_reason != "length"
+                    and ((paso == 1 and "```" not in texto) or sin_herramienta >= 1)
+                )
+                if es_respuesta_directa:
+                    return self._cerrar(texto, paso, "respuesta")
+                sin_herramienta += 1
+                self.ctx.tropiezo("sin_herramienta")
+                if sin_herramienta > 2:
+                    return self._cerrar(texto or "El agente no produjo un resultado.", paso, "sin_herramientas")
+                aviso = RECORDATORIO
+                if respuesta.finish_reason == "length":
+                    aviso = ("Tu respuesta se cortó por longitud. Escribí menos por mensaje: "
+                             "archivos largos en partes (write_to_file con partial=true + append_to_file).\n\n") + aviso
+                self._agregar_usuario(aviso)
+                continue
+
+            sin_herramienta = 0
+            limite = max(1, self.settings.max_llamadas_turno)
+            llamadas, excedentes = analisis.llamadas[:limite], analisis.llamadas[limite:]
+            observaciones: list[str] = []
+            hubo_error = False
+            final: Optional[tuple[str, bool]] = None
+
+            i = 0
+            while i < len(llamadas):
+                llamada = llamadas[i]
+                if llamada.nombre == "delegate":
+                    grupo = [llamada]
+                    while i + len(grupo) < len(llamadas) and llamadas[i + len(grupo)].nombre == "delegate":
+                        grupo.append(llamadas[i + len(grupo)])
+                    obs, error = self._delegar(grupo)
+                    observaciones.extend(obs)
+                    hubo_error |= error
+                    i += len(grupo)
+                    continue
+                if llamada.nombre == "attempt_completion" and "attempt_completion" in self.rol.herramientas:
+                    aceptado, obs, ok_final = self._intentar_terminar(hubo_error)
+                    if aceptado:
+                        informe = (llamada.params.get("result") or "").strip() or analisis.texto
+                        final = (informe, ok_final)
+                        break
+                    observaciones.append(obs)
+                    i += 1
+                    continue
+                if not llamada.completa and respuesta.finish_reason == "length" \
+                        and llamada.nombre in HERRAMIENTAS_CONTINUABLES and self.settings.continuar_cortes:
+                    obs, error = self._continuar_corte(llamada)
+                    observaciones.append(obs)
+                    hubo_error |= error
+                    i += 1
+                    continue
+                obs, error = self._ejecutar_herramienta(llamada, repeticiones)
+                observaciones.append(obs)
+                hubo_error |= error
+                i += 1
+
+            if final is not None:
+                return self._cerrar(final[0], paso, "completado", ok=final[1])
+
+            if excedentes:
+                observaciones.append(
+                    f"(Ignoré {len(excedentes)} herramienta(s) extra: máximo {limite} por mensaje. "
+                    "Repetilas si siguen haciendo falta.)"
+                )
+            if respuesta.finish_reason == "length" and not any("SEGUÍ DESDE" in o for o in observaciones):
+                observaciones.append("(Tu mensaje se cortó por longitud: escribí menos por mensaje.)")
+            diagnostico = self._quizas_escalar(observaciones)
+            if diagnostico:
+                observaciones.append(diagnostico)
+            restantes = self.max_pasos - paso
+            if 0 < restantes <= 3:
+                observaciones.append(f"(Te quedan {restantes} pasos: cerrá pronto con attempt_completion.)")
+            self._agregar_usuario("\n\n".join(observaciones))
+
+        return self._cerrar(
+            "Se alcanzó el límite de pasos sin terminar. Último razonamiento: " + recortar(self._ultimo_texto, 800),
+            self.max_pasos,
+            "max_pasos",
+            ok=False,
+        )
+
+    # ------------------------------------------------------------ preparación
+    def _preparar_tarea(self, tarea: str) -> str:
+        extras = []
+        if self.settings.mapa_relevantes and self.rol.nombre in ("principal", "implementador", "reparador",
+                                                                 "explorador", "especificador"):
+            mapa = mapa_relevante(self.ws, tarea, self.settings.max_relevantes)
+            if mapa:
+                extras.append(mapa)
+        if self.rol.nombre in ("implementador", "especificador", "qa", "principal", "escritor"):
+            archivos = re.findall(r"[\w./-]+\.(?:py|js|mjs|cjs|ts|html|css|sh|go|rs)\b", tarea)
+            guia = guias_para(archivos or self.ws.archivos_codigo(limite=60), tarea)
+            if guia:
+                extras.append("GUÍA RÁPIDA DEL LENGUAJE:\n" + guia)
+            recetas = recetas_para_prompt(tarea)
+            if recetas:
+                extras.append(recetas)
+        if not extras:
+            return tarea
+        return tarea + "\n\n" + "\n\n".join(extras)
+
+    # ------------------------------------------------------------ internos
+    def _cerrar(self, resumen: str, pasos: int, motivo: str, ok: Optional[bool] = None) -> ResultadoAgente:
+        if ok is None:
+            ok = motivo in ("completado", "respuesta")
+            if self.ctx.cambios:
+                ok = ok and not fallos(validar_archivos(self.ws, sorted(self.ctx.cambios)))
+        return ResultadoAgente(ok, resumen, sorted(self.ctx.cambios), pasos, motivo, self.rol.nombre,
+                               self._ultimo_texto, self._errores_texto[-3:], self._escalado)
+
+    def _llamar_modelo(self) -> Respuesta:
+        progreso = (lambda n: self.ui.progreso(self.etiqueta, n)) if self.mostrar_progreso else None
+        if self.mostrar_progreso:
+            self.ui.esperando(self.etiqueta)
+        try:
+            return self.llm.chat(
+                self.mensajes,
+                modelo=self.modelo or self.settings.modelo_para(self.rol.nombre),
+                temperatura=self.temperatura,
+                stop=STOP,
+                on_progress=progreso,
+                rol=self.rol.nombre,
+            )
+        finally:
+            if self.mostrar_progreso:
+                self.ui.fin_progreso()
+
+    def _llamar_con_recuperacion(self) -> Respuesta:
+        """Si el proveedor dice que el contexto se excedió, compacta fuerte y reintenta una vez."""
+        try:
+            return self._llamar_modelo()
+        except LLMError as e:
+            if not getattr(e, "contexto_excedido", False):
+                raise
+            self.ui.aviso(f"  [{self.etiqueta}] contexto excedido: compacto la conversación y reintento")
+            self._factor_contexto = max(0.4, self._factor_contexto * 0.65)
+            self._compactar(forzar=True)
+            return self._llamar_modelo()
+
+    def _agregar_usuario(self, texto: str) -> None:
+        if self.mensajes and self.mensajes[-1]["role"] == "user":
+            self.mensajes[-1]["content"] += "\n\n" + texto
+        else:
+            self.mensajes.append({"role": "user", "content": texto})
+
+    def _ejecutar_herramienta(self, llamada: Llamada, repeticiones: dict) -> tuple[str, bool]:
+        nombre = llamada.nombre
+        h = REGISTRO.get(nombre)
+
+        def obs(texto: str, attrs: str = "") -> str:
+            return f'<resultado herramienta="{nombre}"{attrs}>\n{texto}\n</resultado>'
+
+        if h is None or nombre not in self.rol.herramientas:
+            disponibles = ", ".join(self.rol.herramientas)
+            self.ui.resultado_herramienta(False, f"herramienta no disponible: {nombre}")
+            return obs(f"ERROR: '{nombre}' no existe o no está disponible para tu rol. Disponibles: {disponibles}"), True
+        if not llamada.completa:
+            self.ui.resultado_herramienta(False, f"{nombre}: llamada incompleta")
+            self.ctx.tropiezo("llamada_incompleta")
+            return obs(
+                f"ERROR: la llamada a {nombre} quedó incompleta (falta la etiqueta de cierre o se cortó tu "
+                "respuesta). Si el archivo es largo, escribilo por partes: write_to_file con partial=true y "
+                "después append_to_file."
+            ), True
+
+        faltan = []
+        for p in h.params:
+            if not p.requerido:
+                continue
+            valor = llamada.params.get(p.nombre)
+            if valor is None or (not p.largo and not str(valor).strip()):
+                faltan.append(p.nombre)
+        if faltan:
+            self.ui.resultado_herramienta(False, f"{nombre}: faltan {', '.join(faltan)}")
+            return obs(f"ERROR: faltan parámetros: {', '.join(faltan)}. Uso correcto:\n{h.ejemplo}"), True
+
+        clave = nombre + json.dumps(llamada.params, sort_keys=True, ensure_ascii=False)
+        repeticiones[clave] = repeticiones.get(clave, 0) + 1
+        if repeticiones[clave] >= 3 and not h.escribe:
+            self.ui.resultado_herramienta(False, f"{nombre}: llamada repetida")
+            return obs(
+                f"ERROR: ya hiciste exactamente esta llamada {repeticiones[clave]} veces y el resultado no cambia. "
+                "Cambiá de enfoque o terminá con lo que sabés."
+            ), True
+
+        self.ui.herramienta(self.etiqueta, nombre, resumen_params(nombre, llamada.params))
+        error = False
+        try:
+            salida = h.fn(self.ctx, llamada.params)
+        except ErrorHerramienta as e:
+            salida, error = f"ERROR: {e}", True
+        except (Cancelado, KeyboardInterrupt):
+            raise
+        except Exception as e:  # una herramienta rota no debe tumbar al agente
+            salida, error = f"ERROR inesperado en {nombre}: {type(e).__name__}: {e}", True
+        if not error and "VALIDACIÓN FALLÓ" in salida:
+            error = True
+        if nombre == "run_tests" and salida.startswith("Tests FALLARON"):
+            error = True
+        self.ui.resultado_herramienta(not error, salida)
+        if error:
+            self._registrar_error(nombre, llamada.params.get("path", ""), salida)
+            if self.settings.pistas_errores and "PISTAS DE REAPER" not in salida:
+                salida = anexar_pistas(salida, 2)
+            salida += self._sugerencia_por_repeticion(nombre, llamada.params.get("path", ""))
+        salida = redactar_secretos(recortar(salida, MAX_OBSERVACION))
+
+        attrs = ""
+        ruta = None
+        if "path" in llamada.params:
+            try:
+                ruta = self.ws.rel(self.ws.ruta(llamada.params["path"]))
+            except (ErrorRuta, ValueError):
+                ruta = None
+        if nombre in ("read_file", "read_symbol") and ruta and not error:
+            attrs = f' ruta="{ruta}"'
+            self._lecturas.append((len(self.mensajes), ruta))
+        if h.escribe and ruta and not salida.startswith("ERROR"):
+            self._marcar_lecturas_viejas(ruta)
+        return obs(salida, attrs), error
+
+    def _registrar_error(self, herramienta: str, ruta: str, salida: str) -> None:
+        firma = _firma_error(salida)
+        self._errores[firma] += 1
+        self._errores_texto.append(recortar(salida, 3000))
+        self._errores_texto = self._errores_texto[-6:]
+        self._fallos_por_herramienta[(herramienta, ruta)] += 1
+
+    def _sugerencia_por_repeticion(self, herramienta: str, ruta: str) -> str:
+        veces = self._fallos_por_herramienta[(herramienta, ruta)]
+        if veces < 2:
+            return ""
+        if herramienta == "replace_in_file":
+            return ("\n\n(Ya falló {} veces en {}. Cambiá de estrategia: read_symbol + replace_symbol para "
+                    "reemplazar la función entera, o read_file + replace_lines con los números actuales.)").format(veces, ruta)
+        if herramienta in ("write_to_file", "append_to_file") and veces >= 2:
+            return ("\n\n(Ya falló {} veces. Si el archivo es largo, escribilo en partes más chicas "
+                    "(~100 líneas) y validá cada parte.)").format(veces)
+        if herramienta == "run_tests" and veces >= 3:
+            return ("\n\n(Los tests fallan una y otra vez. Leé con atención el PRIMER fallo, buscá la línea exacta "
+                    "del código que lo causa con read_symbol y arreglá solo eso.)")
+        return ""
+
+    def _quizas_escalar(self, observaciones: list[str]) -> str:
+        """Si el mismo error real se repite, pide un diagnóstico a un modelo más fuerte (una vez por tarea)."""
+        if self._escalado or self.on_atascado is None or not self.settings.escalar:
+            return ""
+        if not self._errores:
+            return ""
+        firma, veces = self._errores.most_common(1)[0]
+        if veces < self.settings.umbral_escalada:
+            return ""
+        self._escalado = True
+        contexto = "\n\n".join(self._errores_texto[-2:])
+        try:
+            diagnostico = self.on_atascado(contexto)
+        except (LLMError, OSError) as e:
+            self.ui.aviso(f"  [{self.etiqueta}] la escalada falló: {e}")
+            return ""
+        if not diagnostico:
+            return ""
+        return ("DIAGNÓSTICO DE UN EXPERTO (un modelo más fuerte analizó el error que se repite). Aplicalo:\n"
+                + recortar(diagnostico, 5000))
+
+    def _continuar_corte(self, llamada: Llamada) -> tuple[str, bool]:
+        """
+        La respuesta se cortó por longitud en medio de write_to_file/append_to_file:
+        se guarda lo escrito hasta la última línea completa y se pide continuar.
+        """
+        nombre = llamada.nombre
+
+        def obs(texto: str) -> str:
+            return f'<resultado herramienta="{nombre}">\n{texto}\n</resultado>'
+
+        parcial = contenido_parcial(llamada, self._esquemas)
+        ruta_txt = (llamada.params.get("path") or "").strip()
+        if not parcial or not ruta_txt:
+            self.ctx.tropiezo("llamada_incompleta")
+            return obs("ERROR: tu respuesta se cortó antes de que se entendiera la herramienta. Escribí partes más "
+                       "chicas (máximo ~150 líneas por mensaje)."), True
+        _param, texto = parcial
+        texto = cortar_en_linea_completa(texto)
+        contador = self._continuaciones.get(ruta_txt, 0) + 1
+        self._continuaciones[ruta_txt] = contador
+        if contador > self.settings.max_continuaciones:
+            return obs(f"ERROR: {ruta_txt} ya se cortó {contador - 1} veces. Dividí el archivo en módulos más "
+                       "chicos o escribí partes de ~80 líneas."), True
+        if len(texto.strip().splitlines()) < 3:
+            self.ctx.tropiezo("llamada_incompleta")
+            return obs("ERROR: tu respuesta se cortó casi al principio del contenido. Escribí partes más chicas."), True
+        params = dict(llamada.params)
+        params["content"] = texto
+        if nombre == "write_to_file":
+            params["partial"] = "true"
+        else:
+            params.pop("last", None)
+            try:
+                # Un append cortado deja el archivo incompleto: se valida recién al final.
+                self.ctx.parciales.setdefault(self.ws.rel(self.ws.ruta(ruta_txt)), 0)
+            except ErrorRuta:
+                pass
+        sintetica = Llamada(nombre, params, True, llamada.crudo)
+        salida, error = self._ejecutar_herramienta(sintetica, {})
+        if error:
+            return salida, True
+        try:
+            rel = self.ws.rel(self.ws.ruta(ruta_txt))
+            actual = self.ws.leer(rel)
+        except (ErrorRuta, OSError, ValueError):
+            return salida, False
+        self.ctx.parciales[rel] = actual.count("\n")
+        total = actual.count("\n")
+        ultimas = "\n".join(f"{n:>5}| {l}" for n, l in
+                            enumerate(actual.splitlines()[-8:], start=max(1, total - 7)))
+        self.ui.tenue(f"      ↻ respuesta cortada: guardé {rel} hasta la línea {total}; el modelo sigue desde ahí")
+        return salida + (
+            f"\n\nTU RESPUESTA SE CORTÓ POR LONGITUD. Guardé {rel} hasta la línea {total} (solo líneas completas). "
+            f"SEGUÍ DESDE la línea {total + 1} con append_to_file (sin repetir lo ya escrito; si es la última "
+            f"parte poné last=true). Últimas líneas guardadas:\n{ultimas}"
+        ), False
+
+    def _marcar_lecturas_viejas(self, ruta: str) -> None:
+        patron = re.compile(
+            r'<resultado herramienta="(?:read_file|read_symbol)" ruta="' + re.escape(ruta) + r'">\n.*?\n</resultado>',
+            re.S,
+        )
+        reemplazo = (
+            f'<resultado herramienta="read_file" ruta="{ruta}">\n'
+            f"[contenido viejo de {ruta} omitido: el archivo cambió después. Releelo si necesitás editarlo otra vez.]\n"
+            "</resultado>"
+        )
+        quedan = []
+        for indice, r in self._lecturas:
+            if r == ruta and indice < len(self.mensajes):
+                mensaje = self.mensajes[indice]
+                mensaje["content"] = patron.sub(lambda _m: reemplazo, mensaje["content"])
+            else:
+                quedan.append((indice, r))
+        self._lecturas = quedan
+
+    def _intentar_terminar(self, hubo_error: bool) -> tuple[bool, str, bool]:
+        def obs(texto: str) -> str:
+            return f'<resultado herramienta="attempt_completion">\n{texto}\n</resultado>'
+
+        if hubo_error and self._rechazos < 2:
+            self._rechazos += 1
+            self.ctx.tropiezo("cierre_rechazado")
+            return False, obs(
+                "No acepto el cierre todavía: hubo errores en herramientas de este mismo mensaje. "
+                "Revisá esos resultados y corregí antes de terminar."
+            ), False
+
+        if self.ctx.parciales and self._rechazos < 3:
+            self._rechazos += 1
+            pendientes = ", ".join(f"{r} ({n} líneas)" for r, n in self.ctx.parciales.items())
+            return False, obs(
+                f"Hay archivos EN CONSTRUCCIÓN sin terminar: {pendientes}. Completalos con append_to_file "
+                "(la última parte con last=true) antes de terminar."
+            ), False
+        if self.ctx.parciales:
+            self.ctx.parciales.clear()
+
+        ok = True
+        if self.ctx.cambios:
+            resultados = validar_archivos(self.ws, sorted(self.ctx.cambios))
+            if fallos(resultados):
+                if self._rechazos < 2:
+                    self._rechazos += 1
+                    self.ctx.tropiezo("cierre_rechazado")
+                    self.ui.aviso(f"  [{self.etiqueta}] cierre rechazado: la validación real falla")
+                    return False, obs(
+                        "No podés terminar todavía: la validación REAL de los archivos que cambiaste falla:\n"
+                        + anexar_pistas(resumen_validacion(resultados), 2)
+                    ), False
+                ok = False
+            elif self.rol.nombre in ("implementador", "escritor", "reparador") and self._rechazos < 2:
+                vacias = []
+                for rel in sorted(self.ctx.cambios):
+                    if rel.endswith(".py") and (self.ws.raiz / rel).is_file() and rel not in self.ctx.protegidos:
+                        try:
+                            for nombre, linea in funciones_vacias_python(self.ws.leer(rel)):
+                                vacias.append(f"{rel}:{linea} {nombre}")
+                        except (OSError, ValueError, ErrorRuta):
+                            continue
+                if vacias:
+                    self._rechazos += 1
+                    self.ctx.tropiezo("funcion_vacia")
+                    return False, obs(
+                        "Quedaron funciones sin implementar (cuerpo pass/.../NotImplementedError): "
+                        + ", ".join(vacias[:8]) + ". Implementalas con replace_symbol antes de terminar "
+                        "(si alguna es intencional, explicá por qué en el informe y volvé a cerrar)."
+                    ), False
+        return True, "", ok
+
+    def _delegar(self, grupo: list) -> tuple[list[str], bool]:
+        def obs(texto: str, rol: str = "?") -> str:
+            return f'<resultado herramienta="delegate" rol="{rol}">\n{texto}\n</resultado>'
+
+        if not self.rol.puede_delegar or self.profundidad >= self.settings.max_profundidad:
+            return [obs("ERROR: no podés lanzar subagentes desde acá; hacé la tarea vos.")] * len(grupo), True
+
+        salida: list[Optional[str]] = [None] * len(grupo)
+        specs = []
+        error = False
+        for k, llamada in enumerate(grupo):
+            rol = (llamada.params.get("role") or "").strip().lower()
+            rol = ALIAS_ROLES.get(rol, rol)
+            tarea = (llamada.params.get("task") or "").strip()
+            if rol not in ROLES_DELEGABLES or not tarea:
+                salida[k] = obs(
+                    f"ERROR: rol inválido o tarea vacía. Roles válidos: {', '.join(ROLES_DELEGABLES)}", rol or "?"
+                )
+                error = True
+                continue
+            specs.append((k, rol, tarea, llamada.params.get("files") or ""))
+
+        resultados = ejecutar_subagentes(
+            [(rol, tarea, archivos, "", {"memoria": self.memoria, "on_atascado": self.on_atascado})
+             for _, rol, tarea, archivos in specs],
+            self.llm, self.ws, self.settings, self.ui,
+            profundidad=self.profundidad + 1,
+            cid_inicio=self.ctx.cid_inicio,
+        )
+        for (k, rol, _tarea, _archivos), res in zip(specs, resultados):
+            self.ctx.cambios.update(res.cambios)
+            estado = "COMPLETADO" if res.ok else f"NO COMPLETADO ({res.motivo})"
+            salida[k] = obs(
+                f"Subagente {rol}: {estado} en {res.pasos} pasos.\n"
+                f"Archivos cambiados: {', '.join(res.cambios) or 'ninguno'}\n"
+                f"Informe:\n{recortar(redactar_secretos(res.resumen), 6000)}",
+                rol,
+            )
+            error |= not res.ok
+        return [s or obs("ERROR interno") for s in salida], error
+
+    # ------------------------------------------------------------ contexto
+    def _tamano(self) -> int:
+        return sum(len(m["content"]) for m in self.mensajes)
+
+    def _limite_contexto(self) -> int:
+        contexto = min(self.settings.contexto_tokens,
+                       info_modelo(self.modelo or self.settings.modelo_para(self.rol.nombre)).contexto)
+        return int((contexto - self.settings.max_tokens) * 0.85 * CARACTERES_POR_TOKEN * self._factor_contexto)
+
+    def _compactar(self, forzar: bool = False) -> None:
+        limite = self._limite_contexto()
+        if self._tamano() <= limite and not forzar:
+            return
+        proteger = max(self._indice_tarea + 1, len(self.mensajes) - 6)
+
+        # Fase 1: resultados viejos largos → resumen corto.
+        for i in range(1, proteger):
+            m = self.mensajes[i]
+            if m["role"] == "user" and "<resultado" in m["content"]:
+                m["content"] = _RE_RESULTADO.sub(_stub_resultado, m["content"])
+                if self._tamano() <= limite and not forzar:
+                    return
+        # Fase 2: código ya aplicado en mensajes viejos del modelo.
+        for i in range(1, proteger):
+            m = self.mensajes[i]
+            if m["role"] == "assistant":
+                m["content"] = _RE_LARGO.sub(_stub_largo, m["content"])
+                if self._tamano() <= limite and not forzar:
+                    return
+        if self._tamano() <= limite:
+            return
+        # Fase 3: descartar el medio de la conversación (se conserva la tarea y la cola).
+        if self._indice_tarea >= proteger:
+            cola = self.mensajes[self._indice_tarea:]
+            descartados = self._indice_tarea - 1
+            nuevos = [self.mensajes[0]] + cola
+            indice = 1
+        else:
+            inicio = proteger
+            while inicio < len(self.mensajes) and self.mensajes[inicio]["role"] != "assistant":
+                inicio += 1
+            descartados = inicio - self._indice_tarea - 1
+            nuevos = [self.mensajes[0], dict(self.mensajes[self._indice_tarea])] + self.mensajes[inicio:]
+            indice = 1
+        if descartados > 0:
+            todo = "\n".join(f"[{e}] {t}" for e, t in self.ctx.todo)
+            nota = f"\n\n[REAPER: se omitieron {descartados} mensajes anteriores para ahorrar contexto."
+            if todo:
+                nota += f" Tu lista de tareas actual:\n{todo}"
+            if self.ctx.cambios:
+                nota += f"\nArchivos que ya cambiaste: {', '.join(sorted(self.ctx.cambios))}"
+            if self.ctx.parciales:
+                nota += "\nArchivos EN CONSTRUCCIÓN (seguí con append_to_file): " + ", ".join(
+                    f"{r} ({n} líneas)" for r, n in self.ctx.parciales.items())
+            if self._errores_texto:
+                nota += "\nÚltimo error real visto:\n" + recortar(self._errores_texto[-1], 1200)
+            nuevos[indice] = {"role": "user", "content": nuevos[indice]["content"] + nota + "]"}
+        self.mensajes = nuevos
+        self._indice_tarea = indice
+        self._lecturas = []
+        # Último recurso: recortar todo resultado salvo el del último mensaje.
+        if self._tamano() > limite:
+            for m in self.mensajes[1:-1]:
+                if m["role"] == "user":
+                    m["content"] = _RE_RESULTADO.sub(_stub_resultado, m["content"])
+                else:
+                    m["content"] = _RE_LARGO.sub(_stub_largo, m["content"])
+        if self._tamano() > limite and len(self.mensajes) > 2:
+            ultimo = self.mensajes[-1]
+            ultimo["content"] = recortar(ultimo["content"], max(2000, limite // 3))
+
+
+def _titulo(tarea: str) -> str:
+    """Primera línea útil de la tarea (saltea encabezados tipo 'PEDIDO DEL USUARIO:')."""
+    for linea in tarea.splitlines():
+        linea = linea.strip()
+        if linea and not (linea.endswith(":") and linea.upper() == linea):
+            return linea[:100] + ("…" if len(linea) > 100 else "")
+    return "(sin descripción)"
+
+
+def ejecutar_subagentes(
+    specs: list,
+    llm,
+    ws: Workspace,
+    settings: Settings,
+    ui: UI,
+    *,
+    profundidad: int = 1,
+    cid_inicio: Optional[int] = None,
+    max_paralelo: Optional[int] = None,
+) -> list[ResultadoAgente]:
+    """
+    Corre subagentes. specs: (rol, tarea, archivos[, título[, opciones]]).
+    opciones es un dict con kwargs para Agente (temperatura, modelo, memoria,
+    protegidos, extra_prompt, max_pasos, on_atascado) y opcionalmente 'ws'
+    (otro workspace, p. ej. una copia aislada) y 'cid' (checkpoint inicial).
+
+    Corren en paralelo si todos son de solo lectura o si cada uno trabaja en
+    su propio workspace (copias aisladas); si no, van en secuencia para no
+    pisarse archivos.
+    """
+    def opciones_de(spec) -> dict:
+        return dict(spec[4]) if len(spec) > 4 and isinstance(spec[4], dict) else {}
+
+    espacios = [opciones_de(s).get("ws") for s in specs]
+    aislados = all(e is not None for e in espacios) and len({id(e) for e in espacios}) == len(espacios)
+    limite = max_paralelo or settings.paralelo
+    paralelo = (
+        len(specs) > 1
+        and limite > 1
+        and (all(ROLES[spec[0]].solo_lectura for spec in specs) or aislados)
+    )
+
+    def correr(spec, progreso: bool) -> ResultadoAgente:
+        rol, tarea, archivos = spec[0], spec[1], spec[2]
+        titulo = spec[3] if len(spec) > 3 and spec[3] else _titulo(tarea)
+        opciones = opciones_de(spec)
+        ws_agente = opciones.pop("ws", None) or ws
+        cid = opciones.pop("cid", cid_inicio)
+        etiqueta_extra = opciones.pop("etiqueta", None)
+        agente = Agente(rol, llm, ws_agente, settings, ui, profundidad=profundidad,
+                        mostrar_progreso=progreso, cid_inicio=cid, etiqueta=etiqueta_extra, **opciones)
+        ui.agente(agente.etiqueta, f"↳ {titulo}")
+        texto = tarea + (f"\n\nArchivos relevantes: {archivos}" if archivos else "") + SUFIJO_SUBTAREA
+        try:
+            res = agente.ejecutar(texto)
+        except (Cancelado, KeyboardInterrupt, LLMError):
+            # Si el modelo no responde (después de reintentos y respaldos) no tiene sentido seguir.
+            raise
+        except Exception as e:
+            res = ResultadoAgente(False, f"{type(e).__name__}: {e}", sorted(agente.ctx.cambios), 0, "error", rol)
+        ui.agente(agente.etiqueta, ("✓ terminó" if res.ok else f"✗ no completó ({res.motivo})") + f" · {res.pasos} pasos")
+        return res
+
+    if not paralelo:
+        return [correr(s, True) for s in specs]
+
+    ui.tenue(f"  ⇉ {len(specs)} subagentes en paralelo (máx {limite} a la vez)")
+    ejecutor = ThreadPoolExecutor(max_workers=min(limite, len(specs)))
+    try:
+        futuros = [ejecutor.submit(correr, s, False) for s in specs]
+        return [f.result() for f in futuros]
+    except (KeyboardInterrupt, Cancelado):
+        CANCELAR.set()
+        raise
+    finally:
+        ejecutor.shutdown(wait=not CANCELAR.is_set(), cancel_futures=True)
+
+
+# ======================================================================
+# MÓDULO: longwriter
+# ======================================================================
+"""
+Escritor de archivos largos: esqueleto + relleno por función.
+
+Un modelo de 24B con 32k de contexto y ~6k tokens de salida no puede escribir
+un archivo de 1500 líneas de una vez: se corta, se olvida de lo que escribió
+arriba o pone "...". REAPER lo divide así:
+
+  1. ESQUELETO: el modelo escribe el plano completo del archivo (imports,
+     constantes, clases, firmas y docstrings) con un marcador en cada cuerpo:
+         raise NotImplementedError("REAPER")      (Python)
+         throw new Error("REAPER");               (JS/TS)
+     El esqueleto es corto, compila, y fija la arquitectura.
+  2. RELLENO: por cada función marcada, una llamada chica con solo lo que hace
+     falta (el contorno del archivo, la firma, el docstring y la especificación)
+     devuelve la función completa. REAPER la aplica con replace_symbol, valida
+     que compile y, si falla, reintenta con el error real.
+  3. VERIFICACIÓN: no puede quedar ningún marcador; validadores + tests.
+
+Las funciones se generan en paralelo (son independientes dado el esqueleto)
+y se aplican en secuencia.
+"""
+
+MARCADOR_PY = 'raise NotImplementedError("REAPER")'
+MARCADOR_JS = 'throw new Error("REAPER");'
+_RE_MARCADOR = re.compile(r"""NotImplementedError\(\s*["']REAPER["']\s*\)|new Error\(\s*["']REAPER["']\s*\)""")
+_RE_BLOQUE = re.compile(r"```[ \t]*([\w+#.-]*)[ \t]*\r?\n(.*?)\r?\n?```", re.S)
+
+LENGUAJES_ESCRITOR = {".py": "python", ".js": "js", ".mjs": "js", ".cjs": "js", ".ts": "js", ".tsx": "js",
+                      ".jsx": "js"}
+
+PROMPT_ESQUELETO = """Vas a diseñar el ESQUELETO del archivo `{rel}` ({lenguaje}). Es el plano completo del archivo final:
+TODOS los imports, constantes, clases, y las firmas de TODAS las funciones y métodos que el archivo va a
+necesitar, cada una con un docstring/comentario que diga qué recibe, qué devuelve y los casos borde.
+NO implementes los cuerpos: cada función o método tiene SOLO su docstring y esta línea:
+    {marcador}
+Excepciones: constantes, dataclasses/estructuras de datos simples y el bloque `if __name__ == "__main__":`
+(o el arranque del programa) se escriben completos.
+El esqueleto TIENE que ser código válido que compile.
+
+ESPECIFICACIÓN DEL ARCHIVO:
+{especificacion}
+{contexto}
+Respondé SOLO con un bloque de código ```{bloque}``` con el esqueleto completo."""
+
+PROMPT_RELLENO = """Estás implementando el archivo `{rel}` función por función. Este es su contorno actual (las
+funciones con {marcador_corto} todavía no están implementadas; otras ya pueden estarlo):
+```
+{contorno}
+```
+{vecinos}
+ESPECIFICACIÓN GENERAL DEL ARCHIVO:
+{especificacion}
+
+IMPLEMENTÁ AHORA {cuales}:
+{actuales}
+
+Reglas: misma firma y mismo nombre; cuerpo REAL y completo (nada de '...', TODO ni {marcador_corto});
+usá solo nombres que existan en el archivo o en la librería estándar (o en los imports del esqueleto);
+manejá los casos borde del docstring.
+Respondé SOLO con {formato}."""
+
+
+class ErrorEscritor(RuntimeError):
+    pass
+
+
+@dataclass
+class InformeEscritor:
+    ok: bool
+    rel: str
+    lineas: int = 0
+    funciones: int = 0
+    rellenadas: int = 0
+    fallidas: list = field(default_factory=list)
+    notas: list = field(default_factory=list)
+
+    def texto(self) -> str:
+        estado = "COMPLETO" if self.ok else "INCOMPLETO"
+        partes = [f"Archivo largo {self.rel}: {estado} ({self.lineas} líneas, {self.rellenadas}/{self.funciones} "
+                  "funciones implementadas)."]
+        if self.fallidas:
+            partes.append("Sin implementar (seguí con replace_symbol): " + ", ".join(self.fallidas[:20]))
+        partes.extend(self.notas)
+        return "\n".join(partes)
+
+
+def extraer_bloques_codigo(texto: str) -> list[tuple[str, str]]:
+    bloques = [(m.group(1).lower(), m.group(2)) for m in _RE_BLOQUE.finditer(texto or "")]
+    if bloques:
+        return bloques
+    limpio = (texto or "").strip()
+    if re.match(r"^(@|def |async def |class |function |export |const |let |var |import |from )", limpio):
+        return [("", limpio)]
+    abierto = re.search(r"```[ \t]*[\w+#.-]*[ \t]*\r?\n(.*)$", texto or "", re.S)
+    if abierto:  # bloque sin cerrar (respuesta cortada): se usa igual y la validación decide
+        return [("", abierto.group(1))]
+    return []
+
+
+def simbolos_pendientes(texto: str, rel: str) -> list[Simbolo]:
+    """Funciones/métodos cuyo cuerpo todavía tiene el marcador del esqueleto (los más internos)."""
+    simbolos = extraer_simbolos(Path(rel), texto, rel)
+    lineas = texto.splitlines()
+    pendientes = []
+    for s in simbolos:
+        if s.tipo not in ("funcion", "metodo"):
+            continue
+        cuerpo = "\n".join(lineas[s.inicio - 1: s.fin])
+        if not _RE_MARCADOR.search(cuerpo):
+            continue
+        # Si una función interna tiene el marcador, la externa no se rellena como un todo.
+        internas = [o for o in simbolos if o is not s and o.inicio > s.inicio and o.fin <= s.fin
+                    and o.tipo in ("funcion", "metodo")
+                    and _RE_MARCADOR.search("\n".join(lineas[o.inicio - 1: o.fin]))]
+        if internas:
+            continue
+        pendientes.append(s)
+    return pendientes
+
+
+def contorno_archivo(texto: str, rel: str, maximo: int = 9000) -> str:
+    """Contorno legible: imports, constantes y firmas con docstring corto (sin cuerpos)."""
+    simbolos = extraer_simbolos(Path(rel), texto, rel)
+    lineas = texto.splitlines()
+    if len(texto) <= maximo // 2:
+        return texto
+    incluidas: set[int] = set()
+    for i, l in enumerate(lineas, start=1):
+        if i <= 40 and (l.startswith(("import ", "from ", "const ", "let ", "export ", "#!")) or l.isupper()):
+            incluidas.add(i)
+        if re.match(r"^[A-Z_][A-Z0-9_]*\s*[:=]", l):
+            incluidas.add(i)
+    for s in simbolos:
+        incluidas.add(s.inicio)
+        # Firma de varias líneas + primera línea del docstring.
+        for k in range(s.inicio, min(s.fin, s.inicio + 4) + 1):
+            linea = lineas[k - 1] if k - 1 < len(lineas) else ""
+            incluidas.add(k)
+            if linea.rstrip().endswith((":", "{")):
+                if k < len(lineas) and re.match(r'^\s*("""|\'\'\'|/\*\*|//)', lineas[k]):
+                    incluidas.add(k + 1)
+                break
+    salida, previo = [], 0
+    for i in sorted(incluidas):
+        if i - previo > 1:
+            salida.append("    ...")
+        salida.append(lineas[i - 1])
+        previo = i
+    return recortar("\n".join(salida), maximo)
+
+
+def _vecinos_llamados(texto: str, rel: str, simbolo: Simbolo, limite: int = 2500) -> str:
+    """Código de funciones ya implementadas que el docstring del símbolo menciona (para coherencia)."""
+    lineas = texto.splitlines()
+    cuerpo = "\n".join(lineas[simbolo.inicio - 1: simbolo.fin])
+    salida, usado = [], 0
+    for otro in extraer_simbolos(Path(rel), texto, rel):
+        if otro.nombre == simbolo.nombre or otro.tipo not in ("funcion", "metodo"):
+            continue
+        if not re.search(r"\b" + re.escape(otro.nombre) + r"\b", cuerpo):
+            continue
+        codigo = "\n".join(lineas[otro.inicio - 1: otro.fin])
+        if _RE_MARCADOR.search(codigo) or usado + len(codigo) > limite:
+            continue
+        salida.append(codigo)
+        usado += len(codigo)
+    if not salida:
+        return ""
+    return "Funciones ya implementadas que usa:\n```\n" + "\n\n".join(salida) + "\n```\n"
+
+
+def _definicion_de(bloque: str, nombre: str, lenguaje: str) -> Optional[str]:
+    """Del bloque devuelto por el modelo, la definición completa de 'nombre' (o el bloque entero)."""
+    if lenguaje == "python":
+        try:
+            arbol = ast.parse(textwrap.dedent(bloque))
+        except SyntaxError:
+            return bloque if re.search(r"\bdef\s+" + re.escape(nombre) + r"\b", bloque) else None
+        lineas = textwrap.dedent(bloque).splitlines()
+        for nodo in ast.walk(arbol):
+            if isinstance(nodo, (ast.FunctionDef, ast.AsyncFunctionDef)) and nodo.name == nombre:
+                inicio = min([d.lineno for d in nodo.decorator_list] + [nodo.lineno])
+                return "\n".join(lineas[inicio - 1: nodo.end_lineno])
+        return None
+    simbolos = simbolos_llaves(bloque, "bloque.js", "js")
+    for s in simbolos:
+        if s.nombre == nombre:
+            return "\n".join(bloque.splitlines()[s.inicio - 1: s.fin])
+    if re.search(r"\b" + re.escape(nombre) + r"\s*\(", bloque):
+        return bloque
+    return None
+
+
+class EscritorLargo:
+    def __init__(self, llm, ws: Workspace, settings: Settings, ui: UI, *, modelo: Optional[str] = None,
+                 etiqueta: str = "escritor"):
+        self.llm = llm
+        self.ws = ws
+        self.settings = settings
+        self.ui = ui
+        self.modelo = modelo or settings.modelo_para("implementador")
+        self.etiqueta = etiqueta
+        self._lock = threading.Lock()
+
+    # ------------------------------------------------------------ fases
+    def escribir(self, rel: str, especificacion: str, contexto: str = "",
+                 escribir_archivo: Optional[Callable[[str, str], None]] = None) -> InformeEscritor:
+        sufijo = Path(rel).suffix.lower()
+        lenguaje = LENGUAJES_ESCRITOR.get(sufijo)
+        if not lenguaje:
+            raise ErrorEscritor(f"El escritor largo soporta Python y JS/TS; para {sufijo or 'este archivo'} "
+                                "escribí por partes con write_to_file + append_to_file.")
+        escribir_archivo = escribir_archivo or self.ws.escribir
+        informe = InformeEscritor(False, rel)
+        existente = self.ws.leer(rel) if self.ws.existe(rel) else ""
+        if existente and simbolos_pendientes(existente, rel):
+            self.ui.tenue(f"  [{self.etiqueta}] {rel} ya tiene un esqueleto con funciones pendientes: sigo desde ahí")
+            texto = existente
+        else:
+            texto = self._esqueleto(rel, lenguaje, especificacion, contexto)
+            escribir_archivo(rel, texto)
+            self.ui.ok(f"[{self.etiqueta}] esqueleto de {rel}: {texto.count(chr(10)) + 1} líneas")
+        pendientes = simbolos_pendientes(texto, rel)
+        informe.funciones = len(pendientes)
+        self.ui.tenue(f"  [{self.etiqueta}] {len(pendientes)} funciones por implementar")
+        texto = self._rellenar(rel, lenguaje, especificacion, texto, informe, escribir_archivo)
+        restantes = simbolos_pendientes(texto, rel)
+        informe.fallidas = [s.nombre_completo for s in restantes]
+        informe.lineas = texto.count("\n") + 1
+        informe.rellenadas = informe.funciones - len(restantes)
+        validacion = validar_archivo(self.ws, rel)
+        malos = fallos(validacion)
+        if malos:
+            informe.notas.append("Validación final con errores:\n" + resumen_validacion(validacion, 1500))
+        informe.ok = not restantes and not malos
+        return informe
+
+    def _esqueleto(self, rel: str, lenguaje: str, especificacion: str, contexto: str) -> str:
+        marcador = MARCADOR_PY if lenguaje == "python" else MARCADOR_JS
+        prompt = PROMPT_ESQUELETO.format(
+            rel=rel, lenguaje="Python" if lenguaje == "python" else "JavaScript/TypeScript",
+            marcador=marcador, especificacion=recortar(especificacion, 6000),
+            contexto=("\nCONTEXTO DEL PROYECTO:\n" + recortar(contexto, 4000) + "\n") if contexto else "",
+            bloque="python" if lenguaje == "python" else "javascript",
+        )
+        mensajes = [{"role": "system", "content": "Sos un arquitecto de software. Escribís código válido y completo."},
+                    {"role": "user", "content": prompt}]
+        ultimo_error = ""
+        for intento in range(3):
+            self.ui.esperando(self.etiqueta, "diseñando el esqueleto")
+            try:
+                respuesta = self.llm.chat(mensajes, modelo=self.modelo, temperatura=0.2,
+                                          max_tokens=self.settings.max_tokens, rol="escritor")
+            finally:
+                self.ui.fin_progreso()
+            bloques = extraer_bloques_codigo(respuesta.texto)
+            if not bloques:
+                ultimo_error = "No devolviste un bloque de código."
+            else:
+                codigo = max(bloques, key=lambda b: len(b[1]))[1].rstrip() + "\n"
+                problema = self._problema_sintaxis(codigo, lenguaje, rel)
+                if not problema and not _RE_MARCADOR.search(codigo):
+                    problema = f"El esqueleto no tiene ningún marcador {marcador}: ¿implementaste todo? Dejá los cuerpos con el marcador."
+                    if codigo.count("\n") < 120:
+                        return codigo  # archivo chico: si ya vino completo, sirve
+                if not problema:
+                    return codigo
+                ultimo_error = problema
+                if respuesta.finish_reason == "length":
+                    ultimo_error += " (Tu respuesta se cortó: hacé el esqueleto más compacto, docstrings de una línea.)"
+            mensajes.append({"role": "assistant", "content": respuesta.texto})
+            mensajes.append({"role": "user", "content": f"El esqueleto tiene un problema:\n{ultimo_error}\n"
+                                                         "Devolvé el esqueleto COMPLETO corregido en un solo bloque."})
+        raise ErrorEscritor(f"No logré un esqueleto válido para {rel}: {ultimo_error}")
+
+    def _problema_sintaxis(self, codigo: str, lenguaje: str, rel: str) -> str:
+        if lenguaje == "python":
+            try:
+                compile(codigo, rel, "exec", dont_inherit=True)
+                return ""
+            except SyntaxError as e:
+                return f"SyntaxError: {e.msg} (línea {e.lineno})"
+        problema = balance_llaves(codigo, "js")
+        if problema:
+            return problema
+        if shutil.which("node") and Path(rel).suffix in (".js", ".mjs", ".cjs"):
+            r = _node_check_texto(self.ws, codigo, ".mjs" if re.search(r"^\s*(import|export)\b", codigo, re.M) else ".js")
+            if not r.ok:
+                return (r.stderr or r.stdout).strip()[-600:]
+        return ""
+
+    def _pedir_relleno(self, rel: str, lenguaje: str, especificacion: str, texto: str,
+                       grupo: list[Simbolo], error: str = "") -> dict[str, str]:
+        lineas = texto.splitlines()
+        actuales = "\n\n".join("```\n" + "\n".join(lineas[s.inicio - 1: s.fin]) + "\n```" for s in grupo)
+        nombres = [s.nombre for s in grupo]
+        cuales = (f"la función `{nombres[0]}`" if len(grupo) == 1
+                  else "estas funciones: " + ", ".join(f"`{n}`" for n in nombres))
+        formato = ("un bloque de código con la definición COMPLETA de la función" if len(grupo) == 1 else
+                   "un bloque de código por función, cada uno con la definición COMPLETA, en el mismo orden")
+        if grupo[0].padre and lenguaje == "python":
+            formato += f" (es un método de {grupo[0].padre}: incluí self y escribila sin indentar)"
+        prompt = PROMPT_RELLENO.format(
+            rel=rel, marcador_corto="REAPER", contorno=contorno_archivo(texto, rel),
+            vecinos=_vecinos_llamados(texto, rel, grupo[0]), especificacion=recortar(especificacion, 3000),
+            cuales=cuales, actuales=actuales, formato=formato,
+        )
+        if error:
+            prompt += f"\n\nTU INTENTO ANTERIOR FALLÓ:\n{recortar(error, 1500)}\nCorregilo."
+        mensajes = [{"role": "system", "content": "Sos un programador senior. Devolvés código real, completo y correcto."},
+                    {"role": "user", "content": prompt}]
+        respuesta = self.llm.chat(mensajes, modelo=self.modelo, temperatura=0.15,
+                                  max_tokens=self.settings.max_tokens, rol="escritor")
+        bloques = extraer_bloques_codigo(respuesta.texto)
+        salida: dict[str, str] = {}
+        for s in grupo:
+            for _lang, bloque in bloques:
+                definicion = _definicion_de(bloque, s.nombre, lenguaje)
+                if definicion:
+                    salida[s.nombre_completo] = definicion
+                    break
+        return salida
+
+    def _aplicar(self, rel: str, lenguaje: str, texto: str, simbolo_nombre: str, definicion: str) -> tuple[str, str]:
+        """Aplica una definición sobre el texto actual. Devuelve (texto_nuevo, error)."""
+        encontrados, _ = elegir_simbolo(extraer_simbolos(Path(rel), texto, rel), simbolo_nombre)
+        if len(encontrados) != 1:
+            return texto, f"no ubiqué '{simbolo_nombre}' en el archivo actual"
+        if _RE_MARCADOR.search(definicion) or tiene_marcadores_perezosos(definicion):
+            return texto, "la implementación todavía tiene el marcador REAPER o '...'"
+        nuevo = reemplazar_simbolo(texto, encontrados[0], definicion)
+        problema = self._problema_sintaxis(nuevo, lenguaje, rel)
+        if problema:
+            return texto, problema
+        if lenguaje == "python":
+            indefinidos = [n for n, _ in nombres_indefinidos_python(nuevo)
+                           if n not in {x for x, _ in nombres_indefinidos_python(texto)}]
+            if indefinidos:
+                return texto, "usa nombres que no existen: " + ", ".join(sorted(set(indefinidos))[:6])
+        return nuevo, ""
+
+    def _rellenar(self, rel: str, lenguaje: str, especificacion: str, texto: str, informe: InformeEscritor,
+                  escribir_archivo: Callable[[str, str], None]) -> str:
+        pendientes = simbolos_pendientes(texto, rel)
+        if not pendientes:
+            return texto
+        # Grupos chicos: hasta 3 funciones cortas seguidas del mismo padre por llamada.
+        grupos: list[list[Simbolo]] = []
+        for s in pendientes:
+            if grupos and len(grupos[-1]) < 3 and grupos[-1][-1].padre == s.padre and s.lineas <= 12 \
+                    and grupos[-1][-1].lineas <= 12:
+                grupos[-1].append(s)
+            else:
+                grupos.append([s])
+        total = len(pendientes)
+        hechos = 0
+        paralelo = max(1, min(self.settings.paralelo, 4))
+        errores: dict[str, str] = {}
+
+        def generar(grupo: list[Simbolo], texto_base: str) -> tuple[list[Simbolo], dict[str, str]]:
+            if CANCELAR.is_set():
+                raise Cancelado()
+            try:
+                return grupo, self._pedir_relleno(rel, lenguaje, especificacion, texto_base, grupo,
+                                                  "\n".join(errores.get(s.nombre_completo, "") for s in grupo).strip())
+            except LLMError as e:
+                if e.presupuesto:
+                    raise
+                return grupo, {}
+
+        for ronda in range(3):
+            if not grupos:
+                break
+            fallidos: list[Simbolo] = []
+            base = texto
+            with ThreadPoolExecutor(max_workers=paralelo) as ejecutor:
+                futuros = [ejecutor.submit(generar, g, base) for g in grupos]
+                for futuro in as_completed(futuros):
+                    grupo, definiciones = futuro.result()
+                    with self._lock:
+                        for s in grupo:
+                            definicion = definiciones.get(s.nombre_completo)
+                            if not definicion:
+                                errores[s.nombre_completo] = "No devolviste la definición completa de esta función."
+                                fallidos.append(s)
+                                continue
+                            nuevo, error = self._aplicar(rel, lenguaje, texto, s.nombre_completo, definicion)
+                            if error:
+                                errores[s.nombre_completo] = error
+                                fallidos.append(s)
+                                continue
+                            texto = nuevo
+                            hechos += 1
+                            escribir_archivo(rel, texto)
+                            self.ui.linea(f"      {Tema.ok}✓{C.RESET} {Tema.tenue}{s.nombre_completo} "
+                                          f"({hechos}/{total}){C.RESET}")
+            if not fallidos:
+                break
+            self.ui.tenue(f"  [{self.etiqueta}] ronda {ronda + 2}: reintento {len(fallidos)} función(es) con el error real")
+            grupos = [[s] for s in fallidos]
+        return texto
+
+
+@herramienta(
+    "write_large_file",
+    "Escribe un archivo LARGO (Python o JS/TS, cientos o miles de líneas) sin cortarse: REAPER genera primero "
+    "un esqueleto con todas las firmas y después implementa cada función por separado, validando cada una. "
+    "Usalo para archivos nuevos de más de ~250 líneas. Describí en spec TODO lo que el archivo debe hacer.",
+    [Param("path", "archivo a crear"), Param("spec", "especificación completa: responsabilidades, clases, "
+                                                     "funciones, datos, casos borde", largo=True)],
+    "<write_large_file>\n<path>juego/motor.py</path>\n<spec>\nMotor de un juego de serpiente en terminal: clase "
+    "Tablero (ancho, alto, celdas), clase Serpiente (mover, crecer, choca), clase Juego (tick, puntaje, "
+    "guardar_record en records.json)...\n</spec>\n</write_large_file>",
+    escribe=True,
+)
+def write_large_file(ctx: Contexto, p: dict) -> str:
+    if ctx.llm is None:
+        raise ErrorHerramienta("El escritor largo no está disponible en este contexto.")
+    try:
+        ruta = ctx.ws.ruta(p["path"], escribir=True)
+    except ErrorRuta as e:
+        raise ErrorHerramienta(str(e))
+    rel = ctx.ws.rel(ruta)
+    if rel in ctx.protegidos:
+        raise ErrorHerramienta(f"{rel} es parte de la especificación y no se puede modificar.")
+    if ctx.permitidos and not any(fnmatch.fnmatch(rel, patron) for patron in ctx.permitidos):
+        raise ErrorHerramienta(f"En este rol no podés escribir {rel}.")
+    especificacion = p.get("spec") or ""
+    if len(especificacion.strip()) < 30:
+        raise ErrorHerramienta("La spec es demasiado corta: describí clases, funciones y comportamiento esperado.")
+    antes = ruta.read_text(encoding="utf-8", errors="replace") if ruta.is_file() else None
+    if antes and not simbolos_pendientes(antes, rel) and antes.count("\n") > 30:
+        raise ErrorHerramienta(f"{rel} ya existe con contenido: para cambiarlo usá replace_symbol / replace_in_file.")
+    if ctx.settings.modo == "confirmar" and not ctx.ui.confirmar(f"  ¿{ctx.etiqueta} puede generar {rel} (archivo largo)?"):
+        raise ErrorHerramienta("El usuario no aprobó generar el archivo.")
+    escritor = EscritorLargo(ctx.llm, ctx.ws, ctx.settings, ctx.ui, etiqueta=f"{ctx.etiqueta}/escritor")
+
+    def escribir(rel_: str, contenido: str) -> None:
+        ctx.ws.escribir(rel_, contenido)
+        indice_de(ctx.ws).invalidar(rel_)
+
+    try:
+        informe = escritor.escribir(rel, especificacion, contexto=ctx.ws.memoria(1500), escribir_archivo=escribir)
+    except ErrorEscritor as e:
+        raise ErrorHerramienta(str(e))
+    ctx.cambios.add(rel)
+    texto = informe.texto()
+    resultados = validar_archivo(ctx.ws, rel)
+    if fallos(resultados):
+        texto += "\nVALIDACIÓN FALLÓ (corregilo antes de seguir):\n" + resumen_validacion(resultados)
+    else:
+        texto += "\nValidación: " + resumen_validacion(resultados)
+    return texto
+
+
+# ======================================================================
+# MÓDULO: tournament
+# ======================================================================
+"""
+Torneo de implementadores: varios intentos compiten y gana el que pasa más tests reales.
+
+Un modelo de 24B es irregular: el mismo pedido sale bien una vez y mal la
+siguiente. En vez de confiar en un solo intento, REAPER lanza N
+implementadores EN PARALELO, cada uno en una copia aislada del proyecto y con
+temperatura distinta (0.1 / 0.4 / 0.7 por defecto). Después, en cada copia:
+
+  1. restaura los tests de la especificación y los tests que ya existían
+     (nadie gana debilitando o borrando tests)
+  2. aparta los tests NUEVOS que agregó el candidato (nadie gana inflando el
+     número con tests triviales) y corre la suite
+  3. corre los validadores sobre los archivos que cambió
+
+Gana el que pasa más tests; si empatan: validadores OK, menos tests fallando,
+el agente terminó limpio y menos líneas cambiadas. Solo el cambio ganador se
+aplica al proyecto real (con checkpoint, así /deshacer sigue funcionando).
+"""
+
+
+@dataclass
+class Candidato:
+    indice: int
+    temperatura: float
+    copia: Optional[Copia] = None
+    resultado: Optional[ResultadoAgente] = None
+    cambios: list = field(default_factory=list)
+    validaciones: list = field(default_factory=list)
+    tests: Optional[Resultado] = None
+    conteo: ConteoTests = field(default_factory=ConteoTests)
+    lineas: int = 0
+    error: str = ""
+    segundos: float = 0.0
+
+    @property
+    def validaciones_ok(self) -> bool:
+        return not fallos(self.validaciones)
+
+    def clave(self) -> tuple:
+        """Menor es mejor (se usa con sorted)."""
+        agente_ok = bool(self.resultado and self.resultado.ok)
+        return (
+            bool(self.error),                       # los que explotaron, al final
+            -self.conteo.pasados,                   # más tests pasando
+            0 if self.validaciones_ok else 1,       # validadores OK
+            self.conteo.fallados + self.conteo.errores,
+            0 if self.cambios else 1,               # hizo algo
+            0 if agente_ok else 1,
+            self.lineas,                            # menos líneas cambiadas
+            self.temperatura,
+        )
+
+    def fila(self) -> list:
+        estado = "error" if self.error else ("✓" if self.resultado and self.resultado.ok else "✗")
+        tests = self.conteo.texto() if self.conteo.reconocido else ("sin suite" if self.tests is None else
+                                                                    ("OK" if self.tests.ok else "falló"))
+        return [f"#{self.indice + 1}", f"{self.temperatura:.1f}", estado, tests,
+                "OK" if self.validaciones_ok else f"{len(fallos(self.validaciones))} fallos",
+                str(len(self.cambios)), str(self.lineas), formatear_duracion(self.segundos)]
+
+
+@dataclass
+class ResultadoTorneo:
+    ganador: Optional[Candidato]
+    candidatos: list
+    aplicados: list = field(default_factory=list)
+    todos_pasan: bool = False
+    modo: str = "torneo"  # torneo | simple
+    notas: list = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        return self.ganador is not None and not self.ganador.error and self.ganador.validaciones_ok \
+            and bool(self.aplicados or self.ganador.cambios)
+
+    def informe(self) -> str:
+        if not self.ganador:
+            return "Ningún candidato produjo un resultado utilizable."
+        g = self.ganador
+        partes = [f"Ganó el candidato #{g.indice + 1} (temperatura {g.temperatura:.1f}): "
+                  f"{g.conteo.texto() if g.conteo.reconocido else 'sin conteo de tests'}; "
+                  f"validadores {'OK' if g.validaciones_ok else 'con fallos'}; {len(g.cambios)} archivo(s), "
+                  f"{g.lineas} líneas cambiadas."]
+        if g.resultado:
+            partes.append("Informe del ganador:\n" + recortar(g.resultado.resumen, 2500))
+        partes.extend(self.notas)
+        return "\n".join(partes)
+
+
+def _archivos_de_tests(ws: Workspace) -> list[str]:
+    return [r for r in ws.archivos_codigo(limite=2000)
+            if any(fnmatch.fnmatch(r, p) for p in PATRONES_TESTS)]
+
+
+class Torneo:
+    def __init__(self, llm, ws: Workspace, settings: Settings, ui: UI, *,
+                 memoria: Optional[MemoriaLecciones] = None,
+                 on_atascado: Optional[Callable[[str], Optional[str]]] = None):
+        self.llm = llm
+        self.ws = ws
+        self.settings = settings
+        self.ui = ui
+        self.memoria = memoria
+        self.on_atascado = on_atascado
+
+    # ------------------------------------------------------------ evaluación
+    def _evaluar(self, cand: Candidato, protegidos: dict[str, Optional[str]], existentes: dict[str, Optional[str]]) -> None:
+        copia = cand.copia
+        assert copia is not None and copia.ws is not None
+        # 1) restaurar especificación y tests previos
+        copia.forzar_contenidos({**existentes, **protegidos})
+        cambios = copia.cambios()
+        # 2) apartar tests nuevos del candidato mientras se puntúa
+        nuevos_tests = {c.rel: c.despues for c in cambios
+                        if c.tipo == "nuevo" and c.rel not in protegidos
+                        and any(fnmatch.fnmatch(c.rel, p) for p in PATRONES_TESTS)}
+        if nuevos_tests:
+            copia.forzar_contenidos({rel: None for rel in nuevos_tests})
+        try:
+            cand.tests = ejecutar_tests(copia.ws, timeout=self.settings.tests_timeout, completo=True)
+            cand.conteo = conteo_de_resultado(cand.tests)
+        finally:
+            if nuevos_tests:
+                copia.forzar_contenidos(nuevos_tests)
+        cand.cambios = [c for c in copia.cambios() if c.rel not in protegidos]
+        rels = [c.rel for c in cand.cambios if c.tipo != "borrado"]
+        cand.validaciones = validar_archivos(copia.ws, rels)
+        cand.lineas = sum(c.lineas_cambiadas() for c in cand.cambios)
+
+    def _correr_candidato(self, cand: Candidato, tarea: str, archivos: str, rol: str,
+                          protegidos: dict[str, Optional[str]], existentes: dict[str, Optional[str]],
+                          progreso: bool) -> Candidato:
+        inicio = time.monotonic()
+        assert cand.copia is not None and cand.copia.ws is not None
+        etiqueta = f"impl{cand.indice + 1}·t{cand.temperatura:.1f}"
+        agente = Agente(rol, self.llm, cand.copia.ws, self.settings, self.ui, profundidad=1,
+                        etiqueta=etiqueta, mostrar_progreso=progreso, temperatura=cand.temperatura,
+                        memoria=self.memoria, protegidos=set(protegidos), on_atascado=self.on_atascado)
+        texto = tarea + (f"\n\nArchivos relevantes: {archivos}" if archivos else "") + SUFIJO_SUBTAREA
+        try:
+            cand.resultado = agente.ejecutar(texto, cid_inicio=cand.copia.ws.checkpoints.iniciar("candidato"))
+        except (Cancelado, KeyboardInterrupt):
+            raise
+        except LLMError as e:
+            cand.error = f"modelo: {e}"
+        except Exception as e:  # un candidato roto no tumba el torneo
+            cand.error = f"{type(e).__name__}: {e}"
+        try:
+            self._evaluar(cand, protegidos, existentes)
+        except (OSError, ErrorSandbox) as e:
+            cand.error = cand.error or f"evaluación: {e}"
+        cand.segundos = time.monotonic() - inicio
+        estado = "✗ error" if cand.error else f"{cand.conteo.texto() if cand.conteo.reconocido else 'listo'}"
+        self.ui.agente(etiqueta, f"terminó · {estado} · {len(cand.cambios)} archivo(s)")
+        return cand
+
+    # ------------------------------------------------------------ API
+    def correr(self, tarea: str, *, archivos: str = "", titulo: str = "", rol: str = "implementador",
+               n: Optional[int] = None, protegidos: Optional[dict[str, Optional[str]]] = None,
+               cid: Optional[int] = None) -> ResultadoTorneo:
+        n = max(1, n or self.settings.candidatos)
+        protegidos = dict(protegidos or {})
+        # Los tests que ya existían se restauran antes de puntuar, salvo los que la tarea pide tocar.
+        pedidos = {a.strip() for a in re.split(r"[,;\s]+", archivos or "") if a.strip()}
+        existentes = copiar_contenidos(self.ws, [r for r in _archivos_de_tests(self.ws) if r not in pedidos])
+        if n == 1:
+            return self._simple(tarea, archivos, titulo, rol, protegidos, cid)
+
+        candidatos = [Candidato(i, self.settings.temperatura_candidato(i)) for i in range(n)]
+        try:
+            for cand in candidatos:
+                cand.copia = Copia(self.ws, f"cand{cand.indice + 1}").crear()
+        except ErrorSandbox as e:
+            for cand in candidatos:
+                if cand.copia:
+                    cand.copia.limpiar()
+            self.ui.aviso(f"  Torneo desactivado: {e}")
+            res = self._simple(tarea, archivos, titulo, rol, protegidos, cid)
+            res.notas.append(f"Sin torneo: {e}")
+            return res
+
+        try:
+            paralelo = max(1, min(self.settings.paralelo_torneo, n))
+            temps = ", ".join(f"{c.temperatura:.1f}" for c in candidatos)
+            self.ui.tenue(f"  ⚔ torneo: {n} implementadores en copias aisladas (temperaturas {temps}; "
+                          f"{paralelo} a la vez)" + (f" · {titulo}" if titulo else ""))
+            if paralelo == 1:
+                for cand in candidatos:
+                    self._correr_candidato(cand, tarea, archivos, rol, protegidos, existentes, True)
+            else:
+                with ThreadPoolExecutor(max_workers=paralelo) as ejecutor:
+                    futuros = [ejecutor.submit(self._correr_candidato, cand, tarea, archivos, rol, protegidos,
+                                               existentes, False) for cand in candidatos]
+                    try:
+                        for f in futuros:
+                            f.result()
+                    except (KeyboardInterrupt, Cancelado):
+                        CANCELAR.set()
+                        raise
+            return self._decidir(candidatos, cid, protegidos)
+        finally:
+            for cand in candidatos:
+                if cand.copia:
+                    cand.copia.limpiar()
+
+    def _decidir(self, candidatos: list[Candidato], cid: Optional[int],
+                 protegidos: dict[str, Optional[str]]) -> ResultadoTorneo:
+        ordenados = sorted(candidatos, key=lambda c: c.clave())
+        self.ui.tabla([c.fila() for c in sorted(candidatos, key=lambda c: c.indice)],
+                      ["cand", "temp", "agente", "tests", "validación", "archivos", "líneas", "tiempo"], "llllllrr")
+        ganador = next((c for c in ordenados if not c.error and c.cambios), None)
+        resultado = ResultadoTorneo(ganador, candidatos)
+        if ganador is None:
+            resultado.notas.append("Ningún candidato cambió archivos sin errores.")
+            self.ui.error("Ningún candidato produjo cambios utilizables.")
+            return resultado
+        if cid is not None:
+            self.ws.checkpoints.actual = cid
+        assert ganador.copia is not None
+        resultado.aplicados = ganador.copia.aplicar_a(self.ws, ganador.cambios, excluir=protegidos.keys())
+        resultado.todos_pasan = ganador.conteo.ok and ganador.conteo.reconocido and ganador.conteo.pasados > 0
+        indice_de(self.ws).invalidar()
+        self.ui.ok(f"Ganó el candidato #{ganador.indice + 1} (t={ganador.temperatura:.1f}): "
+                   f"{len(resultado.aplicados)} archivo(s) aplicados al proyecto")
+        return resultado
+
+    def _simple(self, tarea: str, archivos: str, titulo: str, rol: str,
+                protegidos: dict[str, Optional[str]], cid: Optional[int]) -> ResultadoTorneo:
+        """Un solo intento en el workspace real (sin copias)."""
+        inicio = time.monotonic()
+        res = ejecutar_subagentes(
+            [(rol, tarea, archivos, titulo, {"memoria": self.memoria, "protegidos": set(protegidos),
+                                             "on_atascado": self.on_atascado})],
+            self.llm, self.ws, self.settings, self.ui, profundidad=1, cid_inicio=cid,
+        )[0]
+        cand = Candidato(0, ROLES[rol].temperatura, resultado=res, segundos=time.monotonic() - inicio)
+        if protegidos:
+            # Si el agente igual tocó la especificación (p. ej. con execute_command), se restaura.
+            for rel, contenido in protegidos.items():
+                actual = self.ws.leer(rel) if self.ws.existe(rel) else None
+                if actual != contenido and contenido is not None:
+                    self.ws.escribir(rel, contenido)
+        cand.tests = ejecutar_tests(self.ws, timeout=self.settings.tests_timeout, completo=True)
+        cand.conteo = conteo_de_resultado(cand.tests)
+        cand.validaciones = validar_archivos(self.ws, [r for r in res.cambios if (self.ws.raiz / r).is_file()])
+        cand.cambios = [CambioArchivo(r, "modificado") for r in res.cambios]
+        resultado = ResultadoTorneo(cand, [cand], list(res.cambios), cand.conteo.ok and cand.conteo.reconocido,
+                                    modo="simple")
+        return resultado
+
+
+# ======================================================================
+# MÓDULO: escalation
+# ======================================================================
+"""
+Escalada a un modelo más fuerte cuando Venice se traba.
+
+El modelo de respaldo de v6 solo se usaba si la API fallaba. En v7, si la
+misma tarea falla la verificación real `umbral_escalada` veces (2 por
+defecto), ese paso —y solo ese— se le consulta a un modelo más fuerte
+(deepseek, qwen-coder...). El modelo fuerte NO edita: lee el error real y el
+código y escribe un diagnóstico preciso con el arreglo exacto. Después Venice
+(el reparador) lo aplica. Así se paga el modelo caro solo en los pocos casos
+difíciles y Venice sigue haciendo todo lo demás.
+"""
+
+
+@dataclass
+class Consulta:
+    momento: str
+    modelo: str
+    tarea: str
+    diagnostico: str
+    ok: bool
+    segundos: float
+
+
+class Escalador:
+    def __init__(self, llm, settings: Settings, ui: UI):
+        self.llm = llm
+        self.settings = settings
+        self.ui = ui
+        self.historial: list[Consulta] = []
+        self._lock = threading.Lock()
+
+    @property
+    def modelo(self) -> str:
+        return resolver_modelo(self.settings.modelo_fuerte)
+
+    def disponible(self) -> bool:
+        if not self.settings.escalar or not self.settings.modelo_fuerte.strip():
+            return False
+        return self.modelo != resolver_modelo(self.settings.modelo)
+
+    def diagnosticar(self, ws: Workspace, tarea: str, error: str, archivos: Iterable[str] = (),
+                     intentos: str = "") -> Optional[str]:
+        """Lanza un consultor (solo lectura) con el modelo fuerte. Devuelve su diagnóstico o None."""
+        if not self.disponible():
+            return None
+        archivos = [a for a in archivos if a]
+        texto = (
+            f"TAREA QUE EL OTRO MODELO NO LOGRA RESOLVER:\n{recortar(tarea, 3500)}\n\n"
+            f"ERROR REAL (validadores/tests):\n{recortar(error, 5000)}\n\n"
+        )
+        if archivos:
+            texto += f"Archivos involucrados: {', '.join(archivos[:12])}\n\n"
+        if intentos:
+            texto += f"LO QUE YA SE INTENTÓ (sin éxito):\n{recortar(intentos, 2500)}\n\n"
+        texto += ("Leé el código necesario y escribí el diagnóstico con el arreglo exacto "
+                  "(DIAGNÓSTICO / ARREGLO / VERIFICACIÓN).")
+        self.ui.linea(f"{Tema.acento}⇪ escalada:{C.RESET} {Tema.tenue}consulto a {self.modelo} "
+                      f"(la verificación falló {self.settings.umbral_escalada} veces){C.RESET}")
+        inicio = time.monotonic()
+        agente = Agente("consultor", self.llm, ws, self.settings, self.ui, profundidad=2,
+                        etiqueta="consultor", modelo=self.modelo, temperatura=0.1, mostrar_progreso=True)
+        try:
+            res = agente.ejecutar(texto + SUFIJO_SUBTAREA)
+        except LLMError as e:
+            self.ui.aviso(f"  El modelo fuerte no respondió ({e}); sigo sin escalar.")
+            self._registrar(tarea, f"error: {e}", False, time.monotonic() - inicio)
+            return None
+        diagnostico = (res.resumen or "").strip()
+        if len(diagnostico) < 40 and res.contexto:
+            diagnostico = (res.contexto + "\n" + diagnostico).strip()
+        ok = len(diagnostico) >= 40
+        self._registrar(tarea, diagnostico, ok, time.monotonic() - inicio)
+        if ok:
+            self.ui.ok(f"diagnóstico del experto recibido ({len(diagnostico)} caracteres)")
+            primera = next((l for l in diagnostico.splitlines() if l.strip()), "")
+            self.ui.tenue("  " + recortar(primera, 200))
+            return diagnostico
+        self.ui.aviso("  El modelo fuerte no produjo un diagnóstico útil.")
+        return None
+
+    def _registrar(self, tarea: str, diagnostico: str, ok: bool, segundos: float) -> None:
+        with self._lock:
+            self.historial.append(Consulta(datetime.now().strftime("%H:%M:%S"), self.modelo,
+                                           _titulo(tarea), diagnostico, ok, segundos))
+
+    def gancho(self, ws: Workspace, tarea: str) -> Optional[Callable[[str], Optional[str]]]:
+        """Función para Agente.on_atascado: se llama cuando el agente repite el mismo error."""
+        if not self.disponible():
+            return None
+
+        def consultar(error: str) -> Optional[str]:
+            return self.diagnosticar(ws, tarea, error)
+
+        return consultar
+
+    def resumen(self) -> str:
+        if not self.historial:
+            return "Sin escaladas en esta sesión."
+        lineas = [f"{len(self.historial)} consulta(s) al modelo fuerte:"]
+        for c in self.historial[-10:]:
+            marca = "✓" if c.ok else "✗"
+            lineas.append(f"  {marca} {c.momento} {c.modelo} · {c.tarea} ({formatear_duracion(c.segundos)})")
+        return "\n".join(lineas)
+
+
+def tarea_con_diagnostico(tarea: str, diagnostico: str) -> str:
+    return (f"{tarea}\n\nDIAGNÓSTICO DE UN EXPERTO (un modelo más fuerte analizó el error real; seguilo al pie "
+            f"de la letra y verificá con validate/run_tests):\n{recortar(diagnostico, 6000)}")
+
+
+# ======================================================================
+# MÓDULO: git
+# ======================================================================
+"""
+Integración con git: un commit por cada build verificada, en una rama aparte.
+
+REAPER guarda una foto del proyecto en la rama `reaper/builds` (configurable)
+SIN tocar tu rama actual, tu índice ni tus archivos: usa un índice temporal y
+los comandos de bajo nivel de git (read-tree, add, write-tree, commit-tree,
+update-ref). Así podés ver el historial de lo que hizo REAPER, comparar o
+recuperar cualquier build con:
+
+    git log reaper/builds
+    git diff reaper/builds~1 reaper/builds
+    git checkout reaper/builds -- archivo.py
+"""
+
+
+def es_repo_git(ws: Workspace) -> bool:
+    return (ws.raiz / ".git").exists() and shutil.which("git") is not None
+
+
+def git(ws: Workspace, *args: str, env: Optional[dict] = None, timeout: int = 60,
+        entrada: Optional[str] = None) -> Resultado:
+    entorno = entorno_seguro()
+    entorno.setdefault("GIT_TERMINAL_PROMPT", "0")
+    if env:
+        entorno.update(env)
+    try:
+        proceso = subprocess.run(
+            ["git", *args], cwd=str(ws.raiz), capture_output=True, text=True, encoding="utf-8",
+            errors="replace", timeout=timeout, env=entorno, input=entrada,
+        )
+    except FileNotFoundError:
+        return Resultado(False, "git " + " ".join(args), 127, stderr="git no está instalado (pkg install git)")
+    except subprocess.TimeoutExpired:
+        return Resultado(False, "git " + " ".join(args), 124, stderr="git tardó demasiado", timeout=True)
+    return Resultado(proceso.returncode == 0, "git " + " ".join(args), proceso.returncode,
+                     proceso.stdout, proceso.stderr)
+
+
+def _identidad(ws: Workspace) -> dict:
+    """Si el repo no tiene user.name/email, se firma como REAPER (solo para estos commits)."""
+    env = {}
+    nombre = git(ws, "config", "user.name").stdout.strip()
+    correo = git(ws, "config", "user.email").stdout.strip()
+    if not nombre:
+        env["GIT_AUTHOR_NAME"] = env["GIT_COMMITTER_NAME"] = "REAPER"
+    if not correo:
+        env["GIT_AUTHOR_EMAIL"] = env["GIT_COMMITTER_EMAIL"] = "reaper@localhost"
+    return env
+
+
+def snapshot_build(ws: Workspace, rama: str = "reaper/builds", mensaje: str = "build REAPER") -> Optional[str]:
+    """
+    Guarda el estado actual del working tree (respetando .gitignore) como un
+    commit nuevo en 'rama'. Devuelve el hash del commit o None si no hubo
+    cambios desde la foto anterior. Lanza RuntimeError si git falla.
+    """
+    if not es_repo_git(ws):
+        raise RuntimeError("El proyecto no es un repositorio git.")
+    if not re.fullmatch(r"[\w./-]+", rama) or ".." in rama:
+        raise RuntimeError(f"Nombre de rama inválido: {rama}")
+    git_dir = git(ws, "rev-parse", "--git-dir")
+    if not git_dir.ok:
+        raise RuntimeError(git_dir.stderr.strip() or "git rev-parse falló")
+    carpeta_git = Path(git_dir.stdout.strip())
+    if not carpeta_git.is_absolute():
+        carpeta_git = ws.raiz / carpeta_git
+    indice = carpeta_git / "reaper_index_tmp"
+    env = {"GIT_INDEX_FILE": str(indice), **_identidad(ws)}
+    try:
+        base = git(ws, "rev-parse", "--verify", "-q", f"refs/heads/{rama}")
+        padre = base.stdout.strip() if base.ok else ""
+        if not padre:
+            head = git(ws, "rev-parse", "--verify", "-q", "HEAD")
+            padre = head.stdout.strip() if head.ok else ""
+        r = git(ws, "read-tree", padre, env=env) if padre else git(ws, "read-tree", "--empty", env=env)
+        if not r.ok:
+            raise RuntimeError(r.stderr.strip())
+        r = git(ws, "add", "-A", env=env, timeout=180)
+        if not r.ok:
+            raise RuntimeError(r.stderr.strip())
+        arbol = git(ws, "write-tree", env=env)
+        if not arbol.ok:
+            raise RuntimeError(arbol.stderr.strip())
+        arbol_id = arbol.stdout.strip()
+        if padre:
+            arbol_padre = git(ws, "rev-parse", f"{padre}^{{tree}}").stdout.strip()
+            if arbol_padre == arbol_id and base.ok:
+                return None
+        args = ["commit-tree", arbol_id, "-m", mensaje[:2000]]
+        if padre:
+            args[2:2] = ["-p", padre]
+        commit = git(ws, *args, env=env)
+        if not commit.ok:
+            raise RuntimeError(commit.stderr.strip())
+        commit_id = commit.stdout.strip()
+        actualizar = ["update-ref", f"refs/heads/{rama}", commit_id] + ([base.stdout.strip()] if base.ok else [])
+        r = git(ws, *actualizar)
+        if not r.ok:
+            raise RuntimeError(r.stderr.strip())
+        return commit_id
+    finally:
+        try:
+            indice.unlink()
+        except OSError:
+            pass
+
+
+def log_rama(ws: Workspace, rama: str = "reaper/builds", n: int = 15) -> str:
+    r = git(ws, "log", f"-{n}", "--date=format:%Y-%m-%d %H:%M", "--pretty=format:%h  %ad  %s", rama, "--")
+    if not r.ok:
+        return "Todavía no hay builds guardadas en git." if "unknown revision" in r.stderr else r.stderr.strip()
+    return r.stdout.strip() or "Sin commits."
+
+
+def diff_desde_snapshot(ws: Workspace, rama: str = "reaper/builds") -> str:
+    """Diferencias entre la última build guardada y el working tree actual."""
+    r = git(ws, "diff", rama, "--", ".")
+    return r.stdout if r.ok else r.stderr
+
+
+def estado_git(ws: Workspace) -> str:
+    rama = git(ws, "rev-parse", "--abbrev-ref", "HEAD")
+    estado = git(ws, "status", "--short")
+    if not estado.ok:
+        return estado.stderr.strip()
+    lineas = estado.stdout.strip().splitlines()
+    return (f"rama: {rama.stdout.strip() or '?'} · {len(lineas)} archivo(s) con cambios\n"
+            + "\n".join(lineas[:30]))
+
+
+def inicializar_repo(ws: Workspace) -> Resultado:
+    r = git(ws, "init")
+    if r.ok and not (ws.raiz / ".gitignore").exists():
+        try:
+            escritura_atomica(ws.raiz / ".gitignore", "__pycache__/\n*.pyc\n.venv/\nnode_modules/\n.reaper/sandboxes/\n")
+        except OSError:
+            pass
+    return r
+
+
+# ======================================================================
+# MÓDULO: pipeline
+# ======================================================================
+"""
+Pipeline /construir v7: tests primero + torneo + escalada + lecciones.
+
+    PEDIDO
+      ↓
+    Exploradores (en paralelo, solo lectura) → informe del código real
+      ↓
+    Arquitecto → plan con INTERFAZ (firmas exactas), tareas y criterios
+      ↓
+    confirmación del usuario (puede pedir cambios al plan)
+      ↓
+    Especificador (QA ANTES de implementar) → tests que todavía fallan:
+      la especificación ejecutable. Quedan protegidos durante la build.
+      ↓
+    por cada tarea:
+      ⚔ TORNEO: N implementadores en copias aisladas (temperaturas distintas)
+         → se corren los tests en cada copia → gana el que pasa más tests
+         → solo el cambio ganador se aplica al proyecto real
+      → verificación de la tarea (validadores + que no se rompa nada que andaba)
+      → si falla: reparador con el error real; si vuelve a fallar → ⇪ ESCALADA:
+        un modelo más fuerte diagnostica y el reparador aplica
+      → revisor (opcional) sobre el diff real
+      ↓
+    verificación final: validadores + suite completa
+      ↓ ¿falló?
+    Reparador (diagnóstico real) → re-verificar (con escalada si se repite)
+      ↓
+    Lecciones: cada reparación que funcionó deja una lección de una línea
+      ↓
+    BUILD VERIFICADA → snapshot en la rama git reaper/builds
+"""
+
+_RE_TAREA = re.compile(r"<\s*(tarea|task)\b([^>]*)>(.*?)<\s*/\s*\1\s*>", re.S | re.I)
+_RE_ATTR = re.compile(r"(\w+)\s*=\s*[\"']([^\"']*)[\"']")
+_RE_OBJETIVO = re.compile(r"<\s*objetivo\s*>(.*?)<\s*/\s*objetivo\s*>", re.S | re.I)
+_RE_CRITERIOS = re.compile(r"<\s*criterios\s*>(.*?)<\s*/\s*criterios\s*>", re.S | re.I)
+_RE_INTERFAZ = re.compile(r"<\s*interfaz\s*>(.*?)<\s*/\s*interfaz\s*>", re.S | re.I)
+_RE_VEREDICTO = re.compile(r"VEREDICTO\s*:?\s*\**\s*(APROBADO|CAMBIOS|RECHAZADO)", re.I)
+
+EXTENSIONES_TESTEABLES = (".py", ".js", ".mjs", ".cjs", ".ts")
+
+
+@dataclass
+class Tarea:
+    id: str
+    descripcion: str
+    archivos: list = field(default_factory=list)
+
+
+@dataclass
+class Plan:
+    objetivo: str
+    tareas: list
+    criterios: list
+    texto: str = ""
+    interfaz: str = ""
+
+    def como_texto(self, actual: Optional[int] = None, hechas: int = 0) -> str:
+        lineas = [f"Objetivo: {self.objetivo}"]
+        if self.interfaz:
+            lineas.append("Interfaz:")
+            lineas.extend(f"  {l.strip()}" for l in self.interfaz.strip().splitlines() if l.strip())
+        for i, t in enumerate(self.tareas):
+            marca = "✓" if i < hechas else ("▸" if i == actual else " ")
+            archivos = f" [{', '.join(t.archivos)}]" if t.archivos else ""
+            lineas.append(f"[{marca}] {t.id}. {recortar(t.descripcion, 400)}{archivos}")
+        if self.criterios:
+            lineas.append("Criterios de aceptación:")
+            lineas.extend(f"- {c}" for c in self.criterios)
+        return "\n".join(lineas)
+
+    def archivos(self) -> list[str]:
+        vistos: dict[str, None] = {}
+        for t in self.tareas:
+            for a in t.archivos:
+                vistos.setdefault(a, None)
+        for m in re.finditer(r"([\w./-]+\.(?:py|js|mjs|cjs|ts|tsx|html|css|sh|go|rs))", self.interfaz):
+            vistos.setdefault(m.group(1), None)
+        return list(vistos)
+
+
+def parsear_plan(texto: str, pedido: str, max_tareas: int = 8) -> Plan:
+    texto = texto or ""
+    m = _RE_OBJETIVO.search(texto)
+    objetivo = m.group(1).strip() if m else recortar(pedido.strip().splitlines()[0] if pedido.strip() else "", 200)
+
+    tareas: list[Tarea] = []
+    for m in _RE_TAREA.finditer(texto):
+        attrs = {k.lower(): v for k, v in _RE_ATTR.findall(m.group(2))}
+        lista = attrs.get("archivos") or attrs.get("files") or ""
+        archivos = [a.strip() for a in re.split(r"[,;\s]+", lista) if a.strip()]
+        descripcion = m.group(3).strip()
+        if descripcion:
+            tareas.append(Tarea(attrs.get("id") or str(len(tareas) + 1), descripcion, archivos))
+
+    if not tareas:
+        sin_criterios = _RE_INTERFAZ.sub("", _RE_CRITERIOS.sub("", texto))
+        for linea in sin_criterios.splitlines():
+            m = re.match(r"^\s*(?:tarea\s*)?(\d+)[.):-]\s+(.{8,})$", linea, re.I)
+            if m:
+                tareas.append(Tarea(m.group(1), m.group(2).strip(), []))
+    if not tareas:
+        tareas = [Tarea("1", pedido.strip(), [])]
+
+    if len(tareas) > max_tareas:
+        sobrantes = tareas[max_tareas - 1:]
+        tareas = tareas[: max_tareas - 1] + [Tarea(
+            sobrantes[0].id,
+            "\n".join(f"- {t.descripcion}" for t in sobrantes),
+            sorted({a for t in sobrantes for a in t.archivos}),
+        )]
+
+    criterios = []
+    m = _RE_CRITERIOS.search(texto)
+    if m:
+        for linea in m.group(1).splitlines():
+            linea = re.sub(r"^\s*([-*•]|\d+[.)])\s*", "", linea).strip()
+            if linea:
+                criterios.append(linea)
+    m = _RE_INTERFAZ.search(texto)
+    interfaz = m.group(1).strip() if m else ""
+    return Plan(objetivo, tareas, criterios, texto, interfaz)
+
+
+def veredicto(informe: str) -> tuple[bool, bool]:
+    """(aprobado, claro). Si el revisor no respeta el formato se aprueba para no entrar en bucles."""
+    m = _RE_VEREDICTO.search(informe or "")
+    if not m:
+        return True, False
+    return m.group(1).upper() == "APROBADO", True
+
+
+@dataclass
+class Verificacion:
+    ok: bool
+    validaciones: list
+    tests: Optional[Resultado]
+    diagnostico: str
+    archivos: list
+    conteo: ConteoTests = field(default_factory=ConteoTests)
+
+
+@dataclass
+class InformeBuild:
+    estado: str
+    plan: Optional[Plan] = None
+    archivos: list = field(default_factory=list)
+    tests: Optional[Resultado] = None
+    diagnostico: str = ""
+    cid: Optional[int] = None
+    ruta_informe: Optional[Path] = None
+    notas: list = field(default_factory=list)
+    lecciones: list = field(default_factory=list)
+    escaladas: int = 0
+    torneos: list = field(default_factory=list)
+    commit: Optional[str] = None
+    spec_tests: list = field(default_factory=list)
+    segundos: float = 0.0
+
+    @property
+    def ok(self) -> bool:
+        return self.estado in ("verificada", "validada")
+
+
+def _diffstat(diff: str) -> str:
+    stats: dict[str, list[int]] = {}
+    actual = None
+    for linea in diff.splitlines():
+        if linea.startswith("+++ b/"):
+            actual = linea[6:]
+            stats.setdefault(actual, [0, 0])
+        elif actual and linea.startswith("+") and not linea.startswith("+++"):
+            stats[actual][0] += 1
+        elif actual and linea.startswith("-") and not linea.startswith("---"):
+            stats[actual][1] += 1
+    return "\n".join(f"  {a}  +{m} -{n}" for a, (m, n) in stats.items())
+
+
+def _es_test(rel: str) -> bool:
+    return any(fnmatch.fnmatch(rel, p) for p in PATRONES_TESTS)
+
+
+class Orquestador:
+    def __init__(self, llm, ws: Workspace, settings: Settings, ui: UI):
+        self.llm = llm
+        self.ws = ws
+        self.settings = settings
+        self.ui = ui
+        self.memoria = MemoriaLecciones(ws) if settings.lecciones else None
+        self.escalador = Escalador(llm, settings, ui)
+        self._protegidos: dict[str, Optional[str]] = {}
+
+    def _sub(self, rol: str, tarea: str, cid: Optional[int], archivos: str = "", titulo: str = "",
+             **opciones) -> ResultadoAgente:
+        opciones.setdefault("memoria", self.memoria)
+        return ejecutar_subagentes(
+            [(rol, tarea, archivos, titulo, opciones)], self.llm, self.ws, self.settings, self.ui,
+            profundidad=1, cid_inicio=cid,
+        )[0]
+
+    # ------------------------------------------------------------ fases
+    def explorar(self, pedido: str) -> str:
+        archivos = self.ws.archivos_codigo(limite=500)
+        if not archivos:
+            return "El workspace está vacío: hay que crear todo desde cero."
+        mapa = mapa_relevante(self.ws, pedido, self.settings.max_relevantes) if self.settings.mapa_relevantes else ""
+        if len(archivos) <= 6:
+            # Proyecto chico: un mapa directo sale gratis y no gasta llamadas al modelo.
+            partes = ["Proyecto chico; mapa completo:"]
+            for rel in archivos:
+                simbolos = outline(self.ws.raiz / rel)
+                partes.append(rel + ("\n" + "\n".join("  " + s for s in simbolos[:30]) if simbolos else ""))
+            return "\n".join(partes)
+
+        specs = [(
+            "explorador",
+            f"PEDIDO DEL USUARIO:\n{pedido}\n\nInvestigá qué partes del código tocan este pedido: archivos, "
+            "funciones y clases involucradas, cómo se conectan y qué convenciones hay que respetar.",
+            "",
+            "código relacionado con el pedido",
+            {"memoria": self.memoria},
+        )]
+        if len(archivos) > 15 and self.settings.paralelo > 1:
+            specs.append((
+                "explorador",
+                f"PEDIDO DEL USUARIO:\n{pedido}\n\nNO analices la lógica del pedido. Investigá cómo se ejecuta y "
+                "cómo se prueba este proyecto: puntos de entrada, dependencias, tests existentes y su comando, "
+                "estructura de carpetas y configuración.",
+                "",
+                "cómo se ejecuta y se prueba el proyecto",
+                {"memoria": self.memoria},
+            ))
+        resultados = ejecutar_subagentes(specs, self.llm, self.ws, self.settings, self.ui, profundidad=1)
+        informe = "\n\n".join(
+            f"### Informe explorador {i}\n{r.resumen}" for i, r in enumerate(resultados, start=1)
+        )
+        return (mapa + "\n\n" + informe) if mapa else informe
+
+    def planificar(self, pedido: str, exploracion: str, feedback: str = "", anterior: Optional[Plan] = None) -> Plan:
+        detectado = detectar_comando_tests(self.ws)
+        tarea = (
+            f"PEDIDO DEL USUARIO:\n{pedido}\n\n"
+            f"INFORME DE EXPLORACIÓN (código real):\n{recortar(exploracion, 7000)}\n\n"
+            f"Comando de tests detectado: {detectado[0] if detectado else 'ninguno (habrá que crear tests)'}\n"
+            f"Armá el plan con un máximo de {self.settings.max_tareas} tareas."
+        )
+        if self.settings.tests_primero:
+            tarea += ("\nLos tests se escriben ANTES de implementar a partir de tu <interfaz> y tus <criterios>: "
+                      "que sean precisos (rutas, nombres, firmas, valores esperados).")
+        if anterior and feedback:
+            tarea += (
+                f"\n\nPLAN ANTERIOR:\n{anterior.como_texto()}\n\n"
+                f"EL USUARIO PIDIÓ ESTOS CAMBIOS AL PLAN:\n{feedback}"
+            )
+        res = self._sub("arquitecto", tarea, None, titulo="diseña el plan de tareas")
+        texto = res.resumen
+        if not _RE_TAREA.search(texto) and _RE_TAREA.search(res.contexto):
+            texto = res.contexto + "\n" + texto
+        plan = parsear_plan(texto, pedido, self.settings.max_tareas)
+        if not res.ok:
+            self.ui.aviso("El arquitecto no terminó limpio; uso lo que produjo.")
+        return plan
+
+    def especificar(self, pedido: str, plan: Plan, cid: int) -> dict[str, Optional[str]]:
+        """Tests primero: el especificador escribe la especificación ejecutable. Devuelve {rel: contenido}."""
+        detectado = detectar_comando_tests(self.ws)
+        criterios = "\n".join(f"- {c}" for c in plan.criterios) or "- (derivalos del pedido y la interfaz)"
+        texto = (
+            f"PEDIDO ORIGINAL:\n{pedido}\n\n"
+            f"PLAN:\n{plan.como_texto()}\n\n"
+            f"INTERFAZ QUE TUS TESTS DEBEN USAR:\n{plan.interfaz or '(no hay interfaz explícita: usá las firmas de las tareas)'}\n\n"
+            f"CRITERIOS DE ACEPTACIÓN:\n{criterios}\n\n"
+            f"Comando de tests detectado: {detectado[0] if detectado else 'ninguno todavía (creá la carpeta tests/)'}\n\n"
+            "Escribí los tests de aceptación AHORA, antes de que exista la implementación. Tienen que fallar por "
+            "falta de implementación (ImportError/AttributeError/assert) y pasar cuando el plan esté hecho."
+        )
+        res = self._sub("especificador", texto, cid, titulo="escribe los tests ANTES de implementar")
+        tests = [r for r in res.cambios if _es_test(r) and (self.ws.raiz / r).is_file()]
+        if not tests:
+            self.ui.aviso("  El especificador no dejó archivos de test: sigo sin especificación ejecutable.")
+            return {}
+        validacion = validar_archivos(self.ws, tests)
+        rotos = [r for r in fallos(validacion) if r.comando.startswith(("py_compile", "node --check"))]
+        if rotos:
+            self.ui.aviso("  Los tests de la especificación tienen errores de sintaxis: le pido al especificador que los arregle.")
+            self._sub("especificador", "Los tests que escribiste no compilan:\n" + resumen_validacion(validacion, 2500)
+                      + "\nCorregí SOLO los errores de sintaxis de los tests.", cid, titulo="corrige los tests")
+            if fallos([r for r in validar_archivos(self.ws, tests) if r.comando.startswith(("py_compile", "node --check"))]):
+                self.ui.aviso("  Siguen sin compilar: descarto la especificación para no bloquear la build.")
+                return {}
+        r = ejecutar_tests(self.ws, timeout=self.settings.tests_timeout, completo=True)
+        conteo = conteo_de_resultado(r)
+        if r is not None and conteo.reconocido:
+            if conteo.ok and conteo.pasados:
+                self.ui.aviso(f"  Ojo: la especificación ya pasa entera ({conteo.texto()}); quizá la función ya existía.")
+            else:
+                self.ui.ok(f"especificación lista: {len(tests)} archivo(s) de test, {conteo.texto()} (esperado: fallan)")
+        else:
+            self.ui.ok(f"especificación lista: {len(tests)} archivo(s) de test")
+        return copiar_contenidos(self.ws, tests)
+
+    def _texto_tarea(self, pedido: str, plan: Plan, indice: int, exploracion: str,
+                     protegidos: dict[str, Optional[str]], correcciones: str = "") -> str:
+        tarea = plan.tareas[indice]
+        texto = (
+            f"PEDIDO ORIGINAL DEL USUARIO:\n{pedido}\n\n"
+            f"PLAN GENERAL:\n{plan.como_texto(actual=indice, hechas=indice)}\n\n"
+            f"TU TAREA AHORA (#{tarea.id}):\n{tarea.descripcion}\n\n"
+            f"CONTEXTO DE EXPLORACIÓN:\n{recortar(exploracion, 3500)}\n\n"
+            "Implementá SOLO esta tarea (las demás las hacen otros). Leé antes de editar."
+        )
+        if protegidos:
+            texto += ("\n\nTESTS DE ESPECIFICACIÓN (escritos antes de implementar; NO los modifiques, hacé que pasen "
+                      "los que corresponden a tu tarea): " + ", ".join(protegidos))
+        if correcciones:
+            texto += (
+                "\n\nUN REVISOR YA REVISÓ TU TRABAJO EN ESTA TAREA Y PIDIÓ CAMBIOS. Aplicalos (si alguno es "
+                f"incorrecto, explicá por qué en el informe):\n{recortar(correcciones, 4000)}"
+            )
+        return texto
+
+    def implementar(self, pedido: str, plan: Plan, indice: int, exploracion: str,
+                    cid: int, correcciones: str = "", protegidos: Optional[dict] = None) -> ResultadoTorneo:
+        protegidos = protegidos or {}
+        tarea = plan.tareas[indice]
+        texto = self._texto_tarea(pedido, plan, indice, exploracion, protegidos, correcciones)
+        titulo = f"tarea {tarea.id}: {recortar(tarea.descripcion.splitlines()[0], 90)}"
+        if correcciones:
+            titulo = f"corrige tarea {tarea.id} según el revisor"
+        usar_torneo = self.settings.torneo and self.settings.candidatos > 1 and not correcciones
+        torneo = Torneo(self.llm, self.ws, self.settings, self.ui, memoria=self.memoria,
+                        on_atascado=self.escalador.gancho(self.ws, texto))
+        return torneo.correr(texto, archivos=", ".join(tarea.archivos), titulo=titulo,
+                             n=self.settings.candidatos if usar_torneo else 1, protegidos=protegidos, cid=cid)
+
+    def revisar(self, pedido: str, tarea: Tarea, diff: str, cid: int) -> tuple[bool, str]:
+        rels = self.ws.checkpoints.archivos_desde(cid)
+        validacion = resumen_validacion(validar_archivos(self.ws, rels), limite=1500)
+        texto = (
+            f"PEDIDO ORIGINAL:\n{pedido}\n\n"
+            f"TAREA REVISADA (#{tarea.id}):\n{tarea.descripcion}\n\n"
+            f"DIFF REAL DE LOS CAMBIOS:\n```diff\n{recortar(diff, 12000)}\n```\n\n"
+            f"Validación automática de los archivos cambiados: {validacion}\n\n"
+            "Leé los archivos completos si necesitás contexto. Empezá tu informe con la línea VEREDICTO."
+        )
+        res = self._sub("revisor", texto, cid, titulo=f"revisa el diff de la tarea {tarea.id}")
+        aprobado, claro = veredicto(res.resumen)
+        if not claro:
+            self.ui.tenue("  (el revisor no usó el formato VEREDICTO: se toma como aprobado)")
+        return aprobado, res.resumen
+
+    def qa(self, pedido: str, plan: Plan, archivos: list, cid: int) -> ResultadoAgente:
+        detectado = detectar_comando_tests(self.ws)
+        criterios = "\n".join(f"- {c}" for c in plan.criterios) or "- (derivalos del pedido)"
+        texto = (
+            f"PEDIDO ORIGINAL:\n{pedido}\n\n"
+            f"CRITERIOS DE ACEPTACIÓN:\n{criterios}\n\n"
+            f"ARCHIVOS CAMBIADOS EN ESTA BUILD: {', '.join(archivos)}\n"
+            f"Comando de tests detectado: {detectado[0] if detectado else 'ninguno todavía'}\n\n"
+            "Escribí (o completá) tests automáticos que verifiquen los criterios y corrélos con run_tests. "
+            "Reportá el resultado REAL."
+        )
+        return self._sub("qa", texto, cid, titulo="escribe y corre tests de aceptación")
+
+    def verificar(self, cid: int) -> Verificacion:
+        archivos = [r for r in self.ws.checkpoints.archivos_desde(cid) if (self.ws.raiz / r).is_file()]
+        validaciones = validar_archivos(self.ws, archivos)
+        tests = ejecutar_tests(self.ws, timeout=self.settings.tests_timeout, completo=True)
+        conteo = conteo_de_resultado(tests)
+        malos = fallos(validaciones)
+        tests_ok = tests is None or tests.ok
+        partes = [r.resumen(2500) for r in malos]
+        if tests is not None and not tests.ok:
+            partes.append("TESTS: " + conteo.texto() + "\n" + fallos_relevantes(f"{tests.stdout}\n{tests.stderr}",
+                                                                                maximo=3, limite=5000))
+        diagnostico = "\n\n".join(partes)
+        if diagnostico and self.settings.pistas_errores:
+            diagnostico = anexar_pistas(diagnostico, 3)
+        return Verificacion(not malos and tests_ok, validaciones, tests, diagnostico, archivos, conteo)
+
+    def reparar(self, pedido: str, verif: Verificacion, cid: int, base_fallaba: bool,
+                diagnostico_experto: str = "", contexto: str = "") -> ResultadoAgente:
+        texto = (
+            f"PEDIDO ORIGINAL:\n{pedido}\n\n"
+            f"Hay fallos REALES. Diagnóstico de validadores/tests:\n{verif.diagnostico}\n\n"
+            f"Archivos cambiados en esta build: {', '.join(verif.archivos)}\n"
+        )
+        if contexto:
+            texto += f"\n{contexto}\n"
+        if base_fallaba:
+            texto += "Ojo: la suite de tests ya fallaba ANTES de esta build; priorizá los fallos causados por los cambios.\n"
+        texto += "Encontrá la causa raíz y corregila. No debilites ni borres tests."
+        if diagnostico_experto:
+            texto = tarea_con_diagnostico(texto, diagnostico_experto)
+        protegidos = set(self._protegidos)
+        return self._sub("reparador", texto, cid, titulo="arregla los fallos reales" + (" (con diagnóstico experto)"
+                                                                                    if diagnostico_experto else ""),
+                         protegidos=protegidos)
+
+    # ------------------------------------------------------------ lecciones
+    def _aprender(self, diagnostico: str, cid: int, informe_reparador: str, build: InformeBuild) -> None:
+        if not self.memoria or not self.settings.lecciones:
+            return
+        diff = self.ws.checkpoints.diff_desde(cid)
+        if not diff.strip():
+            return
+        proyecto, general = extraer_lecciones(self.llm, self.settings.modelo_para("reparador"), diagnostico, diff,
+                                              informe_reparador, self.ws)
+        hechos = self.memoria.registrar(proyecto, general)
+        for h in hechos:
+            self.ui.linea(f"  {Tema.acento}📚 lección{C.RESET} {Tema.tenue}{h}{C.RESET}")
+        build.lecciones.extend(hechos)
+
+    def _reparar_con_escalada(self, pedido: str, verif: Verificacion, grupo: int, base_fallaba: bool,
+                              informe: InformeBuild, etiqueta: str, max_intentos: int,
+                              verificador: Callable[[], Verificacion], contexto: str = "") -> Verificacion:
+        """Bucle de reparación: reparador → re-verificar; al repetirse el fallo, escala al modelo fuerte."""
+        diagnosticos_vistos: list[str] = []
+        fallos_seguidos = 0
+        intento = 0
+        intentos_txt: list[str] = []
+        while not verif.ok and intento < max_intentos:
+            firma = _firma_error(verif.diagnostico)
+            if diagnosticos_vistos.count(firma) >= 3:
+                informe.notas.append(f"{etiqueta}: la reparación no logró avances (mismo diagnóstico repetido).")
+                break
+            diagnosticos_vistos.append(firma)
+            intento += 1
+            experto = ""
+            if fallos_seguidos >= self.settings.umbral_escalada and self.escalador.disponible():
+                experto = self.escalador.diagnosticar(self.ws, pedido, verif.diagnostico, verif.archivos,
+                                                      "\n---\n".join(intentos_txt[-2:])) or ""
+                if experto:
+                    informe.escaladas += 1
+                    fallos_seguidos = 0
+            self.ui.titulo(f"REPARACIÓN {etiqueta} {intento}/{max_intentos}" + (" · con experto" if experto else ""))
+            rcid = self.ws.checkpoints.iniciar(f"reparación {etiqueta} {intento}", grupo=grupo)
+            antes = verif
+            res = self.reparar(pedido, verif, rcid, base_fallaba, experto, contexto)
+            intentos_txt.append(recortar(res.resumen, 1200))
+            verif = verificador()
+            self._mostrar_verificacion(verif)
+            if verif.ok:
+                self._aprender(antes.diagnostico, rcid, res.resumen, informe)
+            else:
+                fallos_seguidos += 1
+        return verif
+
+    # ------------------------------------------------------------ flujos
+    def _mostrar_plan(self, plan: Plan) -> None:
+        self.ui.titulo("PLAN")
+        self.ui.linea(plan.como_texto())
+
+    def obtener_plan(self, pedido: str, confirmar: bool) -> tuple[Optional[Plan], str]:
+        self.ui.fase(1, "Exploración")
+        exploracion = self.explorar(pedido)
+        self.ui.fase(2, "Arquitectura")
+        plan = self.planificar(pedido, exploracion)
+        for _ in range(3):
+            self._mostrar_plan(plan)
+            if not confirmar or self.ui.confirmar("¿Aprobás el plan y arrancamos?", defecto=True):
+                return plan, exploracion
+            feedback = self.ui.preguntar("¿Qué cambiarías del plan? (Enter vacío = cancelar)")
+            if not feedback:
+                return None, exploracion
+            plan = self.planificar(pedido, exploracion, feedback, plan)
+        return None, exploracion
+
+    def solo_plan(self, pedido: str) -> Optional[Path]:
+        plan, exploracion = self.obtener_plan(pedido, confirmar=False)
+        if plan is None:
+            return None
+        carpeta = self.ws.raiz / ".reaper" / "planes"
+        ruta = carpeta / f"plan_{datetime.now():%Y%m%d_%H%M%S}.md"
+        escritura_atomica(ruta, (
+            f"# Plan REAPER\n\n## Pedido\n{pedido}\n\n## Plan\n```\n{plan.como_texto()}\n```\n\n"
+            f"## Exploración\n{exploracion}\n\n## Respuesta del arquitecto\n{plan.texto}\n"
+        ))
+        return ruta
+
+    def _verificar_tarea(self, tcid: int, antes: ConteoTests, nombres_antes: set) -> Verificacion:
+        """
+        Una tarea intermedia no necesita que pasen TODOS los tests (los de tareas
+        siguientes todavía fallan): alcanza con validadores OK y que no se rompa
+        nada que antes pasaba.
+        """
+        archivos = [r for r in self.ws.checkpoints.archivos_desde(tcid) if (self.ws.raiz / r).is_file()]
+        validaciones = validar_archivos(self.ws, archivos)
+        tests = ejecutar_tests(self.ws, timeout=self.settings.tests_timeout, completo=True)
+        conteo = conteo_de_resultado(tests)
+        problemas = [r.resumen(2500) for r in fallos(validaciones)]
+        if tests is not None and not tests.ok and conteo.reconocido:
+            nuevos_fallos = [n for n in conteo.nombres_fallados if n not in nombres_antes]
+            retroceso = conteo.pasados < antes.pasados
+            mas_errores = conteo.errores > antes.errores
+            if retroceso or mas_errores or nuevos_fallos:
+                detalle = f"antes {antes.texto()}, ahora {conteo.texto()}"
+                if nuevos_fallos:
+                    detalle += "; fallan tests que antes no fallaban: " + ", ".join(nuevos_fallos[:8])
+                problemas.append(
+                    f"REGRESIÓN DE TESTS: {detalle}.\n"
+                    + fallos_relevantes(f"{tests.stdout}\n{tests.stderr}", maximo=3, limite=4000)
+                )
+        elif tests is not None and not tests.ok and not conteo.reconocido and antes.ok:
+            problemas.append("TESTS: la suite pasaba antes de la tarea y ahora falla.\n" + tests.resumen(4000))
+        diagnostico = "\n\n".join(problemas)
+        if diagnostico and self.settings.pistas_errores:
+            diagnostico = anexar_pistas(diagnostico, 2)
+        return Verificacion(not problemas, validaciones, tests, diagnostico, archivos, conteo)
+
+    def construir(self, pedido: str, confirmar: bool = True) -> InformeBuild:
+        inicio = time.monotonic()
+        self._protegidos: dict[str, Optional[str]] = {}
+        base = ejecutar_tests(self.ws, timeout=self.settings.tests_timeout, completo=True)
+        base_fallaba = base is not None and not base.ok
+        if base_fallaba:
+            self.ui.aviso("Atención: la suite de tests YA falla antes de empezar; se tendrá en cuenta.")
+
+        plan, exploracion = self.obtener_plan(pedido, confirmar)
+        if plan is None:
+            self.ui.tenue("Construcción cancelada; no se tocó ningún archivo.")
+            return InformeBuild("cancelada")
+
+        grupo = self.ws.checkpoints.iniciar(f"construir: {pedido[:80]}")
+        informe = InformeBuild("fallida", plan=plan, cid=grupo)
+
+        testeable = any(a.endswith(EXTENSIONES_TESTEABLES) for a in plan.archivos()) or any(
+            a.endswith(EXTENSIONES_TESTEABLES) for a in self.ws.archivos_codigo(limite=200)) or not self.ws.archivos_codigo(limite=5)
+        numero_fase = 3
+        if self.settings.tests_primero and testeable:
+            self.ui.fase(numero_fase, "Tests primero (especificación ejecutable)")
+            numero_fase += 1
+            self._protegidos = self.especificar(pedido, plan, grupo)
+            informe.spec_tests = list(self._protegidos)
+
+        self.ui.fase(numero_fase, "Implementación" + (" · torneo" if self.settings.torneo and self.settings.candidatos > 1 else ""))
+        numero_fase += 1
+        for i, tarea in enumerate(plan.tareas):
+            self.ui.info(f"\n▸ Tarea {i + 1}/{len(plan.tareas)}: {recortar(tarea.descripcion.splitlines()[0], 120)}")
+            antes_tests = ejecutar_tests(self.ws, timeout=self.settings.tests_timeout, completo=True)
+            conteo_antes = conteo_de_resultado(antes_tests)
+            nombres_antes = set(conteo_antes.nombres_fallados)
+            tcid = self.ws.checkpoints.iniciar(f"tarea {tarea.id}", grupo=grupo)
+            resultado = self.implementar(pedido, plan, i, exploracion, tcid, protegidos=self._protegidos)
+            informe.torneos.append((tarea.id, resultado.modo, resultado.ganador.indice if resultado.ganador else None))
+            if not resultado.ok:
+                informe.notas.append(f"Tarea {tarea.id}: la implementación no terminó limpia.")
+
+            verif_tarea = self._verificar_tarea(tcid, conteo_antes, nombres_antes)
+            if not verif_tarea.ok:
+                self.ui.aviso(f"  La tarea {tarea.id} no pasó su verificación: la reparo con el error real.")
+                verif_tarea = self._reparar_con_escalada(
+                    pedido, verif_tarea, grupo, base_fallaba, informe, f"tarea {tarea.id}",
+                    max(1, self.settings.umbral_escalada + 1),
+                    lambda: self._verificar_tarea(tcid, conteo_antes, nombres_antes),
+                    contexto=f"TAREA EN CURSO (#{tarea.id}): {tarea.descripcion}",
+                )
+                if not verif_tarea.ok:
+                    informe.notas.append(f"Tarea {tarea.id}: quedó con fallos de verificación.")
+
+            for ronda in range(self.settings.max_revisiones):
+                diff = self.ws.checkpoints.diff_desde(tcid)
+                if not diff.strip():
+                    informe.notas.append(f"Tarea {tarea.id}: sin cambios en archivos.")
+                    break
+                aprobado, revision = self.revisar(pedido, tarea, diff, tcid)
+                if aprobado:
+                    self.ui.ok(f"Revisor aprobó la tarea {tarea.id}")
+                    break
+                self.ui.aviso(f"  Revisor pidió cambios en la tarea {tarea.id} (ronda {ronda + 1})")
+                if ronda + 1 >= self.settings.max_revisiones:
+                    informe.notas.append(f"Tarea {tarea.id}: quedaron observaciones del revisor sin resolver.")
+                    break
+                self.implementar(pedido, plan, i, exploracion, tcid, correcciones=revision,
+                                 protegidos=self._protegidos)
+
+        archivos = [r for r in self.ws.checkpoints.archivos_desde(grupo) if (self.ws.raiz / r).is_file()]
+        hay_tests_build = any(_es_test(a) for a in archivos)
+        if self.settings.qa and testeable and not (self._protegidos or hay_tests_build):
+            self.ui.fase(numero_fase, "QA (tests reales)")
+            numero_fase += 1
+            qcid = self.ws.checkpoints.iniciar("qa", grupo=grupo)
+            self.qa(pedido, plan, archivos, qcid)
+
+        self.ui.fase(numero_fase, "Verificación real")
+        verif = self.verificar(grupo)
+        self._mostrar_verificacion(verif)
+        verif = self._reparar_con_escalada(pedido, verif, grupo, base_fallaba, informe, "final",
+                                           self.settings.max_reparaciones, lambda: self.verificar(grupo))
+
+        informe.archivos = verif.archivos
+        informe.tests = verif.tests
+        informe.diagnostico = verif.diagnostico
+        if verif.ok:
+            informe.estado = "verificada" if verif.tests is not None and not verif.tests.omitido else "validada"
+            if self.settings.git_snapshots and es_repo_git(self.ws):
+                try:
+                    informe.commit = snapshot_build(self.ws, self.settings.rama_git,
+                                                    f"REAPER build verificada: {pedido[:72]}\n\n{plan.objetivo}")
+                except RuntimeError as e:
+                    informe.notas.append(f"No pude guardar la build en git: {e}")
+        informe.segundos = time.monotonic() - inicio
+        informe.ruta_informe = self._guardar_informe(pedido, informe)
+        self._mostrar_cierre(informe)
+        return informe
+
+    # ------------------------------------------------------------ salida
+    def _mostrar_verificacion(self, verif: Verificacion) -> None:
+        for r in verif.validaciones:
+            if not r.ok:
+                self.ui.error(r.linea()[2:])
+        malos = len(fallos(verif.validaciones))
+        self.ui.linea(f"  validadores: {len(verif.validaciones) - malos}/{len(verif.validaciones)} OK")
+        if verif.tests is None:
+            self.ui.aviso("  tests: no hay suite detectada")
+        elif verif.tests.omitido:
+            self.ui.aviso("  tests: la suite no encontró tests")
+        elif verif.tests.ok:
+            self.ui.ok(f"tests: pasaron ({verif.conteo.texto() if verif.conteo.reconocido else verif.tests.comando})")
+        else:
+            self.ui.error(f"tests: fallaron ({verif.conteo.texto() if verif.conteo.reconocido else verif.tests.comando})")
+            self.ui.tenue(recortar(fallos_relevantes(verif.tests.stdout + "\n" + verif.tests.stderr, 2, 1500), 1500))
+
+    def _guardar_informe(self, pedido: str, informe: InformeBuild) -> Optional[Path]:
+        try:
+            diff = self.ws.checkpoints.diff_desde(informe.cid) if informe.cid else ""
+            tests = informe.tests.resumen(4000) if informe.tests else "sin suite de tests"
+            contenido = (
+                f"# Build REAPER — {informe.estado.upper()}\n\n"
+                f"Fecha: {datetime.now():%Y-%m-%d %H:%M} · duración: {formatear_duracion(informe.segundos)}\n\n"
+                f"## Pedido\n{pedido}\n\n"
+                f"## Plan\n```\n{informe.plan.como_texto() if informe.plan else '-'}\n```\n\n"
+                f"## Archivos\n```\n{_diffstat(diff) or '-'}\n```\n\n"
+                f"## Tests\n```\n{tests}\n```\n\n"
+                + (f"## Especificación (tests escritos antes de implementar)\n" + "\n".join(f"- {t}" for t in informe.spec_tests) + "\n\n"
+                   if informe.spec_tests else "")
+                + (f"## Escaladas al modelo fuerte\n{informe.escaladas}\n\n" if informe.escaladas else "")
+                + ("## Lecciones aprendidas\n" + "\n".join(f"- {l}" for l in informe.lecciones) + "\n\n" if informe.lecciones else "")
+                + (f"## Commit\n`{informe.commit}` en la rama {self.settings.rama_git}\n\n" if informe.commit else "")
+                + (f"## Diagnóstico pendiente\n```\n{informe.diagnostico}\n```\n\n" if informe.diagnostico else "")
+                + ("## Notas\n" + "\n".join(f"- {n}" for n in informe.notas) + "\n" if informe.notas else "")
+            )
+            ruta = self.ws.raiz / ".reaper" / "informes" / f"build_{datetime.now():%Y%m%d_%H%M%S}.md"
+            escritura_atomica(ruta, contenido)
+            return ruta
+        except OSError as e:
+            self.ui.aviso(f"No pude guardar el informe: {e}")
+            return None
+
+    def _mostrar_cierre(self, informe: InformeBuild) -> None:
+        if informe.estado == "verificada":
+            self.ui.titulo("✓ BUILD VERIFICADA (validadores + tests reales)")
+        elif informe.estado == "validada":
+            self.ui.titulo("✓ BUILD VALIDADA (validadores OK, sin tests que correr)")
+        else:
+            self.ui.titulo("✗ BUILD FALLIDA")
+        diff = self.ws.checkpoints.diff_desde(informe.cid) if informe.cid else ""
+        if diff:
+            self.ui.linea(_diffstat(diff))
+        datos = [f"duración {formatear_duracion(informe.segundos)}"]
+        if informe.spec_tests:
+            datos.append(f"{len(informe.spec_tests)} archivo(s) de tests previos")
+        torneos = sum(1 for _, modo, _g in informe.torneos if modo == "torneo")
+        if torneos:
+            datos.append(f"{torneos} torneo(s)")
+        if informe.escaladas:
+            datos.append(f"{informe.escaladas} escalada(s)")
+        if informe.lecciones:
+            datos.append(f"{len(informe.lecciones)} lección(es)")
+        self.ui.tenue("  " + " · ".join(datos))
+        if informe.commit:
+            self.ui.ok(f"guardada en git: {informe.commit[:10]} (rama {self.settings.rama_git})")
+        for nota in informe.notas:
+            self.ui.aviso(f"  • {nota}")
+        if informe.ruta_informe:
+            self.ui.tenue(f"  informe: {informe.ruta_informe}")
+        self.ui.tenue("  /diff para ver los cambios · /deshacer revierte TODA la build\n")
+
+    def revisar_proyecto(self, foco: str = "") -> str:
+        archivos = [a for a in self.ws.archivos_codigo(limite=400)
+                    if a.endswith((".py", ".js", ".mjs", ".ts", ".sh", ".html", ".css"))]
+        if not archivos:
+            return "No hay archivos de código para revisar."
+        grupos = max(1, min(self.settings.paralelo, (len(archivos) + 11) // 12))
+        lotes = [archivos[i::grupos] for i in range(grupos)]
+        specs = []
+        for lote in lotes:
+            specs.append((
+                "revisor",
+                "Revisión general del proyecto (no hay diff). Revisá estos archivos buscando bugs reales, "
+                "errores de manejo de excepciones, problemas de compatibilidad con Termux y riesgos de seguridad. "
+                + (f"Foco pedido por el usuario: {foco}. " if foco else "")
+                + "Empezá con VEREDICTO (APROBADO si no hay problemas graves) y después: hallazgos confirmados "
+                "(archivo:línea), riesgos probables marcados como inferidos y qué arreglar primero.\n\n"
+                f"Archivos asignados: {', '.join(lote)}",
+                "",
+                f"revisa {len(lote)} archivos",
+            ))
+        resultados = ejecutar_subagentes(specs, self.llm, self.ws, self.settings, self.ui, profundidad=1)
+        return "\n\n".join(f"### Revisor {i}\n{r.resumen}" for i, r in enumerate(resultados, start=1))
+
+
+# ======================================================================
+# MÓDULO: plantillas
+# ======================================================================
+"""
+Plantillas de proyectos: arrancar desde una base que ya funciona y ya tiene tests.
+
+Un modelo de 24B construye mucho mejor sobre un proyecto ordenado (lógica
+separada de la interfaz, tests que pasan, comando de tests claro) que desde
+una carpeta vacía. Cada plantilla de REAPER:
+  - usa solo la librería estándar (anda en Termux sin pip) o node/go/rust/cc
+  - trae tests que PASAN (REAPER lo verifica en --autotest)
+  - trae un REAPER.md con cómo ejecutar y testear
+
+Placeholders que se reemplazan al crear: __PROYECTO__ (nombre en snake_case),
+__Proyecto__ (CamelCase), __TITULO__ (texto), __FECHA__, __ANIO__.
+
+También se pueden agregar plantillas propias: ~/reaper/plantillas/<nombre>/
+con los archivos tal cual (y opcionalmente plantilla.json con descripcion,
+lenguaje, comando_tests y comando_ejecutar).
+"""
+
+
+@dataclass
+class Plantilla:
+    nombre: str
+    descripcion: str
+    lenguaje: str
+    archivos: dict
+    comando_tests: str = ""
+    comando_ejecutar: str = ""
+    etiquetas: tuple = ()
+    requiere: tuple = ()
+
+    def disponible(self) -> bool:
+        return all(shutil.which(r) for r in self.requiere)
+
+
+PLANTILLAS: dict[str, Plantilla] = {}
+
+
+def registrar_plantilla(nombre: str, descripcion: str, lenguaje: str, archivos: dict, *,
+                        comando_tests: str = "", comando_ejecutar: str = "", etiquetas: Sequence[str] = (),
+                        requiere: Sequence[str] = ()) -> Plantilla:
+    p = Plantilla(nombre, descripcion.strip(), lenguaje, {k: textwrap.dedent(v).lstrip("\n") if v.startswith("\n") else v
+                                                         for k, v in archivos.items()},
+                  comando_tests, comando_ejecutar, tuple(etiquetas), tuple(requiere))
+    PLANTILLAS[nombre] = p
+    return p
+
+
+def nombre_proyecto(destino: Path) -> str:
+    base = sin_tildes(destino.name).lower()
+    base = re.sub(r"[^a-z0-9]+", "_", base).strip("_") or "proyecto"
+    if base[0].isdigit():
+        base = "p_" + base
+    if keyword.iskeyword(base):
+        base += "_app"
+    return base
+
+
+def variables_para(destino: Path) -> dict[str, str]:
+    slug = nombre_proyecto(destino)
+    return {
+        "__PROYECTO__": slug,
+        "__Proyecto__": "".join(p.capitalize() for p in slug.split("_")),
+        "__TITULO__": slug.replace("_", " ").title(),
+        "__FECHA__": datetime.now().strftime("%Y-%m-%d"),
+        "__ANIO__": datetime.now().strftime("%Y"),
+    }
+
+
+def renderizar_plantilla(texto: str, variables: dict[str, str]) -> str:
+    for clave, valor in variables.items():
+        texto = texto.replace(clave, valor)
+    return texto
+
+
+def _plantilla_usuario(nombre: str) -> Optional[Plantilla]:
+    carpeta = PLANTILLAS_USUARIO_DIR / nombre
+    if not carpeta.is_dir():
+        return None
+    meta: dict = {}
+    if (carpeta / "plantilla.json").is_file():
+        try:
+            meta = json.loads((carpeta / "plantilla.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            meta = {}
+    archivos = {}
+    for ruta in carpeta.rglob("*"):
+        if ruta.is_file() and ruta.name != "plantilla.json" and "__pycache__" not in ruta.parts:
+            try:
+                archivos[ruta.relative_to(carpeta).as_posix()] = ruta.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+    return Plantilla(nombre, meta.get("descripcion", "plantilla propia"), meta.get("lenguaje", "?"), archivos,
+                     meta.get("comando_tests", ""), meta.get("comando_ejecutar", ""), ("propia",))
+
+
+def obtener_plantilla(nombre: str) -> Optional[Plantilla]:
+    return _plantilla_usuario(nombre) or PLANTILLAS.get(nombre)
+
+
+def todas_las_plantillas() -> dict[str, Plantilla]:
+    salida = dict(PLANTILLAS)
+    if PLANTILLAS_USUARIO_DIR.is_dir():
+        for carpeta in PLANTILLAS_USUARIO_DIR.iterdir():
+            propia = _plantilla_usuario(carpeta.name) if carpeta.is_dir() else None
+            if propia:
+                salida[carpeta.name] = propia
+    return salida
+
+
+def _reaper_md(p: Plantilla, variables: dict[str, str]) -> str:
+    return (
+        f"# {variables['__TITULO__']}\n\n"
+        f"## Descripción\n{p.descripcion}\n\n(Creado con la plantilla `{p.nombre}` de REAPER el {variables['__FECHA__']}.)\n\n"
+        f"## Cómo ejecutar\n`{p.comando_ejecutar or '(ver archivos)'}`\n\n"
+        f"## Cómo testear\n`{p.comando_tests or '(sin tests)'}`\n\n"
+        "## Estructura\n" + "\n".join(f"- {rel}" for rel in sorted(p.archivos)) + "\n\n"
+        "## Convenciones\n- Lógica pura separada de la entrada/salida para poder testearla.\n"
+        "- Solo librería estándar salvo que se indique otra cosa.\n- Interfaz en español.\n"
+    )
+
+
+def crear_desde_plantilla(nombre: str, destino: Path, variables: Optional[dict] = None,
+                          sobrescribir: bool = False) -> list[str]:
+    p = obtener_plantilla(nombre)
+    if p is None:
+        raise KeyError(nombre)
+    destino = Path(destino).expanduser()
+    if destino.exists() and any(destino.iterdir()) and not sobrescribir:
+        raise FileExistsError(f"{destino} ya existe y no está vacía.")
+    variables = {**variables_para(destino), **(variables or {})}
+    creados = []
+    for rel, contenido in sorted(p.archivos.items()):
+        rel_final = renderizar_plantilla(rel, variables)
+        ruta = destino / rel_final
+        texto = renderizar_plantilla(contenido, variables)
+        escritura_atomica(ruta, texto)
+        if rel_final.endswith(".sh") or texto.startswith("#!"):
+            try:
+                os.chmod(ruta, 0o755)
+            except OSError:
+                pass
+        creados.append(rel_final)
+    if "REAPER.md" not in creados:
+        escritura_atomica(destino / "REAPER.md", _reaper_md(p, variables))
+        creados.append("REAPER.md")
+    if p.comando_tests and "comando_tests" not in p.archivos.get(".reaper/config.json", ""):
+        config = destino / ".reaper" / "config.json"
+        if not config.exists():
+            escritura_atomica(config, json.dumps({"comando_tests": p.comando_tests}, indent=2) + "\n")
+    return creados
+
+
+def plantillas_sugeridas(pedido: str, k: int = 3) -> list[Plantilla]:
+    tokens = set(tokens_pedido(pedido))
+    puntuadas = []
+    for p in PLANTILLAS.values():
+        texto = f"{p.nombre} {p.descripcion} {' '.join(p.etiquetas)} {p.lenguaje}"
+        propios = {_raiz(sin_tildes(t)) for t in re.findall(r"[a-záéíóúñ0-9]{3,}", texto.lower())}
+        comunes = tokens & propios
+        if comunes:
+            puntuadas.append((len(comunes), p.nombre, p))
+    puntuadas.sort(key=lambda t: (-t[0], t[1]))
+    return [p for _, _, p in puntuadas[:k]]
+
+
+def comando_portable(comando: str) -> str:
+    """En autotest/CI se usa el Python actual en vez de 'python3' a secas."""
+    return re.sub(r"(^|&&\s*|;\s*)python3?(?=\s)", lambda m: m.group(1) + shlex.quote(sys.executable), comando)
+
+
+# ======================================================================
+# MÓDULO: plantillas_py
+# ======================================================================
+"""Plantillas Python (librería estándar): CLIs, APIs, juegos, bots y utilidades. Lote 1."""
+
+_PY_TESTS = "python3 -m unittest discover -s tests -t ."
+
+# ======================================================================
+# python-cli
+# ======================================================================
+registrar_plantilla(
+    "python-cli",
+    "CLI en Python con subcomandos (argparse), lógica pura separada y tests. Base para cualquier herramienta de terminal.",
+    "python",
+    {
+        "__PROYECTO__/__init__.py": r'''
+"""__TITULO__: herramienta de línea de comandos."""
+
+__version__ = "0.1.0"
+''',
+        "__PROYECTO__/__main__.py": r'''
+import sys
+
+from __PROYECTO__.cli import main
+
+sys.exit(main())
+''',
+        "__PROYECTO__/nucleo.py": r'''
+"""Lógica pura (sin input/print): fácil de testear y de reutilizar."""
+
+import re
+from collections import Counter
+
+_PALABRA = re.compile(r"[a-záéíóúüñ0-9']+", re.IGNORECASE)
+
+
+def normalizar(texto: str) -> str:
+    """Minúsculas y espacios simples."""
+    return " ".join(texto.lower().split())
+
+
+def palabras(texto: str) -> list[str]:
+    """Lista de palabras del texto, en minúsculas."""
+    return [p.lower() for p in _PALABRA.findall(texto)]
+
+
+def contar(texto: str) -> dict[str, int]:
+    """Cantidad de líneas, palabras y caracteres."""
+    return {
+        "lineas": len(texto.splitlines()),
+        "palabras": len(palabras(texto)),
+        "caracteres": len(texto),
+    }
+
+
+def frecuentes(texto: str, n: int = 5) -> list[tuple[str, int]]:
+    """Las n palabras más frecuentes (empates por orden alfabético)."""
+    if n <= 0:
+        return []
+    conteo = Counter(palabras(texto))
+    return sorted(conteo.items(), key=lambda kv: (-kv[1], kv[0]))[:n]
+
+
+def saludo(nombre: str, gritar: bool = False) -> str:
+    nombre = nombre.strip() or "mundo"
+    texto = f"Hola, {nombre}!"
+    return texto.upper() if gritar else texto
+''',
+        "__PROYECTO__/cli.py": r'''
+"""Interfaz de línea de comandos."""
+
+import argparse
+import json
+import sys
+from pathlib import Path
+from typing import Optional
+
+from __PROYECTO__ import __version__
+from __PROYECTO__.nucleo import contar, frecuentes, saludo
+
+
+def _leer(ruta: str) -> str:
+    if ruta == "-":
+        return sys.stdin.read()
+    return Path(ruta).read_text(encoding="utf-8")
+
+
+def construir_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="__PROYECTO__", description="__TITULO__")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    sub = parser.add_subparsers(dest="comando", required=True)
+
+    p = sub.add_parser("saludar", help="saluda a alguien")
+    p.add_argument("nombre", nargs="?", default="mundo")
+    p.add_argument("--gritar", action="store_true")
+
+    p = sub.add_parser("contar", help="cuenta líneas, palabras y caracteres de un archivo")
+    p.add_argument("archivo", help="ruta o - para stdin")
+    p.add_argument("--json", action="store_true", help="salida en JSON")
+
+    p = sub.add_parser("top", help="palabras más frecuentes")
+    p.add_argument("archivo")
+    p.add_argument("-n", type=int, default=5)
+    return parser
+
+
+def main(argv: Optional[list] = None) -> int:
+    args = construir_parser().parse_args(argv)
+    try:
+        if args.comando == "saludar":
+            print(saludo(args.nombre, args.gritar))
+        elif args.comando == "contar":
+            datos = contar(_leer(args.archivo))
+            if args.json:
+                print(json.dumps(datos, ensure_ascii=False))
+            else:
+                for clave, valor in datos.items():
+                    print(f"{clave}: {valor}")
+        elif args.comando == "top":
+            for palabra, veces in frecuentes(_leer(args.archivo), args.n):
+                print(f"{veces:>5}  {palabra}")
+    except FileNotFoundError as e:
+        print(f"error: no existe {e.filename}", file=sys.stderr)
+        return 1
+    except UnicodeDecodeError:
+        print("error: el archivo no es texto UTF-8", file=sys.stderr)
+        return 1
+    return 0
+''',
+        "tests/__init__.py": "",
+        "tests/test_nucleo.py": r'''
+import unittest
+
+from __PROYECTO__.nucleo import contar, frecuentes, normalizar, palabras, saludo
+
+
+class TestNucleo(unittest.TestCase):
+    def test_normalizar(self):
+        self.assertEqual(normalizar("  Hola   MUNDO "), "hola mundo")
+
+    def test_palabras_con_tildes(self):
+        self.assertEqual(palabras("Árbol, canción y ñandú"), ["árbol", "canción", "y", "ñandú"])
+
+    def test_contar(self):
+        self.assertEqual(contar("uno dos\ntres"), {"lineas": 2, "palabras": 3, "caracteres": 12})
+
+    def test_contar_vacio(self):
+        self.assertEqual(contar(""), {"lineas": 0, "palabras": 0, "caracteres": 0})
+
+    def test_frecuentes_ordena_y_desempata(self):
+        self.assertEqual(frecuentes("b a b c a b", 2), [("b", 3), ("a", 2)])
+        self.assertEqual(frecuentes("x y", 0), [])
+
+    def test_saludo(self):
+        self.assertEqual(saludo("Ana"), "Hola, Ana!")
+        self.assertEqual(saludo("", gritar=True), "HOLA, MUNDO!")
+
+
+if __name__ == "__main__":
+    unittest.main()
+''',
+        "tests/test_cli.py": r'''
+import io
+import json
+import tempfile
+import unittest
+from contextlib import redirect_stderr, redirect_stdout
+from pathlib import Path
+
+from __PROYECTO__.cli import main
+
+
+def correr(*argv):
+    salida, errores = io.StringIO(), io.StringIO()
+    with redirect_stdout(salida), redirect_stderr(errores):
+        codigo = main(list(argv))
+    return codigo, salida.getvalue(), errores.getvalue()
+
+
+class TestCLI(unittest.TestCase):
+    def test_saludar(self):
+        self.assertEqual(correr("saludar", "Leo"), (0, "Hola, Leo!\n", ""))
+
+    def test_contar_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ruta = Path(tmp) / "a.txt"
+            ruta.write_text("hola hola\nchau\n", encoding="utf-8")
+            codigo, salida, _ = correr("contar", str(ruta), "--json")
+            self.assertEqual(codigo, 0)
+            self.assertEqual(json.loads(salida)["palabras"], 3)
+
+    def test_archivo_inexistente(self):
+        codigo, _, errores = correr("contar", "/no/existe.txt")
+        self.assertEqual(codigo, 1)
+        self.assertIn("no existe", errores)
+
+    def test_top(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ruta = Path(tmp) / "a.txt"
+            ruta.write_text("sol luna sol", encoding="utf-8")
+            codigo, salida, _ = correr("top", str(ruta), "-n", "1")
+            self.assertEqual(codigo, 0)
+            self.assertIn("sol", salida)
+
+
+if __name__ == "__main__":
+    unittest.main()
+''',
+    },
+    comando_tests=_PY_TESTS,
+    comando_ejecutar="python3 -m __PROYECTO__ saludar Termux",
+    etiquetas=("cli", "terminal", "argparse", "herramienta", "comandos"),
+)
+
+# ======================================================================
+# tareas (todo)
+# ======================================================================
+registrar_plantilla(
+    "tareas",
+    "Gestor de tareas (todo) en la terminal con prioridades, búsqueda y guardado atómico en JSON.",
+    "python",
+    {
+        "tareas/__init__.py": "",
+        "tareas/modelo.py": r'''
+"""Modelo de tareas sin entrada/salida."""
+
+from dataclasses import asdict, dataclass, field
+from datetime import datetime
+from typing import Optional
+
+PRIORIDADES = ("baja", "media", "alta")
+
+
+@dataclass
+class Tarea:
+    id: int
+    texto: str
+    prioridad: str = "media"
+    hecha: bool = False
+    creada: str = field(default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
+
+    def __post_init__(self):
+        self.texto = self.texto.strip()
+        if not self.texto:
+            raise ValueError("la tarea no puede estar vacía")
+        if self.prioridad not in PRIORIDADES:
+            raise ValueError(f"prioridad inválida: {self.prioridad} (usá {', '.join(PRIORIDADES)})")
+
+
+class ListaTareas:
+    def __init__(self, tareas: Optional[list] = None):
+        self.tareas: list[Tarea] = list(tareas or [])
+
+    def _siguiente_id(self) -> int:
+        return max((t.id for t in self.tareas), default=0) + 1
+
+    def agregar(self, texto: str, prioridad: str = "media") -> Tarea:
+        tarea = Tarea(self._siguiente_id(), texto, prioridad)
+        self.tareas.append(tarea)
+        return tarea
+
+    def obtener(self, id_: int) -> Tarea:
+        for t in self.tareas:
+            if t.id == id_:
+                return t
+        raise KeyError(f"no existe la tarea {id_}")
+
+    def completar(self, id_: int) -> Tarea:
+        tarea = self.obtener(id_)
+        tarea.hecha = True
+        return tarea
+
+    def borrar(self, id_: int) -> Tarea:
+        tarea = self.obtener(id_)
+        self.tareas.remove(tarea)
+        return tarea
+
+    def pendientes(self) -> list[Tarea]:
+        orden = {p: i for i, p in enumerate(reversed(PRIORIDADES))}
+        return sorted((t for t in self.tareas if not t.hecha), key=lambda t: (orden[t.prioridad], t.id))
+
+    def buscar(self, texto: str) -> list[Tarea]:
+        texto = texto.lower().strip()
+        return [t for t in self.tareas if texto in t.texto.lower()]
+
+    def a_dicts(self) -> list[dict]:
+        return [asdict(t) for t in self.tareas]
+
+    @classmethod
+    def desde_dicts(cls, datos: list) -> "ListaTareas":
+        return cls([Tarea(**d) for d in datos])
+''',
+        "tareas/almacen.py": r'''
+"""Guardado en JSON con escritura atómica (no se corrompe si se corta a mitad)."""
+
+import json
+import os
+import tempfile
+from pathlib import Path
+
+from tareas.modelo import ListaTareas
+
+
+def cargar(ruta: Path) -> ListaTareas:
+    ruta = Path(ruta)
+    if not ruta.exists():
+        return ListaTareas()
+    texto = ruta.read_text(encoding="utf-8").strip()
+    if not texto:
+        return ListaTareas()
+    return ListaTareas.desde_dicts(json.loads(texto))
+
+
+def guardar(ruta: Path, lista: ListaTareas) -> None:
+    ruta = Path(ruta)
+    ruta.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporal = tempfile.mkstemp(dir=str(ruta.parent), prefix=".tareas_", suffix=".json")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(lista.a_dicts(), f, ensure_ascii=False, indent=2)
+        os.replace(temporal, ruta)
+    except BaseException:
+        if os.path.exists(temporal):
+            os.unlink(temporal)
+        raise
+''',
+        "tareas/cli.py": r'''
+"""Uso: python3 -m tareas.cli agregar "comprar pan" -p alta | listar | hecha 1 | borrar 1 | buscar pan"""
+
+import argparse
+import os
+import sys
+from pathlib import Path
+from typing import Optional
+
+from tareas.almacen import cargar, guardar
+from tareas.modelo import PRIORIDADES
+
+MARCAS = {"alta": "!!", "media": "! ", "baja": "  "}
+
+
+def ruta_datos() -> Path:
+    return Path(os.environ.get("TAREAS_ARCHIVO", Path.home() / ".tareas.json"))
+
+
+def main(argv: Optional[list] = None) -> int:
+    parser = argparse.ArgumentParser(prog="tareas")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("agregar")
+    p.add_argument("texto")
+    p.add_argument("-p", "--prioridad", choices=PRIORIDADES, default="media")
+    p = sub.add_parser("listar")
+    p.add_argument("--todas", action="store_true")
+    for nombre in ("hecha", "borrar"):
+        sub.add_parser(nombre).add_argument("id", type=int)
+    sub.add_parser("buscar").add_argument("texto")
+    args = parser.parse_args(argv)
+
+    ruta = ruta_datos()
+    lista = cargar(ruta)
+    try:
+        if args.cmd == "agregar":
+            t = lista.agregar(args.texto, args.prioridad)
+            print(f"agregada #{t.id}: {t.texto}")
+        elif args.cmd == "listar":
+            tareas = lista.tareas if args.todas else lista.pendientes()
+            if not tareas:
+                print("no hay tareas")
+            for t in tareas:
+                print(f"{'✓' if t.hecha else '○'} #{t.id:<3} {MARCAS[t.prioridad]} {t.texto}")
+        elif args.cmd == "hecha":
+            print(f"completada: {lista.completar(args.id).texto}")
+        elif args.cmd == "borrar":
+            print(f"borrada: {lista.borrar(args.id).texto}")
+        elif args.cmd == "buscar":
+            for t in lista.buscar(args.texto):
+                print(f"#{t.id} {t.texto}")
+    except (KeyError, ValueError) as e:
+        print(f"error: {e.args[0] if e.args else e}", file=sys.stderr)
+        return 1
+    guardar(ruta, lista)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+''',
+        "tests/__init__.py": "",
+        "tests/test_tareas.py": r'''
+import io
+import os
+import tempfile
+import unittest
+from contextlib import redirect_stdout
+from pathlib import Path
+
+from tareas import cli
+from tareas.almacen import cargar, guardar
+from tareas.modelo import ListaTareas, Tarea
+
+
+class TestModelo(unittest.TestCase):
+    def test_agregar_y_ids(self):
+        lista = ListaTareas()
+        self.assertEqual(lista.agregar("a").id, 1)
+        self.assertEqual(lista.agregar("b").id, 2)
+
+    def test_vacia_o_prioridad_invalida(self):
+        with self.assertRaises(ValueError):
+            Tarea(1, "   ")
+        with self.assertRaises(ValueError):
+            Tarea(1, "x", "urgente")
+
+    def test_pendientes_ordenadas_por_prioridad(self):
+        lista = ListaTareas()
+        lista.agregar("baja", "baja")
+        lista.agregar("alta", "alta")
+        lista.agregar("media")
+        self.assertEqual([t.texto for t in lista.pendientes()], ["alta", "media", "baja"])
+
+    def test_completar_borrar_buscar(self):
+        lista = ListaTareas()
+        lista.agregar("Comprar pan")
+        lista.agregar("Llamar")
+        lista.completar(1)
+        self.assertEqual([t.texto for t in lista.pendientes()], ["Llamar"])
+        self.assertEqual(len(lista.buscar("PAN")), 1)
+        lista.borrar(2)
+        with self.assertRaises(KeyError):
+            lista.obtener(2)
+
+
+class TestAlmacen(unittest.TestCase):
+    def test_ida_y_vuelta(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ruta = Path(tmp) / "t.json"
+            lista = ListaTareas()
+            lista.agregar("persistir", "alta")
+            guardar(ruta, lista)
+            otra = cargar(ruta)
+            self.assertEqual(otra.tareas[0].texto, "persistir")
+            self.assertEqual(otra.tareas[0].prioridad, "alta")
+
+    def test_archivo_inexistente_o_vacio(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(cargar(Path(tmp) / "no.json").tareas, [])
+            (Path(tmp) / "vacio.json").write_text("")
+            self.assertEqual(cargar(Path(tmp) / "vacio.json").tareas, [])
+
+
+class TestCLI(unittest.TestCase):
+    def test_flujo(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.environ["TAREAS_ARCHIVO"] = str(Path(tmp) / "t.json")
+            try:
+                salida = io.StringIO()
+                with redirect_stdout(salida):
+                    self.assertEqual(cli.main(["agregar", "uno", "-p", "alta"]), 0)
+                    self.assertEqual(cli.main(["hecha", "1"]), 0)
+                    self.assertEqual(cli.main(["listar"]), 0)
+                self.assertIn("no hay tareas", salida.getvalue())
+                self.assertEqual(cli.main(["borrar", "9"]), 1)
+            finally:
+                del os.environ["TAREAS_ARCHIVO"]
+
+
+if __name__ == "__main__":
+    unittest.main()
+''',
+    },
+    comando_tests=_PY_TESTS,
+    comando_ejecutar='python3 -m tareas.cli agregar "probar REAPER" -p alta',
+    etiquetas=("tareas", "todo", "pendientes", "json", "cli", "lista"),
+)
+
+# ======================================================================
+# api-notas (http.server + sqlite)
+# ======================================================================
+registrar_plantilla(
+    "api-notas",
+    "API REST JSON de notas con http.server y sqlite3 (CRUD completo, errores 400/404, tests con servidor real).",
+    "python",
+    {
+        "api/__init__.py": "",
+        "api/db.py": r'''
+"""Repositorio de notas sobre sqlite3."""
+
+import sqlite3
+import threading
+from datetime import datetime
+from typing import Optional
+
+
+class Repositorio:
+    def __init__(self, ruta: str = ":memory:"):
+        self._conexion = sqlite3.connect(ruta, check_same_thread=False)
+        self._conexion.row_factory = sqlite3.Row
+        self._lock = threading.Lock()
+        with self._lock, self._conexion:
+            self._conexion.execute(
+                "CREATE TABLE IF NOT EXISTS notas ("
+                " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                " titulo TEXT NOT NULL,"
+                " texto TEXT NOT NULL DEFAULT '',"
+                " creada TEXT NOT NULL)"
+            )
+
+    @staticmethod
+    def _dict(fila: Optional[sqlite3.Row]) -> Optional[dict]:
+        return dict(fila) if fila is not None else None
+
+    def crear(self, titulo: str, texto: str = "") -> dict:
+        titulo = (titulo or "").strip()
+        if not titulo:
+            raise ValueError("el título es obligatorio")
+        with self._lock, self._conexion:
+            cursor = self._conexion.execute(
+                "INSERT INTO notas (titulo, texto, creada) VALUES (?, ?, ?)",
+                (titulo, texto or "", datetime.now().isoformat(timespec="seconds")),
+            )
+            nuevo_id = cursor.lastrowid
+        return self.obtener(nuevo_id)
+
+    def listar(self, buscar: str = "") -> list[dict]:
+        with self._lock:
+            if buscar:
+                filas = self._conexion.execute(
+                    "SELECT * FROM notas WHERE titulo LIKE ? OR texto LIKE ? ORDER BY id",
+                    (f"%{buscar}%", f"%{buscar}%"),
+                ).fetchall()
+            else:
+                filas = self._conexion.execute("SELECT * FROM notas ORDER BY id").fetchall()
+        return [dict(f) for f in filas]
+
+    def obtener(self, id_: int) -> Optional[dict]:
+        with self._lock:
+            fila = self._conexion.execute("SELECT * FROM notas WHERE id = ?", (id_,)).fetchone()
+        return self._dict(fila)
+
+    def actualizar(self, id_: int, titulo: Optional[str] = None, texto: Optional[str] = None) -> Optional[dict]:
+        actual = self.obtener(id_)
+        if actual is None:
+            return None
+        nuevo_titulo = actual["titulo"] if titulo is None else titulo.strip()
+        if not nuevo_titulo:
+            raise ValueError("el título no puede quedar vacío")
+        with self._lock, self._conexion:
+            self._conexion.execute(
+                "UPDATE notas SET titulo = ?, texto = ? WHERE id = ?",
+                (nuevo_titulo, actual["texto"] if texto is None else texto, id_),
+            )
+        return self.obtener(id_)
+
+    def borrar(self, id_: int) -> bool:
+        with self._lock, self._conexion:
+            cursor = self._conexion.execute("DELETE FROM notas WHERE id = ?", (id_,))
+        return cursor.rowcount > 0
+
+    def cerrar(self) -> None:
+        self._conexion.close()
+''',
+        "api/servidor.py": r'''
+"""Servidor HTTP JSON. Rutas:
+    GET    /notas?buscar=texto
+    POST   /notas            {"titulo": "...", "texto": "..."}
+    GET    /notas/<id>
+    PUT    /notas/<id>       {"titulo": "...", "texto": "..."}
+    DELETE /notas/<id>
+"""
+
+import json
+import os
+import re
+import sys
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
+
+from api.db import Repositorio
+
+_RUTA_NOTA = re.compile(r"^/notas/(\d+)/?$")
+MAX_CUERPO = 1_000_000
+
+
+class Manejador(BaseHTTPRequestHandler):
+    repo: Repositorio = None  # se asigna en crear_servidor
+    server_version = "__Proyecto__/0.1"
+
+    def log_message(self, formato, *args):  # silencio en tests; poner print para depurar
+        if os.environ.get("API_LOG"):
+            sys.stderr.write(formato % args + "\n")
+
+    def _responder(self, estado: int, datos=None) -> None:
+        cuerpo = b"" if datos is None else json.dumps(datos, ensure_ascii=False).encode("utf-8")
+        self.send_response(estado)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(cuerpo)))
+        self.end_headers()
+        if cuerpo:
+            self.wfile.write(cuerpo)
+
+    def _json(self):
+        largo = int(self.headers.get("Content-Length") or 0)
+        if largo > MAX_CUERPO:
+            raise ValueError("cuerpo demasiado grande")
+        crudo = self.rfile.read(largo) if largo else b"{}"
+        try:
+            datos = json.loads(crudo.decode("utf-8") or "{}")
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise ValueError("JSON inválido")
+        if not isinstance(datos, dict):
+            raise ValueError("se esperaba un objeto JSON")
+        return datos
+
+    def do_GET(self):
+        url = urlparse(self.path)
+        if url.path.rstrip("/") == "/notas":
+            buscar = parse_qs(url.query).get("buscar", [""])[0]
+            return self._responder(200, self.repo.listar(buscar))
+        m = _RUTA_NOTA.match(url.path)
+        if m:
+            nota = self.repo.obtener(int(m.group(1)))
+            return self._responder(200, nota) if nota else self._responder(404, {"error": "no existe"})
+        return self._responder(404, {"error": "ruta desconocida"})
+
+    def do_POST(self):
+        if urlparse(self.path).path.rstrip("/") != "/notas":
+            return self._responder(404, {"error": "ruta desconocida"})
+        try:
+            datos = self._json()
+            nota = self.repo.crear(datos.get("titulo", ""), datos.get("texto", ""))
+        except ValueError as e:
+            return self._responder(400, {"error": str(e)})
+        return self._responder(201, nota)
+
+    def do_PUT(self):
+        m = _RUTA_NOTA.match(urlparse(self.path).path)
+        if not m:
+            return self._responder(404, {"error": "ruta desconocida"})
+        try:
+            datos = self._json()
+            nota = self.repo.actualizar(int(m.group(1)), datos.get("titulo"), datos.get("texto"))
+        except ValueError as e:
+            return self._responder(400, {"error": str(e)})
+        return self._responder(200, nota) if nota else self._responder(404, {"error": "no existe"})
+
+    def do_DELETE(self):
+        m = _RUTA_NOTA.match(urlparse(self.path).path)
+        if not m:
+            return self._responder(404, {"error": "ruta desconocida"})
+        if self.repo.borrar(int(m.group(1))):
+            return self._responder(204)
+        return self._responder(404, {"error": "no existe"})
+
+
+def crear_servidor(puerto: int = 8000, ruta_db: str = "notas.db", host: str = "127.0.0.1") -> ThreadingHTTPServer:
+    manejador = type("ManejadorConfigurado", (Manejador,), {"repo": Repositorio(ruta_db)})
+    return ThreadingHTTPServer((host, puerto), manejador)
+
+
+def main() -> int:
+    puerto = int(os.environ.get("PUERTO", "8000"))
+    servidor = crear_servidor(puerto, os.environ.get("NOTAS_DB", "notas.db"))
+    print(f"API de notas en http://127.0.0.1:{servidor.server_address[1]}/notas (Ctrl+C para salir)")
+    try:
+        servidor.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        servidor.server_close()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+''',
+        "tests/__init__.py": "",
+        "tests/test_api.py": r'''
+import json
+import threading
+import unittest
+import urllib.error
+import urllib.request
+
+from api.db import Repositorio
+from api.servidor import crear_servidor
+
+
+class TestRepositorio(unittest.TestCase):
+    def setUp(self):
+        self.repo = Repositorio(":memory:")
+
+    def tearDown(self):
+        self.repo.cerrar()
+
+    def test_crud(self):
+        nota = self.repo.crear("Hola", "mundo")
+        self.assertEqual(nota["titulo"], "Hola")
+        self.assertEqual(self.repo.actualizar(nota["id"], texto="chau")["texto"], "chau")
+        self.assertEqual(len(self.repo.listar("chau")), 1)
+        self.assertTrue(self.repo.borrar(nota["id"]))
+        self.assertIsNone(self.repo.obtener(nota["id"]))
+
+    def test_titulo_obligatorio(self):
+        with self.assertRaises(ValueError):
+            self.repo.crear("  ")
+
+
+class TestServidor(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.servidor = crear_servidor(0, ":memory:")
+        cls.base = f"http://127.0.0.1:{cls.servidor.server_address[1]}"
+        cls.hilo = threading.Thread(target=cls.servidor.serve_forever, daemon=True)
+        cls.hilo.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.servidor.shutdown()
+        cls.servidor.server_close()
+
+    def pedir(self, metodo, ruta, datos=None):
+        cuerpo = json.dumps(datos).encode() if datos is not None else None
+        pedido = urllib.request.Request(self.base + ruta, data=cuerpo, method=metodo,
+                                        headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(pedido, timeout=5) as r:
+                texto = r.read().decode()
+                return r.status, json.loads(texto) if texto else None
+        except urllib.error.HTTPError as e:
+            texto = e.read().decode()
+            return e.code, json.loads(texto) if texto else None
+
+    def test_flujo_completo(self):
+        estado, nota = self.pedir("POST", "/notas", {"titulo": "Comprar", "texto": "pan"})
+        self.assertEqual(estado, 201)
+        estado, lista = self.pedir("GET", "/notas")
+        self.assertEqual(estado, 200)
+        self.assertTrue(any(n["id"] == nota["id"] for n in lista))
+        estado, editada = self.pedir("PUT", f"/notas/{nota['id']}", {"texto": "leche"})
+        self.assertEqual((estado, editada["texto"]), (200, "leche"))
+        self.assertEqual(self.pedir("DELETE", f"/notas/{nota['id']}")[0], 204)
+        self.assertEqual(self.pedir("GET", f"/notas/{nota['id']}")[0], 404)
+
+    def test_errores(self):
+        self.assertEqual(self.pedir("POST", "/notas", {"titulo": ""})[0], 400)
+        self.assertEqual(self.pedir("GET", "/otra")[0], 404)
+        self.assertEqual(self.pedir("PUT", "/notas/999", {"titulo": "x"})[0], 404)
+
+
+if __name__ == "__main__":
+    unittest.main()
+''',
+    },
+    comando_tests=_PY_TESTS,
+    comando_ejecutar="python3 -m api.servidor",
+    etiquetas=("api", "rest", "servidor", "http", "sqlite", "notas", "backend", "json"),
+)
+
+# ======================================================================
+# snake (curses)
+# ======================================================================
+registrar_plantilla(
+    "snake",
+    "Juego de la serpiente en la terminal con curses: motor puro testeable, velocidad creciente y récord guardado.",
+    "python",
+    {
+        "snake/__init__.py": "",
+        "snake/motor.py": r'''
+"""Motor del juego: sin curses ni tiempo real, para poder testearlo."""
+
+import random
+from collections import deque
+from typing import Optional
+
+ARRIBA, ABAJO, IZQUIERDA, DERECHA = (0, -1), (0, 1), (-1, 0), (1, 0)
+OPUESTA = {ARRIBA: ABAJO, ABAJO: ARRIBA, IZQUIERDA: DERECHA, DERECHA: IZQUIERDA}
+
+
+class Juego:
+    def __init__(self, ancho: int = 20, alto: int = 12, semilla: Optional[int] = None, paredes: bool = True):
+        if ancho < 5 or alto < 5:
+            raise ValueError("el tablero mínimo es 5x5")
+        self.ancho, self.alto = ancho, alto
+        self.paredes = paredes
+        self.azar = random.Random(semilla)
+        centro = (ancho // 2, alto // 2)
+        self.serpiente = deque([centro, (centro[0] - 1, centro[1]), (centro[0] - 2, centro[1])])
+        self.direccion = DERECHA
+        self._pendiente = DERECHA
+        self.puntaje = 0
+        self.vivo = True
+        self.comida = self._colocar_comida()
+
+    @property
+    def cabeza(self) -> tuple:
+        return self.serpiente[0]
+
+    def _colocar_comida(self) -> Optional[tuple]:
+        libres = [(x, y) for x in range(self.ancho) for y in range(self.alto) if (x, y) not in self.serpiente]
+        return self.azar.choice(libres) if libres else None
+
+    def girar(self, direccion: tuple) -> None:
+        """Cambia la dirección del próximo paso (no se puede dar media vuelta)."""
+        if direccion in OPUESTA and direccion != OPUESTA[self.direccion]:
+            self._pendiente = direccion
+
+    def paso(self) -> bool:
+        """Avanza un paso. Devuelve True si comió. Si choca, vivo pasa a False."""
+        if not self.vivo:
+            return False
+        self.direccion = self._pendiente
+        x, y = self.cabeza
+        nx, ny = x + self.direccion[0], y + self.direccion[1]
+        if self.paredes:
+            if not (0 <= nx < self.ancho and 0 <= ny < self.alto):
+                self.vivo = False
+                return False
+        else:
+            nx, ny = nx % self.ancho, ny % self.alto
+        come = (nx, ny) == self.comida
+        cuerpo = list(self.serpiente) if come else list(self.serpiente)[:-1]
+        if (nx, ny) in cuerpo:
+            self.vivo = False
+            return False
+        self.serpiente.appendleft((nx, ny))
+        if come:
+            self.puntaje += 10
+            self.comida = self._colocar_comida()
+            if self.comida is None:
+                self.vivo = False  # ganó: llenó el tablero
+        else:
+            self.serpiente.pop()
+        return come
+
+    def velocidad(self) -> float:
+        """Segundos entre pasos: arranca en 0.18 y baja hasta 0.06 con el puntaje."""
+        return max(0.06, 0.18 - self.puntaje / 1000)
+''',
+        "snake/records.py": r'''
+import json
+from pathlib import Path
+
+ARCHIVO = Path.home() / ".snake_record.json"
+
+
+def leer_record(ruta: Path = ARCHIVO) -> int:
+    try:
+        return int(json.loads(Path(ruta).read_text(encoding="utf-8")).get("record", 0))
+    except (OSError, ValueError, AttributeError):
+        return 0
+
+
+def guardar_record(puntaje: int, ruta: Path = ARCHIVO) -> bool:
+    """Guarda si supera el récord. Devuelve True si fue récord nuevo."""
+    if puntaje <= leer_record(ruta):
+        return False
+    Path(ruta).write_text(json.dumps({"record": puntaje}), encoding="utf-8")
+    return True
+''',
+        "snake/__main__.py": r'''
+"""Jugar: python3 -m snake   (flechas o WASD, q para salir)"""
+
+import curses
+import time
+
+from snake.motor import ABAJO, ARRIBA, DERECHA, IZQUIERDA, Juego
+from snake.records import guardar_record, leer_record
+
+TECLAS = {
+    curses.KEY_UP: ARRIBA, curses.KEY_DOWN: ABAJO, curses.KEY_LEFT: IZQUIERDA, curses.KEY_RIGHT: DERECHA,
+    ord("w"): ARRIBA, ord("s"): ABAJO, ord("a"): IZQUIERDA, ord("d"): DERECHA,
+}
+
+
+def jugar(pantalla) -> int:
+    curses.curs_set(0)
+    pantalla.nodelay(True)
+    alto, ancho = pantalla.getmaxyx()
+    juego = Juego(max(10, (ancho - 2) // 2), max(8, alto - 4))
+    record = leer_record()
+    if curses.has_colors():
+        curses.start_color()
+        curses.init_pair(1, curses.COLOR_GREEN, curses.COLOR_BLACK)
+        curses.init_pair(2, curses.COLOR_RED, curses.COLOR_BLACK)
+    while juego.vivo:
+        tecla = pantalla.getch()
+        if tecla in (ord("q"), 27):
+            break
+        if tecla in TECLAS:
+            juego.girar(TECLAS[tecla])
+        juego.paso()
+        pantalla.erase()
+        pantalla.addstr(0, 0, f" Puntaje: {juego.puntaje}  Récord: {record}  (q sale) "[: ancho - 1])
+        for x, y in juego.serpiente:
+            pantalla.addstr(y + 2, x * 2, "██", curses.color_pair(1))
+        if juego.comida:
+            cx, cy = juego.comida
+            pantalla.addstr(cy + 2, cx * 2, "●", curses.color_pair(2))
+        pantalla.refresh()
+        time.sleep(juego.velocidad())
+    return juego.puntaje
+
+
+def main() -> None:
+    puntaje = curses.wrapper(jugar)
+    nuevo = guardar_record(puntaje)
+    print(f"Fin del juego. Puntaje: {puntaje}" + ("  ¡RÉCORD NUEVO!" if nuevo else ""))
+
+
+main()
+''',
+        "tests/__init__.py": "",
+        "tests/test_motor.py": r'''
+import tempfile
+import unittest
+from pathlib import Path
+
+from snake.motor import ABAJO, ARRIBA, DERECHA, IZQUIERDA, Juego
+from snake.records import guardar_record, leer_record
+
+
+class TestMotor(unittest.TestCase):
+    def test_avanza_a_la_derecha(self):
+        j = Juego(10, 10, semilla=1)
+        x, y = j.cabeza
+        j.comida = (0, 0)
+        j.paso()
+        self.assertEqual(j.cabeza, (x + 1, y))
+        self.assertEqual(len(j.serpiente), 3)
+
+    def test_no_puede_dar_media_vuelta(self):
+        j = Juego(10, 10, semilla=1)
+        j.girar(IZQUIERDA)
+        j.comida = (0, 0)
+        j.paso()
+        self.assertEqual(j.direccion, DERECHA)
+
+    def test_comer_crece_y_suma(self):
+        j = Juego(10, 10, semilla=1)
+        x, y = j.cabeza
+        j.comida = (x + 1, y)
+        self.assertTrue(j.paso())
+        self.assertEqual(len(j.serpiente), 4)
+        self.assertEqual(j.puntaje, 10)
+        self.assertNotIn(j.comida, j.serpiente)
+
+    def test_choque_con_pared(self):
+        j = Juego(5, 5, semilla=1)
+        j.comida = (0, 0)
+        for _ in range(5):
+            j.paso()
+        self.assertFalse(j.vivo)
+
+    def test_sin_paredes_da_la_vuelta(self):
+        j = Juego(5, 5, semilla=1, paredes=False)
+        j.comida = (0, 0)
+        j.girar(ARRIBA)
+        for _ in range(5):
+            j.paso()
+        self.assertTrue(j.vivo)
+
+    def test_choque_consigo_misma(self):
+        j = Juego(10, 10, semilla=1)
+        x, y = j.cabeza
+        j.serpiente.extend([(x - 3, y), (x - 4, y)])
+        j.comida = (0, 0)
+        for d in (ABAJO, IZQUIERDA, ARRIBA):
+            j.girar(d)
+            j.paso()
+        self.assertFalse(j.vivo)
+
+    def test_tablero_minimo_y_velocidad(self):
+        with self.assertRaises(ValueError):
+            Juego(3, 3)
+        j = Juego(10, 10)
+        j.puntaje = 5000
+        self.assertEqual(j.velocidad(), 0.06)
+
+
+class TestRecords(unittest.TestCase):
+    def test_record(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ruta = Path(tmp) / "r.json"
+            self.assertEqual(leer_record(ruta), 0)
+            self.assertTrue(guardar_record(30, ruta))
+            self.assertFalse(guardar_record(20, ruta))
+            self.assertEqual(leer_record(ruta), 30)
+
+
+if __name__ == "__main__":
+    unittest.main()
+''',
+    },
+    comando_tests=_PY_TESTS,
+    comando_ejecutar="python3 -m snake",
+    etiquetas=("juego", "snake", "serpiente", "curses", "terminal", "game"),
+)
+
+# ======================================================================
+# quiz
+# ======================================================================
+registrar_plantilla(
+    "quiz",
+    "Juego de preguntas (trivia) desde un JSON: opciones mezcladas, puntaje, racha y resumen final.",
+    "python",
+    {
+        "quiz/__init__.py": "",
+        "quiz/preguntas.json": r'''
+[
+  {"pregunta": "¿Cuál es el planeta más grande del sistema solar?", "opciones": ["Júpiter", "Saturno", "Tierra", "Neptuno"], "correcta": 0, "categoria": "ciencia"},
+  {"pregunta": "¿En qué año llegó el ser humano a la Luna?", "opciones": ["1965", "1969", "1972", "1959"], "correcta": 1, "categoria": "historia"},
+  {"pregunta": "¿Qué lenguaje usa Termux para sus paquetes?", "opciones": ["apt/pkg", "brew", "choco", "pacman"], "correcta": 0, "categoria": "tecnología"},
+  {"pregunta": "¿Cuántos lados tiene un hexágono?", "opciones": ["5", "6", "7", "8"], "correcta": 1, "categoria": "matemática"}
+]
+''',
+        "quiz/motor.py": r'''
+"""Lógica del quiz sin input/print."""
+
+import json
+import random
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Optional
+
+
+@dataclass
+class Pregunta:
+    pregunta: str
+    opciones: list
+    correcta: int
+    categoria: str = "general"
+
+    def __post_init__(self):
+        if len(self.opciones) < 2:
+            raise ValueError(f"la pregunta '{self.pregunta}' necesita al menos 2 opciones")
+        if not 0 <= self.correcta < len(self.opciones):
+            raise ValueError(f"índice correcto fuera de rango en '{self.pregunta}'")
+
+    def mezclada(self, azar: random.Random) -> "Pregunta":
+        orden = list(range(len(self.opciones)))
+        azar.shuffle(orden)
+        return Pregunta(self.pregunta, [self.opciones[i] for i in orden], orden.index(self.correcta), self.categoria)
+
+
+def cargar_preguntas(ruta: Path) -> list[Pregunta]:
+    datos = json.loads(Path(ruta).read_text(encoding="utf-8"))
+    if not isinstance(datos, list) or not datos:
+        raise ValueError("el archivo de preguntas debe ser una lista no vacía")
+    return [Pregunta(**d) for d in datos]
+
+
+@dataclass
+class Partida:
+    preguntas: list
+    semilla: Optional[int] = None
+    indice: int = 0
+    aciertos: int = 0
+    racha: int = 0
+    mejor_racha: int = 0
+    respuestas: list = field(default_factory=list)
+
+    def __post_init__(self):
+        azar = random.Random(self.semilla)
+        self.preguntas = [p.mezclada(azar) for p in self.preguntas]
+        azar.shuffle(self.preguntas)
+
+    @property
+    def terminada(self) -> bool:
+        return self.indice >= len(self.preguntas)
+
+    def actual(self) -> Pregunta:
+        if self.terminada:
+            raise IndexError("la partida terminó")
+        return self.preguntas[self.indice]
+
+    def responder(self, opcion: int) -> bool:
+        pregunta = self.actual()
+        if not 0 <= opcion < len(pregunta.opciones):
+            raise ValueError("opción inválida")
+        correcta = opcion == pregunta.correcta
+        self.respuestas.append((pregunta.pregunta, correcta))
+        self.indice += 1
+        if correcta:
+            self.aciertos += 1
+            self.racha += 1
+            self.mejor_racha = max(self.mejor_racha, self.racha)
+        else:
+            self.racha = 0
+        return correcta
+
+    def porcentaje(self) -> float:
+        return round(100 * self.aciertos / len(self.respuestas), 1) if self.respuestas else 0.0
+''',
+        "quiz/__main__.py": r'''
+"""Jugar: python3 -m quiz"""
+
+from pathlib import Path
+
+from quiz.motor import Partida, cargar_preguntas
+
+
+def main() -> None:
+    partida = Partida(cargar_preguntas(Path(__file__).with_name("preguntas.json")))
+    while not partida.terminada:
+        p = partida.actual()
+        print(f"\n[{p.categoria}] {p.pregunta}")
+        for i, opcion in enumerate(p.opciones, start=1):
+            print(f"  {i}. {opcion}")
+        respuesta = input("> ").strip()
+        if not respuesta.isdigit() or not 1 <= int(respuesta) <= len(p.opciones):
+            print("Respondé con el número de la opción.")
+            continue
+        if partida.responder(int(respuesta) - 1):
+            print("¡Correcto!")
+        else:
+            print(f"No: era {p.opciones[p.correcta]}")
+    print(f"\nAciertos: {partida.aciertos}/{len(partida.preguntas)} ({partida.porcentaje()}%)"
+          f" · mejor racha: {partida.mejor_racha}")
+
+
+main()
+''',
+        "tests/__init__.py": "",
+        "tests/test_quiz.py": r'''
+import json
+import random
+import tempfile
+import unittest
+from pathlib import Path
+
+from quiz.motor import Partida, Pregunta, cargar_preguntas
+
+
+def preguntas():
+    return [Pregunta("2+2", ["3", "4"], 1), Pregunta("capital de Francia", ["París", "Roma", "Madrid"], 0)]
+
+
+class TestQuiz(unittest.TestCase):
+    def test_validacion(self):
+        with self.assertRaises(ValueError):
+            Pregunta("x", ["solo una"], 0)
+        with self.assertRaises(ValueError):
+            Pregunta("x", ["a", "b"], 5)
+
+    def test_mezclar_conserva_la_correcta(self):
+        p = Pregunta("capital", ["París", "Roma", "Madrid", "Lima"], 0).mezclada(random.Random(3))
+        self.assertEqual(p.opciones[p.correcta], "París")
+
+    def test_partida_completa(self):
+        partida = Partida(preguntas(), semilla=7)
+        for _ in range(2):
+            p = partida.actual()
+            partida.responder(p.correcta)
+        self.assertTrue(partida.terminada)
+        self.assertEqual((partida.aciertos, partida.mejor_racha, partida.porcentaje()), (2, 2, 100.0))
+        with self.assertRaises(IndexError):
+            partida.actual()
+
+    def test_racha_se_corta(self):
+        partida = Partida(preguntas(), semilla=1)
+        p = partida.actual()
+        partida.responder((p.correcta + 1) % len(p.opciones))
+        self.assertEqual(partida.racha, 0)
+        self.assertEqual(partida.porcentaje(), 0.0)
+
+    def test_cargar(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ruta = Path(tmp) / "p.json"
+            ruta.write_text(json.dumps([{"pregunta": "a", "opciones": ["x", "y"], "correcta": 1}]))
+            self.assertEqual(cargar_preguntas(ruta)[0].correcta, 1)
+            ruta.write_text("[]")
+            with self.assertRaises(ValueError):
+                cargar_preguntas(ruta)
+
+    def test_archivo_incluido_es_valido(self):
+        ruta = Path(__file__).resolve().parent.parent / "quiz" / "preguntas.json"
+        self.assertGreaterEqual(len(cargar_preguntas(ruta)), 4)
+
+
+if __name__ == "__main__":
+    unittest.main()
+''',
+    },
+    comando_tests=_PY_TESTS,
+    comando_ejecutar="python3 -m quiz",
+    etiquetas=("quiz", "trivia", "preguntas", "juego", "examen"),
+)
+
+# ======================================================================
+# gastos
+# ======================================================================
+registrar_plantilla(
+    "gastos",
+    "Control de gastos: montos con Decimal, categorías, resumen mensual y por categoría, importar/exportar CSV.",
+    "python",
+    {
+        "gastos/__init__.py": "",
+        "gastos/modelo.py": r'''
+"""Gastos con Decimal (nunca float para dinero)."""
+
+from collections import defaultdict
+from dataclasses import dataclass
+from datetime import date
+from decimal import Decimal, InvalidOperation
+from typing import Iterable
+
+
+@dataclass(frozen=True)
+class Gasto:
+    fecha: date
+    monto: Decimal
+    categoria: str
+    descripcion: str = ""
+
+    @staticmethod
+    def crear(fecha: str, monto: str, categoria: str, descripcion: str = "") -> "Gasto":
+        try:
+            fecha_ok = date.fromisoformat(fecha.strip())
+        except ValueError:
+            raise ValueError(f"fecha inválida: {fecha!r} (usá AAAA-MM-DD)")
+        try:
+            monto_ok = Decimal(str(monto).strip().replace(",", ".")).quantize(Decimal("0.01"))
+        except InvalidOperation:
+            raise ValueError(f"monto inválido: {monto!r}")
+        if monto_ok <= 0:
+            raise ValueError("el monto debe ser positivo")
+        categoria = categoria.strip().lower()
+        if not categoria:
+            raise ValueError("la categoría es obligatoria")
+        return Gasto(fecha_ok, monto_ok, categoria, descripcion.strip())
+
+
+def total(gastos: Iterable[Gasto]) -> Decimal:
+    return sum((g.monto for g in gastos), Decimal("0.00"))
+
+
+def por_categoria(gastos: Iterable[Gasto]) -> dict[str, Decimal]:
+    acumulado: dict[str, Decimal] = defaultdict(lambda: Decimal("0.00"))
+    for g in gastos:
+        acumulado[g.categoria] += g.monto
+    return dict(sorted(acumulado.items(), key=lambda kv: (-kv[1], kv[0])))
+
+
+def por_mes(gastos: Iterable[Gasto]) -> dict[str, Decimal]:
+    acumulado: dict[str, Decimal] = defaultdict(lambda: Decimal("0.00"))
+    for g in gastos:
+        acumulado[g.fecha.strftime("%Y-%m")] += g.monto
+    return dict(sorted(acumulado.items()))
+
+
+def del_mes(gastos: Iterable[Gasto], mes: str) -> list[Gasto]:
+    return [g for g in gastos if g.fecha.strftime("%Y-%m") == mes]
+''',
+        "gastos/csvio.py": r'''
+"""Importar y exportar CSV con validación fila por fila."""
+
+import csv
+from pathlib import Path
+
+from gastos.modelo import Gasto
+
+COLUMNAS = ("fecha", "monto", "categoria", "descripcion")
+
+
+def exportar(ruta: Path, gastos: list) -> int:
+    with open(ruta, "w", encoding="utf-8", newline="") as f:
+        escritor = csv.writer(f)
+        escritor.writerow(COLUMNAS)
+        for g in gastos:
+            escritor.writerow([g.fecha.isoformat(), f"{g.monto:.2f}", g.categoria, g.descripcion])
+    return len(gastos)
+
+
+def importar(ruta: Path) -> tuple[list, list]:
+    """Devuelve (gastos válidos, errores con número de línea)."""
+    gastos, errores = [], []
+    with open(ruta, encoding="utf-8", newline="") as f:
+        lector = csv.DictReader(f)
+        faltan = [c for c in COLUMNAS[:3] if c not in (lector.fieldnames or [])]
+        if faltan:
+            return [], [f"faltan columnas: {', '.join(faltan)}"]
+        for numero, fila in enumerate(lector, start=2):
+            try:
+                gastos.append(Gasto.crear(fila["fecha"], fila["monto"], fila["categoria"], fila.get("descripcion") or ""))
+            except (ValueError, KeyError, TypeError) as e:
+                errores.append(f"línea {numero}: {e}")
+    return gastos, errores
+''',
+        "gastos/cli.py": r'''
+"""Uso: python3 -m gastos.cli agregar 2026-10-01 1500 comida "super" | resumen | mes 2026-10 | exportar x.csv | importar x.csv"""
+
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+from typing import Optional
+
+from gastos.csvio import exportar, importar
+from gastos.modelo import Gasto, del_mes, por_categoria, por_mes, total
+
+
+def ruta_datos() -> Path:
+    return Path(os.environ.get("GASTOS_ARCHIVO", Path.home() / ".gastos.json"))
+
+
+def cargar() -> list:
+    ruta = ruta_datos()
+    if not ruta.exists():
+        return []
+    return [Gasto.crear(d["fecha"], d["monto"], d["categoria"], d.get("descripcion", ""))
+            for d in json.loads(ruta.read_text(encoding="utf-8") or "[]")]
+
+
+def guardar(gastos: list) -> None:
+    datos = [{"fecha": g.fecha.isoformat(), "monto": str(g.monto), "categoria": g.categoria,
+              "descripcion": g.descripcion} for g in gastos]
+    ruta_datos().write_text(json.dumps(datos, ensure_ascii=False, indent=1), encoding="utf-8")
+
+
+def main(argv: Optional[list] = None) -> int:
+    parser = argparse.ArgumentParser(prog="gastos")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("agregar")
+    p.add_argument("fecha")
+    p.add_argument("monto")
+    p.add_argument("categoria")
+    p.add_argument("descripcion", nargs="?", default="")
+    sub.add_parser("resumen")
+    sub.add_parser("mes").add_argument("mes", help="AAAA-MM")
+    sub.add_parser("exportar").add_argument("archivo")
+    sub.add_parser("importar").add_argument("archivo")
+    args = parser.parse_args(argv)
+    gastos = cargar()
+    try:
+        if args.cmd == "agregar":
+            gastos.append(Gasto.crear(args.fecha, args.monto, args.categoria, args.descripcion))
+            guardar(gastos)
+            print("gasto agregado")
+        elif args.cmd == "resumen":
+            for categoria, monto in por_categoria(gastos).items():
+                print(f"{categoria:<15} {monto:>12.2f}")
+            print(f"{'TOTAL':<15} {total(gastos):>12.2f}")
+            for mes, monto in por_mes(gastos).items():
+                print(f"  {mes}: {monto:.2f}")
+        elif args.cmd == "mes":
+            for g in del_mes(gastos, args.mes):
+                print(f"{g.fecha} {g.monto:>10.2f} {g.categoria} {g.descripcion}")
+        elif args.cmd == "exportar":
+            print(f"{exportar(Path(args.archivo), gastos)} gastos exportados")
+        elif args.cmd == "importar":
+            nuevos, errores = importar(Path(args.archivo))
+            gastos.extend(nuevos)
+            guardar(gastos)
+            print(f"{len(nuevos)} importados, {len(errores)} con error")
+            for e in errores:
+                print("  " + e, file=sys.stderr)
+    except (ValueError, OSError) as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+''',
+        "tests/__init__.py": "",
+        "tests/test_gastos.py": r'''
+import os
+import tempfile
+import unittest
+from datetime import date
+from decimal import Decimal
+from pathlib import Path
+
+from gastos import cli
+from gastos.csvio import exportar, importar
+from gastos.modelo import Gasto, del_mes, por_categoria, por_mes, total
+
+
+def ejemplos():
+    return [Gasto.crear("2026-10-01", "100.50", "Comida"), Gasto.crear("2026-10-15", "40", "transporte"),
+            Gasto.crear("2026-11-02", "9,99", "comida", "café")]
+
+
+class TestModelo(unittest.TestCase):
+    def test_crear_normaliza(self):
+        g = Gasto.crear(" 2026-10-01 ", "9,999", " Comida ")
+        self.assertEqual((g.fecha, g.monto, g.categoria), (date(2026, 10, 1), Decimal("10.00"), "comida"))
+
+    def test_validaciones(self):
+        for args in (("10/10/2026", "1", "x"), ("2026-10-01", "abc", "x"), ("2026-10-01", "-5", "x"),
+                     ("2026-10-01", "5", " ")):
+            with self.assertRaises(ValueError):
+                Gasto.crear(*args)
+
+    def test_resumenes(self):
+        gastos = ejemplos()
+        self.assertEqual(total(gastos), Decimal("150.49"))
+        self.assertEqual(list(por_categoria(gastos).items())[0], ("comida", Decimal("110.49")))
+        self.assertEqual(por_mes(gastos), {"2026-10": Decimal("140.50"), "2026-11": Decimal("9.99")})
+        self.assertEqual(len(del_mes(gastos, "2026-10")), 2)
+        self.assertEqual(total([]), Decimal("0.00"))
+
+
+class TestCSV(unittest.TestCase):
+    def test_ida_y_vuelta_con_errores(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ruta = Path(tmp) / "g.csv"
+            self.assertEqual(exportar(ruta, ejemplos()), 3)
+            with open(ruta, "a", encoding="utf-8") as f:
+                f.write("mal,xx,comida,\n")
+            gastos, errores = importar(ruta)
+            self.assertEqual(len(gastos), 3)
+            self.assertEqual(len(errores), 1)
+            self.assertIn("línea 5", errores[0])
+
+    def test_columnas_faltantes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ruta = Path(tmp) / "g.csv"
+            ruta.write_text("a,b\n1,2\n", encoding="utf-8")
+            self.assertEqual(importar(ruta)[0], [])
+
+
+class TestCLI(unittest.TestCase):
+    def test_agregar_y_resumen(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.environ["GASTOS_ARCHIVO"] = str(Path(tmp) / "g.json")
+            try:
+                self.assertEqual(cli.main(["agregar", "2026-10-01", "12.5", "comida"]), 0)
+                self.assertEqual(len(cli.cargar()), 1)
+                self.assertEqual(cli.main(["agregar", "mal", "1", "x"]), 1)
+            finally:
+                del os.environ["GASTOS_ARCHIVO"]
+
+
+if __name__ == "__main__":
+    unittest.main()
+''',
+    },
+    comando_tests=_PY_TESTS,
+    comando_ejecutar="python3 -m gastos.cli resumen",
+    etiquetas=("gastos", "dinero", "finanzas", "presupuesto", "csv", "contabilidad", "expensas"),
+)
+
+# ======================================================================
+# scraper
+# ======================================================================
+registrar_plantilla(
+    "scraper",
+    "Extractor web con urllib + html.parser: título, encabezados, links absolutos y texto, con tests offline.",
+    "python",
+    {
+        "scraper/__init__.py": "",
+        "scraper/extractor.py": r'''
+"""Extracción de datos de HTML sin dependencias externas."""
+
+from dataclasses import dataclass, field
+from html.parser import HTMLParser
+from urllib.parse import urljoin, urlparse
+
+
+@dataclass
+class Pagina:
+    url: str
+    titulo: str = ""
+    encabezados: list = field(default_factory=list)
+    links: list = field(default_factory=list)
+    texto: str = ""
+
+    def links_internos(self) -> list:
+        dominio = urlparse(self.url).netloc
+        return [l for l in self.links if urlparse(l).netloc == dominio]
+
+
+class _Analizador(HTMLParser):
+    IGNORAR = {"script", "style", "noscript", "template"}
+
+    def __init__(self, base: str):
+        super().__init__(convert_charrefs=True)
+        self.base = base
+        self.titulo, self.encabezados, self.links, self.partes = "", [], [], []
+        self._pila: list = []
+        self._en_titulo = False
+        self._encabezado = None
+
+    def handle_starttag(self, tag, attrs):
+        self._pila.append(tag)
+        atributos = dict(attrs)
+        if tag == "title":
+            self._en_titulo = True
+        elif tag in ("h1", "h2", "h3"):
+            self._encabezado = [tag, ""]
+        elif tag == "a" and atributos.get("href"):
+            href = atributos["href"].strip()
+            if not href.startswith(("javascript:", "mailto:", "#", "tel:")):
+                absoluto = urljoin(self.base, href).split("#")[0]
+                if absoluto not in self.links:
+                    self.links.append(absoluto)
+
+    def handle_endtag(self, tag):
+        if tag == "title":
+            self._en_titulo = False
+        elif tag in ("h1", "h2", "h3") and self._encabezado:
+            texto = " ".join(self._encabezado[1].split())
+            if texto:
+                self.encabezados.append((self._encabezado[0], texto))
+            self._encabezado = None
+        while self._pila and self._pila.pop() != tag:
+            pass
+
+    def handle_data(self, data):
+        if any(t in self.IGNORAR for t in self._pila):
+            return
+        if self._en_titulo:
+            self.titulo += data
+        if self._encabezado is not None:
+            self._encabezado[1] += data
+        if data.strip():
+            self.partes.append(data.strip())
+
+
+def extraer(html: str, url: str = "http://localhost/") -> Pagina:
+    analizador = _Analizador(url)
+    analizador.feed(html or "")
+    analizador.close()
+    return Pagina(url, " ".join(analizador.titulo.split()), analizador.encabezados, analizador.links,
+                  " ".join(analizador.partes))
+''',
+        "scraper/red.py": r'''
+"""Descarga con límites (tamaño y tiempo) y detección de codificación."""
+
+import urllib.request
+
+AGENTE = "Mozilla/5.0 (Linux; Android) __Proyecto__/0.1"
+
+
+def descargar(url: str, timeout: int = 15, maximo: int = 3_000_000) -> str:
+    if not url.startswith(("http://", "https://")):
+        raise ValueError("la URL debe empezar con http:// o https://")
+    pedido = urllib.request.Request(url, headers={"User-Agent": AGENTE})
+    with urllib.request.urlopen(pedido, timeout=timeout) as r:
+        datos = r.read(maximo + 1)
+        if len(datos) > maximo:
+            raise ValueError(f"la página supera {maximo} bytes")
+        codificacion = r.headers.get_content_charset() or "utf-8"
+    return datos.decode(codificacion, errors="replace")
+''',
+        "scraper/__main__.py": r'''
+"""Uso: python3 -m scraper https://ejemplo.com [--json]"""
+
+import json
+import sys
+import urllib.error
+
+from scraper.extractor import extraer
+from scraper.red import descargar
+
+
+def main(argv=None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    if not argv:
+        print("uso: python3 -m scraper <url> [--json]", file=sys.stderr)
+        return 2
+    url = argv[0]
+    try:
+        pagina = extraer(descargar(url), url)
+    except (urllib.error.URLError, ValueError, TimeoutError) as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    if "--json" in argv:
+        print(json.dumps(pagina.__dict__, ensure_ascii=False, indent=2))
+    else:
+        print(f"Título: {pagina.titulo}")
+        for nivel, texto in pagina.encabezados[:20]:
+            print(f"  {nivel}: {texto}")
+        print(f"{len(pagina.links)} links ({len(pagina.links_internos())} internos)")
+    return 0
+
+
+sys.exit(main())
+''',
+        "tests/__init__.py": "",
+        "tests/test_extractor.py": r'''
+import unittest
+
+from scraper.extractor import extraer
+from scraper.red import descargar
+
+HTML = """<html><head><title> Mi   sitio </title><style>.x{}</style></head>
+<body><h1>Bienvenida</h1><p>Hola <b>mundo</b></p>
+<a href="/a">A</a> <a href="https://otro.com/b#seccion">B</a> <a href="/a">repetido</a>
+<a href="javascript:void(0)">no</a> <a href="mailto:x@y.z">mail</a>
+<h2>Sección <i>dos</i></h2><script>var no = 1;</script></body></html>"""
+
+
+class TestExtractor(unittest.TestCase):
+    def setUp(self):
+        self.pagina = extraer(HTML, "https://misitio.com/inicio")
+
+    def test_titulo(self):
+        self.assertEqual(self.pagina.titulo, "Mi sitio")
+
+    def test_encabezados(self):
+        self.assertEqual(self.pagina.encabezados, [("h1", "Bienvenida"), ("h2", "Sección dos")])
+
+    def test_links_absolutos_sin_duplicados(self):
+        self.assertEqual(self.pagina.links, ["https://misitio.com/a", "https://otro.com/b"])
+        self.assertEqual(self.pagina.links_internos(), ["https://misitio.com/a"])
+
+    def test_texto_sin_scripts(self):
+        self.assertIn("Hola mundo", self.pagina.texto.replace("Hola mundo", "Hola mundo"))
+        self.assertNotIn("var no", self.pagina.texto)
+
+    def test_html_vacio(self):
+        self.assertEqual(extraer("").titulo, "")
+
+    def test_url_invalida(self):
+        with self.assertRaises(ValueError):
+            descargar("ftp://algo")
+
+
+if __name__ == "__main__":
+    unittest.main()
+''',
+    },
+    comando_tests=_PY_TESTS,
+    comando_ejecutar="python3 -m scraper https://example.com",
+    etiquetas=("scraper", "web", "html", "extraer", "links", "descargar", "crawler"),
+)
+
+# ======================================================================
+# bot-telegram
+# ======================================================================
+registrar_plantilla(
+    "bot-telegram",
+    "Bot de Telegram con urllib (sin librerías): long polling con reintentos, router de comandos y tests sin red.",
+    "python",
+    {
+        "bot/__init__.py": "",
+        "bot/telegram.py": r'''
+"""Cliente mínimo de la Bot API de Telegram. El transporte es inyectable para testear sin red."""
+
+import json
+import urllib.error
+import urllib.request
+from typing import Callable, Optional
+
+Transporte = Callable[[str, dict, int], dict]
+
+
+def transporte_urllib(url: str, datos: dict, timeout: int) -> dict:
+    cuerpo = json.dumps(datos).encode("utf-8")
+    pedido = urllib.request.Request(url, data=cuerpo, headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(pedido, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+class ErrorTelegram(RuntimeError):
+    pass
+
+
+class ClienteTelegram:
+    def __init__(self, token: str, transporte: Optional[Transporte] = None, base: str = "https://api.telegram.org"):
+        if not token or ":" not in token:
+            raise ValueError("token de bot inválido (pedilo a @BotFather)")
+        self.url = f"{base}/bot{token}"
+        self.transporte = transporte or transporte_urllib
+
+    def _llamar(self, metodo: str, datos: dict, timeout: int = 35) -> dict:
+        respuesta = self.transporte(f"{self.url}/{metodo}", datos, timeout)
+        if not respuesta.get("ok"):
+            raise ErrorTelegram(respuesta.get("description", "error desconocido"))
+        return respuesta.get("result")
+
+    def actualizaciones(self, offset: int = 0, espera: int = 30) -> list:
+        return self._llamar("getUpdates", {"offset": offset, "timeout": espera}, timeout=espera + 5) or []
+
+    def enviar(self, chat_id: int, texto: str) -> dict:
+        return self._llamar("sendMessage", {"chat_id": chat_id, "text": texto[:4096]})
+''',
+        "bot/comandos.py": r'''
+"""Router de comandos: @router.comando("/start") def ...(argumentos, mensaje) -> str"""
+
+import random
+from typing import Callable, Optional
+
+
+class Router:
+    def __init__(self):
+        self._comandos: dict[str, Callable] = {}
+        self._defecto: Optional[Callable] = None
+
+    def comando(self, nombre: str, descripcion: str = ""):
+        def decorador(funcion: Callable) -> Callable:
+            funcion.descripcion = descripcion
+            self._comandos[nombre.lower()] = funcion
+            return funcion
+        return decorador
+
+    def texto_libre(self, funcion: Callable) -> Callable:
+        self._defecto = funcion
+        return funcion
+
+    def ayuda(self) -> str:
+        return "\n".join(f"{n} — {getattr(f, 'descripcion', '')}" for n, f in sorted(self._comandos.items()))
+
+    def manejar(self, mensaje: dict) -> Optional[str]:
+        texto = (mensaje.get("text") or "").strip()
+        if not texto:
+            return None
+        if texto.startswith("/"):
+            nombre, _, argumentos = texto.partition(" ")
+            nombre = nombre.split("@")[0].lower()
+            funcion = self._comandos.get(nombre)
+            if funcion is None:
+                return f"No conozco {nombre}. Probá /ayuda"
+            return funcion(argumentos.strip(), mensaje)
+        return self._defecto(texto, mensaje) if self._defecto else None
+
+
+router = Router()
+
+
+@router.comando("/start", "presentación")
+def start(argumentos: str, mensaje: dict) -> str:
+    nombre = mensaje.get("from", {}).get("first_name", "")
+    return f"¡Hola {nombre}! Soy __TITULO__. Escribí /ayuda para ver lo que sé hacer."
+
+
+@router.comando("/ayuda", "lista de comandos")
+def ayuda(argumentos: str, mensaje: dict) -> str:
+    return router.ayuda()
+
+
+@router.comando("/eco", "repite el texto")
+def eco(argumentos: str, mensaje: dict) -> str:
+    return argumentos or "Decime algo después de /eco"
+
+
+@router.comando("/dado", "tira un dado (o /dado 20)")
+def dado(argumentos: str, mensaje: dict) -> str:
+    caras = int(argumentos) if argumentos.isdigit() and int(argumentos) > 1 else 6
+    return f"🎲 {random.randint(1, caras)} (d{caras})"
+
+
+@router.texto_libre
+def charla(texto: str, mensaje: dict) -> str:
+    return f"Recibí: {texto}"
+''',
+        "bot/__main__.py": r'''
+"""Correr: export TELEGRAM_TOKEN=123:abc ; python3 -m bot"""
+
+import os
+import sys
+import time
+import urllib.error
+
+from bot.comandos import router
+from bot.telegram import ClienteTelegram, ErrorTelegram
+
+
+def bucle(cliente: ClienteTelegram, una_vez: bool = False) -> None:
+    offset, espera_error = 0, 1
+    while True:
+        try:
+            for update in cliente.actualizaciones(offset):
+                offset = update["update_id"] + 1
+                mensaje = update.get("message") or update.get("edited_message")
+                if not mensaje:
+                    continue
+                respuesta = router.manejar(mensaje)
+                if respuesta:
+                    cliente.enviar(mensaje["chat"]["id"], respuesta)
+            espera_error = 1
+        except (urllib.error.URLError, TimeoutError, ErrorTelegram) as e:
+            print(f"error de red/API: {e}; reintento en {espera_error}s", file=sys.stderr)
+            time.sleep(espera_error)
+            espera_error = min(60, espera_error * 2)
+        if una_vez:
+            return
+
+
+def main() -> int:
+    token = os.environ.get("TELEGRAM_TOKEN", "")
+    try:
+        cliente = ClienteTelegram(token)
+    except ValueError as e:
+        print(f"{e}. export TELEGRAM_TOKEN=...", file=sys.stderr)
+        return 1
+    print("Bot corriendo (Ctrl+C para salir)")
+    try:
+        bucle(cliente)
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+''',
+        "tests/__init__.py": "",
+        "tests/test_bot.py": r'''
+import unittest
+
+from bot.comandos import Router, router
+from bot.telegram import ClienteTelegram, ErrorTelegram
+
+
+class FalsoTransporte:
+    def __init__(self, respuestas):
+        self.respuestas = list(respuestas)
+        self.pedidos = []
+
+    def __call__(self, url, datos, timeout):
+        self.pedidos.append((url, datos))
+        return self.respuestas.pop(0)
+
+
+class TestRouter(unittest.TestCase):
+    def test_comandos_incluidos(self):
+        self.assertIn("Hola Ana", router.manejar({"text": "/start", "from": {"first_name": "Ana"}}))
+        self.assertEqual(router.manejar({"text": "/eco hola mundo"}), "hola mundo")
+        self.assertIn("/dado", router.manejar({"text": "/ayuda"}))
+        self.assertIn("No conozco", router.manejar({"text": "/nada"}))
+        self.assertEqual(router.manejar({"text": "/ECO@mi_bot x"}), "x")
+        self.assertIsNone(router.manejar({}))
+
+    def test_dado_en_rango(self):
+        for _ in range(20):
+            valor = int(router.manejar({"text": "/dado 4"}).split()[1])
+            self.assertTrue(1 <= valor <= 4)
+
+    def test_router_nuevo(self):
+        r = Router()
+
+        @r.comando("/hola", "saluda")
+        def hola(args, msg):
+            return "hola!"
+
+        self.assertEqual(r.manejar({"text": "/hola"}), "hola!")
+        self.assertIsNone(r.manejar({"text": "texto suelto"}))
+
+
+class TestCliente(unittest.TestCase):
+    def test_token_invalido(self):
+        with self.assertRaises(ValueError):
+            ClienteTelegram("sin-dos-puntos")
+
+    def test_enviar_y_actualizaciones(self):
+        t = FalsoTransporte([{"ok": True, "result": [{"update_id": 5}]}, {"ok": True, "result": {"message_id": 1}}])
+        c = ClienteTelegram("1:abc", transporte=t)
+        self.assertEqual(c.actualizaciones(3)[0]["update_id"], 5)
+        c.enviar(10, "hola")
+        self.assertTrue(t.pedidos[1][0].endswith("/sendMessage"))
+        self.assertEqual(t.pedidos[1][1]["chat_id"], 10)
+
+    def test_error_de_api(self):
+        c = ClienteTelegram("1:abc", transporte=FalsoTransporte([{"ok": False, "description": "Unauthorized"}]))
+        with self.assertRaises(ErrorTelegram):
+            c.enviar(1, "x")
+
+
+if __name__ == "__main__":
+    unittest.main()
+''',
+    },
+    comando_tests=_PY_TESTS,
+    comando_ejecutar="TELEGRAM_TOKEN=... python3 -m bot",
+    etiquetas=("bot", "telegram", "chat", "mensajes", "api"),
+)
+
+# ======================================================================
+# organizador
+# ======================================================================
+registrar_plantilla(
+    "organizador",
+    "Organizador de archivos por tipo o por fecha, con modo simulación, nombres sin pisarse y reporte.",
+    "python",
+    {
+        "organizador/__init__.py": "",
+        "organizador/reglas.py": r'''
+CATEGORIAS = {
+    "Imagenes": {".jpg", ".jpeg", ".png", ".gif", ".webp", ".heic", ".bmp", ".svg"},
+    "Videos": {".mp4", ".mkv", ".avi", ".mov", ".webm", ".3gp"},
+    "Audio": {".mp3", ".ogg", ".wav", ".m4a", ".flac", ".opus", ".aac"},
+    "Documentos": {".pdf", ".doc", ".docx", ".odt", ".txt", ".md", ".xls", ".xlsx", ".ppt", ".pptx", ".csv", ".epub"},
+    "Comprimidos": {".zip", ".rar", ".7z", ".tar", ".gz", ".xz", ".bz2"},
+    "Codigo": {".py", ".js", ".html", ".css", ".json", ".sh", ".java", ".c", ".cpp", ".go", ".rs"},
+    "Apps": {".apk", ".xapk", ".aab"},
+}
+
+
+def categoria(nombre: str) -> str:
+    sufijo = "." + nombre.rsplit(".", 1)[-1].lower() if "." in nombre else ""
+    for cat, extensiones in CATEGORIAS.items():
+        if sufijo in extensiones:
+            return cat
+    return "Otros"
+''',
+        "organizador/mover.py": r'''
+"""Planifica y ejecuta movimientos. La planificación no toca el disco."""
+
+import shutil
+from datetime import datetime
+from pathlib import Path
+
+from organizador.reglas import CATEGORIAS, categoria
+
+
+def destino_sin_choque(ruta: Path, reservados: set) -> Path:
+    candidato, n = ruta, 1
+    while candidato.exists() or candidato in reservados:
+        candidato = ruta.with_name(f"{ruta.stem} ({n}){ruta.suffix}")
+        n += 1
+    return candidato
+
+
+def planificar(carpeta: Path, por: str = "tipo") -> list:
+    carpeta = Path(carpeta)
+    if not carpeta.is_dir():
+        raise NotADirectoryError(str(carpeta))
+    if por not in ("tipo", "fecha"):
+        raise ValueError("por debe ser 'tipo' o 'fecha'")
+    propias = set(CATEGORIAS) | {"Otros"}
+    plan, reservados = [], set()
+    for archivo in sorted(carpeta.iterdir()):
+        if not archivo.is_file() or archivo.name.startswith("."):
+            continue
+        if por == "tipo":
+            subcarpeta = categoria(archivo.name)
+        else:
+            subcarpeta = datetime.fromtimestamp(archivo.stat().st_mtime).strftime("%Y-%m")
+        if archivo.parent.name in propias:
+            continue
+        destino = destino_sin_choque(carpeta / subcarpeta / archivo.name, reservados)
+        reservados.add(destino)
+        plan.append((archivo, destino))
+    return plan
+
+
+def ejecutar(plan: list, simular: bool = True) -> list:
+    hechos = []
+    for origen, destino in plan:
+        if not simular:
+            destino.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(origen), str(destino))
+        hechos.append(f"{origen.name} → {destino.parent.name}/{destino.name}")
+    return hechos
+''',
+        "organizador/__main__.py": r'''
+"""Uso: python3 -m organizador ~/storage/downloads [--por fecha] [--aplicar]"""
+
+import sys
+from pathlib import Path
+
+from organizador.mover import ejecutar, planificar
+
+
+def main(argv=None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    if not argv:
+        print("uso: python3 -m organizador <carpeta> [--por tipo|fecha] [--aplicar]", file=sys.stderr)
+        return 2
+    por = argv[argv.index("--por") + 1] if "--por" in argv else "tipo"
+    aplicar = "--aplicar" in argv
+    try:
+        plan = planificar(Path(argv[0]).expanduser(), por)
+    except (NotADirectoryError, ValueError) as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    for linea in ejecutar(plan, simular=not aplicar):
+        print(linea)
+    print(f"\n{len(plan)} archivo(s) {'movidos' if aplicar else 'a mover (simulación: agregá --aplicar)'}")
+    return 0
+
+
+sys.exit(main())
+''',
+        "tests/__init__.py": "",
+        "tests/test_organizador.py": r'''
+import tempfile
+import unittest
+from pathlib import Path
+
+from organizador.mover import ejecutar, planificar
+from organizador.reglas import categoria
+
+
+class TestOrganizador(unittest.TestCase):
+    def test_categorias(self):
+        self.assertEqual(categoria("foto.JPG"), "Imagenes")
+        self.assertEqual(categoria("app.apk"), "Apps")
+        self.assertEqual(categoria("sin_extension"), "Otros")
+
+    def test_simular_no_mueve(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            (base / "a.png").write_text("x")
+            plan = planificar(base)
+            self.assertEqual(ejecutar(plan, simular=True), ["a.png → Imagenes/a.png"])
+            self.assertTrue((base / "a.png").exists())
+
+    def test_aplicar_y_choques(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            (base / "Imagenes").mkdir()
+            (base / "Imagenes" / "a.png").write_text("viejo")
+            (base / "a.png").write_text("nuevo")
+            (base / "doc.pdf").write_text("pdf")
+            (base / ".oculto").write_text("no")
+            ejecutar(planificar(base), simular=False)
+            self.assertTrue((base / "Imagenes" / "a (1).png").exists())
+            self.assertTrue((base / "Documentos" / "doc.pdf").exists())
+            self.assertTrue((base / ".oculto").exists())
+
+    def test_por_fecha_y_errores(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            (base / "x.txt").write_text("x")
+            plan = planificar(base, por="fecha")
+            self.assertRegex(plan[0][1].parent.name, r"^\d{4}-\d{2}$")
+            with self.assertRaises(ValueError):
+                planificar(base, por="color")
+            with self.assertRaises(NotADirectoryError):
+                planificar(base / "no")
+
+
+if __name__ == "__main__":
+    unittest.main()
+''',
+    },
+    comando_tests=_PY_TESTS,
+    comando_ejecutar="python3 -m organizador ~/storage/downloads",
+    etiquetas=("organizar", "archivos", "carpetas", "descargas", "ordenar", "fotos"),
+)
+
+# ======================================================================
+# respaldo (backup zip con rotación)
+# ======================================================================
+registrar_plantilla(
+    "respaldo",
+    "Respaldos en ZIP con fecha, exclusiones tipo .gitignore, rotación (conservar N) y restauración segura.",
+    "python",
+    {
+        "respaldo/__init__.py": "",
+        "respaldo/nucleo.py": r'''
+import fnmatch
+import zipfile
+from datetime import datetime
+from pathlib import Path
+
+EXCLUIR_DEFECTO = ("__pycache__", "*.pyc", ".git", "node_modules", ".venv", "*.tmp")
+
+
+def _excluido(rel: str, patrones) -> bool:
+    partes = rel.split("/")
+    return any(fnmatch.fnmatch(p, patron) for patron in patrones for p in partes) or \
+        any(fnmatch.fnmatch(rel, patron) for patron in patrones)
+
+
+def crear_respaldo(origen: Path, destino: Path, excluir=EXCLUIR_DEFECTO, ahora: datetime = None) -> Path:
+    origen, destino = Path(origen), Path(destino)
+    if not origen.is_dir():
+        raise NotADirectoryError(str(origen))
+    destino.mkdir(parents=True, exist_ok=True)
+    marca = (ahora or datetime.now()).strftime("%Y%m%d_%H%M%S")
+    archivo = destino / f"{origen.name}_{marca}.zip"
+    with zipfile.ZipFile(archivo, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for ruta in sorted(origen.rglob("*")):
+            rel = ruta.relative_to(origen).as_posix()
+            if ruta.is_file() and not _excluido(rel, excluir) and destino not in ruta.parents:
+                zf.write(ruta, rel)
+    return archivo
+
+
+def listar(destino: Path, nombre: str) -> list:
+    return sorted(Path(destino).glob(f"{nombre}_*.zip"))
+
+
+def rotar(destino: Path, nombre: str, conservar: int = 5) -> list:
+    if conservar < 1:
+        raise ValueError("hay que conservar al menos 1 respaldo")
+    viejos = listar(destino, nombre)[:-conservar]
+    for archivo in viejos:
+        archivo.unlink()
+    return viejos
+
+
+def restaurar(archivo: Path, destino: Path) -> int:
+    destino = Path(destino).resolve()
+    with zipfile.ZipFile(archivo) as zf:
+        for miembro in zf.namelist():
+            final = (destino / miembro).resolve()
+            if destino not in final.parents and final != destino:
+                raise ValueError(f"ruta peligrosa en el zip: {miembro}")
+        zf.extractall(destino)
+        return len(zf.namelist())
+''',
+        "respaldo/__main__.py": r'''
+"""Uso: python3 -m respaldo <carpeta> [--destino ~/respaldos] [--conservar 5]"""
+
+import sys
+from pathlib import Path
+
+from respaldo.nucleo import crear_respaldo, rotar
+
+
+def main(argv=None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    if not argv:
+        print("uso: python3 -m respaldo <carpeta> [--destino DIR] [--conservar N]", file=sys.stderr)
+        return 2
+    origen = Path(argv[0]).expanduser()
+    destino = Path(argv[argv.index("--destino") + 1]).expanduser() if "--destino" in argv else Path.home() / "respaldos"
+    conservar = int(argv[argv.index("--conservar") + 1]) if "--conservar" in argv else 5
+    try:
+        archivo = crear_respaldo(origen, destino)
+        borrados = rotar(destino, origen.name, conservar)
+    except (NotADirectoryError, ValueError, OSError) as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    print(f"respaldo: {archivo} ({archivo.stat().st_size // 1024} KB); rotados: {len(borrados)}")
+    return 0
+
+
+sys.exit(main())
+''',
+        "tests/__init__.py": "",
+        "tests/test_respaldo.py": r'''
+import tempfile
+import unittest
+import zipfile
+from datetime import datetime
+from pathlib import Path
+
+from respaldo.nucleo import crear_respaldo, listar, restaurar, rotar
+
+
+class TestRespaldo(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.base = Path(self.tmp.name)
+        self.origen = self.base / "proyecto"
+        (self.origen / "sub").mkdir(parents=True)
+        (self.origen / "a.txt").write_text("A")
+        (self.origen / "sub" / "b.txt").write_text("B")
+        (self.origen / "__pycache__").mkdir()
+        (self.origen / "__pycache__" / "x.pyc").write_text("no")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_crear_excluye(self):
+        zipf = crear_respaldo(self.origen, self.base / "resp")
+        with zipfile.ZipFile(zipf) as zf:
+            self.assertEqual(sorted(zf.namelist()), ["a.txt", "sub/b.txt"])
+
+    def test_rotar(self):
+        destino = self.base / "resp"
+        for minuto in range(4):
+            crear_respaldo(self.origen, destino, ahora=datetime(2026, 1, 1, 10, minuto))
+        borrados = rotar(destino, "proyecto", conservar=2)
+        self.assertEqual(len(borrados), 2)
+        self.assertEqual(len(listar(destino, "proyecto")), 2)
+        with self.assertRaises(ValueError):
+            rotar(destino, "proyecto", 0)
+
+    def test_restaurar_y_ruta_peligrosa(self):
+        zipf = crear_respaldo(self.origen, self.base / "resp")
+        self.assertEqual(restaurar(zipf, self.base / "restaurado"), 2)
+        self.assertEqual((self.base / "restaurado" / "sub" / "b.txt").read_text(), "B")
+        malo = self.base / "malo.zip"
+        with zipfile.ZipFile(malo, "w") as zf:
+            zf.writestr("../fuera.txt", "x")
+        with self.assertRaises(ValueError):
+            restaurar(malo, self.base / "r2")
+
+
+if __name__ == "__main__":
+    unittest.main()
+''',
+    },
+    comando_tests=_PY_TESTS,
+    comando_ejecutar="python3 -m respaldo ~/mi_proyecto",
+    etiquetas=("backup", "respaldo", "zip", "copia", "seguridad"),
+)
+
+# ======================================================================
+# chat-asyncio
+# ======================================================================
+registrar_plantilla(
+    "chat",
+    "Chat por TCP con asyncio: sala con apodos (/nick, /quien), avisos de entrada/salida, cliente y tests reales.",
+    "python",
+    {
+        "chat/__init__.py": "",
+        "chat/servidor.py": r'''
+"""Servidor de chat línea por línea. Comandos: /nick nombre, /quien, /salir"""
+
+import asyncio
+import itertools
+import sys
+
+
+class Sala:
+    def __init__(self):
+        self.clientes: dict = {}  # writer → apodo
+        self._numeros = itertools.count(1)
+
+    async def difundir(self, texto: str, excepto=None) -> None:
+        for writer in list(self.clientes):
+            if writer is excepto:
+                continue
+            try:
+                writer.write((texto + "\n").encode("utf-8"))
+                await writer.drain()
+            except (ConnectionError, RuntimeError):
+                self.clientes.pop(writer, None)
+
+    async def atender(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        apodo = f"invitado{next(self._numeros)}"
+        self.clientes[writer] = apodo
+        writer.write(f"* bienvenido, sos {apodo}. /nick nombre para cambiarlo\n".encode())
+        await writer.drain()
+        await self.difundir(f"* {apodo} entró", excepto=writer)
+        try:
+            while True:
+                linea = await reader.readline()
+                if not linea:
+                    break
+                texto = linea.decode("utf-8", "replace").strip()
+                if not texto:
+                    continue
+                if texto == "/salir":
+                    break
+                if texto.startswith("/nick "):
+                    nuevo = texto[6:].strip()[:20]
+                    if not nuevo or nuevo in self.clientes.values():
+                        writer.write(b"* apodo invalido o en uso\n")
+                        await writer.drain()
+                        continue
+                    viejo, self.clientes[writer] = self.clientes[writer], nuevo
+                    await self.difundir(f"* {viejo} ahora es {nuevo}")
+                elif texto == "/quien":
+                    writer.write(("* conectados: " + ", ".join(sorted(self.clientes.values())) + "\n").encode())
+                    await writer.drain()
+                else:
+                    await self.difundir(f"<{self.clientes[writer]}> {texto}", excepto=writer)
+        finally:
+            nombre = self.clientes.pop(writer, apodo)
+            await self.difundir(f"* {nombre} salió")
+            writer.close()
+
+
+async def iniciar(host: str = "127.0.0.1", puerto: int = 7777):
+    sala = Sala()
+    servidor = await asyncio.start_server(sala.atender, host, puerto)
+    return servidor, sala
+
+
+async def principal(puerto: int) -> None:
+    servidor, _ = await iniciar(puerto=puerto)
+    print(f"chat en 127.0.0.1:{servidor.sockets[0].getsockname()[1]} (Ctrl+C para salir)")
+    async with servidor:
+        await servidor.serve_forever()
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(principal(int(sys.argv[1]) if len(sys.argv) > 1 else 7777))
+    except KeyboardInterrupt:
+        pass
+''',
+        "chat/cliente.py": r'''
+"""Cliente: python3 -m chat.cliente [host] [puerto]"""
+
+import asyncio
+import sys
+
+
+async def recibir(reader: asyncio.StreamReader) -> None:
+    while True:
+        linea = await reader.readline()
+        if not linea:
+            print("* conexión cerrada")
+            return
+        print(linea.decode("utf-8", "replace"), end="")
+
+
+async def principal(host: str, puerto: int) -> None:
+    reader, writer = await asyncio.open_connection(host, puerto)
+    tarea = asyncio.create_task(recibir(reader))
+    loop = asyncio.get_running_loop()
+    try:
+        while not tarea.done():
+            linea = await loop.run_in_executor(None, sys.stdin.readline)
+            if not linea:
+                break
+            writer.write(linea.encode("utf-8"))
+            await writer.drain()
+            if linea.strip() == "/salir":
+                break
+    finally:
+        writer.close()
+        tarea.cancel()
+
+
+if __name__ == "__main__":
+    args = sys.argv[1:]
+    asyncio.run(principal(args[0] if args else "127.0.0.1", int(args[1]) if len(args) > 1 else 7777))
+''',
+        "tests/__init__.py": "",
+        "tests/test_chat.py": r'''
+import asyncio
+import unittest
+
+from chat.servidor import iniciar
+
+
+async def leer(reader, timeout=2):
+    return (await asyncio.wait_for(reader.readline(), timeout)).decode().strip()
+
+
+class TestChat(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.servidor, self.sala = await iniciar(puerto=0)
+        self.puerto = self.servidor.sockets[0].getsockname()[1]
+
+    async def asyncTearDown(self):
+        self.servidor.close()
+        await self.servidor.wait_closed()
+
+    async def conectar(self):
+        reader, writer = await asyncio.open_connection("127.0.0.1", self.puerto)
+        bienvenida = await leer(reader)
+        return reader, writer, bienvenida
+
+    async def test_difusion_y_nick(self):
+        r1, w1, b1 = await self.conectar()
+        self.assertIn("bienvenido", b1)
+        r2, w2, _ = await self.conectar()
+        self.assertIn("entró", await leer(r1))
+        w1.write(b"/nick ana\n")
+        await w1.drain()
+        self.assertIn("ahora es ana", await leer(r2))
+        self.assertIn("ahora es ana", await leer(r1))
+        w1.write(b"hola\n")
+        await w1.drain()
+        self.assertEqual(await leer(r2), "<ana> hola")
+        w2.write(b"/quien\n")
+        await w2.drain()
+        self.assertIn("ana", await leer(r2))
+        w2.write(b"/salir\n")
+        await w2.drain()
+        self.assertIn("salió", await leer(r1))
+        w1.close()
+        w2.close()
+
+    async def test_nick_repetido(self):
+        r1, w1, _ = await self.conectar()
+        r2, w2, _ = await self.conectar()
+        await leer(r1)
+        w1.write(b"/nick x\n")
+        await w1.drain()
+        await leer(r1)
+        await leer(r2)
+        w2.write(b"/nick x\n")
+        await w2.drain()
+        self.assertIn("invalido", await leer(r2))
+        w1.close()
+        w2.close()
+
+
+if __name__ == "__main__":
+    unittest.main()
+''',
+    },
+    comando_tests=_PY_TESTS,
+    comando_ejecutar="python3 -m chat.servidor  (y en otra sesión: python3 -m chat.cliente)",
+    etiquetas=("chat", "asyncio", "socket", "tcp", "red", "servidor", "mensajes"),
+)
+
+
+# ======================================================================
+# MÓDULO: recetas
+# ======================================================================
+"""
+Recetario: fragmentos de código correctos y probados para tareas frecuentes.
+
+Para un modelo de 24B, un buen ejemplo en el contexto vale más que mil
+instrucciones. Cuando el pedido coincide claramente con una receta (por sus
+etiquetas), REAPER agrega 1-2 recetas al prompt del implementador. También se
+consultan a mano con /recetas <tema>.
+"""
+
+
+@dataclass(frozen=True)
+class Receta:
+    titulo: str
+    lenguaje: str
+    etiquetas: tuple
+    descripcion: str
+    codigo: str
+
+
+RECETAS: list[Receta] = []
+
+
+def receta(titulo: str, lenguaje: str, etiquetas: str, descripcion: str, codigo: str) -> Receta:
+    r = Receta(titulo, lenguaje, tuple(e.strip() for e in etiquetas.split(",") if e.strip()),
+               descripcion.strip(), textwrap.dedent(codigo).strip("\n"))
+    RECETAS.append(r)
+    return r
+
+
+def _tokens_receta(r: Receta) -> tuple[set, set, set]:
+    etiquetas = {_raiz(sin_tildes(e.lower())) for e in r.etiquetas for e in e.split()}
+    titulo = {_raiz(sin_tildes(t)) for t in re.findall(r"[a-záéíóúñ0-9]{3,}", r.titulo.lower())}
+    descripcion = {_raiz(sin_tildes(t)) for t in re.findall(r"[a-záéíóúñ0-9]{4,}", r.descripcion.lower())}
+    return etiquetas, titulo, descripcion
+
+
+def puntuar_receta(r: Receta, tokens: dict) -> float:
+    etiquetas, titulo, descripcion = _tokens_receta(r)
+    puntaje = 0.0
+    for t, peso in tokens.items():
+        if t in etiquetas:
+            puntaje += 3 * peso
+        if t in titulo:
+            puntaje += 2 * peso
+        if t in descripcion:
+            puntaje += 0.5 * peso
+    return puntaje
+
+
+def buscar_recetas(consulta: str, k: int = 4, lenguaje: str = "") -> list[Receta]:
+    tokens = tokens_pedido(consulta)
+    if not tokens:
+        return []
+    puntuadas = []
+    for i, r in enumerate(RECETAS):
+        if lenguaje and r.lenguaje != lenguaje:
+            continue
+        p = puntuar_receta(r, tokens)
+        if p > 0:
+            puntuadas.append((p, -i, r))
+    puntuadas.sort(key=lambda t: (-t[0], -t[1]))
+    return [r for _, _, r in puntuadas[:k]]
+
+
+def recetas_para_prompt(tarea: str, k: int = 2, umbral: float = 5.0, maximo: int = 2600) -> str:
+    """Recetas que coinciden FUERTE con la tarea (si no, nada: mejor sin ruido)."""
+    tokens = tokens_pedido(tarea)
+    if not tokens:
+        return ""
+    puntuadas = sorted(((puntuar_receta(r, tokens), r) for r in RECETAS), key=lambda t: -t[0])
+    elegidas = [r for p, r in puntuadas[:k] if p >= umbral]
+    if not elegidas:
+        return ""
+    partes, usado = [], 0
+    for r in elegidas:
+        bloque = f"### {r.titulo} ({r.lenguaje})\n{r.descripcion}\n```{r.lenguaje}\n{r.codigo}\n```"
+        if usado + len(bloque) > maximo:
+            break
+        partes.append(bloque)
+        usado += len(bloque)
+    return "RECETAS DE REFERENCIA (código probado; adaptalo, no lo copies a ciegas):\n" + "\n\n".join(partes) if partes else ""
+
+
+# ======================================================================
+# PYTHON: datos y archivos
+# ======================================================================
+receta("Guardar y cargar JSON de forma segura", "python", "json, guardar, cargar, persistencia, archivo, datos",
+       "Escritura atómica (no se corrompe si se corta) y valor por defecto si el archivo no existe o está vacío.", r'''
+import json
+import os
+import tempfile
+from pathlib import Path
+
+
+def cargar_json(ruta: Path, defecto):
+    try:
+        texto = Path(ruta).read_text(encoding="utf-8").strip()
+        return json.loads(texto) if texto else defecto
+    except FileNotFoundError:
+        return defecto
+
+
+def guardar_json(ruta: Path, datos) -> None:
+    ruta = Path(ruta)
+    ruta.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=ruta.parent, suffix=".tmp")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(datos, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, ruta)
+''')
+
+receta("SQLite con contexto y filas como dict", "python", "sqlite, base de datos, db, sql, tabla, crud, guardar",
+       "Conexión con row_factory, CREATE TABLE IF NOT EXISTS, parámetros con ? (nunca f-strings en SQL).", r'''
+import sqlite3
+
+
+def conectar(ruta: str = "datos.db") -> sqlite3.Connection:
+    con = sqlite3.connect(ruta)
+    con.row_factory = sqlite3.Row
+    con.execute("PRAGMA foreign_keys = ON")
+    con.execute("""CREATE TABLE IF NOT EXISTS productos (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        nombre TEXT NOT NULL UNIQUE,
+        precio REAL NOT NULL CHECK (precio >= 0))""")
+    return con
+
+
+def agregar(con, nombre: str, precio: float) -> int:
+    with con:  # commit automático (o rollback si hay excepción)
+        return con.execute("INSERT INTO productos (nombre, precio) VALUES (?, ?)", (nombre, precio)).lastrowid
+
+
+def buscar(con, texto: str) -> list[dict]:
+    filas = con.execute("SELECT * FROM productos WHERE nombre LIKE ? ORDER BY nombre", (f"%{texto}%",))
+    return [dict(f) for f in filas]
+''')
+
+receta("Leer y escribir CSV con encabezados", "python", "csv, planilla, excel, exportar, importar, tabla",
+       "DictReader/DictWriter con newline='' y validación por fila.", r'''
+import csv
+from pathlib import Path
+
+
+def leer_csv(ruta: Path) -> list[dict]:
+    with open(ruta, encoding="utf-8", newline="") as f:
+        return list(csv.DictReader(f))
+
+
+def escribir_csv(ruta: Path, filas: list[dict], columnas: list[str]) -> None:
+    with open(ruta, "w", encoding="utf-8", newline="") as f:
+        escritor = csv.DictWriter(f, fieldnames=columnas, extrasaction="ignore")
+        escritor.writeheader()
+        escritor.writerows(filas)
+''')
+
+receta("Rutas relativas al script", "python", "ruta, path, archivo, carpeta, directorio, pathlib",
+       "Construir rutas desde la ubicación del archivo, no desde el directorio actual.", r'''
+from pathlib import Path
+
+BASE = Path(__file__).resolve().parent
+DATOS = BASE / "datos"
+DATOS.mkdir(parents=True, exist_ok=True)
+config = BASE / "config.json"
+for archivo in sorted(DATOS.glob("*.txt")):
+    print(archivo.name, archivo.stat().st_size)
+''')
+
+receta("Configuración con valores por defecto", "python", "configuracion, config, ajustes, settings, json",
+       "dataclass con defaults que se sobreescriben desde JSON ignorando claves desconocidas.", r'''
+import json
+from dataclasses import asdict, dataclass, fields
+from pathlib import Path
+
+
+@dataclass
+class Config:
+    idioma: str = "es"
+    volumen: int = 5
+    modo_oscuro: bool = True
+
+    @classmethod
+    def cargar(cls, ruta: Path) -> "Config":
+        try:
+            datos = json.loads(Path(ruta).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return cls()
+        validas = {f.name for f in fields(cls)}
+        return cls(**{k: v for k, v in datos.items() if k in validas})
+
+    def guardar(self, ruta: Path) -> None:
+        Path(ruta).write_text(json.dumps(asdict(self), indent=2), encoding="utf-8")
+''')
+
+receta("Fechas: parsear, formatear y sumar", "python", "fecha, fechas, hora, datetime, calendario, dias, timedelta",
+       "date.fromisoformat, strftime, diferencias en días y validación con mensaje claro.", r'''
+from datetime import date, datetime, timedelta
+
+
+def parsear_fecha(texto: str) -> date:
+    for formato in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y"):
+        try:
+            return datetime.strptime(texto.strip(), formato).date()
+        except ValueError:
+            continue
+    raise ValueError(f"fecha inválida: {texto!r} (usá AAAA-MM-DD o DD/MM/AAAA)")
+
+
+hoy = date.today()
+en_una_semana = hoy + timedelta(days=7)
+dias_hasta_fin_de_anio = (date(hoy.year, 12, 31) - hoy).days
+print(hoy.strftime("%d/%m/%Y"), en_una_semana.isoformat(), dias_hasta_fin_de_anio)
+''')
+
+receta("Dinero con Decimal", "python", "dinero, precio, monto, moneda, decimal, factura, total, impuesto",
+       "Nunca float para dinero: Decimal con quantize y redondeo bancario o comercial.", r'''
+from decimal import ROUND_HALF_UP, Decimal
+
+
+def a_dinero(valor) -> Decimal:
+    return Decimal(str(valor).replace(",", ".")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+
+def total_con_iva(subtotal, tasa="0.21") -> Decimal:
+    subtotal = a_dinero(subtotal)
+    return a_dinero(subtotal * (1 + Decimal(tasa)))
+
+
+assert total_con_iva("100") == Decimal("121.00")
+''')
+
+# ======================================================================
+# PYTHON: CLI y terminal
+# ======================================================================
+receta("CLI con subcomandos (argparse)", "python", "cli, argparse, comandos, argumentos, terminal, opciones",
+       "main(argv) devuelve el código de salida: testeable y con errores claros a stderr.", r'''
+import argparse
+import sys
+from typing import Optional
+
+
+def main(argv: Optional[list] = None) -> int:
+    parser = argparse.ArgumentParser(prog="app", description="Mi herramienta")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("agregar", help="agrega un elemento")
+    p.add_argument("nombre")
+    p.add_argument("-c", "--cantidad", type=int, default=1)
+    sub.add_parser("listar")
+    args = parser.parse_args(argv)
+    if args.cmd == "agregar":
+        if args.cantidad < 1:
+            print("error: la cantidad debe ser positiva", file=sys.stderr)
+            return 1
+        print(f"agregado {args.nombre} x{args.cantidad}")
+    elif args.cmd == "listar":
+        print("(vacío)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+''')
+
+receta("Menú interactivo en la terminal", "python", "menu, opciones, interactivo, input, consola, tui",
+       "Bucle de menú robusto: valida la opción, no se cae con Ctrl+D/Ctrl+C.", r'''
+def pedir_opcion(opciones: list[str]) -> int:
+    for i, texto in enumerate(opciones, start=1):
+        print(f"  {i}. {texto}")
+    while True:
+        try:
+            respuesta = input("> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return len(opciones)  # última opción = salir
+        if respuesta.isdigit() and 1 <= int(respuesta) <= len(opciones):
+            return int(respuesta)
+        print(f"Elegí un número entre 1 y {len(opciones)}.")
+
+
+def main() -> None:
+    opciones = ["Ver lista", "Agregar", "Salir"]
+    while True:
+        eleccion = pedir_opcion(opciones)
+        if eleccion == 3:
+            break
+        print(f"Elegiste: {opciones[eleccion - 1]}")
+''')
+
+receta("Colores ANSI en la terminal", "python", "colores, ansi, terminal, consola, estilo, color",
+       "Colores que se apagan solos si la salida no es una terminal o existe NO_COLOR.", r'''
+import os
+import sys
+
+USAR_COLOR = sys.stdout.isatty() and not os.getenv("NO_COLOR")
+
+
+def color(texto: str, codigo: str) -> str:
+    return f"\033[{codigo}m{texto}\033[0m" if USAR_COLOR else texto
+
+
+def verde(t): return color(t, "92")
+def rojo(t): return color(t, "91")
+def negrita(t): return color(t, "1")
+
+print(verde("✓ listo"), rojo("✗ error"), negrita("importante"))
+''')
+
+receta("Barra de progreso sin librerías", "python", "progreso, barra, porcentaje, carga, terminal",
+       "Se redibuja en la misma línea con \\r.", r'''
+import sys
+import time
+
+
+def barra(actual: int, total: int, ancho: int = 30) -> None:
+    fraccion = actual / total if total else 1
+    llenos = int(ancho * fraccion)
+    sys.stdout.write(f"\r[{'█' * llenos}{'·' * (ancho - llenos)}] {fraccion:6.1%}")
+    sys.stdout.flush()
+    if actual >= total:
+        sys.stdout.write("\n")
+
+
+for i in range(101):
+    barra(i, 100)
+    time.sleep(0.01)
+''')
+
+receta("Juego en la terminal con curses", "python", "curses, juego, terminal, teclado, pantalla, game, tui",
+       "Bucle de juego no bloqueante con curses.wrapper (restaura la terminal aunque haya error).", r'''
+import curses
+import time
+
+
+def juego(pantalla) -> int:
+    curses.curs_set(0)
+    pantalla.nodelay(True)  # getch no bloquea
+    alto, ancho = pantalla.getmaxyx()
+    x, y, puntaje = ancho // 2, alto // 2, 0
+    while True:
+        tecla = pantalla.getch()
+        if tecla in (ord("q"), 27):
+            break
+        dx = {curses.KEY_LEFT: -1, curses.KEY_RIGHT: 1}.get(tecla, 0)
+        dy = {curses.KEY_UP: -1, curses.KEY_DOWN: 1}.get(tecla, 0)
+        x = max(0, min(ancho - 2, x + dx))
+        y = max(1, min(alto - 2, y + dy))
+        pantalla.erase()
+        pantalla.addstr(0, 0, f"Puntaje: {puntaje}  (q para salir)")
+        pantalla.addstr(y, x, "@")
+        pantalla.refresh()
+        time.sleep(0.05)
+    return puntaje
+
+
+if __name__ == "__main__":
+    print("puntaje final:", curses.wrapper(juego))
+''')
+
+# ======================================================================
+# PYTHON: red
+# ======================================================================
+receta("GET/POST JSON con urllib", "python", "http, api, request, get, post, json, urllib, red, descargar",
+       "Sin requests: timeout, headers, manejo de HTTPError y JSON.", r'''
+import json
+import urllib.error
+import urllib.request
+
+
+def pedir_json(url: str, datos: dict = None, metodo: str = None, timeout: int = 15) -> dict:
+    cuerpo = json.dumps(datos).encode("utf-8") if datos is not None else None
+    pedido = urllib.request.Request(url, data=cuerpo, method=metodo or ("POST" if datos else "GET"),
+                                    headers={"Content-Type": "application/json", "User-Agent": "mi-app/1.0"})
+    try:
+        with urllib.request.urlopen(pedido, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8") or "{}")
+    except urllib.error.HTTPError as e:
+        detalle = e.read().decode("utf-8", "replace")[:300]
+        raise RuntimeError(f"HTTP {e.code}: {detalle}") from e
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"sin conexión: {e.reason}") from e
+''')
+
+receta("Servidor HTTP JSON mínimo", "python", "servidor, http, api, rest, backend, endpoint, web",
+       "http.server con rutas, JSON y códigos de estado; ThreadingHTTPServer para varios clientes.", r'''
+import json
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+DATOS = {"items": []}
+
+
+class Manejador(BaseHTTPRequestHandler):
+    def _json(self, estado: int, cuerpo) -> None:
+        datos = json.dumps(cuerpo, ensure_ascii=False).encode("utf-8")
+        self.send_response(estado)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(datos)))
+        self.end_headers()
+        self.wfile.write(datos)
+
+    def do_GET(self):
+        if self.path == "/items":
+            return self._json(200, DATOS["items"])
+        self._json(404, {"error": "no existe"})
+
+    def do_POST(self):
+        largo = int(self.headers.get("Content-Length", 0))
+        try:
+            item = json.loads(self.rfile.read(largo) or b"{}")
+        except json.JSONDecodeError:
+            return self._json(400, {"error": "JSON inválido"})
+        DATOS["items"].append(item)
+        self._json(201, item)
+
+
+if __name__ == "__main__":
+    ThreadingHTTPServer(("127.0.0.1", 8000), Manejador).serve_forever()
+''')
+
+receta("Servidor de archivos estáticos para probar una web", "bash", "web, html, servidor, probar, local, navegador",
+       "Para ver una web en el navegador del celular sin instalar nada.", r'''
+# desde la carpeta del proyecto web:
+python3 -m http.server 8080
+# y abrí en el navegador: http://127.0.0.1:8080
+# (Termux) abrir directo: termux-open-url http://127.0.0.1:8080
+''')
+
+receta("Reintentos con espera exponencial", "python", "reintentar, retry, backoff, red, error, fallos",
+       "Decorador para reintentar operaciones que fallan de forma transitoria.", r'''
+import functools
+import random
+import time
+
+
+def reintentar(intentos: int = 4, base: float = 1.0, excepciones=(OSError,)):
+    def decorador(funcion):
+        @functools.wraps(funcion)
+        def envoltura(*args, **kwargs):
+            for intento in range(intentos):
+                try:
+                    return funcion(*args, **kwargs)
+                except excepciones:
+                    if intento == intentos - 1:
+                        raise
+                    time.sleep(base * 2 ** intento + random.uniform(0, 0.5))
+        return envoltura
+    return decorador
+''')
+
+# ======================================================================
+# PYTHON: concurrencia y procesos
+# ======================================================================
+receta("Tareas en paralelo con ThreadPoolExecutor", "python", "paralelo, hilos, threads, concurrencia, descargas",
+       "Para I/O (red, disco): resultados en orden de llegada y errores por tarea.", r'''
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+
+def procesar_todos(elementos, funcion, hilos: int = 4) -> dict:
+    resultados, errores = {}, {}
+    with ThreadPoolExecutor(max_workers=hilos) as ejecutor:
+        futuros = {ejecutor.submit(funcion, e): e for e in elementos}
+        for futuro in as_completed(futuros):
+            elemento = futuros[futuro]
+            try:
+                resultados[elemento] = futuro.result()
+            except Exception as error:  # se registra por elemento, no corta todo
+                errores[elemento] = error
+    return {"ok": resultados, "errores": errores}
+''')
+
+receta("asyncio: varias tareas con timeout", "python", "asyncio, async, await, concurrencia, timeout, tareas",
+       "gather con return_exceptions y wait_for para que nada se cuelgue.", r'''
+import asyncio
+
+
+async def trabajo(n: int) -> int:
+    await asyncio.sleep(0.1 * n)
+    return n * n
+
+
+async def principal() -> None:
+    tareas = [asyncio.wait_for(trabajo(n), timeout=1.0) for n in range(5)]
+    for n, resultado in enumerate(await asyncio.gather(*tareas, return_exceptions=True)):
+        print(n, "error" if isinstance(resultado, Exception) else resultado)
+
+
+asyncio.run(principal())
+''')
+
+receta("Ejecutar comandos de forma segura", "python", "subprocess, comando, shell, ejecutar, proceso, terminal",
+       "Lista de argumentos (sin shell=True), timeout y salida capturada.", r'''
+import subprocess
+
+
+def correr(args: list[str], timeout: int = 60) -> tuple[int, str, str]:
+    try:
+        r = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+    except FileNotFoundError:
+        return 127, "", f"no existe el programa {args[0]}"
+    except subprocess.TimeoutExpired:
+        return 124, "", f"tardó más de {timeout}s"
+    return r.returncode, r.stdout, r.stderr
+
+
+codigo, salida, error = correr(["git", "status", "--short"])
+''')
+
+receta("Logging a archivo y consola", "python", "logging, log, registro, bitacora, depurar, errores",
+       "Configuración de logging con rotación de archivos.", r'''
+import logging
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
+
+
+def configurar_logs(nombre: str = "app", carpeta: Path = Path.home() / ".logs") -> logging.Logger:
+    carpeta.mkdir(parents=True, exist_ok=True)
+    logger = logging.getLogger(nombre)
+    logger.setLevel(logging.DEBUG)
+    if not logger.handlers:
+        archivo = RotatingFileHandler(carpeta / f"{nombre}.log", maxBytes=1_000_000, backupCount=3, encoding="utf-8")
+        archivo.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+        consola = logging.StreamHandler()
+        consola.setLevel(logging.INFO)
+        consola.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
+        logger.addHandler(archivo)
+        logger.addHandler(consola)
+    return logger
+''')
+
+# ======================================================================
+# PYTHON: tests
+# ======================================================================
+receta("Tests con unittest (estructura base)", "python", "test, tests, unittest, prueba, pruebas, assert",
+       "tests/test_modulo.py con casos normales, borde y errores.", r'''
+import unittest
+
+from calculadora import dividir
+
+
+class TestDividir(unittest.TestCase):
+    def test_normal(self):
+        self.assertEqual(dividir(10, 2), 5)
+
+    def test_decimales(self):
+        self.assertAlmostEqual(dividir(1, 3), 0.3333, places=4)
+
+    def test_division_por_cero(self):
+        with self.assertRaises(ZeroDivisionError):
+            dividir(1, 0)
+
+
+if __name__ == "__main__":
+    unittest.main()
+''')
+
+receta("Simular input() y capturar print() en tests", "python", "test, input, print, mock, simular, stdout, consola",
+       "unittest.mock.patch para input y redirect_stdout para la salida.", r'''
+import io
+import unittest
+from contextlib import redirect_stdout
+from unittest.mock import patch
+
+from juego import main
+
+
+class TestInteractivo(unittest.TestCase):
+    def test_flujo(self):
+        salida = io.StringIO()
+        with patch("builtins.input", side_effect=["2", "salir"]), redirect_stdout(salida):
+            main()
+        self.assertIn("Elegiste", salida.getvalue())
+''')
+
+receta("Archivos temporales en tests", "python", "test, temporal, tempfile, archivo, carpeta, prueba",
+       "Cada test trabaja en su carpeta temporal que se borra sola.", r'''
+import tempfile
+import unittest
+from pathlib import Path
+
+from almacen import cargar, guardar
+
+
+class TestAlmacen(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_ida_y_vuelta(self):
+        ruta = self.dir / "datos.json"
+        guardar(ruta, {"a": 1})
+        self.assertEqual(cargar(ruta), {"a": 1})
+''')
+
+receta("Simular red y tiempo en tests", "python", "test, mock, red, api, tiempo, fecha, simular",
+       "Nada de red real en tests: se reemplaza la función que hace la petición.", r'''
+import unittest
+from datetime import datetime
+from unittest.mock import patch
+
+import clima
+
+
+class TestClima(unittest.TestCase):
+    @patch("clima.pedir_json", return_value={"temp": 21.5})
+    def test_temperatura(self, falso):
+        self.assertEqual(clima.temperatura("Rosario"), 21.5)
+        falso.assert_called_once()
+
+    def test_saludo_segun_hora(self):
+        self.assertEqual(clima.saludo(datetime(2026, 1, 1, 9)), "Buen día")
+''')
+
+# ======================================================================
+# TERMUX
+# ======================================================================
+receta("Notificaciones y toasts en Android (termux-api)", "python", "termux, notificacion, notificar, android, toast, aviso",
+       "Requiere `pkg install termux-api` y la app Termux:API. Falla silenciosa si no están.", r'''
+import shutil
+import subprocess
+
+
+def notificar(titulo: str, texto: str) -> bool:
+    if not shutil.which("termux-notification"):
+        return False
+    subprocess.run(["termux-notification", "--title", titulo, "--content", texto], timeout=10)
+    return True
+
+
+def toast(texto: str) -> bool:
+    if not shutil.which("termux-toast"):
+        return False
+    subprocess.run(["termux-toast", texto], timeout=10)
+    return True
+''')
+
+receta("Portapapeles, batería y vibración (termux-api)", "python", "termux, portapapeles, clipboard, bateria, vibrar, android",
+       "Los comandos termux-* devuelven JSON por stdout.", r'''
+import json
+import shutil
+import subprocess
+
+
+def termux(*args: str, timeout: int = 10) -> str:
+    if not shutil.which(args[0]):
+        raise RuntimeError(f"falta {args[0]}: pkg install termux-api (y la app Termux:API)")
+    return subprocess.run(list(args), capture_output=True, text=True, timeout=timeout).stdout
+
+
+def copiar(texto: str) -> None:
+    subprocess.run(["termux-clipboard-set"], input=texto, text=True, timeout=10)
+
+
+def pegar() -> str:
+    return termux("termux-clipboard-get")
+
+
+def bateria() -> dict:
+    return json.loads(termux("termux-battery-status"))  # {"percentage": 80, "status": "CHARGING", ...}
+
+
+def vibrar(ms: int = 300) -> None:
+    termux("termux-vibrate", "-d", str(ms))
+''')
+
+receta("Rutas de almacenamiento en Termux", "bash", "termux, almacenamiento, sdcard, descargas, storage, android",
+       "Acceso a /sdcard y carpetas compartidas.", r'''
+termux-setup-storage            # una vez: pide permiso de almacenamiento
+ls ~/storage/shared             # = /sdcard
+ls ~/storage/downloads          # Descargas
+ls ~/storage/dcim               # Fotos de la cámara
+echo $PREFIX                    # /data/data/com.termux/files/usr (en lugar de /usr)
+pkg install python nodejs git   # paquetes (sin sudo)
+''')
+
+receta("Tarea programada en Termux", "bash", "termux, cron, programar, tarea, automatico, servicio",
+       "crond con termux-services (no hay systemd).", r'''
+pkg install cronie termux-services
+sv-enable crond                 # (reiniciá Termux si sv-enable no existe todavía)
+crontab -e                      # agregar por ejemplo:
+# */30 * * * * python3 $HOME/proyecto/respaldo.py >> $HOME/respaldo.log 2>&1
+''')
+
+# ======================================================================
+# JAVASCRIPT
+# ======================================================================
+receta("Módulo ES con lógica pura + test node:test", "javascript", "javascript, node, test, modulo, esm, import, export",
+       "Separar lógica testeable del DOM; tests con el runner incorporado de Node.", r'''
+// src/carrito.js
+export function total(items) {
+  return items.reduce((suma, { precio, cantidad = 1 }) => suma + precio * cantidad, 0);
+}
+
+// tests/carrito.test.mjs
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { total } from '../src/carrito.js';
+
+test('suma precio por cantidad', () => {
+  assert.equal(total([{ precio: 10, cantidad: 2 }, { precio: 5 }]), 25);
+});
+test('carrito vacío', () => assert.equal(total([]), 0));
+''')
+
+receta("Guardar estado en localStorage", "javascript", "localstorage, guardar, navegador, web, estado, persistencia",
+       "Con valor por defecto y protección contra JSON corrupto.", r'''
+const CLAVE = 'mi-app-estado';
+
+export function cargarEstado(defecto = { tareas: [] }) {
+  try {
+    const crudo = localStorage.getItem(CLAVE);
+    return crudo ? { ...defecto, ...JSON.parse(crudo) } : defecto;
+  } catch {
+    return defecto;
+  }
+}
+
+export function guardarEstado(estado) {
+  localStorage.setItem(CLAVE, JSON.stringify(estado));
+}
+''')
+
+receta("Fetch con timeout y errores claros", "javascript", "fetch, api, http, red, timeout, javascript, json",
+       "AbortController para cortar pedidos colgados.", r'''
+export async function pedirJSON(url, opciones = {}, ms = 10000) {
+  const control = new AbortController();
+  const reloj = setTimeout(() => control.abort(), ms);
+  try {
+    const r = await fetch(url, { ...opciones, signal: control.signal });
+    if (!r.ok) throw new Error(`HTTP ${r.status}: ${(await r.text()).slice(0, 200)}`);
+    return await r.json();
+  } catch (e) {
+    if (e.name === 'AbortError') throw new Error(`tardó más de ${ms} ms`);
+    throw e;
+  } finally {
+    clearTimeout(reloj);
+  }
+}
+''')
+
+receta("Servidor HTTP en Node sin dependencias", "javascript", "node, servidor, http, api, backend, rest",
+       "Módulo http con rutas y JSON (Node 18+).", r'''
+import http from 'node:http';
+
+const notas = [];
+
+export const servidor = http.createServer(async (req, res) => {
+  const enviar = (estado, datos) => {
+    res.writeHead(estado, { 'Content-Type': 'application/json; charset=utf-8' });
+    res.end(JSON.stringify(datos));
+  };
+  if (req.method === 'GET' && req.url === '/notas') return enviar(200, notas);
+  if (req.method === 'POST' && req.url === '/notas') {
+    let cuerpo = '';
+    for await (const trozo of req) cuerpo += trozo;
+    try {
+      const nota = JSON.parse(cuerpo || '{}');
+      notas.push(nota);
+      return enviar(201, nota);
+    } catch {
+      return enviar(400, { error: 'JSON inválido' });
+    }
+  }
+  enviar(404, { error: 'no existe' });
+});
+
+if (import.meta.url === `file://${process.argv[1]}`) servidor.listen(3000);
+''')
+
+receta("Página web base mobile-first", "html", "html, web, pagina, movil, responsive, css",
+       "Estructura HTML con viewport, CSS y JS como módulo.", r'''
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Mi app</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <main id="app">
+    <h1>Mi app</h1>
+    <form id="form"><input id="texto" required placeholder="Escribí algo"><button>Agregar</button></form>
+    <ul id="lista"></ul>
+  </main>
+  <script type="module" src="app.js"></script>
+</body>
+</html>
+''')
+
+# ======================================================================
+# BASH
+# ======================================================================
+receta("Script bash robusto", "bash", "bash, script, shell, getopts, opciones, sh",
+       "Modo estricto, ayuda, opciones con getopts y limpieza al salir.", r'''
+#!/usr/bin/env bash
+set -euo pipefail
+
+uso() { echo "uso: $0 [-v] [-o salida] archivo"; exit 1; }
+VERBOSO=0; SALIDA="salida.txt"
+while getopts ":vo:h" opt; do
+  case $opt in
+    v) VERBOSO=1 ;;
+    o) SALIDA="$OPTARG" ;;
+    h|*) uso ;;
+  esac
+done
+shift $((OPTIND - 1))
+[[ $# -eq 1 ]] || uso
+TMP=$(mktemp)
+trap 'rm -f "$TMP"' EXIT
+[[ $VERBOSO -eq 1 ]] && echo "procesando $1 → $SALIDA"
+sort -u "$1" > "$TMP" && mv "$TMP" "$SALIDA"
+''')
+
+
+# ======================================================================
+# MÓDULO: doctor
+# ======================================================================
+"""
+/doctor e instalador.
+
+/doctor revisa todo lo que REAPER necesita en Termux y dice exactamente qué
+comando corre para arreglar cada cosa. /instalar crea el comando `reaper`:
+copia este archivo a ~/reaper/app/ y genera un lanzador que lo IMPORTA, así
+Python guarda el bytecode compilado y el arranque es rápido aunque el archivo
+tenga decenas de miles de líneas.
+"""
+
+
+@dataclass
+class Chequeo:
+    nombre: str
+    ok: bool
+    detalle: str
+    arreglo: str = ""
+    critico: bool = False
+
+
+def es_termux() -> bool:
+    return "com.termux" in os.getenv("PREFIX", "") or bool(os.getenv("TERMUX_VERSION")) \
+        or os.path.isdir("/data/data/com.termux")
+
+
+def _chequeo_comando(nombre: str, paquete: str, para: str, critico: bool = False) -> Chequeo:
+    ruta = shutil.which(nombre)
+    if ruta:
+        version = ""
+        try:
+            salida = subprocess.run([nombre, "--version"], capture_output=True, text=True, timeout=8)
+            version = (salida.stdout or salida.stderr).strip().splitlines()[0][:60] if (salida.stdout or salida.stderr) else ""
+        except (OSError, subprocess.TimeoutExpired, IndexError):
+            version = ""
+        return Chequeo(nombre, True, version or ruta)
+    instalar = f"pkg install {paquete}" if es_termux() else f"instalá {paquete}"
+    return Chequeo(nombre, False, f"no está ({para})", instalar, critico)
+
+
+def _chequeo_modulo(modulo: str, para: str, pip: str = "") -> Chequeo:
+    disponible = importlib.util.find_spec(modulo) is not None
+    return Chequeo(modulo, disponible, "instalado" if disponible else f"no está ({para})",
+                   "" if disponible else f"pip install {pip or modulo}")
+
+
+def _chequeo_red(url: str) -> Chequeo:
+    try:
+        host = urllib.parse.urlparse(url).hostname or ""
+        puerto = urllib.parse.urlparse(url).port or (443 if url.startswith("https") else 80)
+    except ValueError:
+        return Chequeo("red", False, f"URL inválida: {url}", "revisá api_url en /config", True)
+    if host in ("127.0.0.1", "localhost"):
+        try:
+            with socket.create_connection((host, puerto), timeout=3):
+                return Chequeo("servidor local", True, f"{host}:{puerto} responde")
+        except OSError:
+            return Chequeo("servidor local", False, f"nada escuchando en {host}:{puerto}", "iniciá Ollama (ollama serve)", True)
+    try:
+        inicio = time.monotonic()
+        with socket.create_connection((host, puerto), timeout=6):
+            ms = (time.monotonic() - inicio) * 1000
+        return Chequeo("red", True, f"{host} alcanzable ({ms:.0f} ms)")
+    except socket.gaierror:
+        return Chequeo("red", False, f"no resuelve {host} (DNS)", "revisá la conexión a internet", True)
+    except OSError as e:
+        return Chequeo("red", False, f"no conecta con {host}: {e}", "revisá la conexión o un proxy", True)
+
+
+def _chequeo_symlinks() -> Chequeo:
+    base = _carpeta_temporal_base()
+    if not base:
+        return Chequeo("carpeta temporal", False, "no hay carpeta temporal escribible", "export TMPDIR=$HOME/tmp", True)
+    try:
+        with tempfile.TemporaryDirectory(dir=str(base)) as tmp:
+            destino = Path(tmp) / "x"
+            destino.mkdir()
+            os.symlink(destino, Path(tmp) / "enlace", target_is_directory=True)
+        return Chequeo("copias aisladas", True, f"{base} (soporta symlinks)")
+    except OSError as e:
+        return Chequeo("copias aisladas", False, f"{base}: sin symlinks ({e})",
+                       "export REAPER_TMP=$HOME/.cache/reaper (almacenamiento interno)")
+
+
+def chequeos_sistema(settings: Settings) -> list[Chequeo]:
+    chequeos = []
+    version = sys.version_info
+    chequeos.append(Chequeo("python", version >= (3, 9), f"{sys.version.split()[0]} ({sys.executable})",
+                            "pkg upgrade python", version < (3, 9)))
+    chequeos.append(Chequeo("sistema", True, "Termux en Android" if es_termux() else f"{platform.system()} {platform.machine()}"))
+    variable = settings.variable_clave()
+    clave = obtener_clave_api(settings)
+    chequeos.append(Chequeo("clave API", bool(clave), (f"{variable} configurada" if clave and variable else
+                                                        ("no hace falta" if not variable else f"falta {variable}")),
+                            f'export {variable}="tu_key"  (agregalo a ~/.bashrc)' if not clave else "", not clave))
+    chequeos.append(_chequeo_red(settings.url_api()))
+    chequeos.append(_chequeo_modulo("httpx", "streaming más robusto; sin él se usa urllib"))
+    chequeos.append(_chequeo_modulo("pyflakes", "nombres indefinidos más precisos (REAPER tiene un detector propio)"))
+    chequeos.append(_chequeo_modulo("readline", "historial y autocompletado en el REPL", "gnureadline"))
+    chequeos.append(_chequeo_modulo("pytest", "suite de tests (unittest funciona igual)"))
+    chequeos.append(_chequeo_comando("node", "nodejs", "validar y testear JavaScript"))
+    chequeos.append(_chequeo_comando("git", "git", "snapshots de builds verificadas"))
+    chequeos.append(_chequeo_comando("ruff", "ruff", "lint y arreglos automáticos de Python"))
+    chequeos.append(_chequeo_symlinks())
+    try:
+        uso = shutil.disk_usage(str(BASE_DIR if BASE_DIR.exists() else Path.home()))
+        libre_gb = uso.free / 1e9
+        chequeos.append(Chequeo("disco", libre_gb > 0.5, f"{libre_gb:.1f} GB libres",
+                                "liberá espacio (las copias del torneo necesitan disco)" if libre_gb <= 0.5 else ""))
+    except OSError:
+        pass
+    try:
+        BASE_DIR.mkdir(parents=True, exist_ok=True)
+        prueba = BASE_DIR / ".prueba_escritura"
+        prueba.write_text("ok", encoding="utf-8")
+        prueba.unlink()
+        chequeos.append(Chequeo("carpeta REAPER", True, str(BASE_DIR)))
+    except OSError as e:
+        chequeos.append(Chequeo("carpeta REAPER", False, f"{BASE_DIR}: {e}", "export REAPER_HOME=$HOME/reaper", True))
+    if es_termux():
+        compartido = Path.home() / "storage" / "shared"
+        chequeos.append(Chequeo("almacenamiento", compartido.exists(),
+                                "~/storage/shared disponible" if compartido.exists() else "sin acceso a /sdcard (opcional)",
+                                "" if compartido.exists() else "termux-setup-storage"))
+        chequeos.append(_chequeo_comando("termux-notification", "termux-api", "notificaciones al terminar builds largas"))
+    return chequeos
+
+
+def diagnostico_sistema(ui: UI, settings: Settings, llm=None, probar_modelo: bool = False) -> bool:
+    chequeos = chequeos_sistema(settings)
+    filas = []
+    for c in chequeos:
+        marca = f"{Tema.ok}✓{C.RESET}" if c.ok else (f"{Tema.error}✗{C.RESET}" if c.critico else f"{Tema.aviso}○{C.RESET}")
+        filas.append([marca, c.nombre, recortar(c.detalle, 60).replace("\n", " "), c.arreglo])
+    ui.titulo("DOCTOR REAPER")
+    ui.tabla(filas, ["", "chequeo", "estado", "cómo arreglarlo"])
+    if probar_modelo and llm is not None:
+        try:
+            inicio = time.monotonic()
+            texto = llm.chat_simple("Respondé solo: OK", max_tokens=5, rol="doctor")
+            ui.ok(f"el modelo responde ({formatear_duracion(time.monotonic() - inicio)}): {texto.strip()[:20]}")
+        except LLMError as e:
+            ui.error(f"el modelo no responde: {e}")
+            return False
+    criticos = [c for c in chequeos if c.critico and not c.ok]
+    if criticos:
+        ui.error(f"{len(criticos)} problema(s) crítico(s): REAPER no va a poder trabajar hasta arreglarlos.")
+        return False
+    opcionales = [c for c in chequeos if not c.ok]
+    if opcionales:
+        ui.aviso(f"Todo lo esencial está bien; {len(opcionales)} mejora(s) opcional(es) arriba.")
+    else:
+        ui.ok("Todo en orden. 🐉")
+    return True
+
+
+def archivo_actual() -> Optional[Path]:
+    candidato = globals().get("__file__") or (sys.argv[0] if sys.argv else "")
+    try:
+        ruta = Path(candidato).resolve()
+    except (OSError, RuntimeError):
+        return None
+    return ruta if ruta.is_file() and ruta.suffix == ".py" else None
+
+
+def instalar_lanzador(ui: UI) -> Optional[Path]:
+    origen = archivo_actual()
+    if origen is None:
+        ui.error("No encuentro el archivo de REAPER para instalarlo.")
+        return None
+    carpeta_app = BASE_DIR / "app"
+    carpeta_app.mkdir(parents=True, exist_ok=True)
+    destino = carpeta_app / "reaper_v7.py"
+    import py_compile
+    try:
+        if origen.resolve() != destino.resolve():
+            shutil.copy2(origen, destino)
+        py_compile.compile(str(destino), doraise=True)
+    except (OSError, py_compile.PyCompileError) as e:
+        ui.error(f"No pude copiar/compilar REAPER: {e}")
+        return None
+    prefijo = os.getenv("PREFIX")
+    bin_dir = Path(prefijo) / "bin" if prefijo and es_termux() else Path.home() / ".local" / "bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    lanzador = bin_dir / "reaper"
+    contenido = (
+        "#!/usr/bin/env python3\n"
+        "# Lanzador de REAPER (generado por --instalar). Importa el módulo para usar el bytecode cacheado.\n"
+        "import sys\n"
+        f"sys.path.insert(0, {str(carpeta_app)!r})\n"
+        "import reaper_v7\n"
+        "sys.exit(reaper_v7.main())\n"
+    )
+    try:
+        lanzador.write_text(contenido, encoding="utf-8")
+        os.chmod(lanzador, 0o755)
+    except OSError as e:
+        ui.error(f"No pude crear {lanzador}: {e}")
+        return None
+    ui.ok(f"Instalado: {lanzador}")
+    if str(bin_dir) not in os.getenv("PATH", "").split(os.pathsep):
+        ui.aviso(f'  Agregá {bin_dir} al PATH: echo \'export PATH="{bin_dir}:$PATH"\' >> ~/.bashrc')
+    ui.tenue("  Ahora podés escribir simplemente: reaper  (o reaper --proyecto ~/mi_app)")
+    return lanzador
+
+
+def notificar(titulo: str, texto: str) -> bool:
+    """Notificación de Android al terminar algo largo (si termux-api está instalado)."""
+    if not shutil.which("termux-notification"):
+        return False
+    try:
+        subprocess.run(["termux-notification", "--title", titulo[:80], "--content", texto[:300],
+                        "--id", "reaper"], timeout=10, capture_output=True)
+        return True
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+# ======================================================================
+# MÓDULO: vigilar
+# ======================================================================
+"""
+/vigilar: corre los tests (o un comando) cada vez que cambia un archivo del proyecto.
+
+Sin dependencias (no hay inotify en la librería estándar): compara mtimes
+cada segundo, espera un instante para agrupar guardados seguidos y muestra
+una línea de resultado con el conteo de tests. Ctrl+C para salir.
+"""
+
+
+def foto_mtimes(ws: Workspace, limite: int = 3000) -> dict[str, float]:
+    foto = {}
+    for ruta in ws.iterar(limite=limite):
+        try:
+            foto[ws.rel(ruta)] = ruta.stat().st_mtime
+        except OSError:
+            continue
+    return foto
+
+
+def diferencias_mtimes(antes: dict[str, float], despues: dict[str, float]) -> list[str]:
+    cambiados = [r for r, t in despues.items() if antes.get(r) != t]
+    borrados = [r for r in antes if r not in despues]
+    return sorted(cambiados + borrados)
+
+
+def vigilar(ws: Workspace, ui: UI, comando: Optional[str] = None, timeout: int = 300,
+            intervalo: float = 1.0, max_ciclos: Optional[int] = None, dormir: Callable[[float], None] = time.sleep) -> int:
+    """Devuelve la cantidad de corridas hechas (útil en tests con max_ciclos)."""
+    detectado = None if comando else detectar_comando_tests(ws, completo=True)
+    if not comando and not detectado:
+        ui.aviso("No hay suite de tests detectada; indicá un comando: /vigilar python3 main.py")
+        return 0
+    etiqueta = comando or detectado[0]
+    ui.info(f"Vigilando {ws.raiz} · al cambiar un archivo corro: {etiqueta}")
+    ui.tenue("  Ctrl+C para salir")
+    foto = foto_mtimes(ws)
+    corridas = 0
+    ciclos = 0
+
+    def correr(cambiados: list[str]) -> None:
+        nonlocal corridas
+        corridas += 1
+        hora = datetime.now().strftime("%H:%M:%S")
+        if cambiados:
+            ui.tenue(f"  {hora} cambió: {', '.join(cambiados[:5])}{' ...' if len(cambiados) > 5 else ''}")
+        if comando:
+            r = ejecutar(comando, cwd=ws.raiz, timeout=timeout, shell=True)
+        else:
+            r = ejecutar_tests(ws, timeout=timeout, completo=True)
+        if r is None:
+            ui.aviso("  la suite desapareció")
+            return
+        conteo = conteo_de_resultado(r)
+        resumen = conteo.texto() if conteo.reconocido else f"exit {r.codigo}"
+        if r.ok:
+            ui.ok(f"{hora} {resumen} · {formatear_duracion(r.duracion)}")
+        else:
+            ui.error(f"{hora} {resumen} · {formatear_duracion(r.duracion)}")
+            detalle = fallos_relevantes(f"{r.stdout}\n{r.stderr}", maximo=1, limite=1200)
+            ui.tenue(recortar(detalle, 1200))
+            for pista in pistas_para(r.stdout + r.stderr, 1):
+                ui.tenue(f"  💡 {pista}")
+
+    try:
+        correr([])
+        while max_ciclos is None or ciclos < max_ciclos:
+            ciclos += 1
+            dormir(intervalo)
+            actual = foto_mtimes(ws)
+            cambiados = diferencias_mtimes(foto, actual)
+            if not cambiados:
+                continue
+            dormir(0.3)
+            foto = foto_mtimes(ws)
+            correr(cambiados)
+    except KeyboardInterrupt:
+        ui.linea("")
+        ui.tenue("Fin de la vigilancia.")
+    return corridas
+
+
+# ======================================================================
+# MÓDULO: evals
+# ======================================================================
+"""
+Benchmark /evaluar: tareas reales con tests ocultos para medir al modelo.
+
+Cada tarea arranca en una carpeta temporal con algunos archivos, REAPER
+recibe el pedido (que nombra los módulos y funciones esperados) y trabaja
+solo. Al terminar se agregan los tests OCULTOS y se corren. Así se compara
+Venice contra otros modelos, o el agente simple contra el torneo, con datos.
+
+    python3 reaper_v7.py --evaluar        todas las tareas
+    python3 reaper_v7.py --evaluar 5      las primeras 5
+    /evaluar 3                            desde el REPL
+"""
+
+
+@dataclass
+class TareaEval:
+    id: str
+    titulo: str
+    pedido: str
+    tests: dict
+    archivos: dict = field(default_factory=dict)
+    dificultad: int = 1
+
+
+TAREAS_EVAL: list[TareaEval] = []
+
+
+def tarea_eval(id_: str, titulo: str, pedido: str, tests: dict, archivos: Optional[dict] = None,
+               dificultad: int = 1) -> None:
+    TAREAS_EVAL.append(TareaEval(id_, titulo, textwrap.dedent(pedido).strip(),
+                                 {k: textwrap.dedent(v).lstrip("\n") for k, v in tests.items()},
+                                 {k: textwrap.dedent(v).lstrip("\n") for k, v in (archivos or {}).items()},
+                                 dificultad))
+
+
+tarea_eval("fizzbuzz", "FizzBuzz con reglas", """
+    Creá fizz.py con la función fizzbuzz(n: int) -> list[str] que devuelve los textos del 1 al n:
+    múltiplos de 3 → "Fizz", de 5 → "Buzz", de ambos → "FizzBuzz", y si el número contiene el dígito 7 → "Siete"
+    (esta regla tiene prioridad). Si n < 1 devuelve lista vacía.
+""", {"tests/test_fizz.py": """
+    import unittest
+    from fizz import fizzbuzz
+
+    class T(unittest.TestCase):
+        def test_basico(self):
+            self.assertEqual(fizzbuzz(5), ["1", "2", "Fizz", "4", "Buzz"])
+        def test_quince(self):
+            self.assertEqual(fizzbuzz(15)[-1], "FizzBuzz")
+        def test_siete(self):
+            r = fizzbuzz(27)
+            self.assertEqual(r[6], "Siete")
+            self.assertEqual(r[26], "Siete")
+            self.assertEqual(r[20], "Siete")
+        def test_vacio(self):
+            self.assertEqual(fizzbuzz(0), [])
+"""})
+
+tarea_eval("palindromo", "Palíndromos con tildes", """
+    Creá texto.py con es_palindromo(frase: str) -> bool que ignore mayúsculas, espacios, signos de puntuación
+    y tildes (á→a, ñ se mantiene como ñ). Una cadena vacía o sin letras devuelve False.
+""", {"tests/test_texto.py": """
+    import unittest
+    from texto import es_palindromo
+
+    class T(unittest.TestCase):
+        def test_si(self):
+            self.assertTrue(es_palindromo("Anita lava la tina"))
+            self.assertTrue(es_palindromo("¿Acaso hubo búhos acá?"))
+        def test_no(self):
+            self.assertFalse(es_palindromo("Hola mundo"))
+        def test_vacio(self):
+            self.assertFalse(es_palindromo(""))
+            self.assertFalse(es_palindromo("¡!"))
+"""})
+
+tarea_eval("duracion", "Parsear duraciones", """
+    Creá tiempo.py con parsear_duracion(texto: str) -> int que convierte textos como "1h30m", "45s", "2h",
+    "1h 5m 10s" o "90m" a segundos. Acepta mayúsculas y espacios. Si el formato es inválido (vacío, unidades
+    desconocidas, números negativos) lanza ValueError. También formatear_duracion(segundos: int) -> str que
+    devuelve el formato más corto sin ceros: 5400 → "1h30m", 45 → "45s", 0 → "0s".
+""", {"tests/test_tiempo.py": """
+    import unittest
+    from tiempo import formatear_duracion, parsear_duracion
+
+    class T(unittest.TestCase):
+        def test_parsear(self):
+            self.assertEqual(parsear_duracion("1h30m"), 5400)
+            self.assertEqual(parsear_duracion("1H 5m 10S"), 3910)
+            self.assertEqual(parsear_duracion("90m"), 5400)
+        def test_invalido(self):
+            for malo in ("", "abc", "10x", "-5m"):
+                with self.assertRaises(ValueError):
+                    parsear_duracion(malo)
+        def test_formatear(self):
+            self.assertEqual(formatear_duracion(5400), "1h30m")
+            self.assertEqual(formatear_duracion(3661), "1h1m1s")
+            self.assertEqual(formatear_duracion(0), "0s")
+"""}, dificultad=2)
+
+tarea_eval("estadisticas", "Estadísticas sin statistics", """
+    Creá estadistica.py SIN importar el módulo statistics, con: media(datos), mediana(datos) y modas(datos)
+    (lista ordenada de los valores más frecuentes). Todas lanzan ValueError si la lista está vacía.
+""", {"tests/test_estadistica.py": """
+    import unittest
+    import estadistica as e
+
+    class T(unittest.TestCase):
+        def test_media(self):
+            self.assertAlmostEqual(e.media([1, 2, 3, 4]), 2.5)
+        def test_mediana(self):
+            self.assertEqual(e.mediana([3, 1, 2]), 2)
+            self.assertEqual(e.mediana([4, 1, 3, 2]), 2.5)
+        def test_modas(self):
+            self.assertEqual(e.modas([1, 2, 2, 3, 3]), [2, 3])
+        def test_vacio(self):
+            for f in (e.media, e.mediana, e.modas):
+                with self.assertRaises(ValueError):
+                    f([])
+        def test_sin_statistics(self):
+            import inspect
+            self.assertNotIn("import statistics", inspect.getsource(e))
+"""})
+
+tarea_eval("pila", "Clase Pila", """
+    Creá estructuras.py con la clase Pila: apilar(x), desapilar() (lanza IndexError "pila vacía" si está vacía),
+    tope() (igual que desapilar pero sin sacar), esta_vacia() y len(pila) con __len__. Opcional capacidad máxima
+    en el constructor: Pila(capacidad=3) lanza OverflowError al superar la capacidad.
+""", {"tests/test_pila.py": """
+    import unittest
+    from estructuras import Pila
+
+    class T(unittest.TestCase):
+        def test_lifo(self):
+            p = Pila()
+            p.apilar(1); p.apilar(2)
+            self.assertEqual(p.tope(), 2)
+            self.assertEqual(p.desapilar(), 2)
+            self.assertEqual(len(p), 1)
+        def test_vacia(self):
+            p = Pila()
+            self.assertTrue(p.esta_vacia())
+            with self.assertRaises(IndexError):
+                p.desapilar()
+            with self.assertRaises(IndexError):
+                p.tope()
+        def test_capacidad(self):
+            p = Pila(capacidad=1)
+            p.apilar("a")
+            with self.assertRaises(OverflowError):
+                p.apilar("b")
+"""})
+
+tarea_eval("romanos", "Números romanos", """
+    Creá romanos.py con a_romano(n: int) -> str (1 a 3999) y desde_romano(texto: str) -> int.
+    Fuera de rango o romano inválido (como "IIII", "VX" o letras desconocidas) → ValueError.
+""", {"tests/test_romanos.py": """
+    import unittest
+    from romanos import a_romano, desde_romano
+
+    class T(unittest.TestCase):
+        def test_ida(self):
+            self.assertEqual(a_romano(1994), "MCMXCIV")
+            self.assertEqual(a_romano(3999), "MMMCMXCIX")
+        def test_vuelta(self):
+            self.assertEqual(desde_romano("MCMXCIV"), 1994)
+            self.assertEqual(desde_romano("xlii"), 42)
+        def test_todos(self):
+            for n in range(1, 400):
+                self.assertEqual(desde_romano(a_romano(n)), n)
+        def test_errores(self):
+            for malo in (0, 4000):
+                with self.assertRaises(ValueError):
+                    a_romano(malo)
+            for malo in ("IIII", "VX", "ABC", ""):
+                with self.assertRaises(ValueError):
+                    desde_romano(malo)
+"""}, dificultad=2)
+
+tarea_eval("bug-descuento", "Arreglar un bug existente", """
+    Los clientes se quejan de que el descuento por cantidad de tienda.py no se aplica bien: comprando
+    exactamente 10 unidades no se aplica el 10% y con más de 50 debería ser 20%. Encontrá y arreglá el bug
+    sin cambiar la firma de precio_final(precio_unitario, cantidad).
+""", {"tests/test_tienda.py": """
+    import unittest
+    from tienda import precio_final
+
+    class T(unittest.TestCase):
+        def test_sin_descuento(self):
+            self.assertEqual(precio_final(10, 9), 90)
+        def test_diez(self):
+            self.assertEqual(precio_final(10, 10), 90)
+        def test_cincuenta_y_uno(self):
+            self.assertEqual(precio_final(10, 51), 408)
+        def test_invalido(self):
+            with self.assertRaises(ValueError):
+                precio_final(10, 0)
+"""}, archivos={"tienda.py": """
+    def precio_final(precio_unitario, cantidad):
+        if cantidad <= 0:
+            raise ValueError("cantidad inválida")
+        total = precio_unitario * cantidad
+        if cantidad > 10:
+            total = total * 0.9
+        elif cantidad > 50:
+            total = total * 0.8
+        return round(total, 2)
+"""})
+
+tarea_eval("agregar-funcion", "Extender un módulo sin romperlo", """
+    En geometria.py ya existen area_rectangulo y area_circulo. Agregá perimetro_rectangulo(base, altura) y
+    hipotenusa(a, b). Todas deben lanzar ValueError con medidas negativas (las existentes todavía no lo hacen:
+    agregalo también). No cambies los nombres existentes.
+""", {"tests/test_geometria.py": """
+    import math
+    import unittest
+    from geometria import area_circulo, area_rectangulo, hipotenusa, perimetro_rectangulo
+
+    class T(unittest.TestCase):
+        def test_existentes(self):
+            self.assertEqual(area_rectangulo(2, 3), 6)
+            self.assertAlmostEqual(area_circulo(1), math.pi)
+        def test_nuevas(self):
+            self.assertEqual(perimetro_rectangulo(2, 3), 10)
+            self.assertEqual(hipotenusa(3, 4), 5)
+        def test_negativos(self):
+            for f, args in ((area_rectangulo, (-1, 2)), (area_circulo, (-1,)), (perimetro_rectangulo, (1, -2)),
+                            (hipotenusa, (-3, 4))):
+                with self.assertRaises(ValueError):
+                    f(*args)
+"""}, archivos={"geometria.py": """
+    import math
+
+
+    def area_rectangulo(base, altura):
+        return base * altura
+
+
+    def area_circulo(radio):
+        return math.pi * radio ** 2
+"""})
+
+tarea_eval("config-json", "Config con valores por defecto", """
+    Creá config.py con cargar_config(ruta) -> dict: lee un JSON y lo combina con los valores por defecto
+    {"idioma": "es", "tema": "oscuro", "volumen": 5}. Si el archivo no existe o tiene JSON inválido devuelve los
+    valores por defecto (sin lanzar excepción). "volumen" fuera de 0..10 se corrige al límite más cercano.
+    Y guardar_config(ruta, config) que escribe el JSON con indentación (creando la carpeta si falta).
+""", {"tests/test_config.py": """
+    import json
+    import tempfile
+    import unittest
+    from pathlib import Path
+    from config import cargar_config, guardar_config
+
+    class T(unittest.TestCase):
+        def test_defecto(self):
+            with tempfile.TemporaryDirectory() as tmp:
+                self.assertEqual(cargar_config(Path(tmp) / "no.json")["tema"], "oscuro")
+        def test_mezcla_y_limite(self):
+            with tempfile.TemporaryDirectory() as tmp:
+                ruta = Path(tmp) / "c.json"
+                ruta.write_text(json.dumps({"tema": "claro", "volumen": 50}))
+                c = cargar_config(ruta)
+                self.assertEqual((c["tema"], c["volumen"], c["idioma"]), ("claro", 10, "es"))
+        def test_invalido(self):
+            with tempfile.TemporaryDirectory() as tmp:
+                ruta = Path(tmp) / "c.json"
+                ruta.write_text("{malo")
+                self.assertEqual(cargar_config(ruta)["volumen"], 5)
+        def test_guardar(self):
+            with tempfile.TemporaryDirectory() as tmp:
+                ruta = Path(tmp) / "sub" / "c.json"
+                guardar_config(ruta, {"idioma": "en"})
+                self.assertEqual(cargar_config(ruta)["idioma"], "en")
+"""})
+
+tarea_eval("ventas-csv", "Resumen de ventas desde CSV", """
+    Creá ventas.py con resumen_ventas(ruta_csv) -> dict que lee un CSV con columnas producto,cantidad,precio
+    y devuelve {"total": total_facturado, "por_producto": {producto: total}, "mas_vendido": producto con más
+    unidades}. Las filas con cantidad o precio inválidos se ignoran. Redondeá los montos a 2 decimales.
+""", {"tests/test_ventas.py": """
+    import tempfile
+    import unittest
+    from pathlib import Path
+    from ventas import resumen_ventas
+
+    class T(unittest.TestCase):
+        def test_resumen(self):
+            with tempfile.TemporaryDirectory() as tmp:
+                ruta = Path(tmp) / "v.csv"
+                ruta.write_text("producto,cantidad,precio\\npan,2,1.5\\nleche,1,2.25\\npan,3,1.5\\nmalo,x,1\\n")
+                r = resumen_ventas(ruta)
+                self.assertEqual(r["total"], 9.75)
+                self.assertEqual(r["por_producto"], {"pan": 7.5, "leche": 2.25})
+                self.assertEqual(r["mas_vendido"], "pan")
+"""}, dificultad=2)
+
+tarea_eval("matriz", "Operaciones con matrices", """
+    Creá matriz.py (sin numpy) con transponer(m), rotar_derecha(m) (90° horario), y multiplicar(a, b) que lanza
+    ValueError si las dimensiones no son compatibles. Las matrices son listas de listas; no modifiques la entrada.
+""", {"tests/test_matriz.py": """
+    import unittest
+    from matriz import multiplicar, rotar_derecha, transponer
+
+    class T(unittest.TestCase):
+        def test_transponer(self):
+            self.assertEqual(transponer([[1, 2, 3], [4, 5, 6]]), [[1, 4], [2, 5], [3, 6]])
+        def test_rotar(self):
+            m = [[1, 2], [3, 4]]
+            self.assertEqual(rotar_derecha(m), [[3, 1], [4, 2]])
+            self.assertEqual(m, [[1, 2], [3, 4]])
+        def test_multiplicar(self):
+            self.assertEqual(multiplicar([[1, 2], [3, 4]], [[5], [6]]), [[17], [39]])
+            with self.assertRaises(ValueError):
+                multiplicar([[1, 2]], [[1, 2]])
+"""})
+
+tarea_eval("cuenta-bancaria", "Cuenta bancaria con historial", """
+    Creá banco.py con la clase Cuenta(titular, saldo_inicial=0): depositar(monto), extraer(monto) (no puede
+    quedar saldo negativo: lanza ValueError "saldo insuficiente"), transferir(destino, monto), saldo (propiedad
+    de solo lectura) e historial (lista de tuplas (tipo, monto) con tipos "deposito", "extraccion",
+    "transferencia_enviada", "transferencia_recibida"). Montos <= 0 → ValueError.
+""", {"tests/test_banco.py": """
+    import unittest
+    from banco import Cuenta
+
+    class T(unittest.TestCase):
+        def test_operaciones(self):
+            a, b = Cuenta("Ana", 100), Cuenta("Beto")
+            a.depositar(50)
+            a.extraer(30)
+            a.transferir(b, 20)
+            self.assertEqual((a.saldo, b.saldo), (100, 20))
+            self.assertEqual(a.historial[-1], ("transferencia_enviada", 20))
+            self.assertEqual(b.historial, [("transferencia_recibida", 20)])
+        def test_errores(self):
+            c = Cuenta("Ana", 10)
+            with self.assertRaises(ValueError):
+                c.extraer(11)
+            with self.assertRaises(ValueError):
+                c.depositar(0)
+            with self.assertRaises(AttributeError):
+                c.saldo = 999
+            self.assertEqual(c.saldo, 10)
+"""}, dificultad=2)
+
+
+@dataclass
+class ResultadoEval:
+    tarea: TareaEval
+    ok: bool
+    conteo: ConteoTests
+    pasos: int
+    segundos: float
+    error: str = ""
+
+
+def correr_tarea_eval(tarea: TareaEval, llm, settings: Settings, ui: UI, modo: str = "agente") -> ResultadoEval:
+    inicio = time.monotonic()
+    with tempfile.TemporaryDirectory(prefix=f"reaper_eval_{tarea.id}_") as tmp:
+        raiz = Path(tmp) / tarea.id
+        raiz.mkdir()
+        for rel, contenido in tarea.archivos.items():
+            escritura_atomica(raiz / rel, contenido)
+        ws = Workspace(raiz, checkpoints_dir=Path(tmp) / "_ck")
+        pasos, error = 0, ""
+        silenciosa = UI(silencioso=True, interactivo=False)
+        try:
+            if modo == "torneo":
+                resultado = Torneo(llm, ws, settings, silenciosa).correr(tarea.pedido, n=max(2, settings.candidatos))
+                pasos = sum(c.resultado.pasos for c in resultado.candidatos if c.resultado)
+            else:
+                res = Agente("principal", llm, ws, settings, silenciosa, etiqueta=f"eval:{tarea.id}",
+                             mostrar_progreso=False, memoria=None).ejecutar(tarea.pedido)
+                pasos = res.pasos
+        except LLMError as e:
+            error = str(e)
+        except Exception as e:  # una tarea rota no corta el benchmark
+            error = f"{type(e).__name__}: {e}"
+        for rel, contenido in tarea.tests.items():
+            escritura_atomica(raiz / rel, contenido)
+        r = ejecutar(f"{shlex.quote(sys.executable)} -m unittest discover -s tests", cwd=raiz,
+                     timeout=settings.tests_timeout, shell=True)
+        conteo = contar_tests(r.stdout + r.stderr, r.codigo)
+        return ResultadoEval(tarea, r.ok and not error, conteo, pasos, time.monotonic() - inicio, error)
+
+
+def correr_evaluacion(llm, settings: Settings, ui: UI, cantidad: Optional[int] = None, modo: str = "agente",
+                      ids: Sequence[str] = ()) -> bool:
+    tareas = [t for t in TAREAS_EVAL if not ids or t.id in ids]
+    if cantidad:
+        tareas = tareas[:cantidad]
+    if not tareas:
+        ui.aviso("No hay tareas de evaluación que coincidan.")
+        return False
+    ajustes = Settings.desde_dict({**settings.to_dict(), "modo": "auto", "max_pasos": min(settings.max_pasos, 25)})
+    ui.titulo(f"EVALUACIÓN · {len(tareas)} tareas · modelo {ajustes.modelo.split('/')[-1]} · modo {modo}")
+    resultados = []
+    for i, tarea in enumerate(tareas, start=1):
+        ui.info(f"[{i}/{len(tareas)}] {tarea.titulo}…")
+        res = correr_tarea_eval(tarea, llm, ajustes, ui, modo)
+        resultados.append(res)
+        (ui.ok if res.ok else ui.error)(f"{tarea.titulo}: {res.conteo.texto()} · {res.pasos} pasos · "
+                                        f"{formatear_duracion(res.segundos)}" + (f" · {res.error}" if res.error else ""))
+    aprobadas = sum(1 for r in resultados if r.ok)
+    puntos = sum(r.conteo.pasados for r in resultados)
+    totales = sum(r.conteo.ejecutados for r in resultados) or 1
+    ui.tabla([[r.tarea.id, "✓" if r.ok else "✗", r.conteo.texto(), str(r.pasos), formatear_duracion(r.segundos)]
+              for r in resultados], ["tarea", "", "tests", "pasos", "tiempo"], "lllrr")
+    ui.caja([f"tareas resueltas: {aprobadas}/{len(resultados)} ({100 * aprobadas // len(resultados)}%)",
+             f"tests pasados: {puntos}/{totales} ({100 * puntos // totales}%)",
+             f"uso: {llm.uso.resumen()}"], titulo="RESULTADO")
+    try:
+        carpeta = BASE_DIR / "evals"
+        carpeta.mkdir(parents=True, exist_ok=True)
+        ruta = carpeta / f"eval_{datetime.now():%Y%m%d_%H%M%S}.json"
+        ruta.write_text(json.dumps({
+            "modelo": ajustes.modelo, "modo": modo, "fecha": datetime.now().isoformat(timespec="seconds"),
+            "resueltas": aprobadas, "total": len(resultados),
+            "tareas": [{"id": r.tarea.id, "ok": r.ok, "pasados": r.conteo.pasados, "ejecutados": r.conteo.ejecutados,
+                        "pasos": r.pasos, "segundos": round(r.segundos, 1), "error": r.error} for r in resultados],
+        }, ensure_ascii=False, indent=2), encoding="utf-8")
+        ui.tenue(f"  guardado en {ruta}")
+    except OSError:
+        pass
+    return aprobadas == len(resultados)
+
+
+# ======================================================================
+# MÓDULO: cli
+# ======================================================================
+"""REPL interactivo y modo línea de comandos de REAPER v7."""
+
+INIT_TAREA = """Analizá este proyecto y redactá el contenido de un archivo REAPER.md: la memoria del proyecto
+que leerán otros agentes de IA antes de trabajar. Secciones:
+# <nombre del proyecto>
+## Descripción (2-3 líneas)
+## Cómo ejecutar
+## Cómo testear (comando exacto; si no hay tests, decilo)
+## Estructura (archivos clave y para qué sirven)
+## Convenciones (lenguaje, estilo, librerías, idioma de la interfaz)
+Máximo 60 líneas y SOLO hechos que verificaste leyendo el código.
+Tu attempt_completion debe contener ÚNICAMENTE el markdown del archivo."""
+
+COMANDOS_AYUDA = [
+    ("USO", [
+        ("<pedido>", "lenguaje natural: el agente lee, edita, ejecuta y verifica en el proyecto"),
+        ('"""', "empezá y terminá con una línea \"\"\" para escribir varias líneas"),
+        ("@archivo", "mencioná archivos en el pedido para adjuntar su contenido"),
+        ("!comando", "corre un comando de shell vos mismo (interactivo)"),
+    ]),
+    ("EQUIPO", [
+        ("/construir <pedido>", "exploradores → arquitecto → tests primero → torneo por tarea → verificación → reparador"),
+        ("/plan <pedido>", "solo exploración + plan (se guarda en .reaper/planes)"),
+        ("/torneo <tarea>", "N implementadores compiten en copias aisladas; gana el que pasa más tests"),
+        ("/escribir <ruta> <qué>", "archivo largo por esqueleto + relleno (miles de líneas sin cortarse)"),
+        ("/agente <rol> <tarea>", "subagente suelto (explorador, implementador, revisor, qa, reparador...)"),
+        ("/revisar [foco]", "revisores en paralelo sobre todo el proyecto"),
+        ("/init", "genera REAPER.md (memoria del proyecto)"),
+    ]),
+    ("PROYECTO", [
+        ("/proyecto [ruta]", "cambia de workspace"),
+        ("/nuevo <plantilla> <carpeta>", "crea un proyecto listo y testeado desde una plantilla"),
+        ("/plantillas", "lista las plantillas disponibles"),
+        ("/scan · /tests · /validar [archivos]", "validadores, suite de tests, validación puntual"),
+        ("/correr <archivo> [args]", "ejecuta y ofrece reparar si crashea"),
+        ("/vigilar [comando]", "corre los tests cada vez que cambia un archivo (Ctrl+C para salir)"),
+        ("/diff · /deshacer [id] · /rehacer", "cambios del último pedido, revertir, volver a aplicar"),
+        ("/checkpoints", "historial de checkpoints"),
+    ]),
+    ("CÓDIGO", [
+        ("/simbolo <nombre>", "muestra una función o clase (Clase.metodo)"),
+        ("/referencias <nombre>", "dónde se usa un nombre"),
+        ("/mapa <tema>", "archivos más relevantes para un tema"),
+        ("/recetas [tema]", "recetas de código listas (sqlite, argparse, curses, termux-api...)"),
+    ]),
+    ("MEMORIA", [
+        ("/lecciones [general|borrar N|agregar …]", "lecciones aprendidas entre sesiones"),
+        ("/notas", "notas que dejaron los agentes en .reaper/notas.md"),
+        ("/git [log|estado|diff|snapshot|init]", "builds verificadas guardadas en la rama reaper/builds"),
+        ("/historial · /exportar [ruta]", "pedidos de la sesión · exportar la conversación a Markdown"),
+    ]),
+    ("AJUSTES", [
+        ("/perfil [gratis|rapido|equilibrado|maximo]", "presets de torneo, escalada y límites"),
+        ("/modo [confirmar|auto-edicion|auto]", "permisos para editar y ejecutar"),
+        ("/modelo [alias] · /modelo <rol> <alias>", "modelo principal o por rol (ej: /modelo revisor qwen)"),
+        ("/modelo-fuerte [alias]", "modelo para la escalada (deepseek por defecto)"),
+        ("/modelos · /config [clave valor] · /tema [nombre]", "catálogo, configuración, colores"),
+        ("/uso · /contexto · /compactar · /estado", "consumo, contexto del agente, estado general"),
+        ("/doctor · /instalar · /dragon · /evaluar", "diagnóstico, comando `reaper`, el dragón, benchmark"),
+        ("/todo · /reset · /salir", "lista de tareas, reiniciar conversación, salir"),
+    ]),
+]
+
+
+def texto_ayuda() -> str:
+    lineas = []
+    ancho = min(ancho_terminal(), 100)
+    for seccion, comandos in COMANDOS_AYUDA:
+        lineas.append(f"\n{Tema.titulo}{C.BOLD} {seccion} {C.RESET}")
+        for comando, descripcion in comandos:
+            if ancho < 70:
+                lineas.append(f"  {Tema.ok}{comando}{C.RESET}")
+                lineas.append(f"      {Tema.tenue}{descripcion}{C.RESET}")
+            else:
+                lineas.append(f"  {Tema.ok}{comando:<34}{C.RESET} {Tema.tenue}{descripcion}{C.RESET}")
+    return "\n".join(lineas)
+
+
+def resolver_workspace(texto: str) -> Path:
+    ruta = Path(os.path.expandvars(texto.strip())).expanduser().resolve()
+    if not ruta.exists():
+        raise ErrorRuta(f"No existe: {ruta}")
+    if not ruta.is_dir():
+        raise ErrorRuta(f"No es una carpeta: {ruta}")
+    if not os.getenv("REAPER_LIBRE"):
+        home = Path.home().resolve()
+        if ruta != home and home not in ruta.parents:
+            raise ErrorRuta(
+                f"Por seguridad el proyecto debe estar dentro de {home} (o exportá REAPER_LIBRE=1)."
+            )
+    return ruta
+
+
+_RE_MENCION = re.compile(r"(?<![\w/])@([\w./-]+\.[\w]+|[\w./-]+/)")
+
+
+class App:
+    def __init__(self, settings: Settings, llm, ui: UI, ws: Workspace, persistir: bool = True):
+        self.settings = settings
+        self.llm = llm
+        self.ui = ui
+        self.ws = ws
+        self.persistir = persistir
+        self.aviso_sesion = ""
+        self.historial: list[tuple[str, str, bool]] = []
+        self._rehacer: Optional[dict] = None
+        self._pedido_actual = ""
+        self.escalador = Escalador(llm, settings, ui)
+        self.memoria = self._nueva_memoria()
+        self.principal = self._nuevo_principal()
+        if persistir:
+            self._cargar_sesion()
+
+    # ------------------------------------------------------------ sesión
+    def _nueva_memoria(self) -> Optional[MemoriaLecciones]:
+        if not self.settings.lecciones:
+            return None
+        try:
+            return MemoriaLecciones(self.ws)
+        except OSError:
+            return None
+
+    def _consultar_experto(self, error: str) -> Optional[str]:
+        return self.escalador.diagnosticar(self.ws, self._pedido_actual or "pedido del usuario", error)
+
+    def _nuevo_principal(self) -> Agente:
+        return Agente("principal", self.llm, self.ws, self.settings, self.ui, etiqueta="reaper",
+                      memoria=self.memoria, on_atascado=self._consultar_experto)
+
+    def _ruta_sesion(self) -> Path:
+        return SESIONES_DIR / f"{self.ws.checkpoints.carpeta.name}.json"
+
+    def _guardar_sesion(self) -> None:
+        if not self.persistir:
+            return
+        try:
+            SESIONES_DIR.mkdir(parents=True, exist_ok=True)
+            mensajes = self.principal.mensajes[1:][-60:]
+            while mensajes and mensajes[0]["role"] != "user":
+                mensajes = mensajes[1:]
+            datos = {"mensajes": mensajes, "todo": self.principal.ctx.todo,
+                     "historial": self.historial[-50:], "guardado": datetime.now().isoformat(timespec="seconds")}
+            escritura_atomica(self._ruta_sesion(), json.dumps(datos, ensure_ascii=False))
+        except OSError as e:
+            self.ui.aviso(f"No pude guardar la sesión: {e}")
+
+    def _cargar_sesion(self) -> None:
+        try:
+            datos = json.loads(self._ruta_sesion().read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        mensajes = [m for m in datos.get("mensajes", [])
+                    if isinstance(m, dict) and m.get("role") in ("user", "assistant") and isinstance(m.get("content"), str)]
+        self.historial = [tuple(h) for h in datos.get("historial", []) if isinstance(h, list) and len(h) == 3]
+        if mensajes:
+            self.principal.mensajes = [{"role": "system", "content": ""}] + mensajes
+            self.principal.ctx.todo[:] = [tuple(t) for t in datos.get("todo", []) if len(t) == 2]
+            self.aviso_sesion = (f"retomé la sesión anterior de este proyecto ({len(mensajes)} mensajes) · "
+                                 "/reset para empezar de cero")
+
+    def cambiar_workspace(self, ruta: Path) -> None:
+        self._guardar_sesion()
+        self.ws = Workspace(ruta)
+        self.memoria = self._nueva_memoria()
+        self.principal = self._nuevo_principal()
+        self.historial = []
+        self._rehacer = None
+        if self.persistir:
+            guardar_estado(proyecto=str(self.ws.raiz))
+            self._cargar_sesion()
+            if self.aviso_sesion:
+                self.ui.tenue("  " + self.aviso_sesion)
+
+    # ------------------------------------------------------------ acciones
+    def expandir_menciones(self, texto: str) -> str:
+        """@ruta en el pedido → se adjunta el contenido (recortado) para que el agente no tenga que buscarlo."""
+        adjuntos = []
+        for m in _RE_MENCION.finditer(texto):
+            rel = m.group(1)
+            try:
+                ruta = self.ws.ruta(rel)
+            except ErrorRuta:
+                continue
+            if ruta.is_dir():
+                listado = [self.ws.rel(p) for p in self.ws.iterar(rel, limite=60)]
+                adjuntos.append(f"### Carpeta {self.ws.rel(ruta)}\n" + "\n".join(listado))
+            elif ruta.is_file() and self.ws.es_texto(ruta) and not es_binario(ruta):
+                try:
+                    lineas = ruta.read_text(encoding="utf-8", errors="replace").splitlines()
+                except OSError:
+                    continue
+                cuerpo = "\n".join(f"{i:>5}| {l}" for i, l in enumerate(lineas[:300], start=1))
+                extra = f"\n(... {len(lineas) - 300} líneas más: usá read_file)" if len(lineas) > 300 else ""
+                adjuntos.append(f"### {self.ws.rel(ruta)} ({len(lineas)} líneas)\n{cuerpo}{extra}")
+        if not adjuntos:
+            return texto
+        self.ui.tenue(f"  adjunté {len(adjuntos)} mención(es) @")
+        return texto + "\n\nARCHIVOS MENCIONADOS POR EL USUARIO:\n" + "\n\n".join(adjuntos)
+
+    def turno(self, texto: str) -> bool:
+        self._pedido_actual = texto
+        cid = self.ws.checkpoints.iniciar(f"pedido: {texto[:80]}")
+        inicio = time.monotonic()
+        try:
+            res = self.principal.ejecutar(self.expandir_menciones(texto), cid_inicio=cid)
+        finally:
+            self._guardar_sesion()
+            self.ws.checkpoints.descartar_si_vacio(cid)
+        self.historial.append((datetime.now().strftime("%H:%M"), texto[:200], res.ok))
+        self.ui.linea("")
+        self.ui.linea(f"{Tema.agente}{C.BOLD}reaper »{C.RESET}")
+        mostrar_markdown(self.ui, res.resumen)
+        if res.cambios:
+            self.ui.tenue(
+                f"\n  {len(res.cambios)} archivo(s) cambiados: {', '.join(res.cambios[:8])}"
+                f"{' ...' if len(res.cambios) > 8 else ''} · /diff · /deshacer"
+            )
+        detalle = [formatear_duracion(time.monotonic() - inicio), f"{res.pasos} pasos"]
+        if res.escalado:
+            detalle.append("con escalada")
+        self.ui.tenue("  " + " · ".join(detalle))
+        if not res.ok:
+            self.ui.aviso(f"  (terminó con estado: {res.motivo})")
+        self.ui.linea("")
+        return res.ok
+
+    def construir(self, pedido: str, confirmar: bool = True) -> bool:
+        self._pedido_actual = pedido
+        informe = Orquestador(self.llm, self.ws, self.settings, self.ui).construir(pedido, confirmar)
+        self.historial.append((datetime.now().strftime("%H:%M"), f"/construir {pedido[:180]}", informe.ok))
+        return informe.ok
+
+    # ------------------------------------------------------------ comandos
+    def comando(self, entrada: str) -> Optional[str]:
+        partes = entrada.split(maxsplit=1)
+        cmd = partes[0].lower()
+        arg = partes[1].strip() if len(partes) > 1 else ""
+        alias = {
+            "/help": "ayuda", "/h": "ayuda", "/?": "ayuda", "/exit": "salir", "/quit": "salir", "/q": "salir",
+            "/equipo": "plan", "/undo": "deshacer", "/redo": "rehacer", "/build": "construir", "/b": "construir",
+            "/symbol": "simbolo", "/sym": "simbolo", "/refs": "referencias", "/map": "mapa", "/new": "nuevo",
+            "/templates": "plantillas", "/lessons": "lecciones", "/notes": "notas", "/watch": "vigilar",
+            "/profile": "perfil", "/theme": "tema", "/usage": "uso", "/costos": "uso", "/write": "escribir",
+            "/tournament": "torneo", "/recipes": "recetas", "/eval": "evaluar", "/export": "exportar",
+            "/history": "historial", "/status": "estado", "/context": "contexto", "/compact": "compactar",
+            "/run": "correr", "/test": "tests", "/project": "proyecto", "/model": "modelo", "/mode": "modo",
+            "/strong": "modelo_fuerte",
+        }
+        nombre = alias.get(cmd, cmd[1:]).replace("-", "_")
+        metodo = getattr(self, "cmd_" + nombre, None)
+        if metodo is None:
+            parecidos = difflib.get_close_matches(cmd[1:], [n[4:] for n in dir(self) if n.startswith("cmd_")], n=2)
+            sugerencia = f" ¿Quisiste decir /{parecidos[0].replace('_', '-')}?" if parecidos else ""
+            self.ui.error(f"Comando desconocido: {cmd}.{sugerencia} (probá /ayuda)")
+            return None
+        return metodo(arg)
+
+    def nombres_comandos(self) -> list[str]:
+        return sorted("/" + n[4:].replace("_", "-") for n in dir(self) if n.startswith("cmd_"))
+
+    def cmd_ayuda(self, arg: str) -> None:
+        self.ui.linea(texto_ayuda())
+
+    def cmd_salir(self, arg: str) -> str:
+        self._guardar_sesion()
+        u = self.llm.uso
+        if u.llamadas:
+            self.ui.tenue(f"Sesión: {u.resumen()}")
+        self.ui.tenue("Chau (sesión guardada). 🐉")
+        return "salir"
+
+    # ---------------------------------------------------------------- equipo
+    def cmd_construir(self, arg: str) -> None:
+        if not arg:
+            self.ui.tenue("Uso: /construir <qué querés construir>")
+            return
+        self.construir(arg)
+
+    def cmd_plan(self, arg: str) -> None:
+        if not arg:
+            self.ui.tenue("Uso: /plan <qué querés diseñar>")
+            return
+        ruta = Orquestador(self.llm, self.ws, self.settings, self.ui).solo_plan(arg)
+        if ruta:
+            self.ui.ok(f"Plan guardado en {ruta}")
+
+    def cmd_torneo(self, arg: str) -> None:
+        if not arg:
+            self.ui.tenue(f"Uso: /torneo <tarea>   (compiten {self.settings.candidatos} implementadores; "
+                          "cambiá la cantidad con /config candidatos N)")
+            return
+        self._pedido_actual = arg
+        cid = self.ws.checkpoints.iniciar(f"torneo: {arg[:70]}")
+        torneo = Torneo(self.llm, self.ws, self.settings, self.ui, memoria=self.memoria,
+                        on_atascado=self.escalador.gancho(self.ws, arg))
+        resultado = torneo.correr(self.expandir_menciones(arg), titulo=_titulo(arg),
+                                  n=max(2, self.settings.candidatos), cid=cid)
+        self.ws.checkpoints.descartar_si_vacio(cid)
+        self.ui.linea("")
+        mostrar_markdown(self.ui, resultado.informe())
+        self.historial.append((datetime.now().strftime("%H:%M"), f"/torneo {arg[:180]}", resultado.ok))
+
+    def cmd_escribir(self, arg: str) -> None:
+        partes = arg.split(maxsplit=1)
+        if len(partes) < 2:
+            self.ui.tenue("Uso: /escribir <ruta.py|.js> <descripción completa de lo que debe hacer el archivo>")
+            return
+        rel, especificacion = partes
+        try:
+            ruta = self.ws.ruta(rel, escribir=True)
+        except ErrorRuta as e:
+            self.ui.error(str(e))
+            return
+        cid = self.ws.checkpoints.iniciar(f"escribir {rel}")
+        escritor = EscritorLargo(self.llm, self.ws, self.settings, self.ui)
+        try:
+            informe = escritor.escribir(self.ws.rel(ruta), especificacion, contexto=self.ws.memoria(1500))
+        except ErrorEscritor as e:
+            self.ui.error(str(e))
+            self.ws.checkpoints.descartar_si_vacio(cid)
+            return
+        (self.ui.ok if informe.ok else self.ui.aviso)(informe.texto())
+        self.ui.tenue("  /diff para ver el archivo · /deshacer para descartarlo")
+
+    def cmd_agente(self, arg: str) -> None:
+        partes = arg.split(maxsplit=1)
+        rol = ALIAS_ROLES.get(partes[0].lower(), partes[0].lower()) if partes else ""
+        if len(partes) < 2 or rol not in ROLES_DELEGABLES:
+            self.ui.tenue(f"Uso: /agente <{'|'.join(ROLES_DELEGABLES)}> <tarea>")
+            return
+        cid = self.ws.checkpoints.iniciar(f"agente {rol}: {partes[1][:60]}")
+        res = ejecutar_subagentes([(rol, self.expandir_menciones(partes[1]), "", "",
+                                    {"memoria": self.memoria, "on_atascado": self._consultar_experto})],
+                                  self.llm, self.ws, self.settings, self.ui, profundidad=1, cid_inicio=cid)[0]
+        self.ws.checkpoints.descartar_si_vacio(cid)
+        self.ui.linea("")
+        mostrar_markdown(self.ui, res.resumen)
+        self.ui.linea("")
+
+    def cmd_revisar(self, arg: str) -> None:
+        informe = Orquestador(self.llm, self.ws, self.settings, self.ui).revisar_proyecto(arg)
+        self.ui.titulo("REVISIÓN")
+        mostrar_markdown(self.ui, informe)
+
+    def cmd_init(self, arg: str) -> None:
+        destino = self.ws.raiz / "REAPER.md"
+        if destino.exists() and not self.ui.confirmar("REAPER.md ya existe. ¿Regenerarlo?"):
+            return
+        res = ejecutar_subagentes([("explorador", INIT_TAREA, "")], self.llm, self.ws,
+                                  self.settings, self.ui, profundidad=1)[0]
+        contenido = res.resumen.strip()
+        m = re.fullmatch(r"```(?:markdown|md)?\s*\n(.*?)\n```", contenido, re.S)
+        if m:
+            contenido = m.group(1)
+        if len(contenido) < 40:
+            self.ui.error("El explorador no produjo un REAPER.md utilizable.")
+            return
+        cid = self.ws.checkpoints.iniciar("init REAPER.md")
+        self.ws.escribir("REAPER.md", contenido.rstrip() + "\n")
+        self.ws.checkpoints.descartar_si_vacio(cid)
+        self.ui.ok("REAPER.md creado: los agentes lo leen en cada tarea (editalo cuando quieras).")
+
+    # ---------------------------------------------------------------- proyecto
+    def cmd_proyecto(self, arg: str) -> None:
+        if not arg:
+            self.ui.info(f"Proyecto activo: {self.ws.raiz}")
+            return
+        try:
+            ruta = resolver_workspace(arg)
+        except ErrorRuta as e:
+            self.ui.error(str(e))
+            return
+        self.cambiar_workspace(ruta)
+        detectado = detectar_comando_tests(self.ws)
+        self.ui.ok(f"Proyecto: {self.ws.raiz}")
+        self.ui.tenue(f"  {len(self.ws.archivos_codigo())} archivos de texto · tests: "
+                      f"{detectado[0] if detectado else 'no detectados'}"
+                      f"{' · memoria: REAPER.md' if self.ws.memoria() else ' · tip: /init crea REAPER.md'}")
+
+    def cmd_plantillas(self, arg: str) -> None:
+        filas = []
+        for nombre, p in sorted(PLANTILLAS.items()):
+            if arg and arg.lower() not in (nombre + " " + p.descripcion + " " + " ".join(p.etiquetas)).lower():
+                continue
+            filas.append([nombre, p.lenguaje, recortar(p.descripcion, 70).replace("\n", " ")])
+        if not filas:
+            self.ui.tenue("No hay plantillas que coincidan.")
+            return
+        self.ui.tabla(filas, ["plantilla", "lenguaje", "descripción"])
+        self.ui.tenue("  /nuevo <plantilla> <carpeta>  ·  plantillas propias en ~/reaper/plantillas/<nombre>/")
+
+    def cmd_nuevo(self, arg: str) -> None:
+        partes = arg.split()
+        if len(partes) < 2:
+            self.ui.tenue("Uso: /nuevo <plantilla> <carpeta>   (mirá /plantillas)")
+            return
+        nombre, carpeta = partes[0], partes[1]
+        destino = Path(os.path.expandvars(carpeta)).expanduser()
+        if not destino.is_absolute():
+            destino = (PROJECTS_DIR / destino) if not (Path.cwd() / destino).parent.exists() else (Path.cwd() / destino)
+        try:
+            creados = crear_desde_plantilla(nombre, destino)
+        except (KeyError, FileExistsError, OSError) as e:
+            self.ui.error(str(e) if not isinstance(e, KeyError) else f"No existe la plantilla {nombre} (mirá /plantillas)")
+            return
+        self.ui.ok(f"Proyecto creado en {destino} ({len(creados)} archivos)")
+        try:
+            self.cambiar_workspace(resolver_workspace(str(destino)))
+        except ErrorRuta as e:
+            self.ui.aviso(str(e))
+            return
+        plantilla = obtener_plantilla(nombre)
+        if plantilla and plantilla.comando_tests:
+            r = ejecutar(plantilla.comando_tests, cwd=self.ws.raiz, timeout=self.settings.tests_timeout, shell=True)
+            (self.ui.ok if r.ok else self.ui.aviso)(f"tests de la plantilla: {'pasan' if r.ok else 'fallan'} "
+                                                    f"({conteo_de_resultado(r).texto()})")
+        if plantilla and plantilla.comando_ejecutar:
+            self.ui.tenue(f"  para correrlo: {plantilla.comando_ejecutar}")
+
+    def cmd_scan(self, arg: str) -> None:
+        archivos = self.ws.archivos_codigo(limite=400)
+        por_ext: dict[str, int] = {}
+        for a in archivos:
+            ext = Path(a).suffix or Path(a).name
+            por_ext[ext] = por_ext.get(ext, 0) + 1
+        self.ui.info(f"Proyecto: {self.ws.raiz}")
+        self.ui.tenue("  " + " · ".join(f"{k}:{v}" for k, v in sorted(por_ext.items(), key=lambda kv: -kv[1])[:12]))
+        resultados = validar_archivos(self.ws, archivos)
+        malos = fallos(resultados)
+        self.ui.linea(f"  validaciones: {len(resultados) - len(malos)}/{len(resultados)} OK")
+        for r in malos[:25]:
+            self.ui.error(r.linea()[2:])
+            self.ui.tenue(recortar(r.stderr or r.stdout, 600))
+        avisos = 0
+        for rel in archivos:
+            if rel.endswith(".py"):
+                try:
+                    for aviso in advertencias_python(self.ws.leer(rel))[:3]:
+                        if avisos < 15:
+                            self.ui.aviso(f"  ⚠ {rel}: {aviso}")
+                        avisos += 1
+                except (OSError, ValueError):
+                    continue
+        detectado = detectar_comando_tests(self.ws)
+        self.ui.tenue(f"  tests: {detectado[0] if detectado else 'no detectados'}")
+
+    def cmd_tests(self, arg: str) -> None:
+        detectado = detectar_comando_tests(self.ws, completo=True)
+        if not detectado:
+            self.ui.aviso("No detecté una suite de tests.")
+            return
+        self.ui.info(f"Ejecutando {detectado[0]} ...")
+        r = ejecutar_tests(self.ws, timeout=self.settings.tests_timeout, completo=True)
+        self.ui.linea(recortar((r.stdout + "\n" + r.stderr).strip(), 6000))
+        conteo = conteo_de_resultado(r)
+        (self.ui.ok if r.ok else self.ui.error)(
+            f"tests {'OK' if r.ok else 'FALLARON'} (exit {r.codigo}) · {conteo.texto()} · {formatear_duracion(r.duracion)}")
+
+    def cmd_validar(self, arg: str) -> None:
+        rels = shlex.split(arg) if arg else self.ws.checkpoints.archivos_desde(self.ws.checkpoints.inicio_grupo() or 1)
+        if not rels:
+            self.ui.tenue("Uso: /validar archivo.py [otro.js ...]")
+            return
+        for r in validar_archivos(self.ws, rels):
+            (self.ui.ok if r.ok else self.ui.error)(r.linea()[2:])
+            if not r.ok:
+                self.ui.tenue(recortar(r.stderr or r.stdout, 1500))
+
+    def cmd_correr(self, arg: str) -> None:
+        try:
+            tokens = shlex.split(arg)
+        except ValueError as e:
+            self.ui.error(f"Argumentos inválidos: {e}")
+            return
+        if not tokens:
+            self.ui.tenue("Uso: /correr archivo.py [args...]   (para programas interactivos usá !python3 archivo.py)")
+            return
+        try:
+            ruta = self.ws.ruta(tokens[0])
+        except ErrorRuta as e:
+            self.ui.error(str(e))
+            return
+        lanzadores = {".py": [sys.executable], ".sh": ["bash"], ".js": ["node"], ".mjs": ["node"], ".cjs": ["node"]}
+        if not ruta.is_file() or ruta.suffix not in lanzadores:
+            self.ui.error("Archivo inexistente o tipo no ejecutable (.py .sh .js .mjs .cjs).")
+            return
+        rel = self.ws.rel(ruta)
+        for intento in range(1, 4):
+            r = ejecutar(lanzadores[ruta.suffix] + [rel] + tokens[1:], cwd=self.ws.raiz,
+                         timeout=self.settings.exec_timeout)
+            self.ui.linea(recortar(r.stdout.strip(), 6000))
+            if r.stderr.strip():
+                self.ui.aviso(recortar(r.stderr.strip(), 4000))
+            self.ui.tenue(f"exit code: {r.codigo} · {formatear_duracion(r.duracion)}")
+            if r.ok:
+                self.ui.ok("Ejecución correcta.")
+                return
+            if not es_crash_real(r):
+                self.ui.aviso("Terminó con error controlado (sin traceback): no lo trato como bug.")
+                return
+            for pista in pistas_para(r.stderr + r.stdout, 2):
+                self.ui.tenue(f"  💡 {pista}")
+            if intento == 3 or not self.ui.confirmar("Crash detectado. ¿Lo mando al reparador?"):
+                return
+            cid = self.ws.checkpoints.iniciar(f"reparar {rel}")
+            tarea = (f"Al ejecutar `{r.comando}` el programa falló:\n{anexar_pistas(r.resumen(4000), 2)}\n\n"
+                     f"Archivo principal: {rel}. Encontrá la causa raíz y corregila. "
+                     "Podés verificar con execute_command usando el mismo comando.")
+            self._pedido_actual = tarea
+            ejecutar_subagentes([("reparador", tarea, rel, "", {"memoria": self.memoria,
+                                                                "on_atascado": self._consultar_experto})],
+                                self.llm, self.ws, self.settings, self.ui, profundidad=1, cid_inicio=cid)
+            self.ws.checkpoints.descartar_si_vacio(cid)
+            self.ui.info("Reintentando ejecución...")
+
+    def cmd_vigilar(self, arg: str) -> None:
+        vigilar(self.ws, self.ui, comando=arg or None, timeout=self.settings.tests_timeout)
+
+    def cmd_diff(self, arg: str) -> None:
+        cid = int(arg) if arg.isdigit() else self.ws.checkpoints.inicio_grupo()
+        if cid is None:
+            self.ui.tenue("No hay cambios registrados.")
+            return
+        diff = self.ws.checkpoints.diff_desde(cid)
+        if not diff.strip():
+            self.ui.tenue("El último checkpoint no tiene diferencias.")
+            return
+        self.ui.linea(_diffstat(diff))
+        self.ui.diff(diff, max_lineas=500)
+
+    def cmd_deshacer(self, arg: str) -> None:
+        cid = int(arg) if arg.isdigit() else self.ws.checkpoints.inicio_grupo()
+        if cid is None:
+            self.ui.tenue("No hay nada para deshacer.")
+            return
+        archivos = self.ws.checkpoints.archivos_desde(cid)
+        etiqueta = next((m["etiqueta"] for m in self.ws.checkpoints.listar() if m["id"] == cid), "?")
+        self.ui.aviso(f"Se revierte «{etiqueta}» y todo lo posterior: {', '.join(archivos) or '(sin archivos)'}")
+        if not self.ui.confirmar("¿Confirmás?"):
+            return
+        self._rehacer = {"etiqueta": etiqueta, "contenidos": copiar_contenidos(self.ws, archivos)}
+        tocados = self.ws.checkpoints.deshacer(cid)
+        indice_de(self.ws).invalidar()
+        self.ui.ok(f"Revertidos {len(tocados)} archivo(s). (/rehacer los vuelve a aplicar)")
+
+    def cmd_rehacer(self, arg: str) -> None:
+        if not self._rehacer:
+            self.ui.tenue("No hay nada para rehacer (solo se puede justo después de /deshacer).")
+            return
+        datos = self._rehacer
+        cid = self.ws.checkpoints.iniciar(f"rehacer: {datos['etiqueta']}")
+        aplicados = 0
+        for rel, contenido in datos["contenidos"].items():
+            try:
+                if contenido is None:
+                    if self.ws.existe(rel):
+                        self.ws.borrar(rel)
+                        aplicados += 1
+                else:
+                    self.ws.escribir(rel, contenido)
+                    aplicados += 1
+            except (ErrorRuta, OSError) as e:
+                self.ui.aviso(f"  {rel}: {e}")
+        self.ws.checkpoints.descartar_si_vacio(cid)
+        self._rehacer = None
+        indice_de(self.ws).invalidar()
+        self.ui.ok(f"Rehechos {aplicados} archivo(s) de «{datos['etiqueta']}».")
+
+    def cmd_checkpoints(self, arg: str) -> None:
+        lista = self.ws.checkpoints.listar()
+        if not lista:
+            self.ui.tenue("Sin checkpoints.")
+            return
+        filas = []
+        for m in lista[-15:]:
+            grupo = f"build {m['grupo']}" if m.get("grupo") != m["id"] else ""
+            filas.append([str(m["id"]), m["fecha"].replace("T", " "), str(len(m["archivos"])),
+                          recortar(m["etiqueta"], 50).replace("\n", " "), grupo])
+        self.ui.tabla(filas, ["id", "fecha", "arch", "etiqueta", "grupo"], "rlrll")
+        self.ui.tenue("  /deshacer <id> revierte desde ese checkpoint · /diff <id> muestra sus cambios")
+
+    # ---------------------------------------------------------------- código
+    def cmd_simbolo(self, arg: str) -> None:
+        if not arg:
+            self.ui.tenue("Uso: /simbolo <nombre | Clase.metodo> [archivo]")
+            return
+        partes = arg.split()
+        encontrados, sugerencias = indice_de(self.ws).buscar(partes[0], partes[1] if len(partes) > 1 else None)
+        if not encontrados:
+            self.ui.error(f"No encontré '{partes[0]}'." + (f" ¿{', '.join(sugerencias)}?" if sugerencias else ""))
+            return
+        for s in encontrados[:3]:
+            self.ui.info(s.describir())
+            try:
+                texto = self.ws.leer(s.archivo)
+            except (OSError, ValueError):
+                continue
+            tramo = "\n".join(texto.splitlines()[s.inicio - 1: s.fin][:200])
+            self.ui.codigo(tramo, Path(s.archivo).suffix, numeros=True, desde=s.inicio)
+        if len(encontrados) > 3:
+            self.ui.tenue(f"  ... y {len(encontrados) - 3} coincidencias más")
+
+    def cmd_referencias(self, arg: str) -> None:
+        if not arg:
+            self.ui.tenue("Uso: /referencias <nombre>")
+            return
+        usos = indice_de(self.ws).referencias(arg.strip())
+        if not usos:
+            self.ui.tenue("Sin usos fuera de su definición.")
+            return
+        for u in usos:
+            archivo, _, resto = u.partition(": ")
+            self.ui.linea(f"  {Tema.info}{archivo}{C.RESET} {resto}")
+
+    def cmd_mapa(self, arg: str) -> None:
+        if not arg:
+            self.ui.tenue("Uso: /mapa <tema o pedido>")
+            return
+        texto = mapa_relevante(self.ws, arg, maximo=12)
+        self.ui.linea(texto or "No encontré archivos relacionados.")
+
+    def cmd_recetas(self, arg: str) -> None:
+        if not arg:
+            temas = collections.Counter(t for r in RECETAS for t in r.etiquetas[:1])
+            self.ui.info(f"{len(RECETAS)} recetas. Temas: " + ", ".join(f"{t} ({n})" for t, n in temas.most_common(25)))
+            self.ui.tenue("  /recetas <tema>  (ej: /recetas sqlite, /recetas notificacion termux)")
+            return
+        encontradas = buscar_recetas(arg, 4)
+        if not encontradas:
+            self.ui.tenue("No encontré recetas para eso.")
+            return
+        for r in encontradas:
+            self.ui.caja([r.descripcion], titulo=f"{r.titulo} · {r.lenguaje}")
+            self.ui.codigo(r.codigo, r.lenguaje)
+
+    # ---------------------------------------------------------------- memoria
+    def cmd_lecciones(self, arg: str) -> None:
+        if self.memoria is None:
+            self.ui.tenue("Las lecciones están desactivadas (/config lecciones true).")
+            return
+        partes = arg.split(maxsplit=1)
+        accion = partes[0].lower() if partes else ""
+        archivo = self.memoria.general if accion in ("general", "generales", "g") else self.memoria.proyecto
+        if accion == "borrar" and len(partes) == 2:
+            objetivo, _, numero = partes[1].rpartition(" ")
+            archivo = self.memoria.general if objetivo.strip().lower().startswith("gen") else self.memoria.proyecto
+            if not numero.isdigit():
+                self.ui.tenue("Uso: /lecciones borrar [general] <número>")
+                return
+            quitada = archivo.borrar(int(numero) - 1)
+            (self.ui.ok if quitada else self.ui.error)(f"Borrada: {quitada.texto}" if quitada else "Número inválido.")
+            return
+        if accion == "agregar" and len(partes) == 2:
+            texto = partes[1]
+            general = texto.lower().startswith("general ")
+            if general:
+                texto = texto[8:]
+            hechos = self.memoria.registrar([] if general else [texto], [texto] if general else [])
+            (self.ui.ok if hechos else self.ui.aviso)(hechos[0] if hechos else "No la guardé: tiene que ser concreta.")
+            return
+        lecciones = archivo.cargar()
+        titulo = "generales (~/reaper/lecciones.md)" if archivo is self.memoria.general else f"de {self.ws.raiz.name}"
+        if not lecciones:
+            self.ui.tenue(f"Todavía no hay lecciones {titulo}. Se agregan solas cuando el reparador arregla fallos reales.")
+            return
+        self.ui.info(f"Lecciones {titulo}:")
+        for i, l in enumerate(lecciones, start=1):
+            self.ui.linea(f"  {Tema.tenue}{i:>2}.{C.RESET} {Tema.acento}[{l.veces}]{C.RESET} {l.texto}")
+        self.ui.tenue("  /lecciones general · /lecciones borrar [general] N · /lecciones agregar [general] <texto>")
+
+    def cmd_notas(self, arg: str) -> None:
+        notas = self.ws.notas(limite=8000)
+        if not notas.strip():
+            self.ui.tenue("No hay notas todavía (los agentes las dejan con save_note).")
+            return
+        mostrar_markdown(self.ui, notas)
+
+    def cmd_git(self, arg: str) -> None:
+        accion = (arg.split() or ["estado"])[0].lower()
+        if accion == "init":
+            if es_repo_git(self.ws):
+                self.ui.tenue("Ya es un repositorio git.")
+                return
+            r = inicializar_repo(self.ws)
+            (self.ui.ok if r.ok else self.ui.error)(r.stdout.strip() or r.stderr.strip())
+            return
+        if not es_repo_git(self.ws):
+            self.ui.tenue("El proyecto no es un repositorio git (o no está instalado git). /git init para crearlo.")
+            return
+        rama = self.settings.rama_git
+        if accion in ("log", "builds"):
+            self.ui.linea(log_rama(self.ws, rama))
+        elif accion == "diff":
+            self.ui.diff(diff_desde_snapshot(self.ws, rama), max_lineas=400)
+        elif accion in ("snapshot", "guardar", "commit"):
+            try:
+                commit = snapshot_build(self.ws, rama, "REAPER snapshot manual")
+            except RuntimeError as e:
+                self.ui.error(str(e))
+                return
+            self.ui.ok(f"Snapshot {commit[:10]} en {rama}" if commit else "Sin cambios desde el último snapshot.")
+        else:
+            self.ui.linea(estado_git(self.ws))
+            self.ui.tenue(f"  builds verificadas en la rama {rama}: /git log · /git diff · /git snapshot")
+
+    def cmd_historial(self, arg: str) -> None:
+        if not self.historial:
+            self.ui.tenue("Sin pedidos en esta sesión.")
+            return
+        for hora, texto, ok in self.historial[-25:]:
+            self.ui.linea(f"  {Tema.tenue}{hora}{C.RESET} {Tema.ok + '✓' if ok else Tema.error + '✗'}{C.RESET} {texto}")
+
+    def cmd_exportar(self, arg: str) -> None:
+        destino = Path(arg).expanduser() if arg else self.ws.raiz / ".reaper" / f"conversacion_{datetime.now():%Y%m%d_%H%M%S}.md"
+        partes = [f"# Conversación REAPER · {self.ws.raiz.name}\n", f"Fecha: {datetime.now():%Y-%m-%d %H:%M}\n"]
+        for m in self.principal.mensajes[1:]:
+            quien = "Vos" if m["role"] == "user" else "REAPER"
+            partes.append(f"\n## {quien}\n\n{m['content']}\n")
+        try:
+            escritura_atomica(destino, redactar_secretos("".join(partes)))
+        except OSError as e:
+            self.ui.error(f"No pude exportar: {e}")
+            return
+        self.ui.ok(f"Conversación exportada a {destino}")
+
+    # ---------------------------------------------------------------- ajustes
+    def cmd_todo(self, arg: str) -> None:
+        if not self.principal.ctx.todo:
+            self.ui.tenue("La lista de tareas está vacía.")
+        for estado, texto in self.principal.ctx.todo:
+            self.ui.linea(f"  {'✓' if estado == 'x' else '▸' if estado == '>' else '○'} {texto}")
+
+    def cmd_modo(self, arg: str) -> None:
+        if arg not in MODOS:
+            self.ui.info(f"Modo actual: {self.settings.modo}  (opciones: {', '.join(MODOS)})")
+            return
+        self.settings.modo = arg
+        guardar_settings(self.settings)
+        self.ui.ok(f"Modo: {arg}")
+
+    def cmd_perfil(self, arg: str) -> None:
+        if not arg:
+            filas = [[n, p["descripcion"]] for n, p in PERFILES.items()]
+            self.ui.tabla(filas, ["perfil", "qué hace"])
+            self.ui.tenue(f"  actual: torneo={self.settings.torneo} ({self.settings.candidatos} candidatos), "
+                          f"tests_primero={self.settings.tests_primero}, escalar={self.settings.escalar}")
+            return
+        try:
+            cambios = aplicar_perfil(self.settings, arg)
+        except KeyError:
+            self.ui.error(f"Perfil desconocido: {arg} ({', '.join(PERFILES)})")
+            return
+        guardar_settings(self.settings)
+        self.llm.limitador = LimitadorTasa(self.settings.rpm_efectivo()) if hasattr(self.llm, "limitador") else None
+        self.ui.ok(f"Perfil {arg}: " + (", ".join(cambios) or "sin cambios"))
+
+    def cmd_tema(self, arg: str) -> None:
+        if not arg:
+            self.ui.info(f"Tema actual: {Tema.nombre} (opciones: {', '.join(TEMAS)})")
+            return
+        nombre = aplicar_tema(arg)
+        self.settings.tema = nombre
+        guardar_settings(self.settings)
+        self.ui.ok(f"Tema: {nombre}")
+
+    def cmd_modelo(self, arg: str) -> None:
+        partes = arg.split()
+        if not partes:
+            self.ui.info(f"Modelo principal: {self.settings.modelo}")
+            for rol, modelo in self.settings.modelos_rol.items():
+                self.ui.tenue(f"  {rol}: {resolver_modelo(modelo)}")
+            self.ui.tenue(f"  escalada: {resolver_modelo(self.settings.modelo_fuerte)}")
+            return
+        if len(partes) == 2 and partes[0].lower() in ROLES:
+            rol = partes[0].lower()
+            if partes[1] in ("-", "default", "ninguno"):
+                self.settings.modelos_rol.pop(rol, None)
+            else:
+                self.settings.modelos_rol[rol] = resolver_modelo(partes[1])
+            self.ui.ok(f"{rol} → {self.settings.modelo_para(rol)}")
+        else:
+            self.settings.modelo = resolver_modelo(partes[0])
+            self.ui.ok(f"Modelo principal: {self.settings.modelo}")
+        guardar_settings(self.settings)
+
+    def cmd_modelo_fuerte(self, arg: str) -> None:
+        if not arg:
+            self.ui.info(f"Modelo de escalada: {resolver_modelo(self.settings.modelo_fuerte)} "
+                         f"({'activada' if self.settings.escalar else 'desactivada'}; umbral {self.settings.umbral_escalada})")
+            self.ui.tenue("  /modelo-fuerte <alias>  ·  /modelo-fuerte off  ·  /config umbral_escalada N")
+            self.ui.linea(self.escalador.resumen())
+            return
+        if arg.lower() in ("off", "no", "ninguno"):
+            self.settings.escalar = False
+            self.ui.ok("Escalada desactivada.")
+        else:
+            self.settings.modelo_fuerte = arg
+            self.settings.escalar = True
+            self.ui.ok(f"Modelo de escalada: {resolver_modelo(arg)}")
+        guardar_settings(self.settings)
+
+    def cmd_modelos(self, arg: str) -> None:
+        filas = [[alias, info.nivel, formatear_numero(info.contexto), info.id, info.nota]
+                 for alias, info in INFO_MODELOS.items()]
+        self.ui.tabla(filas, ["alias", "nivel", "contexto", "id", "nota"], "llrll")
+        self.ui.tenue("  Cualquier id de OpenRouter sirve también: /modelo proveedor/modelo")
+
+    def cmd_config(self, arg: str) -> None:
+        if not arg:
+            self.ui.linea(resaltar_codigo(json.dumps(self.settings.to_dict(), ensure_ascii=False, indent=2), "json"))
+            self.ui.tenue(f"  archivo: {CONFIG_FILE} · cambiar: /config <clave> <valor>")
+            return
+        partes = arg.split(maxsplit=1)
+        if len(partes) != 2 or not hasattr(self.settings, partes[0]):
+            claves = [f.name for f in fields(Settings)]
+            parecida = difflib.get_close_matches(partes[0], claves, n=1)
+            self.ui.error("Uso: /config <clave> <valor>  (ej: /config paralelo 3)"
+                          + (f" · ¿{parecida[0]}?" if parecida else ""))
+            return
+        clave, texto = partes
+        actual = getattr(self.settings, clave)
+        try:
+            if isinstance(actual, bool):
+                valor = texto.lower() in ("1", "true", "si", "sí", "s", "on")
+            elif isinstance(actual, int):
+                valor = int(texto)
+            elif isinstance(actual, float):
+                valor = float(texto)
+            elif isinstance(actual, (list, dict)):
+                valor = json.loads(texto)
+                if not isinstance(valor, type(actual)):
+                    raise ValueError(f"se esperaba {type(actual).__name__}")
+            else:
+                valor = texto
+        except ValueError as e:
+            self.ui.error(f"Valor inválido: {e}")
+            return
+        setattr(self.settings, clave, valor)
+        self.settings.validar()
+        if clave == "tema":
+            aplicar_tema(self.settings.tema)
+        if clave in ("rpm", "modelo") and hasattr(self.llm, "limitador"):
+            self.llm.limitador = LimitadorTasa(self.settings.rpm_efectivo())
+        guardar_settings(self.settings)
+        self.ui.ok(f"{clave} = {getattr(self.settings, clave)!r}")
+
+    def cmd_uso(self, arg: str) -> None:
+        u = self.llm.uso
+        self.ui.info(u.resumen())
+        if u.por_modelo:
+            filas = [[m, str(d.llamadas), formatear_numero(d.tokens_entrada), formatear_numero(d.tokens_salida),
+                      f"${d.costo:.4f}" if d.costo else "-", formatear_duracion(d.segundos)]
+                     for m, d in u.por_modelo.items()]
+            self.ui.tabla(filas, ["modelo", "llamadas", "entrada", "salida", "costo", "tiempo"], "lrrrrr")
+        if u.por_rol:
+            self.ui.tenue("  por rol: " + ", ".join(f"{r}: {d['llamadas']}" for r, d in sorted(u.por_rol.items())))
+        if self.settings.costo_maximo:
+            self.ui.barra("presupuesto", u.costo, self.settings.costo_maximo)
+
+    def cmd_contexto(self, arg: str) -> None:
+        mensajes = self.principal.mensajes
+        tokens = tokens_mensajes(mensajes)
+        limite = self.settings.contexto_tokens
+        self.ui.info(f"Contexto del agente principal: ~{formatear_numero(tokens)} de {formatear_numero(limite)} tokens "
+                     f"({len(mensajes)} mensajes)")
+        self.ui.barra("uso", tokens, limite)
+        self.ui.tenue("  /compactar resume la conversación · /reset la vacía")
+
+    def cmd_compactar(self, arg: str) -> None:
+        antes = tokens_mensajes(self.principal.mensajes)
+        self.principal._factor_contexto = 0.5
+        self.principal._compactar(forzar=True)
+        self.principal._factor_contexto = 1.0
+        despues = tokens_mensajes(self.principal.mensajes)
+        self.ui.ok(f"Contexto: {formatear_numero(antes)} → {formatear_numero(despues)} tokens")
+        self._guardar_sesion()
+
+    def cmd_reset(self, arg: str) -> None:
+        self.principal = self._nuevo_principal()
+        try:
+            self._ruta_sesion().unlink()
+        except OSError:
+            pass
+        self.ui.aviso("Conversación reiniciada (los archivos y checkpoints no se tocan).")
+
+    def cmd_estado(self, arg: str) -> None:
+        detectado = detectar_comando_tests(self.ws)
+        lecciones = (len(self.memoria.proyecto.cargar()), len(self.memoria.general.cargar())) if self.memoria else (0, 0)
+        lineas = [
+            f"proyecto:   {self.ws.raiz}",
+            f"modelo:     {self.settings.modelo}",
+            f"escalada:   {resolver_modelo(self.settings.modelo_fuerte) if self.settings.escalar else 'desactivada'}",
+            f"modo:       {self.settings.modo} · paralelo {self.settings.paralelo}",
+            f"torneo:     {'sí, ' + str(self.settings.candidatos) + ' candidatos' if self.settings.torneo else 'no'}"
+            f" · tests primero: {'sí' if self.settings.tests_primero else 'no'}",
+            f"memoria:    {len(self.principal.mensajes)} mensajes · checkpoints: {len(self.ws.checkpoints.ids())}",
+            f"lecciones:  {lecciones[0]} del proyecto · {lecciones[1]} generales",
+            f"tests:      {detectado[0] if detectado else 'no detectados'}",
+            f"git:        {'sí' if es_repo_git(self.ws) else 'no'}",
+        ]
+        self.ui.caja(lineas, titulo="ESTADO REAPER")
+
+    def cmd_doctor(self, arg: str) -> None:
+        diagnostico_sistema(self.ui, self.settings, self.llm)
+
+    def cmd_instalar(self, arg: str) -> None:
+        instalar_lanzador(self.ui)
+
+    def cmd_dragon(self, arg: str) -> None:
+        if arg.strip().lower() == "png":
+            ruta = dragon_png(self.ws.raiz / "reaper_dragon.png")
+            self.ui.ok(f"Dragón exportado a {ruta}")
+            return
+        if not animar_intro():
+            self.ui.linea(banner_dragon())
+
+    def cmd_evaluar(self, arg: str) -> None:
+        cantidad = int(arg) if arg.isdigit() else 0
+        correr_evaluacion(self.llm, self.settings, self.ui, cantidad=cantidad or None)
+
+    def shell(self, comando: str) -> None:
+        if not comando.strip():
+            return
+        try:
+            subprocess.run(comando, shell=True, cwd=str(self.ws.raiz))
+        except OSError as e:
+            self.ui.error(str(e))
+
+    # ------------------------------------------------------------ REPL
+    def _configurar_readline(self) -> None:
+        try:
+            import readline
+        except ImportError:  # pragma: no cover - depende de la plataforma
+            return
+        try:
+            HISTORIAL_FILE.parent.mkdir(parents=True, exist_ok=True)
+            if HISTORIAL_FILE.exists():
+                readline.read_history_file(str(HISTORIAL_FILE))
+            readline.set_history_length(1000)
+        except (OSError, AttributeError):
+            pass
+        comandos = self.nombres_comandos()
+
+        def completar(texto: str, estado: int) -> Optional[str]:
+            buffer = readline.get_line_buffer()
+            if buffer.startswith("/") and " " not in buffer:
+                opciones = [c for c in comandos if c.startswith(texto)]
+            else:
+                base = texto.lstrip("@")
+                prefijo = "@" if texto.startswith("@") else ""
+                opciones = [prefijo + r for r in self.ws.archivos_codigo(limite=800) if r.startswith(base)][:50]
+            return opciones[estado] if estado < len(opciones) else None
+
+        try:
+            readline.set_completer(completar)
+            readline.set_completer_delims(" \t\n")
+            readline.parse_and_bind("tab: complete")
+        except (AttributeError, ValueError):
+            pass
+
+    def _guardar_historial_readline(self) -> None:
+        try:
+            import readline
+            readline.write_history_file(str(HISTORIAL_FILE))
+        except (ImportError, OSError, AttributeError):
+            pass
+
+    def _leer_entrada(self) -> str:
+        entrada = input(f"{Tema.prompt}{C.BOLD}vos ›{C.RESET} ")
+        if entrada.strip() != '"""':
+            return entrada.strip()
+        lineas = []
+        while True:
+            linea = input(f"{Tema.herramienta}│ {C.RESET}")
+            if linea.strip() == '"""':
+                return "\n".join(lineas).strip()
+            lineas.append(linea)
+
+    def mostrar_inicio(self, animar: bool = True) -> None:
+        if not (animar and self.settings.animacion and animar_intro()):
+            self.ui.linea(banner_dragon())
+        detectado = detectar_comando_tests(self.ws)
+        funciones = []
+        if self.settings.tests_primero:
+            funciones.append("tests primero")
+        if self.settings.torneo and self.settings.candidatos > 1:
+            funciones.append(f"torneo ×{self.settings.candidatos}")
+        if self.escalador.disponible():
+            funciones.append(f"escalada→{self.settings.modelo_fuerte}")
+        if self.settings.lecciones:
+            funciones.append("lecciones")
+        modelo_corto = self.settings.modelo.split("/")[-1]
+        lineas = [
+            f"{Tema.tenue}proyecto{C.RESET}  {self.ws.raiz}",
+            f"{Tema.tenue}modelo{C.RESET}    {modelo_corto} · modo {self.settings.modo}",
+            f"{Tema.tenue}equipo{C.RESET}    {' · '.join(funciones) or 'básico'}",
+            f"{Tema.tenue}tests{C.RESET}     {detectado[0].split()[-1] if detectado else 'no detectados'}",
+        ]
+        if self.aviso_sesion:
+            lineas.append(f"{Tema.tenue}sesión{C.RESET}    {self.aviso_sesion}")
+        self.ui.linea("")
+        self.ui.caja(lineas, color=C.VIOLETA)
+        self.ui.tenue("  escribí lo que necesitás · /ayuda · /construir <pedido> · @archivo para adjuntar\n")
+
+    def repl(self, animar: bool = True) -> int:
+        self._configurar_readline()
+        self.mostrar_inicio(animar)
+        while True:
+            try:
+                entrada = self._leer_entrada()
+            except (EOFError, KeyboardInterrupt):
+                self.ui.linea("")
+                self.cmd_salir("")
+                self._guardar_historial_readline()
+                return 0
+            if not entrada:
+                continue
+            CANCELAR.clear()
+            try:
+                if entrada.startswith("!"):
+                    self.shell(entrada[1:])
+                elif entrada.startswith("/"):
+                    if self.comando(entrada) == "salir":
+                        self._guardar_historial_readline()
+                        return 0
+                else:
+                    self.turno(entrada)
+            except (KeyboardInterrupt, Cancelado):
+                CANCELAR.set()
+                self.ui.fin_progreso()
+                self.ui.aviso("\n⏹ Interrumpido. Lo ya escrito queda en disco; /diff para ver, /deshacer para revertir.")
+                self._guardar_sesion()
+            except LLMError as e:
+                self.ui.error(f"Modelo: {e}")
+                for pista in pistas_para(str(e), 1):
+                    self.ui.tenue(f"  💡 {pista}")
+            except ErrorRuta as e:
+                self.ui.error(str(e))
+            finally:
+                self._guardar_historial_readline()
+
+
+# ======================================================================
+# MÓDULO: mock
+# ======================================================================
+"""
+Modelo simulado para probar REAPER sin gastar API (autotest, evals en seco, demos).
+
+MockLLM implementa la misma interfaz que LLMClient (chat, chat_simple, uso)
+y responde con un guion:
+  - una lista de respuestas (se consumen en orden), o
+  - una función(mensajes, kwargs) -> str que decide según el contexto
+    (rol del system prompt, temperatura, último resultado...).
+
+También hay un transporte falso de SSE para probar el cliente HTTP real
+(reintentos, respaldos, errores del proveedor) sin red.
+"""
+
+
+class GuionAgotado(LLMError):
+    pass
+
+
+class MockLLM:
+    def __init__(self, guion: Union[Sequence[str], Callable[[list, dict], str], None] = None, *,
+                 finish_reason: Optional[str] = None, latencia: float = 0.0):
+        self._lista = list(guion) if isinstance(guion, (list, tuple)) else None
+        self._funcion = guion if callable(guion) else None
+        self.finish_reason = finish_reason
+        self.latencia = latencia
+        self.uso = Uso()
+        self.llamadas: list[dict] = []
+        self._lock = threading.Lock()
+        self.on_evento = None
+        self.settings = None
+
+    def chat(self, mensajes: list[dict], **kwargs) -> Respuesta:
+        if self.latencia:
+            time.sleep(self.latencia)
+        with self._lock:
+            self.llamadas.append({"mensajes": copy.deepcopy(mensajes), **{k: v for k, v in kwargs.items()
+                                                                          if k != "on_progress"}})
+            if self._funcion is not None:
+                texto = self._funcion(mensajes, kwargs)
+            elif self._lista:
+                texto = self._lista.pop(0)
+            else:
+                raise GuionAgotado("El guion del MockLLM se agotó.")
+            self.uso.llamadas += 1
+            self.uso.tokens_entrada += tokens_mensajes(mensajes)
+            self.uso.tokens_salida += estimar_tokens(texto if isinstance(texto, str) else str(texto))
+        finish = self.finish_reason
+        if isinstance(texto, tuple):
+            texto, finish = texto
+        stop = kwargs.get("stop") or []
+        for marca in stop:
+            corte = texto.find(marca)
+            if corte >= 0:
+                texto = texto[:corte]
+        if kwargs.get("on_progress"):
+            kwargs["on_progress"](len(texto))
+        return Respuesta(texto=texto, finish_reason=finish, modelo=str(kwargs.get("modelo") or "mock"),
+                         tokens_salida=estimar_tokens(texto))
+
+    def chat_simple(self, prompt: str, *, sistema: str = "", modelo: Optional[str] = None,
+                    temperatura: float = 0.2, max_tokens: int = 1500, rol: str = "") -> str:
+        mensajes = ([{"role": "system", "content": sistema}] if sistema else []) + [{"role": "user", "content": prompt}]
+        return self.chat(mensajes, modelo=modelo, temperatura=temperatura, max_tokens=max_tokens, rol=rol).texto
+
+    # ------------------------------------------------------------ ayudas para guiones
+    @staticmethod
+    def rol_de(mensajes: list) -> str:
+        sistema = mensajes[0]["content"] if mensajes and mensajes[0]["role"] == "system" else ""
+        m = re.search(r"# TU ROL: (\w+)", sistema)
+        return m.group(1).lower() if m else ""
+
+    @staticmethod
+    def ultimo_usuario(mensajes: list) -> str:
+        for m in reversed(mensajes):
+            if m["role"] == "user":
+                return m["content"]
+        return ""
+
+    @staticmethod
+    def turnos_asistente(mensajes: list) -> int:
+        return sum(1 for m in mensajes if m["role"] == "assistant")
+
+
+def herramienta_xml(nombre: str, **params: str) -> str:
+    """Arma una llamada de herramienta en el formato XML del protocolo (para guiones)."""
+    cuerpo = "".join(f"<{k}>\n{v}\n</{k}>\n" if "\n" in str(v) or k in ("content", "diff", "result", "task", "items", "spec")
+                     else f"<{k}>{v}</{k}>\n" for k, v in params.items())
+    return f"<{nombre}>\n{cuerpo}</{nombre}>"
+
+
+def terminar_xml(informe: str = "Listo.") -> str:
+    return herramienta_xml("attempt_completion", result=informe)
+
+
+def transporte_falso(eventos: Sequence[Union[str, dict, Exception]]) -> Callable:
+    """
+    Transporte SSE de prueba para LLMClient. Cada elemento es:
+      - str: texto de una respuesta completa (se parte en chunks)
+      - dict: evento crudo (se serializa como 'data: {...}')
+      - Exception: se lanza al iniciar esa llamada (p. ej. _Transitorio o LLMError)
+    Cada llamada al transporte consume UN elemento.
+    """
+    pendientes = list(eventos)
+
+    def transporte(url: str, headers: dict, payload: dict, timeout: int) -> Iterator[str]:
+        if not pendientes:
+            raise _Transitorio("sin más respuestas falsas")
+        actual = pendientes.pop(0)
+        if isinstance(actual, Exception):
+            raise actual
+        if isinstance(actual, dict):
+            yield "data: " + json.dumps(actual)
+            yield "data: [DONE]"
+            return
+        for i in range(0, len(actual), 7):
+            yield "data: " + json.dumps({"choices": [{"delta": {"content": actual[i:i + 7]}}]})
+        yield "data: " + json.dumps({"choices": [{"delta": {}, "finish_reason": "stop"}],
+                                     "usage": {"prompt_tokens": 10, "completion_tokens": 5, "cost": 0.0001}})
+        yield "data: [DONE]"
+
+    transporte.pendientes = pendientes  # type: ignore[attr-defined]
+    return transporte
+
+
+# ======================================================================
+# MÓDULO: autotest_base
+# ======================================================================
+"""
+Autotest interno: `python3 reaper_v7.py --autotest` verifica REAPER sin gastar API.
+
+Todo corre en un entorno aislado (REAPER_HOME temporal), con UI silenciosa y
+MockLLM. Los tests que necesitan node, git o go se saltean si no están.
+Filtrar: REAPER_AUTOTEST=parser python3 reaper_v7.py --autotest
+"""
+
+_RUTAS_GLOBALES = ("BASE_DIR", "PROJECTS_DIR", "CHECKPOINTS_DIR", "SESIONES_DIR", "LOGS_DIR", "CACHE_DIR",
+                   "PLANTILLAS_USUARIO_DIR", "CONFIG_FILE", "ESTADO_FILE", "LECCIONES_GLOBALES", "HISTORIAL_FILE",
+                   "ESTADISTICAS_FILE")
+
+
+class entorno_aislado:
+    """Redirige todas las rutas de REAPER a una carpeta temporal (y las restaura al salir)."""
+
+    def __init__(self, base: Path):
+        self.base = Path(base)
+        self._previas: dict = {}
+        self._env_previo: dict = {}
+
+    def __enter__(self) -> "entorno_aislado":
+        g = globals()
+        nuevas = {
+            "BASE_DIR": self.base,
+            "PROJECTS_DIR": self.base / "proyectos",
+            "CHECKPOINTS_DIR": self.base / "checkpoints",
+            "SESIONES_DIR": self.base / "sesiones",
+            "LOGS_DIR": self.base / "logs",
+            "CACHE_DIR": self.base / "cache",
+            "PLANTILLAS_USUARIO_DIR": self.base / "plantillas",
+            "CONFIG_FILE": self.base / "config.json",
+            "ESTADO_FILE": self.base / "estado.json",
+            "LECCIONES_GLOBALES": self.base / "lecciones.md",
+            "HISTORIAL_FILE": self.base / "historial_repl.txt",
+            "ESTADISTICAS_FILE": self.base / "estadisticas.json",
+        }
+        for nombre in _RUTAS_GLOBALES:
+            self._previas[nombre] = g[nombre]
+            g[nombre] = nuevas[nombre]
+        for variable, valor in (("REAPER_TMP", str(self.base / "tmp")), ("REAPER_SIN_ANIMACION", "1")):
+            self._env_previo[variable] = os.environ.get(variable)
+            os.environ[variable] = valor
+        (self.base / "tmp").mkdir(parents=True, exist_ok=True)
+        asegurar_dirs()
+        return self
+
+    def __exit__(self, *exc) -> None:
+        g = globals()
+        for nombre, valor in self._previas.items():
+            g[nombre] = valor
+        for variable, valor in self._env_previo.items():
+            if valor is None:
+                os.environ.pop(variable, None)
+            else:
+                os.environ[variable] = valor
+        with _LOCK_INDICES:
+            _INDICES.clear()
+        with _LOCK_MAPAS:
+            _MAPAS.clear()
+
+
+class BaseTest(unittest.TestCase):
+    maxDiff = 4000
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory(prefix="reaper_autotest_")
+        self.dir = Path(self._tmp.name)
+        self.entorno = entorno_aislado(self.dir / "home")
+        self.entorno.__enter__()
+        CANCELAR.clear()
+
+    def tearDown(self) -> None:
+        CANCELAR.clear()
+        self.entorno.__exit__(None, None, None)
+        self._tmp.cleanup()
+
+    # ------------------------------------------------------------ fábricas
+    def proyecto(self, archivos: Optional[dict] = None, nombre: str = "proy") -> Workspace:
+        raiz = self.dir / nombre
+        raiz.mkdir(parents=True, exist_ok=True)
+        for rel, contenido in (archivos or {}).items():
+            ruta = raiz / rel
+            ruta.parent.mkdir(parents=True, exist_ok=True)
+            ruta.write_text(textwrap.dedent(contenido).lstrip("\n") if contenido.startswith("\n") else contenido,
+                            encoding="utf-8")
+        return Workspace(raiz, checkpoints_dir=self.dir / f"ck_{nombre}")
+
+    def ui(self, respuestas: Optional[list] = None, interactivo: bool = False) -> UI:
+        return UI(silencioso=True, interactivo=interactivo, respuestas=respuestas)
+
+    def ajustes(self, **valores) -> Settings:
+        base = {"modo": "auto", "paralelo": 1, "torneo": False, "tests_primero": False, "escalar": False,
+                "rpm": 0, "max_pasos": 12, "max_pasos_sub": 10, "reintentos": 0, "animacion": False,
+                "git_snapshots": False, "max_revisiones": 0, "qa": False, "autofix_ruff": False}
+        base.update(valores)
+        return Settings.desde_dict(base)
+
+    def contexto(self, ws: Workspace, **valores) -> Contexto:
+        return Contexto(ws, self.ajustes(**valores), self.ui(), "test")
+
+    def herramienta(self, ctx: Contexto, nombre: str, **params) -> str:
+        return REGISTRO[nombre].fn(ctx, params)
+
+
+# ======================================================================
+# UI y dragón
+# ======================================================================
+class TestUI(BaseTest):
+    def test_registro_silencioso(self):
+        ui = self.ui()
+        ui.ok("listo")
+        ui.error("falló")
+        texto = ui.texto_registrado()
+        self.assertIn("✓ listo", texto)
+        self.assertIn("✗ falló", texto)
+
+    def test_confirmar_con_respuestas(self):
+        ui = self.ui(respuestas=["s", "no", True])
+        self.assertTrue(ui.confirmar("¿?"))
+        self.assertFalse(ui.confirmar("¿?"))
+        self.assertTrue(ui.confirmar("¿?"))
+        self.assertTrue(ui.confirmar("¿?", defecto=True))  # sin respuestas y no interactivo → defecto
+
+    def test_elegir(self):
+        self.assertEqual(self.ui(respuestas=["2"]).elegir("x", ["a", "b", "c"]), 2)
+        self.assertEqual(self.ui().elegir("x", ["a", "b"], defecto=1), 1)
+
+    def test_ancho_visible_y_ajustar(self):
+        self.assertEqual(ancho_visible("\033[92mhola\033[0m"), 4)
+        self.assertEqual(ancho_visible("日本"), 4)
+        self.assertEqual(ancho_visible(ajustar("abcdef", 4)), 4)
+        self.assertEqual(ajustar("ab", 4), "ab  ")
+
+    def test_caja_y_tabla(self):
+        dibujo = sin_ansi(caja(["uno", "dos"], titulo="T"))
+        lineas = dibujo.splitlines()
+        self.assertEqual(len({ancho_visible(l) for l in lineas}), 1)
+        tab = sin_ansi(tabla([["a", "1"], ["bb", "22"]], ["col", "n"], "lr"))
+        self.assertIn("col", tab)
+        self.assertIn("22", tab)
+
+    def test_barra(self):
+        self.assertIn("50%", sin_ansi(barra(5, 10)))
+        self.assertIn("100%", sin_ansi(barra(20, 10)))
+
+    def test_markdown(self):
+        lineas = [sin_ansi(l) for l in renderizar_markdown("# Título\n- [x] hecho\n```py\nx = 1\n```\ntexto **negrita**")]
+        self.assertTrue(any("Título" in l for l in lineas))
+        self.assertTrue(any("x = 1" in l for l in lineas))
+        self.assertTrue(any("negrita" in l for l in lineas))
+
+    def test_resaltar_sin_color_no_cambia(self):
+        if _USAR_COLOR:
+            self.skipTest("la terminal tiene color")
+        self.assertEqual(resaltar_codigo("def f(): pass", "py"), "def f(): pass")
+
+    def test_hex_y_degradado(self):
+        self.assertEqual(hex_a_rgb("#ff8000"), (255, 128, 0))
+        self.assertEqual(hex_a_rgb("fff"), (255, 255, 255))
+        with self.assertRaises(ValueError):
+            hex_a_rgb("zz")
+        self.assertEqual(sin_ansi(degradado("abc", (0, 0, 0), (255, 255, 255))), "abc")
+
+    def test_formatos(self):
+        self.assertEqual(formatear_duracion(0.5), "500ms")
+        self.assertEqual(formatear_duracion(75), "1m15s")
+        self.assertEqual(formatear_numero(1500), "1.5k")
+        self.assertEqual(recortar("a" * 100, 20).count("recortado"), 1)
+
+    def test_temas(self):
+        for nombre in TEMAS:
+            self.assertEqual(aplicar_tema(nombre), nombre)
+        self.assertEqual(aplicar_tema("inexistente"), "dragon")
+
+
+class TestDragon(BaseTest):
+    def test_tamanos(self):
+        for ancho in (28, 40, 60, 104):
+            pixeles = pintar_dragon(ancho)
+            self.assertEqual(len(pixeles[0]), ancho)
+            opacos = sum(1 for fila in pixeles for p in fila if p)
+            self.assertGreater(opacos, ancho * len(pixeles) * 0.15, f"dragón casi vacío a {ancho}")
+
+    def test_tiene_los_colores_del_dragon(self):
+        pixeles = pintar_dragon(80)
+        colores = {p for fila in pixeles for p in fila if p}
+        azules = [c for c in colores if c[2] > c[0] + 40]
+        naranjas = [c for c in colores if c[0] > 200 and 80 < c[1] < 200 and c[2] < 120]
+        self.assertTrue(azules and naranjas)
+
+    def test_render_y_ascii(self):
+        pixeles = pintar_dragon(40)
+        self.assertEqual(len(renderizar_pixeles(pixeles)), (len(pixeles) + 1) // 2)
+        ascii_ = renderizar_ascii(pixeles)
+        self.assertTrue(any(l.strip() for l in ascii_))
+
+    def test_banner_y_logo(self):
+        texto = sin_ansi(banner_dragon(60))
+        self.assertIn("v" + __version__, texto)
+        self.assertEqual(len(logo_texto("REAPER")), 3)
+
+    def test_animacion_sin_tty_no_anima(self):
+        self.assertFalse(animar_intro(salida=io.StringIO()))
+
+    def test_png(self):
+        ruta = dragon_png(self.dir / "d.png", ancho=32, escala=2)
+        datos = ruta.read_bytes()
+        self.assertTrue(datos.startswith(b"\x89PNG"))
+        self.assertGreater(len(datos), 200)
+
+    def test_alas_y_fuego_cambian_el_dibujo(self):
+        quieto = pintar_dragon(50)
+        self.assertNotEqual(quieto, pintar_dragon(50, alas=0.8))
+        self.assertNotEqual(quieto, pintar_dragon(50, fuego=0.3))
+
+
+# ======================================================================
+# Config y tokens
+# ======================================================================
+class TestConfig(BaseTest):
+    def test_guardar_y_cargar(self):
+        s = Settings()
+        s.paralelo = 3
+        guardar_settings(s)
+        self.assertEqual(cargar_settings().paralelo, 3)
+
+    def test_desde_dict_ignora_basura(self):
+        s = Settings.desde_dict({"paralelo": "tres", "candidatos": 99, "nada": 1, "torneo": False, "temperatura": 1})
+        self.assertEqual(s.paralelo, 2)
+        self.assertEqual(s.candidatos, 6)
+        self.assertFalse(s.torneo)
+        self.assertEqual(s.temperatura, 1.0)
+
+    def test_validar(self):
+        s = Settings()
+        s.modo, s.temperaturas, s.max_pasos = "raro", ["x", 3, 0.2], 1
+        s.validar()
+        self.assertEqual((s.modo, s.temperaturas, s.max_pasos), ("auto-edicion", [2.0, 0.2], 3))
+
+    def test_modelos_y_rpm(self):
+        self.assertEqual(resolver_modelo("deepseek"), "deepseek/deepseek-chat")
+        self.assertEqual(resolver_modelo("otro/modelo"), "otro/modelo")
+        s = Settings(modelo=MODELOS["venice-free"])
+        self.assertEqual(s.rpm_efectivo(), 16)
+        s.rpm = 5
+        self.assertEqual(s.rpm_efectivo(), 5)
+        self.assertEqual(info_modelo("qwen3-coder").contexto, 262144)
+
+    def test_temperaturas_de_candidatos(self):
+        s = Settings()
+        self.assertEqual([s.temperatura_candidato(i) for i in range(4)], [0.1, 0.4, 0.7, 0.85])
+
+    def test_perfiles(self):
+        s = Settings()
+        cambios = aplicar_perfil(s, "gratis")
+        self.assertIn("rpm=16", cambios)
+        self.assertFalse(s.escalar)
+        with self.assertRaises(KeyError):
+            aplicar_perfil(s, "turbo")
+
+    def test_settings_con_local(self):
+        s = settings_con_local(Settings(), {"settings": {"candidatos": 2, "torneo": False}})
+        self.assertEqual((s.candidatos, s.torneo), (2, False))
+
+    def test_url_y_clave(self):
+        s = Settings(proveedor="ollama")
+        self.assertIn("11434", s.url_api())
+        self.assertEqual(obtener_clave_api(s), "sin-clave")
+
+    def test_estado(self):
+        guardar_estado(proyecto="/x")
+        self.assertEqual(cargar_estado()["proyecto"], "/x")
+
+
+class TestTokens(BaseTest):
+    def test_estimar(self):
+        self.assertEqual(estimar_tokens(""), 0)
+        self.assertGreater(estimar_tokens("def f(x):\n    return x + 1\n"), 5)
+        self.assertGreater(estimar_tokens("a" * 30000), 9000)
+
+    def test_presupuesto(self):
+        p = Presupuesto(32768, 6000)
+        mensajes = [{"role": "user", "content": "hola"}]
+        self.assertTrue(p.cabe(mensajes))
+        self.assertEqual(p.respuesta_posible(mensajes), 6000)
+        grande = [{"role": "user", "content": "x " * 60000}]
+        self.assertLess(p.respuesta_posible(grande), 6000)
+        self.assertLessEqual(estimar_tokens(recortar_a_tokens("palabra " * 5000, 100)), 160)
+
+
+# ======================================================================
+# Cliente LLM (transporte falso)
+# ======================================================================
+class TestLLM(BaseTest):
+    def cliente(self, eventos, **ajustes):
+        s = self.ajustes(**ajustes)
+        c = LLMClient("clave", s, url="http://falso", transporte=transporte_falso(eventos))
+        c.dormir = lambda _s: None
+        return c
+
+    def test_streaming_y_uso(self):
+        c = self.cliente(["Hola mundo, soy el modelo."])
+        r = c.chat([{"role": "user", "content": "x"}], rol="principal")
+        self.assertEqual(r.texto, "Hola mundo, soy el modelo.")
+        self.assertEqual(r.finish_reason, "stop")
+        self.assertEqual(c.uso.llamadas, 1)
+        self.assertAlmostEqual(c.uso.costo, 0.0001)
+        self.assertEqual(c.uso.por_rol["principal"]["llamadas"], 1)
+
+    def test_reintenta_transitorios(self):
+        c = self.cliente([_Transitorio("caída"), "ok"], reintentos=2)
+        self.assertEqual(c.chat([{"role": "user", "content": "x"}]).texto, "ok")
+        self.assertEqual(c.uso.reintentos, 1)
+
+    def test_respaldo_de_modelo(self):
+        c = self.cliente([LLMError("404", probar_otro_modelo=True), "desde el respaldo"], fallbacks=["qwen"])
+        self.assertEqual(c.chat([{"role": "user", "content": "x"}]).texto, "desde el respaldo")
+        self.assertEqual(c.uso.respaldos, 1)
+
+    def test_error_no_recuperable(self):
+        c = self.cliente([LLMError("401 clave inválida")], fallbacks=["qwen"])
+        with self.assertRaises(LLMError):
+            c.chat([{"role": "user", "content": "x"}])
+
+    def test_error_en_streaming(self):
+        c = self.cliente([{"error": {"message": "maximum context length exceeded", "code": 400}}])
+        with self.assertRaises(LLMError) as cm:
+            c.chat([{"role": "user", "content": "x"}])
+        self.assertTrue(cm.exception.contexto_excedido)
+
+    def test_respuesta_vacia_se_reintenta(self):
+        c = self.cliente(["", "ahora sí"], reintentos=1)
+        self.assertEqual(c.chat([{"role": "user", "content": "x"}]).texto, "ahora sí")
+
+    def test_presupuesto(self):
+        c = self.cliente(["a", "b"], costo_maximo=0.00005)
+        c.chat([{"role": "user", "content": "x"}])
+        with self.assertRaises(LLMError) as cm:
+            c.chat([{"role": "user", "content": "x"}])
+        self.assertTrue(cm.exception.presupuesto)
+
+    def test_lanzar_http(self):
+        with self.assertRaises(_Transitorio):
+            _lanzar_http(429, "lento", "3")
+        with self.assertRaises(LLMError) as cm:
+            _lanzar_http(400, "This model's maximum context length is 32768 tokens", None)
+        self.assertTrue(cm.exception.contexto_excedido)
+        with self.assertRaises(LLMError) as cm:
+            _lanzar_http(404, "no model", None)
+        self.assertTrue(cm.exception.probar_otro_modelo)
+
+    def test_parsear_sse(self):
+        self.assertEqual(parsear_linea_sse("data: [DONE]"), "DONE")
+        self.assertIsNone(parsear_linea_sse(": comentario"))
+        self.assertEqual(parsear_linea_sse('data: {"a": 1}'), {"a": 1})
+        self.assertIsNone(parsear_linea_sse("data: {roto"))
+
+    def test_limitador(self):
+        reloj = [0.0]
+        esperas = []
+
+        def dormir(s):
+            esperas.append(s)
+            reloj[0] += s
+
+        lim = LimitadorTasa(2, reloj=lambda: reloj[0], dormir=dormir)
+        lim.adquirir()
+        lim.adquirir()
+        self.assertGreater(lim.espera_necesaria(), 59)
+        lim.adquirir()
+        self.assertGreaterEqual(sum(esperas), 59)
+        self.assertEqual(LimitadorTasa(0).adquirir(), 0.0)
+
+    def test_payload_por_proveedor(self):
+        s = self.ajustes(proveedor="openai")
+        c = LLMClient("k", s, url="http://x", transporte=transporte_falso([]))
+        p = c._payload("m", [{"role": "user", "content": "x"}], 0.3, 100, ["<resultado"])
+        self.assertIn("stream_options", p)
+        self.assertNotIn("usage", p)
+        self.assertEqual(p["temperature"], 0.3)
+
+
+# ======================================================================
+# Protocolo
+# ======================================================================
+class TestProtocolo(BaseTest):
+    def setUp(self):
+        super().setUp()
+        self.esq = esquemas()
+
+    def test_xml_basico(self):
+        a = analizar("Leo.\n<read_file>\n<path>a.py</path>\n</read_file>", self.esq)
+        self.assertEqual(a.llamadas[0].nombre, "read_file")
+        self.assertEqual(a.llamadas[0].params["path"], "a.py")
+        self.assertEqual(a.texto, "Leo.")
+
+    def test_alias_y_atajo(self):
+        a = analizar("<cat>a.py</cat>", self.esq)
+        self.assertEqual((a.llamadas[0].nombre, a.llamadas[0].params["path"]), ("read_file", "a.py"))
+        a = analizar("<write_file><file>x.py</file><code>print(1)</code></write_file>", self.esq)
+        self.assertEqual(a.llamadas[0].params, {"path": "x.py", "content": "print(1)"})
+
+    def test_atributos_y_autocerrada(self):
+        a = analizar('<read_file path="b.py"/>', self.esq)
+        self.assertEqual(a.llamadas[0].params["path"], "b.py")
+        a = analizar('<write_to_file path="c.py">\n<content>\nx = 1\n</content>\n</write_to_file>', self.esq)
+        self.assertEqual(a.llamadas[0].params, {"path": "c.py", "content": "x = 1"})
+
+    def test_invoke_parameter(self):
+        texto = '<invoke name="read_symbol"><parameter name="symbol">Carrito.total</parameter></invoke>'
+        a = analizar(texto, self.esq)
+        self.assertEqual((a.llamadas[0].nombre, a.llamadas[0].params["symbol"]), ("read_symbol", "Carrito.total"))
+
+    def test_estilo_llama(self):
+        a = analizar('<function=read_file>{"path": "z.py"}</function>', self.esq)
+        self.assertEqual(a.llamadas[0].params["path"], "z.py")
+
+    def test_json_de_respaldo(self):
+        a = analizar('```json\n{"tool": "list_files", "args": {"path": "src"}}\n```', self.esq)
+        self.assertEqual((a.llamadas[0].nombre, a.llamadas[0].params["path"]), ("list_files", "src"))
+
+    def test_codigo_con_etiquetas_adentro(self):
+        html = "<html><body><path>no soy param</path></body></html>"
+        a = analizar(f"<write_to_file>\n<path>i.html</path>\n<content>\n{html}\n</content>\n</write_to_file>", self.esq)
+        self.assertEqual(a.llamadas[0].params["path"], "i.html")
+        self.assertEqual(a.llamadas[0].params["content"], html)
+
+    def test_cierre_content_dentro_del_codigo(self):
+        contenido = "doc = '</content>'\nprint(doc)"
+        a = analizar(f"<write_to_file><path>d.py</path><content>\n{contenido}\n</content></write_to_file>", self.esq)
+        self.assertEqual(a.llamadas[0].params["content"], contenido)
+
+    def test_incompleta_y_parcial(self):
+        a = analizar("<write_to_file>\n<path>largo.py</path>\n<content>\nlinea1\nlinea2\nlin", self.esq)
+        llamada = a.llamadas[0]
+        self.assertFalse(llamada.completa)
+        nombre, texto = contenido_parcial(llamada, self.esq)
+        self.assertEqual(nombre, "content")
+        self.assertTrue(texto.startswith("linea1"))
+
+    def test_corta_resultados_inventados(self):
+        a = analizar("<read_file><path>a</path></read_file>\n<resultado>inventado</resultado>", self.esq)
+        self.assertNotIn("inventado", a.respuesta_limpia)
+
+    def test_varias_llamadas_y_fence(self):
+        texto = "<read_file><path>a</path></read_file>\n<read_file><path>b</path></read_file>"
+        self.assertEqual([l.params["path"] for l in analizar(texto, self.esq).llamadas], ["a", "b"])
+        self.assertEqual(limpiar_largo("\n```python\nx = 1\n```\n"), "x = 1")
+
+    def test_herramientas_nuevas_alias(self):
+        a = analizar("<replace_function><path>a.py</path><name>f</name><content>def f(): pass</content></replace_function>", self.esq)
+        self.assertEqual(a.llamadas[0].nombre, "replace_symbol")
+        self.assertEqual(a.llamadas[0].params["symbol"], "f")
+
+    def test_sin_herramientas(self):
+        a = analizar("Solo texto, sin herramientas.", self.esq)
+        self.assertEqual(a.llamadas, [])
+
+
+# ======================================================================
+# Ediciones
+# ======================================================================
+class TestEdiciones(BaseTest):
+    def test_exacto(self):
+        nuevo, _ = aplicar_bloques("a\nb\nc\n", parsear_bloques("<<<<<<< SEARCH\nb\n=======\nB\n>>>>>>> REPLACE"))
+        self.assertEqual(nuevo, "a\nB\nc\n")
+
+    def test_ignorando_indentacion(self):
+        original = "def f():\n    if x:\n        return 1\n"
+        diff = "<<<<<<< SEARCH\nif x:\n    return 1\n=======\nif x:\n    return 2\n>>>>>>> REPLACE"
+        nuevo, notas = aplicar_bloques(original, parsear_bloques(diff))
+        self.assertEqual(nuevo, "def f():\n    if x:\n        return 2\n")
+        self.assertTrue(notas)
+
+    def test_ambiguo_y_no_encontrado(self):
+        with self.assertRaises(ErrorEdicion):
+            aplicar_bloques("x\nx\n", parsear_bloques("<<<<<<< SEARCH\nx\n=======\ny\n>>>>>>> REPLACE"))
+        with self.assertRaises(ErrorEdicion) as cm:
+            aplicar_bloques("def calcular(a):\n    return a\n",
+                            parsear_bloques("<<<<<<< SEARCH\ndef calcula(a):\n    return a\n=======\nz\n>>>>>>> REPLACE"))
+        self.assertIn("parecidas", str(cm.exception))
+
+    def test_ya_aplicado_y_numeros(self):
+        original = "x = 1\ny = 2\nz = 3\n"
+        diff = "<<<<<<< SEARCH\nx = 0\n=======\nx = 1\ny = 2\n>>>>>>> REPLACE"
+        nuevo, notas = aplicar_bloques(original, parsear_bloques(diff))
+        self.assertEqual(nuevo, original)
+        self.assertIn("ya estaba aplicado", notas[0])
+        bloques = parsear_bloques("<<<<<<< SEARCH\n    2| y = 2\n=======\n    2| y = 20\n>>>>>>> REPLACE")
+        self.assertEqual(aplicar_bloques(original, bloques)[0], "x = 1\ny = 20\nz = 3\n")
+
+    def test_marcadores_perezosos(self):
+        self.assertTrue(tiene_marcadores_perezosos("    # ... resto del código"))
+        self.assertTrue(tiene_marcadores_perezosos("// ... existing code"))
+        self.assertIsNone(tiene_marcadores_perezosos("x = [1, 2, 3]  # lista"))
+
+    def test_diff_unificado(self):
+        original = "uno\ndos\ntres\ncuatro\n"
+        diff = "--- a/x\n+++ b/x\n@@ -10,3 +10,3 @@\n dos\n-tres\n+TRES\n cuatro\n"
+        self.assertTrue(parece_diff_unificado(diff))
+        nuevo, _ = aplicar_diff_unificado(original, diff)
+        self.assertEqual(nuevo, "uno\ndos\nTRES\ncuatro\n")
+        with self.assertRaises(ErrorEdicion):
+            aplicar_diff_unificado(original, "@@ -1 +1 @@\n-no existe\n+x\n")
+
+    def test_lineas(self):
+        texto = "a\nb\nc\n"
+        self.assertEqual(reemplazar_lineas(texto, 2, 2, "B"), "a\nB\nc\n")
+        self.assertEqual(insertar_despues(texto, 0, "cero"), "cero\na\nb\nc\n")
+        self.assertEqual(insertar_despues(texto, 3, "d"), "a\nb\nc\nd\n")
+        with self.assertRaises(ErrorEdicion):
+            reemplazar_lineas(texto, 9, 10, "x")
+
+    def test_continuacion_sin_duplicar(self):
+        existente = "def f():\n    total = calcular_algo_largo()\n    return total\n"
+        nuevo = "    return total\n\n\ndef g():\n    pass\n"
+        unido, repetidas = unir_continuacion(existente, nuevo)
+        self.assertEqual(repetidas, 1)
+        self.assertEqual(unido.count("return total"), 1)
+        self.assertIn("def g():", unido)
+        self.assertEqual(cortar_en_linea_completa("a\nb\nmedia lin"), "a\nb\n")
+        self.assertEqual(agregar_al_final("x", "y"), "x\ny\n")
+
+
+# ======================================================================
+# MÓDULO: autotest_runner
+# ======================================================================
+"""Ejecutor del autotest interno."""
+
+
+def clases_de_test() -> list:
+    return sorted(
+        (obj for nombre, obj in globals().items()
+         if isinstance(obj, type) and issubclass(obj, unittest.TestCase) and nombre.startswith("Test")),
+        key=lambda c: c.__name__,
+    )
+
+
+def correr_autotest(filtro: Optional[str] = None, verbosidad: Optional[int] = None) -> int:
+    filtro = (filtro if filtro is not None else os.getenv("REAPER_AUTOTEST", "")).lower()
+    verbosidad = verbosidad if verbosidad is not None else (2 if os.getenv("REAPER_AUTOTEST_V") else 1)
+    cargador = unittest.TestLoader()
+    suite = unittest.TestSuite()
+    for clase in clases_de_test():
+        if filtro and filtro not in clase.__name__.lower():
+            continue
+        suite.addTests(cargador.loadTestsFromTestCase(clase))
+    total = suite.countTestCases()
+    print(f"{Tema.titulo}{C.BOLD}🐉 REAPER v{__version__} · autotest{C.RESET} {Tema.tenue}"
+          f"({total} tests, sin API){C.RESET}")
+    inicio = time.monotonic()
+    resultado = unittest.TextTestRunner(verbosity=verbosidad, stream=sys.stdout).run(suite)
+    duracion = formatear_duracion(time.monotonic() - inicio)
+    if resultado.wasSuccessful():
+        print(f"{Tema.ok}✓ {resultado.testsRun} tests OK en {duracion}"
+              f"{f' ({len(resultado.skipped)} salteados)' if resultado.skipped else ''}{C.RESET}")
+        return 0
+    print(f"{Tema.error}✗ {len(resultado.failures)} fallos y {len(resultado.errors)} errores de "
+          f"{resultado.testsRun} tests ({duracion}){C.RESET}")
+    return 1
+
+
+# ======================================================================
+# MÓDULO: main
+# ======================================================================
+"""Punto de entrada."""
+
+
+def construir_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="reaper",
+        description=f"REAPER v{__version__} «{__codename__}» · agente de programación autónomo para Termux",
+    )
+    parser.add_argument("-p", "--pedido", help="ejecuta un pedido con el agente principal y sale")
+    parser.add_argument("--construir", help="corre el pipeline completo (tests primero + torneo) y sale")
+    parser.add_argument("--plan", help="solo exploración + plan y sale")
+    parser.add_argument("--torneo", help="corre un torneo de implementadores para una tarea y sale")
+    parser.add_argument("--escribir", nargs=2, metavar=("RUTA", "DESCRIPCION"), help="genera un archivo largo y sale")
+    parser.add_argument("--proyecto", help="carpeta del workspace")
+    parser.add_argument("--nuevo", nargs=2, metavar=("PLANTILLA", "CARPETA"), help="crea un proyecto desde una plantilla")
+    parser.add_argument("--modelo", help="alias o id de OpenRouter (solo esta ejecución)")
+    parser.add_argument("--modelo-fuerte", help="modelo para la escalada (solo esta ejecución)")
+    parser.add_argument("--perfil", choices=list(PERFILES), help="preset de configuración (solo esta ejecución)")
+    parser.add_argument("--modo", choices=MODOS, help="permisos (solo esta ejecución)")
+    parser.add_argument("--auto", action="store_true", help="equivale a --modo auto y sin confirmar el plan")
+    parser.add_argument("--sin-torneo", action="store_true", help="un solo implementador por tarea")
+    parser.add_argument("--sin-animacion", action="store_true", help="banner fijo, sin animar el dragón")
+    parser.add_argument("--silencioso", action="store_true", help="muestra menos detalle de los agentes")
+    parser.add_argument("--doctor", action="store_true", help="diagnóstico del entorno y sale")
+    parser.add_argument("--instalar", action="store_true", help="crea el comando `reaper` y sale")
+    parser.add_argument("--autotest", action="store_true", help="corre los tests internos de REAPER (sin API) y sale")
+    parser.add_argument("--evaluar", nargs="?", const=0, type=int, metavar="N",
+                        help="benchmark con tareas reales (usa la API) y sale")
+    parser.add_argument("--dragon", action="store_true", help="muestra el dragón y sale")
+    parser.add_argument("--version", action="version", version=f"REAPER {__version__} «{__codename__}»")
+    return parser
+
+
+def main(argv: Optional[list] = None) -> int:
+    args = construir_parser().parse_args(argv)
+
+    if args.autotest:
+        return correr_autotest()
+    if args.dragon:
+        if not animar_intro():
+            print(banner_dragon())
+        return 0
+
+    asegurar_dirs()
+    settings = cargar_settings()
+    aplicar_tema(settings.tema)
+    if args.perfil:
+        aplicar_perfil(settings, args.perfil)
+    if args.modelo:
+        settings.modelo = resolver_modelo(args.modelo)
+    if args.modelo_fuerte:
+        settings.modelo_fuerte = args.modelo_fuerte
+        settings.escalar = True
+    if args.modo:
+        settings.modo = args.modo
+    if args.auto:
+        settings.modo = "auto"
+    if args.sin_torneo:
+        settings.torneo = False
+    if args.sin_animacion:
+        settings.animacion = False
+
+    no_interactivo = bool(args.pedido or args.construir or args.plan or args.torneo or args.escribir or args.evaluar is not None)
+    log = LOGS_DIR / f"{datetime.now():%Y%m%d}.log" if settings.log else None
+    ui = UI(interactivo=not no_interactivo or sys.stdin.isatty(), log=log,
+            detalle=0 if args.silencioso else settings.detalle)
+
+    if args.instalar:
+        return 0 if instalar_lanzador(ui) else 1
+
+    api_key = obtener_clave_api(settings)
+    if args.doctor:
+        llm = LLMClient(api_key, settings) if api_key else None
+        return 0 if diagnostico_sistema(ui, settings, llm, probar_modelo=bool(api_key)) else 1
+    if not api_key:
+        if not animar_intro():
+            print(banner_dragon())
+        variable = settings.variable_clave() or "OPENROUTER_API_KEY"
+        ui.error(f"Falta {variable}.")
+        ui.tenue(f'  export {variable}="tu_key"      (agregalo a ~/.bashrc para no repetirlo)')
+        ui.tenue("  python3 reaper_v7.py --doctor    revisa todo el entorno")
+        return 1
+
+    limpiar_sandboxes_viejos()
+    try:
+        if args.nuevo:
+            plantilla, carpeta = args.nuevo
+            destino = Path(carpeta).expanduser().resolve()
+            creados = crear_desde_plantilla(plantilla, destino)
+            ui.ok(f"Proyecto creado en {destino} ({len(creados)} archivos)")
+            args.proyecto = str(destino)
+        if args.proyecto:
+            raiz = resolver_workspace(args.proyecto)
+        else:
+            guardado = cargar_estado().get("proyecto")
+            raiz = Path(guardado) if guardado and Path(guardado).is_dir() else PROJECTS_DIR
+        ws = Workspace(raiz)
+    except (ErrorRuta, KeyError, FileExistsError, OSError) as e:
+        ui.error(str(e) if not isinstance(e, KeyError) else f"No existe la plantilla {e}")
+        return 1
+
+    llm = LLMClient(api_key, settings)
+    llm.on_evento = lambda texto: ui.tenue(f"  ↻ {texto}")
+    app = App(settings, llm, ui, ws)
+    if args.proyecto:
+        guardar_estado(proyecto=str(ws.raiz))
+
+    inicio = time.monotonic()
+    try:
+        if args.evaluar is not None:
+            return 0 if correr_evaluacion(llm, settings, ui, cantidad=args.evaluar or None) else 2
+        if args.construir:
+            ok = app.construir(args.construir, confirmar=not args.auto)
+            if time.monotonic() - inicio > 120:
+                notificar("REAPER", f"Build {'verificada ✓' if ok else 'fallida ✗'}: {args.construir[:80]}")
+            return 0 if ok else 2
+        if args.torneo:
+            app.cmd_torneo(args.torneo)
+            return 0
+        if args.escribir:
+            app.cmd_escribir(" ".join(args.escribir))
+            return 0
+        if args.plan:
+            app.cmd_plan(args.plan)
+            return 0
+        if args.pedido:
+            return 0 if app.turno(args.pedido) else 2
+        return app.repl(animar=settings.animacion)
+    except (KeyboardInterrupt, Cancelado):
+        CANCELAR.set()
+        ui.aviso("\n⏹ Interrumpido.")
+        return 130
+    except LLMError as e:
+        ui.error(f"Modelo: {e}")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,419 @@
+"""
+Cliente LLM compatible con OpenAI/OpenRouter: streaming, reintentos con
+backoff, modelos de respaldo, límite de solicitudes por minuto, presupuesto
+de costo, ajuste automático de max_tokens y registro de uso por modelo.
+"""
+
+try:  # httpx es opcional: sin él se usa urllib (streaming igual).
+    import httpx
+except ImportError:  # pragma: no cover - depende del entorno
+    httpx = None
+
+
+class LLMError(RuntimeError):
+    def __init__(self, mensaje: str, *, probar_otro_modelo: bool = False, contexto_excedido: bool = False,
+                 presupuesto: bool = False):
+        super().__init__(mensaje)
+        self.probar_otro_modelo = probar_otro_modelo
+        self.contexto_excedido = contexto_excedido
+        self.presupuesto = presupuesto
+
+
+class _Transitorio(Exception):
+    """Error que vale la pena reintentar (429, 5xx, red, respuesta vacía)."""
+
+    def __init__(self, mensaje: str, espera: Optional[float] = None):
+        super().__init__(mensaje)
+        self.espera = espera
+
+
+@dataclass
+class Respuesta:
+    texto: str
+    finish_reason: Optional[str] = None
+    modelo: str = ""
+    tokens_entrada: int = 0
+    tokens_salida: int = 0
+    duracion: float = 0.0
+    primer_token: float = 0.0
+
+
+@dataclass
+class UsoModelo:
+    llamadas: int = 0
+    tokens_entrada: int = 0
+    tokens_salida: int = 0
+    costo: float = 0.0
+    segundos: float = 0.0
+
+
+@dataclass
+class Uso:
+    llamadas: int = 0
+    tokens_entrada: int = 0
+    tokens_salida: int = 0
+    costo: float = 0.0
+    reintentos: int = 0
+    errores: int = 0
+    respaldos: int = 0
+    por_modelo: dict = field(default_factory=dict)
+    por_rol: dict = field(default_factory=dict)
+
+    def resumen(self) -> str:
+        texto = (f"{self.llamadas} llamadas · {formatear_numero(self.tokens_entrada)} tokens entrada · "
+                 f"{formatear_numero(self.tokens_salida)} salida")
+        if self.costo:
+            texto += f" · ${self.costo:.4f}"
+        if self.reintentos:
+            texto += f" · {self.reintentos} reintentos"
+        return texto
+
+
+MENSAJES_HTTP = {
+    400: "Pedido rechazado por el proveedor (¿contexto demasiado largo?).",
+    401: "Clave API inválida, revocada o ausente.",
+    402: "La cuenta no tiene crédito suficiente para este modelo.",
+    403: "Acceso denegado por el proveedor (moderación o permisos).",
+    404: "Modelo o endpoint no disponible.",
+    408: "El proveedor tardó demasiado.",
+    413: "El pedido es demasiado grande.",
+    429: "Límite de solicitudes alcanzado.",
+}
+
+TRANSITORIOS = {408, 409, 425, 429, 500, 502, 503, 504, 520, 522, 524, 529}
+
+_RE_CONTEXTO = re.compile(
+    r"context(_| )length|maximum context|too many tokens|context window|prompt is too long|reduce the length",
+    re.I,
+)
+
+
+def _lanzar_http(status: int, cuerpo: str, retry_after: Optional[str]) -> None:
+    detalle = " ".join((cuerpo or "").split())[:400]
+    motivo = MENSAJES_HTTP.get(status, "Error HTTP del proveedor.")
+    if status in TRANSITORIOS:
+        espera = None
+        try:
+            espera = float(retry_after) if retry_after else None
+        except ValueError:
+            espera = None
+        raise _Transitorio(f"{motivo} HTTP {status}. {detalle}".strip(), espera)
+    excedido = status in (400, 413) and bool(_RE_CONTEXTO.search(cuerpo or ""))
+    raise LLMError(
+        f"{motivo} HTTP {status}. {detalle}".strip(),
+        probar_otro_modelo=status in (400, 402, 403, 404) and not excedido,
+        contexto_excedido=excedido,
+    )
+
+
+def _transporte_httpx(url: str, headers: dict, payload: dict, timeout: int) -> Iterator[str]:
+    try:
+        with httpx.stream(
+            "POST",
+            url,
+            headers=headers,
+            json=payload,
+            timeout=httpx.Timeout(timeout, connect=30),
+        ) as r:
+            if r.status_code >= 400:
+                # En streaming hay que leer el cuerpo antes de usarlo.
+                cuerpo = r.read().decode("utf-8", "replace")
+                _lanzar_http(r.status_code, cuerpo, r.headers.get("retry-after"))
+            for linea in r.iter_lines():
+                yield linea
+    except httpx.TimeoutException as e:
+        raise _Transitorio(f"El modelo no respondió dentro de {timeout}s.") from e
+    except httpx.RequestError as e:
+        raise _Transitorio(f"Error de red hablando con el proveedor: {e}") from e
+
+
+def _transporte_urllib(url: str, headers: dict, payload: dict, timeout: int) -> Iterator[str]:
+    datos = json.dumps(payload).encode("utf-8")
+    pedido = urllib.request.Request(url, data=datos, headers=headers, method="POST")
+    try:
+        respuesta = urllib.request.urlopen(pedido, timeout=timeout)
+    except urllib.error.HTTPError as e:
+        cuerpo = e.read().decode("utf-8", "replace") if e.fp else ""
+        _lanzar_http(e.code, cuerpo, e.headers.get("Retry-After") if e.headers else None)
+        return
+    except (urllib.error.URLError, socket.timeout, TimeoutError, ConnectionError) as e:
+        raise _Transitorio(f"Error de red hablando con el proveedor: {e}") from e
+
+    with respuesta:
+        try:
+            for crudo in respuesta:
+                yield crudo.decode("utf-8", "replace").rstrip("\r\n")
+        except (socket.timeout, TimeoutError, ConnectionError) as e:
+            raise _Transitorio(f"Se cortó el streaming: {e}") from e
+
+
+def parsear_linea_sse(linea: str):
+    """Devuelve dict del evento, la cadena 'DONE' o None si la línea no aporta nada."""
+    if not linea or not linea.startswith("data:"):
+        return None
+    datos = linea[5:].strip()
+    if datos == "[DONE]":
+        return "DONE"
+    try:
+        obj = json.loads(datos)
+    except json.JSONDecodeError:
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+Transporte = Callable[[str, dict, dict, int], Iterator[str]]
+
+
+class LimitadorTasa:
+    """Ventana deslizante de 60 s: como máximo 'rpm' solicitudes por minuto (thread-safe)."""
+
+    def __init__(self, rpm: int, reloj: Callable[[], float] = time.monotonic,
+                 dormir: Callable[[float], None] = time.sleep):
+        self.rpm = max(0, int(rpm))
+        self._reloj = reloj
+        self._dormir = dormir
+        self._marcas: collections.deque = collections.deque()
+        self._lock = threading.Lock()
+
+    def espera_necesaria(self) -> float:
+        if self.rpm <= 0:
+            return 0.0
+        with self._lock:
+            ahora = self._reloj()
+            while self._marcas and ahora - self._marcas[0] >= 60.0:
+                self._marcas.popleft()
+            if len(self._marcas) < self.rpm:
+                return 0.0
+            return max(0.0, 60.0 - (ahora - self._marcas[0]) + 0.05)
+
+    def adquirir(self, cancelado: Optional[Callable[[], bool]] = None) -> float:
+        """Bloquea hasta que haya lugar. Devuelve los segundos esperados."""
+        esperado = 0.0
+        while True:
+            espera = self.espera_necesaria()
+            if espera <= 0:
+                with self._lock:
+                    self._marcas.append(self._reloj())
+                return esperado
+            tramo = min(espera, 1.0)
+            if cancelado and cancelado():
+                raise LLMError("Cancelado mientras se esperaba el límite de solicitudes.")
+            self._dormir(tramo)
+            esperado += tramo
+
+
+class LLMClient:
+    def __init__(
+        self,
+        api_key: str,
+        settings: Settings,
+        url: Optional[str] = None,
+        transporte: Optional[Transporte] = None,
+    ):
+        self.api_key = api_key
+        self.settings = settings
+        self.url = url or settings.url_api()
+        self.uso = Uso()
+        self._lock = threading.Lock()
+        self._transporte = transporte or (_transporte_httpx if httpx else _transporte_urllib)
+        self.dormir = time.sleep
+        self.limitador = LimitadorTasa(settings.rpm_efectivo())
+        self.on_evento: Optional[Callable[[str], None]] = None
+
+    # ------------------------------------------------------------ API
+    def chat(
+        self,
+        mensajes: list[dict],
+        *,
+        modelo: Optional[str] = None,
+        temperatura: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        stop: Optional[list[str]] = None,
+        on_progress: Optional[Callable[[int], None]] = None,
+        rol: str = "",
+        sin_respaldo: bool = False,
+    ) -> Respuesta:
+        self._verificar_presupuesto()
+        principal = resolver_modelo(modelo or self.settings.modelo)
+        candidatos = [principal]
+        if not sin_respaldo:
+            for respaldo in self.settings.fallbacks:
+                respaldo = resolver_modelo(respaldo)
+                if respaldo and respaldo not in candidatos:
+                    candidatos.append(respaldo)
+
+        ultimo: Optional[LLMError] = None
+        for n, candidato in enumerate(candidatos):
+            try:
+                respuesta = self._con_reintentos(
+                    candidato, mensajes, temperatura, max_tokens, stop, on_progress
+                )
+                if n:
+                    with self._lock:
+                        self.uso.respaldos += 1
+                self._registrar_rol(rol, respuesta)
+                return respuesta
+            except LLMError as e:
+                ultimo = e
+                with self._lock:
+                    self.uso.errores += 1
+                if not e.probar_otro_modelo:
+                    raise
+                if self.on_evento and n + 1 < len(candidatos):
+                    self.on_evento(f"{candidato} falló ({e}); pruebo con {candidatos[n + 1]}")
+        assert ultimo is not None
+        raise ultimo
+
+    def chat_simple(self, prompt: str, *, sistema: str = "", modelo: Optional[str] = None,
+                    temperatura: float = 0.2, max_tokens: int = 1500, rol: str = "") -> str:
+        """Una pregunta y una respuesta, sin herramientas (diagnósticos, lecciones, resúmenes)."""
+        mensajes = []
+        if sistema:
+            mensajes.append({"role": "system", "content": sistema})
+        mensajes.append({"role": "user", "content": prompt})
+        return self.chat(mensajes, modelo=modelo, temperatura=temperatura, max_tokens=max_tokens, rol=rol).texto
+
+    # ------------------------------------------------------------ internos
+    def _verificar_presupuesto(self) -> None:
+        limite = self.settings.costo_maximo
+        if limite and self.uso.costo >= limite:
+            raise LLMError(
+                f"Se alcanzó el presupuesto de la sesión (${self.uso.costo:.4f} de ${limite:.2f}). "
+                "Subilo con /config costo_maximo <usd> o ponelo en 0.",
+                presupuesto=True,
+            )
+
+    def _payload(self, modelo, mensajes, temperatura, max_tokens, stop) -> dict:
+        info = info_modelo(modelo)
+        presupuesto = Presupuesto(min(self.settings.contexto_tokens, info.contexto) if info.contexto else
+                                  self.settings.contexto_tokens, max_tokens or self.settings.max_tokens)
+        payload = {
+            "model": modelo,
+            "messages": mensajes,
+            "temperature": self.settings.temperatura if temperatura is None else temperatura,
+            "max_tokens": presupuesto.respuesta_posible(mensajes),
+            "stream": True,
+        }
+        if self.settings.proveedor == "openrouter":
+            payload["usage"] = {"include": True}
+        elif self.settings.proveedor == "openai":
+            payload["stream_options"] = {"include_usage": True}
+        if stop:
+            payload["stop"] = stop[:4]
+        return payload
+
+    def _con_reintentos(self, modelo, mensajes, temperatura, max_tokens, stop, on_progress):
+        payload = self._payload(modelo, mensajes, temperatura, max_tokens, stop)
+        intentos = max(0, int(self.settings.reintentos))
+        for intento in range(intentos + 1):
+            try:
+                cancelado = (lambda: CANCELAR.is_set()) if "CANCELAR" in globals() else None
+                self.limitador.adquirir(cancelado)
+                return self._una_vez(modelo, payload, on_progress)
+            except _Transitorio as e:
+                with self._lock:
+                    self.uso.reintentos += 1
+                if intento >= intentos:
+                    raise LLMError(
+                        f"{e} (después de {intentos + 1} intentos)",
+                        probar_otro_modelo=True,
+                    ) from e
+                espera = e.espera
+                if espera is None:
+                    espera = min(60.0, 2.0 * (2 ** intento)) + random.uniform(0, 1)
+                if self.on_evento:
+                    self.on_evento(f"reintento {intento + 1}/{intentos} en {espera:.0f}s: {e}")
+                self.dormir(min(espera, 120.0))
+        raise LLMError("No se obtuvo respuesta del modelo.")  # pragma: no cover
+
+    def _headers(self) -> dict:
+        headers = {"Content-Type": "application/json"}
+        if self.api_key and self.api_key != "sin-clave":
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        if self.settings.proveedor == "openrouter":
+            headers["X-Title"] = "REAPER"
+            headers["HTTP-Referer"] = "https://github.com/reaper-termux"
+        return headers
+
+    def _una_vez(self, modelo: str, payload: dict, on_progress) -> Respuesta:
+        partes: list[str] = []
+        total = 0
+        finish = None
+        inicio = time.monotonic()
+        primer = 0.0
+        tokens_in = tokens_out = 0
+
+        for linea in self._transporte(self.url, self._headers(), payload, self.settings.timeout):
+            evento = parsear_linea_sse(linea)
+            if evento is None:
+                continue
+            if evento == "DONE":
+                break
+
+            if "error" in evento:
+                err = evento["error"]
+                mensaje = err.get("message", str(err)) if isinstance(err, dict) else str(err)
+                codigo = err.get("code") if isinstance(err, dict) else None
+                if _RE_CONTEXTO.search(mensaje or ""):
+                    raise LLMError(f"Contexto excedido: {mensaje}", contexto_excedido=True)
+                if codigo is None or codigo in TRANSITORIOS:
+                    raise _Transitorio(f"Error del proveedor durante el streaming: {mensaje}")
+                raise LLMError(f"Error del proveedor: {mensaje}", probar_otro_modelo=True)
+
+            uso = evento.get("usage")
+            if isinstance(uso, dict):
+                tokens_in = int(uso.get("prompt_tokens") or tokens_in or 0)
+                tokens_out = int(uso.get("completion_tokens") or tokens_out or 0)
+                self._registrar_uso(modelo, uso)
+
+            for choice in evento.get("choices") or []:
+                delta = choice.get("delta") or choice.get("message") or {}
+                contenido = delta.get("content")
+                if contenido:
+                    if not primer:
+                        primer = time.monotonic() - inicio
+                    partes.append(contenido)
+                    total += len(contenido)
+                    if on_progress:
+                        on_progress(total)
+                if choice.get("finish_reason"):
+                    finish = choice["finish_reason"]
+
+        duracion = time.monotonic() - inicio
+        with self._lock:
+            self.uso.llamadas += 1
+            por = self.uso.por_modelo.setdefault(modelo, UsoModelo())
+            por.llamadas += 1
+            por.segundos += duracion
+
+        texto = "".join(partes)
+        if not texto.strip():
+            raise _Transitorio("El modelo devolvió una respuesta vacía.")
+        if not tokens_out:
+            tokens_out = estimar_tokens(texto)
+        return Respuesta(texto=texto, finish_reason=finish, modelo=modelo, tokens_entrada=tokens_in,
+                         tokens_salida=tokens_out, duracion=duracion, primer_token=primer)
+
+    def _registrar_uso(self, modelo: str, uso: dict) -> None:
+        with self._lock:
+            entrada = int(uso.get("prompt_tokens") or 0)
+            salida = int(uso.get("completion_tokens") or 0)
+            self.uso.tokens_entrada += entrada
+            self.uso.tokens_salida += salida
+            por = self.uso.por_modelo.setdefault(modelo, UsoModelo())
+            por.tokens_entrada += entrada
+            por.tokens_salida += salida
+            try:
+                costo = float(uso.get("cost") or 0.0)
+            except (TypeError, ValueError):
+                costo = 0.0
+            self.uso.costo += costo
+            por.costo += costo
+
+    def _registrar_rol(self, rol: str, respuesta: Respuesta) -> None:
+        if not rol:
+            return
+        with self._lock:
+            datos = self.uso.por_rol.setdefault(rol, {"llamadas": 0, "tokens_salida": 0})
+            datos["llamadas"] += 1
+            datos["tokens_salida"] += respuesta.tokens_salida

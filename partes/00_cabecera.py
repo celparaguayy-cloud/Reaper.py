@@ -1,0 +1,92 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+REAPER v7.0.0 «Dragón» — agente de programación autónomo para Termux vía OpenRouter
+(estilo Claude Code / Codex / Antigravity, pensado para sacarle el máximo a un modelo de 24B).
+
+Archivo único generado desde partes/ con empaquetar.py.
+
+QUÉ TRAE LA v7
+  1. Tests primero + torneo: el QA escribe la especificación ejecutable ANTES de
+     implementar; por tarea compiten N implementadores en copias aisladas del
+     proyecto (temperaturas 0.1 / 0.4 / 0.7) y gana el que pasa más tests reales.
+  2. Escalada: si una tarea falla la verificación 2 veces, un modelo más fuerte
+     (deepseek, qwen...) lee el error real y escribe el diagnóstico; Venice aplica.
+  3. Lecciones entre sesiones: cada reparación real deja una lección de una línea
+     en .reaper/lecciones.md (proyecto) y ~/reaper/lecciones.md (general).
+  4. Archivos largos sin romperse: escritura por partes, continuación automática
+     cuando el modelo se corta, esqueleto + relleno por función (replace_symbol).
+  5. read_symbol / replace_symbol / find_references, mapa de archivos relevantes
+     según el pedido, arreglos automáticos sin modelo, snapshots git por build.
+
+Instalar:
+    pip install httpx pyflakes      (opcionales: sin httpx usa urllib)
+    pkg install nodejs git          (opcionales: validan JS y guardan builds en git)
+
+Clave:
+    export OPENROUTER_API_KEY="tu_key"
+
+Ejecutar:
+    python3 reaper_v7.py                                  modo interactivo (/ayuda)
+    python3 reaper_v7.py --proyecto ~/mi_app              abre un workspace
+    python3 reaper_v7.py -p "agregá tests a utils.py"     un pedido y sale
+    python3 reaper_v7.py --construir "API de notas" --auto
+    python3 reaper_v7.py --autotest                       verifica REAPER sin gastar API
+    python3 reaper_v7.py --instalar                       crea el comando `reaper`
+"""
+
+from __future__ import annotations
+
+__version__ = "7.0.0"
+__codename__ = "Dragón"
+
+import argparse
+import ast
+import base64
+import collections
+import contextlib
+import copy
+import difflib
+import fnmatch
+import functools
+import hashlib
+import heapq
+import importlib.util
+import io
+import itertools
+import json
+import keyword
+import math
+import os
+import platform
+import queue
+import random
+import re
+import shlex
+import shutil
+import signal
+import socket
+import string
+import subprocess
+import sys
+import tempfile
+import textwrap
+import threading
+import time
+import traceback
+import unicodedata
+import unittest
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import asdict, dataclass, field, fields, replace
+from datetime import datetime, timedelta
+from difflib import SequenceMatcher
+from pathlib import Path
+from typing import Any, Callable, Iterable, Iterator, Optional, Sequence, Union
+
+if sys.version_info < (3, 9):  # pragma: no cover - Termux trae Python moderno
+    sys.stderr.write("REAPER necesita Python 3.9 o superior (pkg upgrade python).\n")
+    sys.exit(1)
