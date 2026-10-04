@@ -12037,10 +12037,29 @@ def investigar(ws: Workspace, settings: Settings, ui: UI, llm=None, *, fallidos:
         escritura_atomica(informe.ruta, informe.texto(20000) + "\n")
     except OSError:
         informe.ruta = None
+    for hallazgo in hallazgos_principales(informe):
+        ui.linea(f"    {Tema.aviso}•{C.RESET} {hallazgo}")
     ui.tenue(f"  🔎 informe forense listo ({len(informe.hipotesis)} hipótesis, "
              f"{len(informe.dependientes_de_orden)} dependencias de orden, {len(informe.inestables)} inestables, "
-             f"{len(informe.culpables)} culpables)")
+             f"{len(informe.culpables)} culpables)" + (f" · {ws.rel(informe.ruta)}" if informe.ruta else ""))
     return informe
+
+
+def hallazgos_principales(informe: InformeForense) -> list[str]:
+    """Lo más importante del informe en pocas líneas, para mostrarle al usuario."""
+    salida = []
+    if informe.inestables:
+        salida.append("el resultado cambia entre corridas idénticas: hay estado que persiste")
+    if informe.dependientes_de_orden:
+        salida.append("depende del orden o de estado compartido: " + ", ".join(informe.dependientes_de_orden[:3]))
+    if informe.archivos_tocados_por_tests:
+        salida.append("los tests escriben en el proyecto: " + ", ".join(informe.archivos_tocados_por_tests[:3]))
+    if informe.culpables:
+        salida.append("cambio culpable: " + informe.culpables[0].splitlines()[0][:120])
+    confirmadas = [h for h in informe.hipotesis if h.estado == "confirmada"]
+    if confirmadas:
+        salida.append("hipótesis confirmada: " + confirmadas[0].texto[:120])
+    return salida
 
 
 def _investigar_con_corridas(ws: Workspace, settings: Settings, informe: InformeForense, fallidos, estado_bueno) -> None:
@@ -39716,6 +39735,44 @@ capitulo("interactivos", "Programas interactivos y servidores", """
     `/procesos` los lista; `/procesos parar todos` los detiene. Al salir de REAPER se detienen solos.
 """)
 
+capitulo("forense", "Cuando un bug no sale: guardia de regresión y modo forense", """
+    # Guardia de regresión y modo forense (v8)
+
+    Un modelo de 24B que no encuentra la causa de un fallo tiende a "probar cosas", y cada intento puede
+    empeorar el proyecto (2 fallos → 13). Desde la v8 REAPER repara con método:
+
+    ## Guardia de regresión
+    REAPER recuerda el **mejor estado** de los tests en la tarea. Si una edición los deja peor (más fallos o
+    menos tests que pasan), **la revierte sola** y le dice al modelo qué revirtió y por qué. En `/construir`,
+    un intento del reparador que empeora la verificación se deshace entero. Si cambian los archivos de tests
+    (por ejemplo al escribir tests nuevos que todavía fallan), se toma una base nueva: TDD no dispara la guardia.
+    Se apaga con `/config guardia_regresion false`.
+
+    ## Modo forense
+    Se activa solo cuando dos intentos empeoran los tests, tres intentos no mejoran nada, el mismo error se
+    repite, o el agente quiere terminar con tests fallando. También a mano: `/forense [tests]`.
+    1. **Aislar**: cada test que falla corre solo, en su propio proceso.
+    2. **Repetir**: si la misma prueba da otro resultado sin cambiar el código, hay **estado que persiste**
+       entre corridas (típico: una base de datos o archivo en una ruta fija que los tests nunca limpian; los
+       números "crecen" corrida a corrida).
+    3. **Orden**: la suite se corre en orden directo e inverso; si cambia, hay estado compartido entre tests.
+    4. **Evidencia**: variables locales y atributos de los objetos en el punto del fallo, los fixtures de
+       `setUp`, el árbol de llamadas con lo que devolvió cada función y los archivos que los tests escriben.
+    5. **Bisección**: si hubo un estado mejor, encuentra el bloque exacto que introdujo la regresión.
+    6. **Hipótesis con experimentos**: el modelo (el fuerte si hay escalada) propone hipótesis con un
+       experimento cada una; REAPER los ejecuta de verdad (los que borran archivos o usan la red no) y le
+       devuelve los resultados reales.
+    La investigación deja el proyecto como estaba y el informe queda en `.reaper/forense/`.
+
+    ## Confirmación al cerrar
+    Si en la tarea hubo tests fallando, o algún comando tocó archivos del proyecto, REAPER corre los tests una
+    vez más antes de aceptar el cierre: un "pasa" por suerte (por ejemplo después de borrar a mano los datos
+    de una base) no cuenta como arreglo.
+
+    ## Para medirlo
+    `/evaluar comportamiento persistente no_empeorar` corre los dos casos de autonomía con tu modelo.
+""")
+
 capitulo("plantillas", "Plantillas y recetas", """
     # Plantillas y recetas
 
@@ -39798,6 +39855,8 @@ capitulo("problemas", "Solución de problemas", """
     | `429` / límite de tasa | `/config rpm 10` o un plan pago; REAPER reintenta con espera creciente |
     | "contexto excedido" | REAPER compacta solo; para pedidos largos usá `/construir` (contexto chico por tarea) |
     | el modelo repite una herramienta | REAPER devuelve el resultado anterior y corta el bucle; si pasa seguido, `/evaluar comportamiento` |
+    | un arreglo empeoró los tests | la guardia lo revierte sola; si no estaba activa: `/deshacer` |
+    | un bug "no sale" o los números cambian entre corridas | `/forense` (ver `/manual forense`) |
     | dice que validó y no es cierto | el cierre se rechaza o queda marcado con ⚠; pedile que corra `run_tests` |
     | archivo largo cortado | escribe por partes y REAPER continúa solo; para >300 líneas usá `/escribir` |
     | EOFError en un programa | es interactivo: probalo con `<stdin>` (ver `/manual interactivos`) |

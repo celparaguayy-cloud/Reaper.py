@@ -511,10 +511,29 @@ def investigar(ws: Workspace, settings: Settings, ui: UI, llm=None, *, fallidos:
         escritura_atomica(informe.ruta, informe.texto(20000) + "\n")
     except OSError:
         informe.ruta = None
+    for hallazgo in hallazgos_principales(informe):
+        ui.linea(f"    {Tema.aviso}•{C.RESET} {hallazgo}")
     ui.tenue(f"  🔎 informe forense listo ({len(informe.hipotesis)} hipótesis, "
              f"{len(informe.dependientes_de_orden)} dependencias de orden, {len(informe.inestables)} inestables, "
-             f"{len(informe.culpables)} culpables)")
+             f"{len(informe.culpables)} culpables)" + (f" · {ws.rel(informe.ruta)}" if informe.ruta else ""))
     return informe
+
+
+def hallazgos_principales(informe: InformeForense) -> list[str]:
+    """Lo más importante del informe en pocas líneas, para mostrarle al usuario."""
+    salida = []
+    if informe.inestables:
+        salida.append("el resultado cambia entre corridas idénticas: hay estado que persiste")
+    if informe.dependientes_de_orden:
+        salida.append("depende del orden o de estado compartido: " + ", ".join(informe.dependientes_de_orden[:3]))
+    if informe.archivos_tocados_por_tests:
+        salida.append("los tests escriben en el proyecto: " + ", ".join(informe.archivos_tocados_por_tests[:3]))
+    if informe.culpables:
+        salida.append("cambio culpable: " + informe.culpables[0].splitlines()[0][:120])
+    confirmadas = [h for h in informe.hipotesis if h.estado == "confirmada"]
+    if confirmadas:
+        salida.append("hipótesis confirmada: " + confirmadas[0].texto[:120])
+    return salida
 
 
 def _investigar_con_corridas(ws: Workspace, settings: Settings, informe: InformeForense, fallidos, estado_bueno) -> None:
