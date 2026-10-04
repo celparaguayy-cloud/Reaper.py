@@ -79,3 +79,31 @@ class TestEvalsComportamiento(BaseTest):
         ids = [t.id for t in TAREAS_COMPORTAMIENTO]
         self.assertEqual(len(ids), len(set(ids)))
         self.assertGreaterEqual(len(ids), 8)
+
+
+class TestManual(BaseTest):
+    def test_indice_y_capitulos(self):
+        self.assertIn("/manual inicio", indice_manual())
+        self.assertGreaterEqual(len(MANUAL), 12)
+        self.assertEqual(buscar_capitulo("interactivos"), "interactivos")
+        self.assertEqual(buscar_capitulo("Solución"), "problemas")      # por título, sin importar tildes
+        self.assertEqual(buscar_capitulo("EOFError"), "interactivos")   # por contenido
+        self.assertIsNone(buscar_capitulo("zzzz-nada"))
+
+    def test_comando_manual(self):
+        ws = self.proyecto()
+        app = App(self.ajustes(), MockLLM([]), self.ui(), ws, persistir=False)
+        app.comando("/manual modos")
+        texto = app.ui.texto_registrado()
+        self.assertIn("Modo plan", texto)
+        app.comando("/manual")
+        self.assertIn("Manual de REAPER", app.ui.texto_registrado())
+
+    def test_el_manual_menciona_comandos_que_existen(self):
+        app = App(self.ajustes(), MockLLM([]), self.ui(), self.proyecto(), persistir=False)
+        existentes = set(app.nombres_comandos())
+        mencionados = set()
+        for _titulo, texto in MANUAL.values():
+            mencionados |= set(re.findall(r"`(/[a-z][a-z-]*)", texto))
+        faltan = sorted(c for c in mencionados if c not in existentes)
+        self.assertEqual(faltan, [], f"el manual menciona comandos inexistentes: {faltan}")
