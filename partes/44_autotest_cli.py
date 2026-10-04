@@ -246,8 +246,8 @@ class TestDoctor(BaseTest):
             if es_termux():
                 self.skipTest("en Termux el lanzador va a $PREFIX/bin")
             self.assertTrue(lanzador and lanzador.exists())
-            self.assertIn("import reaper_v7", lanzador.read_text())
-            self.assertTrue((BASE_DIR / "app" / "reaper_v7.py").exists())
+            self.assertIn("import reaper_v8", lanzador.read_text())
+            self.assertTrue((BASE_DIR / "app" / "reaper_v8.py").exists())
         finally:
             for k, v in anteriores.items():
                 if v is None:

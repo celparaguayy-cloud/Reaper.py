@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Empaquetador de REAPER: une partes/*.py en un único reaper_v7.py.
+Empaquetador de REAPER: une partes/*.py en un único reaper_v8.py.
 
 Cada parte comparte el mismo espacio de nombres (igual que en v6), así que
 no hay imports internos: todo lo de la librería estándar se importa en
@@ -13,7 +13,7 @@ no hay imports internos: todo lo de la librería estándar se importa en
   - que ninguna parte tenga marcadores de código omitido ("...resto igual")
 
 Uso:
-    python3 empaquetar.py              genera reaper_v7.py
+    python3 empaquetar.py              genera reaper_v8.py
     python3 empaquetar.py --stats      además muestra líneas por parte
     python3 empaquetar.py --test       genera y corre el autotest interno
 """
@@ -30,7 +30,7 @@ from pathlib import Path
 
 RAIZ = Path(__file__).resolve().parent
 PARTES = RAIZ / "partes"
-SALIDA = RAIZ / "reaper_v7.py"
+SALIDA = RAIZ / "reaper_v8.py"
 
 _PEREZOSO = re.compile(r"^\s*#\s*\.\.\.\s*(resto|rest of|el resto)", re.I | re.M)
 

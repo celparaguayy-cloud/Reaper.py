@@ -18,7 +18,7 @@ capitulo("inicio", "Primeros pasos", """
     pkg update && pkg install python git nodejs     # git y node son opcionales pero recomendados
     pip install httpx pyflakes                      # opcionales: httpx (red más estable), pyflakes (validación)
     export OPENROUTER_API_KEY="tu_clave"            # ponelo en ~/.bashrc para no repetirlo
-    python3 reaper_v7.py --instalar                 # crea el comando `reaper`
+    python3 reaper_v8.py --instalar                 # crea el comando `reaper`
     ```
 
     ## Primer uso

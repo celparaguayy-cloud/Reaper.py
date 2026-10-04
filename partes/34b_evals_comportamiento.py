@@ -11,7 +11,7 @@ Salen de los bugs vistos en Termux:
   contar           pregunta sobre un archivo → pocas lecturas y respuesta correcta
   minimo           arreglar una función → no tocar las demás y pasar el test
 
-    python3 reaper_v7.py --comportamiento        todas
+    python3 reaper_v8.py --comportamiento        todas
     /evaluar comportamiento [id ...]              desde el REPL
 """
 

@@ -81,7 +81,7 @@ def main(argv: Optional[list] = None) -> int:
         variable = settings.variable_clave() or "OPENROUTER_API_KEY"
         ui.error(f"Falta {variable}.")
         ui.tenue(f'  export {variable}="tu_key"      (agregalo a ~/.bashrc para no repetirlo)')
-        ui.tenue("  python3 reaper_v7.py --doctor    revisa todo el entorno")
+        ui.tenue("  python3 reaper_v8.py --doctor    revisa todo el entorno")
         return 1
 
     limpiar_sandboxes_viejos()

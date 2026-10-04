@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-REAPER v7.1.0 «Dragón» — agente de programación autónomo para Termux vía OpenRouter
+REAPER v8.0.0 «Dragón» — agente de programación autónomo para Termux vía OpenRouter
 (estilo Claude Code / Codex / Antigravity, pensado para sacarle el máximo a un modelo de 24B).
 
 Archivo único generado desde partes/ con empaquetar.py.
@@ -18,6 +18,22 @@ QUÉ TRAE LA v7
      cuando el modelo se corta, esqueleto + relleno por función (replace_symbol).
   5. read_symbol / replace_symbol / find_references, mapa de archivos relevantes
      según el pedido, arreglos automáticos sin modelo, snapshots git por build.
+
+v8 (reparación con método, en vez de prueba y error)
+  - Guardia de regresión: una edición que deja los tests peor que el mejor
+    estado visto se revierte sola (en el chat y en /construir), y el modelo
+    recibe qué se revirtió y por qué. Antes, un "arreglo" podía llevar de 2
+    a 13 fallos y quedar aplicado.
+  - Modo forense (/forense, o automático al trabarse o antes de rendirse):
+    aísla cada test que falla, lo repite para detectar estado que persiste
+    entre corridas, compara la suite en orden directo e inverso, muestra
+    variables locales, fixtures y el árbol de llamadas con lo que devolvió
+    cada función, detecta archivos de datos que los tests escriben en el
+    proyecto, busca por bisección el cambio que introdujo una regresión y
+    pide hipótesis con experimentos que REAPER ejecuta de verdad.
+  - También: modo plan, "permitir siempre", procesos en segundo plano,
+    plantillas y tests en 10 lenguajes, recetas ejecutables, /manual y
+    /evaluar comportamiento.
 
 v7.1 (bugs vistos en uso real)
   - Tool loop: con "2+2" obtenía 4 y repetía execute_command. La respuesta en
@@ -45,17 +61,17 @@ Clave:
     export OPENROUTER_API_KEY="tu_key"
 
 Ejecutar:
-    python3 reaper_v7.py                                  modo interactivo (/ayuda)
-    python3 reaper_v7.py --proyecto ~/mi_app              abre un workspace
-    python3 reaper_v7.py -p "agregá tests a utils.py"     un pedido y sale
-    python3 reaper_v7.py --construir "API de notas" --auto
-    python3 reaper_v7.py --autotest                       verifica REAPER sin gastar API
-    python3 reaper_v7.py --instalar                       crea el comando `reaper`
+    python3 reaper_v8.py                                  modo interactivo (/ayuda)
+    python3 reaper_v8.py --proyecto ~/mi_app              abre un workspace
+    python3 reaper_v8.py -p "agregá tests a utils.py"     un pedido y sale
+    python3 reaper_v8.py --construir "API de notas" --auto
+    python3 reaper_v8.py --autotest                       verifica REAPER sin gastar API
+    python3 reaper_v8.py --instalar                       crea el comando `reaper`
 """
 
 from __future__ import annotations
 
-__version__ = "7.1.0"
+__version__ = "8.0.0"
 __codename__ = "Dragón"
 
 import argparse

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-REAPER v7.1.0 «Dragón» — agente de programación autónomo para Termux vía OpenRouter
+REAPER v8.0.0 «Dragón» — agente de programación autónomo para Termux vía OpenRouter
 (estilo Claude Code / Codex / Antigravity, pensado para sacarle el máximo a un modelo de 24B).
 
 Archivo único generado desde partes/ con empaquetar.py.
@@ -18,6 +18,22 @@ QUÉ TRAE LA v7
      cuando el modelo se corta, esqueleto + relleno por función (replace_symbol).
   5. read_symbol / replace_symbol / find_references, mapa de archivos relevantes
      según el pedido, arreglos automáticos sin modelo, snapshots git por build.
+
+v8 (reparación con método, en vez de prueba y error)
+  - Guardia de regresión: una edición que deja los tests peor que el mejor
+    estado visto se revierte sola (en el chat y en /construir), y el modelo
+    recibe qué se revirtió y por qué. Antes, un "arreglo" podía llevar de 2
+    a 13 fallos y quedar aplicado.
+  - Modo forense (/forense, o automático al trabarse o antes de rendirse):
+    aísla cada test que falla, lo repite para detectar estado que persiste
+    entre corridas, compara la suite en orden directo e inverso, muestra
+    variables locales, fixtures y el árbol de llamadas con lo que devolvió
+    cada función, detecta archivos de datos que los tests escriben en el
+    proyecto, busca por bisección el cambio que introdujo una regresión y
+    pide hipótesis con experimentos que REAPER ejecuta de verdad.
+  - También: modo plan, "permitir siempre", procesos en segundo plano,
+    plantillas y tests en 10 lenguajes, recetas ejecutables, /manual y
+    /evaluar comportamiento.
 
 v7.1 (bugs vistos en uso real)
   - Tool loop: con "2+2" obtenía 4 y repetía execute_command. La respuesta en
@@ -45,17 +61,17 @@ Clave:
     export OPENROUTER_API_KEY="tu_key"
 
 Ejecutar:
-    python3 reaper_v7.py                                  modo interactivo (/ayuda)
-    python3 reaper_v7.py --proyecto ~/mi_app              abre un workspace
-    python3 reaper_v7.py -p "agregá tests a utils.py"     un pedido y sale
-    python3 reaper_v7.py --construir "API de notas" --auto
-    python3 reaper_v7.py --autotest                       verifica REAPER sin gastar API
-    python3 reaper_v7.py --instalar                       crea el comando `reaper`
+    python3 reaper_v8.py                                  modo interactivo (/ayuda)
+    python3 reaper_v8.py --proyecto ~/mi_app              abre un workspace
+    python3 reaper_v8.py -p "agregá tests a utils.py"     un pedido y sale
+    python3 reaper_v8.py --construir "API de notas" --auto
+    python3 reaper_v8.py --autotest                       verifica REAPER sin gastar API
+    python3 reaper_v8.py --instalar                       crea el comando `reaper`
 """
 
 from __future__ import annotations
 
-__version__ = "7.1.0"
+__version__ = "8.0.0"
 __codename__ = "Dragón"
 
 import argparse
@@ -22941,7 +22957,7 @@ def instalar_lanzador(ui: UI) -> Optional[Path]:
         return None
     carpeta_app = BASE_DIR / "app"
     carpeta_app.mkdir(parents=True, exist_ok=True)
-    destino = carpeta_app / "reaper_v7.py"
+    destino = carpeta_app / "reaper_v8.py"
     import py_compile
     try:
         if origen.resolve() != destino.resolve():
@@ -22959,8 +22975,8 @@ def instalar_lanzador(ui: UI) -> Optional[Path]:
         "# Lanzador de REAPER (generado por --instalar). Importa el módulo para usar el bytecode cacheado.\n"
         "import sys\n"
         f"sys.path.insert(0, {str(carpeta_app)!r})\n"
-        "import reaper_v7\n"
-        "sys.exit(reaper_v7.main())\n"
+        "import reaper_v8\n"
+        "sys.exit(reaper_v8.main())\n"
     )
     try:
         lanzador.write_text(contenido, encoding="utf-8")
@@ -23082,8 +23098,8 @@ recibe el pedido (que nombra los módulos y funciones esperados) y trabaja
 solo. Al terminar se agregan los tests OCULTOS y se corren. Así se compara
 Venice contra otros modelos, o el agente simple contra el torneo, con datos.
 
-    python3 reaper_v7.py --evaluar        todas las tareas
-    python3 reaper_v7.py --evaluar 5      las primeras 5
+    python3 reaper_v8.py --evaluar        todas las tareas
+    python3 reaper_v8.py --evaluar 5      las primeras 5
     /evaluar 3                            desde el REPL
 """
 
@@ -23526,7 +23542,7 @@ Salen de los bugs vistos en Termux:
   contar           pregunta sobre un archivo → pocas lecturas y respuesta correcta
   minimo           arreglar una función → no tocar las demás y pasar el test
 
-    python3 reaper_v7.py --comportamiento        todas
+    python3 reaper_v8.py --comportamiento        todas
     /evaluar comportamiento [id ...]              desde el REPL
 """
 
@@ -33262,11 +33278,11 @@ registrar_plantilla(
 # MÓDULO: autotest_base
 # ======================================================================
 """
-Autotest interno: `python3 reaper_v7.py --autotest` verifica REAPER sin gastar API.
+Autotest interno: `python3 reaper_v8.py --autotest` verifica REAPER sin gastar API.
 
 Todo corre en un entorno aislado (REAPER_HOME temporal), con UI silenciosa y
 MockLLM. Los tests que necesitan node, git o go se saltean si no están.
-Filtrar: REAPER_AUTOTEST=parser python3 reaper_v7.py --autotest
+Filtrar: REAPER_AUTOTEST=parser python3 reaper_v8.py --autotest
 """
 
 _RUTAS_GLOBALES = ("BASE_DIR", "PROJECTS_DIR", "CHECKPOINTS_DIR", "SESIONES_DIR", "LOGS_DIR", "CACHE_DIR",
@@ -35358,8 +35374,8 @@ class TestDoctor(BaseTest):
             if es_termux():
                 self.skipTest("en Termux el lanzador va a $PREFIX/bin")
             self.assertTrue(lanzador and lanzador.exists())
-            self.assertIn("import reaper_v7", lanzador.read_text())
-            self.assertTrue((BASE_DIR / "app" / "reaper_v7.py").exists())
+            self.assertIn("import reaper_v8", lanzador.read_text())
+            self.assertTrue((BASE_DIR / "app" / "reaper_v8.py").exists())
         finally:
             for k, v in anteriores.items():
                 if v is None:
@@ -39358,7 +39374,7 @@ capitulo("inicio", "Primeros pasos", """
     pkg update && pkg install python git nodejs     # git y node son opcionales pero recomendados
     pip install httpx pyflakes                      # opcionales: httpx (red más estable), pyflakes (validación)
     export OPENROUTER_API_KEY="tu_clave"            # ponelo en ~/.bashrc para no repetirlo
-    python3 reaper_v7.py --instalar                 # crea el comando `reaper`
+    python3 reaper_v8.py --instalar                 # crea el comando `reaper`
     ```
 
     ## Primer uso
@@ -39762,7 +39778,7 @@ def main(argv: Optional[list] = None) -> int:
         variable = settings.variable_clave() or "OPENROUTER_API_KEY"
         ui.error(f"Falta {variable}.")
         ui.tenue(f'  export {variable}="tu_key"      (agregalo a ~/.bashrc para no repetirlo)')
-        ui.tenue("  python3 reaper_v7.py --doctor    revisa todo el entorno")
+        ui.tenue("  python3 reaper_v8.py --doctor    revisa todo el entorno")
         return 1
 
     limpiar_sandboxes_viejos()

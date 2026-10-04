@@ -169,7 +169,7 @@ def instalar_lanzador(ui: UI) -> Optional[Path]:
         return None
     carpeta_app = BASE_DIR / "app"
     carpeta_app.mkdir(parents=True, exist_ok=True)
-    destino = carpeta_app / "reaper_v7.py"
+    destino = carpeta_app / "reaper_v8.py"
     import py_compile
     try:
         if origen.resolve() != destino.resolve():
@@ -187,8 +187,8 @@ def instalar_lanzador(ui: UI) -> Optional[Path]:
         "# Lanzador de REAPER (generado por --instalar). Importa el módulo para usar el bytecode cacheado.\n"
         "import sys\n"
         f"sys.path.insert(0, {str(carpeta_app)!r})\n"
-        "import reaper_v7\n"
-        "sys.exit(reaper_v7.main())\n"
+        "import reaper_v8\n"
+        "sys.exit(reaper_v8.main())\n"
     )
     try:
         lanzador.write_text(contenido, encoding="utf-8")

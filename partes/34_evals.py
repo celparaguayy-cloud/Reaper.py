@@ -6,8 +6,8 @@ recibe el pedido (que nombra los módulos y funciones esperados) y trabaja
 solo. Al terminar se agregan los tests OCULTOS y se corren. Así se compara
 Venice contra otros modelos, o el agente simple contra el torneo, con datos.
 
-    python3 reaper_v7.py --evaluar        todas las tareas
-    python3 reaper_v7.py --evaluar 5      las primeras 5
+    python3 reaper_v8.py --evaluar        todas las tareas
+    python3 reaper_v8.py --evaluar 5      las primeras 5
     /evaluar 3                            desde el REPL
 """
 
