@@ -1555,6 +1555,11 @@ class Settings:
 
     # --- v7: escalada a un modelo más fuerte --------------------------
     escalar: bool = True
+    # v8: revertir solo las ediciones que dejan los tests peor que el mejor estado visto
+    guardia_regresion: bool = True
+    # v8: modo forense (aislar tests, estado compartido, bisección, hipótesis con experimentos)
+    forense: bool = True
+    umbral_forense: int = 3
     modelo_fuerte: str = "deepseek"
     umbral_escalada: int = 2
 
@@ -7569,6 +7574,7 @@ class Contexto:
     notas_autofix: list = field(default_factory=list)
     permitidos: tuple = ()                          # globs de rutas escribibles (vacío = todas)
     llm: Any = None                                 # cliente del modelo (lo usa write_large_file)
+    ultimo_conteo: Any = None                       # ConteoTests del último run_tests (guardia de regresión)
 
     def tropiezo(self, tipo: str) -> None:
         if self.memoria is not None:
@@ -8176,6 +8182,7 @@ def run_tests(ctx: Contexto, p: dict) -> str:
     assert r is not None
     estado = "SIN TESTS" if r.omitido else ("PASARON" if r.ok else "FALLARON")
     conteo = conteo_de_resultado(r)
+    ctx.ultimo_conteo = conteo
     cabecera = f"Tests {estado} ({detectado[1]})" + (f": {conteo.texto()}" if conteo.reconocido else "") + "."
     if r.ok or r.omitido:
         return cabecera + "\n" + r.resumen(limite=1500)
@@ -9354,6 +9361,7 @@ _RE_FENCE_VACIO = re.compile(r"```[\w+-]*[ \t]*\n?\s*```")
 _RE_BLOQUE_CODIGO = re.compile(r"```[\w+-]*\n(.*?)```", re.S)
 
 HERRAMIENTAS_COMANDO = ("execute_command", "run_python", "run_tests")
+ROLES_CON_GUARDIA = ("principal", "implementador", "reparador", "escritor")
 HERRAMIENTAS_REUTILIZABLES = ("execute_command", "run_python", "run_tests", "validate", "fetch_url", "view_diff",
                               "project_map", "list_files", "search_files", "code_outline", "find_references")
 HERRAMIENTAS_LECTURA_BARATA = ("read_file", "read_symbol")
@@ -9519,6 +9527,13 @@ class Agente:
         self._pide_cambios = True
         self._pregunta_simple = False
         self._aviso_pendiente = ""
+        # v8: guardia de regresión y modo forense
+        self._guardia: Optional[dict] = None     # {"conteo", "firma", "estado": {rel: contenido|None}}
+        self._reversiones = 0
+        self._sin_progreso = 0
+        self._escrituras_en_test = 0
+        self._forense_hecho = False
+        self._cid_propio: Optional[int] = None
         self._finish_actual: Optional[str] = None
         self._ultima_llamada: Optional[Llamada] = None
 
@@ -9556,6 +9571,15 @@ class Agente:
         self._evidencias = []
         self._reusos_seguidos = 0
         self._ultima_salida_ok = ""
+        self._guardia = None
+        self._reversiones = 0
+        self._sin_progreso = 0
+        self._escrituras_en_test = 0
+        self._forense_hecho = False
+        if self.ctx.cid_inicio is None and self.rol.nombre in ROLES_CON_GUARDIA and not self.rol.solo_lectura:
+            # sin checkpoint del llamador: uno propio, para poder volver al mejor estado si algo empeora
+            self._cid_propio = self.ws.checkpoints.iniciar(f"agente {self.etiqueta}")
+            self.ctx.cid_inicio = self._cid_propio
 
         sin_herramienta = 0
         anuncios = 0
@@ -9659,9 +9683,13 @@ class Agente:
                 )
             if respuesta.finish_reason == "length" and not any("SEGUÍ DESDE" in o for o in observaciones):
                 observaciones.append("(Tu mensaje se cortó por longitud: escribí menos por mensaje.)")
-            diagnostico = self._quizas_escalar(observaciones)
-            if diagnostico:
-                observaciones.append(diagnostico)
+            informe_forense = self._quizas_forense()
+            if informe_forense:
+                observaciones.append(informe_forense)
+            else:
+                diagnostico = self._quizas_escalar(observaciones)
+                if diagnostico:
+                    observaciones.append(diagnostico)
             restantes = self.max_pasos - paso
             if 0 < restantes <= 3:
                 observaciones.append(f"(Te quedan {restantes} pasos: cerrá pronto con attempt_completion.)")
@@ -9709,6 +9737,11 @@ class Agente:
 
     # ------------------------------------------------------------ internos
     def _cerrar(self, resumen: str, pasos: int, motivo: str, ok: Optional[bool] = None) -> ResultadoAgente:
+        if self._cid_propio is not None:
+            self.ws.checkpoints.descartar_si_vacio(self._cid_propio)
+            if self.ctx.cid_inicio == self._cid_propio:
+                self.ctx.cid_inicio = None
+            self._cid_propio = None
         if ok is None:
             ok = motivo in ("completado", "respuesta")
             if self.ctx.cambios:
@@ -9828,6 +9861,8 @@ class Agente:
 
         self.ui.herramienta(self.etiqueta, nombre, resumen_params(nombre, llamada.params))
         version_antes = self._version() if nombre in ("execute_command", "run_python") else ""
+        if nombre == "run_tests":
+            self.ctx.ultimo_conteo = None
         error = False
         try:
             salida = h.fn(self.ctx, llamada.params)
@@ -9867,6 +9902,10 @@ class Agente:
         if nombre in ("run_tests", "validate", "execute_command", "run_python"):
             self._registrar_evidencia(nombre, self._estado_evidencia(nombre, llamada.params, salida, error),
                                       llamada.params.get("command", ""))
+        if nombre == "run_tests" and self.ctx.ultimo_conteo is not None:
+            nota_guardia = self._guardia_tras_tests(self.ctx.ultimo_conteo)
+            if nota_guardia:
+                salida += "\n\n" + nota_guardia
         if not error and nombre in ("execute_command", "run_python", "fetch_url"):
             self._ultima_salida_ok = salida
         if not h.escribe:
@@ -9881,6 +9920,154 @@ class Agente:
             salida += ("\n\n(Si este resultado ya responde lo que te preguntaron, respondé AHORA en texto, sin más "
                        "herramientas. No repitas el comando.)")
         return obs(aviso_relectura + salida, attrs), error
+
+    # ------------------------------------------------------------ guardia de regresión y forense (v8)
+    def _firma_tests(self) -> str:
+        """Huella del contenido de los archivos de tests: si cambian, los conteos no son comparables."""
+        h = hashlib.sha1()
+        for ruta in self.ws.iterar(limite=3000):
+            rel = self.ws.rel(ruta)
+            if any(fnmatch.fnmatch(rel, p) for p in PATRONES_TESTS):
+                try:
+                    h.update(rel.encode() + b"\0" + ruta.read_bytes())
+                except OSError:
+                    continue
+        return h.hexdigest()
+
+    def _archivos_seguidos(self) -> set:
+        rels = set(self.ctx.cambios)
+        if self.ctx.cid_inicio is not None:
+            rels |= set(self.ws.checkpoints.archivos_desde(self.ctx.cid_inicio))
+        if self._guardia:
+            rels |= set(self._guardia["estado"])
+        return rels
+
+    def _contenido(self, rel: str) -> Optional[str]:
+        ruta = self.ws.raiz / rel
+        try:
+            return ruta.read_text(encoding="utf-8", errors="replace") if ruta.is_file() else None
+        except OSError:
+            return None
+
+    def _guardia_tras_tests(self, conteo: "ConteoTests") -> str:
+        if (not self.settings.guardia_regresion or self.rol.nombre not in ROLES_CON_GUARDIA
+                or conteo is None or not conteo.reconocido):
+            return ""
+        escribio = self._escrituras > self._escrituras_en_test
+        self._escrituras_en_test = self._escrituras
+        firma = self._firma_tests()
+        rels = self._archivos_seguidos()
+        if self._guardia is None or self._guardia["firma"] != firma:
+            self._guardia = {"conteo": conteo, "firma": firma, "estado": {r: self._contenido(r) for r in rels}}
+            return ""
+        mejor = self._guardia["conteo"]
+        if es_mejor(conteo, mejor):
+            self._guardia.update(conteo=conteo, estado={r: self._contenido(r) for r in rels})
+            self._sin_progreso = 0
+            return ""
+        if es_peor(conteo, mejor):
+            revertidos, diff = self._revertir_a_mejor(rels)
+            if not revertidos:
+                return ""
+            self._reversiones += 1
+            self.ctx.tropiezo("regresion_revertida")
+            self.ui.aviso(f"  [{self.etiqueta}] ⟲ guardia de regresión: {conteo.texto()} es peor que {mejor.texto()}; "
+                          f"revierto {', '.join(revertidos[:4])}")
+            return (f"⟲ GUARDIA DE REGRESIÓN DE REAPER: tus cambios EMPEORARON los tests (mejor estado: {mejor.texto()}; "
+                    f"ahora: {conteo.texto()}). REVERTÍ esos cambios: {', '.join(revertidos)} volvieron al mejor estado. "
+                    "No repitas ese enfoque. Antes de editar otra vez: leé el test que falla y el código que ejecuta, y "
+                    "formulá UNA hipótesis concreta de la causa. Si necesitás cambiar varias cosas juntas, hacé todas las "
+                    "ediciones antes de correr run_tests.\nLo que se revirtió:\n" + recortar(diff, 2500))
+        if escribio:
+            self._sin_progreso += 1
+        return ""
+
+    def _revertir_a_mejor(self, rels: set) -> tuple[list, str]:
+        estado = self._guardia["estado"]
+        revertidos, diffs = [], []
+        for rel in sorted(rels):
+            if rel in estado:
+                objetivo = estado[rel]
+            elif self.ctx.cid_inicio is not None:
+                objetivo = self.ws.checkpoints.original(rel, self.ctx.cid_inicio)   # no se había tocado antes del mejor estado
+            else:
+                continue
+            actual = self._contenido(rel)
+            if objetivo == actual:
+                continue
+            try:
+                if objetivo is None:
+                    self.ws.borrar(rel)
+                else:
+                    self.ws.escribir(rel, objetivo)
+            except (OSError, ErrorRuta):
+                continue
+            try:
+                indice_de(self.ws).invalidar(rel)
+            except (OSError, ValueError):
+                pass
+            self._marcar_lecturas_viejas(rel)
+            revertidos.append(rel)
+            diffs.append(diff_unificado(objetivo or "", actual or "", rel))
+        if revertidos:
+            self._escrituras += 1
+        return revertidos, "\n".join(diffs)
+
+    def _ultimo_test_falla(self) -> bool:
+        tests = [e for e in self._evidencias if e[0] == "run_tests"]
+        return bool(tests) and tests[-1][1] == "fallo"
+
+    def _correr_forense(self, motivo: str) -> str:
+        self._forense_hecho = True
+        self.ctx.tropiezo("forense")
+        self.ui.aviso(f"  [{self.etiqueta}] {motivo}: activo el modo forense")
+        conteo = self.ctx.ultimo_conteo
+        modelo = resolver_modelo(self.settings.modelo_fuerte) if self.settings.escalar and \
+            self.settings.modelo_fuerte.strip() else None
+        try:
+            informe = investigar(self.ws, self.settings, self.ui, self.llm,
+                                 fallidos=(conteo.nombres_fallados if conteo else ()),
+                                 contexto="\n\n".join(self._errores_texto[-2:]), modelo=modelo)
+        except (OSError, ValueError, LLMError) as e:
+            self.ui.aviso(f"  [{self.etiqueta}] el modo forense falló: {e}")
+            return ""
+        return f"MODO FORENSE ({motivo}).\n" + informe.texto()
+
+    def _quizas_forense(self) -> str:
+        if (not self.settings.forense or self._forense_hecho or self.rol.nombre not in ROLES_CON_GUARDIA
+                or not self._ultimo_test_falla()):
+            return ""
+        repetido = self._errores.most_common(1)[0][1] if self._errores else 0
+        if self._reversiones >= 2:
+            return self._correr_forense("dos intentos empeoraron los tests")
+        if self._sin_progreso >= 3:
+            return self._correr_forense("tres intentos sin mejorar los tests")
+        if repetido >= max(2, self.settings.umbral_forense):
+            return self._correr_forense("el mismo error se repite")
+        return ""
+
+    def _forense_antes_de_rendirse(self) -> str:
+        """Si el agente intentó arreglar algo y quiere terminar con tests fallando: primero, investigación forense."""
+        if not self.settings.forense or self._forense_hecho or self.rol.nombre not in ROLES_CON_GUARDIA \
+                or self._escrituras == 0:
+            return ""
+        corridas = [e for e in self._evidencias if e[0] == "run_tests"]
+        if not corridas:
+            return ""
+        if corridas[-1][2] < self._escrituras:
+            # editó después de la última corrida: lo que vale es el estado de AHORA
+            conteo = conteo_actual(self.ws, self.settings.tests_timeout)
+            if not conteo.reconocido or not (conteo.fallados or conteo.errores):
+                return ""
+            self.ctx.ultimo_conteo = conteo
+        elif corridas[-1][1] != "fallo":
+            return ""
+        informe = self._correr_forense("quiere terminar con tests fallando")
+        if not informe:
+            return ""
+        return ("Antes de rendirte: los tests siguen fallando, así que REAPER investigó con método. "
+                "Usá esta evidencia para encontrar la causa raíz y arreglarla (o explicá con precisión qué la causa "
+                "si no se puede arreglar desde acá).\n\n" + informe)
 
     # ------------------------------------------------------------ anti-bucles y evidencias (v7.1)
     def _version(self) -> str:
@@ -10015,6 +10202,10 @@ class Agente:
                 self._aviso_pendiente = ("Antes de responder: la validación REAL de los archivos que cambiaste falla:\n"
                                          + anexar_pistas(resumen_validacion(resultados), 2))
                 return None
+        forense = self._forense_antes_de_rendirse()
+        if forense:
+            self._aviso_pendiente = forense
+            return None
         motivo = self._falta_evidencia(texto)
         if motivo and self._rechazos < 2 and not sin_tools:
             self._rechazos += 1
@@ -10223,6 +10414,9 @@ class Agente:
                         + ", ".join(vacias[:8]) + ". Implementalas con replace_symbol antes de terminar "
                         "(si alguna es intencional, explicá por qué en el informe y volvé a cerrar)."
                     ), False
+        forense = self._forense_antes_de_rendirse()
+        if forense:
+            return False, obs(forense), False
         motivo = self._falta_evidencia(informe)
         if motivo and self._rechazos < 3:
             self._rechazos += 1
@@ -11248,6 +11442,530 @@ def tarea_con_diagnostico(tarea: str, diagnostico: str) -> str:
 
 
 # ======================================================================
+# MÓDULO: forense
+# ======================================================================
+"""
+MODO FORENSE (v8): cuando la reparación no encuentra la causa raíz, en vez de seguir probando cambios al azar
+(lo que con un modelo de 24B suele EMPEORAR las cosas: 2 fallos → 13), REAPER investiga con método:
+
+  1. AISLAR     corre cada test que falla SOLO y la suite en orden INVERSO:
+                  - falla solo            → bug en el código o en ese test
+                  - pasa solo y falla en la suite, o cambia con el orden → ESTADO COMPARTIDO entre tests
+                    (archivo/DB en ruta fija, variable global, caché, fixture sin limpiar)
+  2. EVIDENCIA  ejecuta el test con un arnés que captura el traceback con las VARIABLES LOCALES de cada
+                frame del proyecto y los archivos que el test crea o modifica dentro del proyecto
+  3. BISECCIÓN  si hay un "mejor estado" anterior, revierte archivo por archivo y bloque por bloque para
+                encontrar QUÉ CAMBIO introdujo la regresión (siempre deja el proyecto como estaba)
+  4. HIPÓTESIS  pide al modelo 2-3 hipótesis, cada una con un EXPERIMENTO (código que imprime algo que la
+                confirma o la descarta), REAPER corre los experimentos y le devuelve los resultados reales
+  5. CONCLUSIÓN causa raíz respaldada por evidencia + arreglo propuesto
+
+El informe entra al contexto del agente y queda en .reaper/forense/.
+"""
+
+_MARCA_FORENSE = "@@REAPER_FORENSE@@"
+
+ARNES_UNITTEST = r'''
+import contextlib, io, json, os, reprlib, sys, traceback, unittest
+raiz = os.getcwd()
+for d in (raiz, os.path.join(raiz, "tests"), os.path.join(raiz, "test")):
+    if os.path.isdir(d) and d not in sys.path:
+        sys.path.insert(0, d)
+repr_corto = reprlib.Repr()
+repr_corto.maxstring, repr_corto.maxother, repr_corto.maxlist, repr_corto.maxdict = 160, 160, 8, 8
+IGNORAR = {"self", "__builtins__", "__class__"}
+
+def foto():
+    estado = {}
+    for base, dirs, archivos in os.walk(raiz):
+        dirs[:] = [d for d in dirs if d not in (".git", ".reaper", "__pycache__", "node_modules", ".pytest_cache")]
+        for a in archivos:
+            ruta = os.path.join(base, a)
+            try:
+                st = os.stat(ruta)
+            except OSError:
+                continue
+            estado[os.path.relpath(ruta, raiz)] = (st.st_size, st.st_mtime_ns)
+    return estado
+
+class Resultado(unittest.TestResult):
+    def __init__(self):
+        super().__init__()
+        self.detalles = []
+    def _guardar(self, test, err, tipo):
+        frames = []
+        for frame, linea in traceback.walk_tb(err[2]):
+            archivo = frame.f_code.co_filename
+            if not archivo.startswith(raiz) or "/unittest/" in archivo:
+                continue
+            locales = {}
+            for k, v in list(frame.f_locals.items())[:25]:
+                if k in IGNORAR or k.startswith("__"):
+                    continue
+                try:
+                    texto = repr_corto.repr(v)
+                    if " object at 0x" in texto and hasattr(v, "__dict__"):
+                        # repr genérico: se muestran los atributos, que es lo que sirve para diagnosticar
+                        atributos = {a: b for a, b in vars(v).items() if not a.startswith("__")}
+                        texto = type(v).__name__ + repr_corto.repr(atributos)
+                    locales[k] = texto
+                except Exception as e:
+                    locales[k] = f"<repr falló: {type(e).__name__}>"
+            frames.append({"archivo": os.path.relpath(archivo, raiz), "linea": linea, "funcion": frame.f_code.co_name,
+                           "locales": locales})
+        self.detalles.append({"test": test.id(), "tipo": tipo, "error": "".join(traceback.format_exception_only(err[0], err[1])).strip(),
+                              "frames": frames[-4:]})
+    def addFailure(self, test, err):
+        super().addFailure(test, err); self._guardar(test, err, "fallo")
+    def addError(self, test, err):
+        super().addError(test, err); self._guardar(test, err, "error")
+
+def aplanar(suite):
+    for t in suite:
+        if isinstance(t, unittest.TestSuite):
+            yield from aplanar(t)
+        else:
+            yield t
+
+def correr(tests):
+    r = Resultado()
+    salida = io.StringIO()
+    with contextlib.redirect_stdout(salida), contextlib.redirect_stderr(salida):
+        for t in tests:
+            t.run(r)
+    return r, salida.getvalue()
+
+modo, argumento = sys.argv[1], json.loads(sys.argv[2])
+cargador = unittest.TestLoader()
+informe = {}
+if modo == "aislar":
+    informe["tests"] = []
+    for nombre in argumento:
+        try:
+            tests = list(aplanar(cargador.loadTestsFromName(nombre)))
+        except Exception as e:
+            informe["tests"].append({"nombre": nombre, "estado": "no_cargo", "detalle": repr(e)[:300]})
+            continue
+        antes = foto()
+        r, texto = correr(tests)
+        despues = foto()
+        cambiados = sorted(k for k in set(antes) | set(despues) if antes.get(k) != despues.get(k))
+        estado = "pasa" if r.wasSuccessful() else ("error" if r.errors else "falla")
+        informe["tests"].append({"nombre": nombre, "estado": estado, "detalles": r.detalles,
+                                 "archivos_tocados": cambiados[:20], "salida": texto[-800:]})
+elif modo == "orden":
+    base = argumento.get("base") or ("tests" if os.path.isdir("tests") else ".")
+    tests = list(aplanar(cargador.discover(base, top_level_dir=None)))
+    if argumento.get("inverso"):
+        tests.reverse()
+    resultado, _ = correr(tests)
+    informe = {"total": len(tests), "fallan": sorted({d["test"] for d in resultado.detalles})}
+print("@@REAPER_FORENSE@@" + json.dumps(informe, ensure_ascii=False))
+'''
+
+
+@dataclass
+class Hipotesis:
+    texto: str
+    experimento: str
+    esperado: str
+    resultado: str = ""
+    estado: str = "sin probar"     # confirmada | descartada | no concluyente | no ejecutada
+
+
+@dataclass
+class InformeForense:
+    fallidos: list = field(default_factory=list)
+    aislados: list = field(default_factory=list)           # dicts del arnés
+    dependientes_de_orden: list = field(default_factory=list)
+    archivos_tocados_por_tests: list = field(default_factory=list)
+    inestables: list = field(default_factory=list)          # el mismo test da otro error al repetirlo
+    culpables: list = field(default_factory=list)          # textos con el cambio que introdujo la regresión
+    hipotesis: list = field(default_factory=list)
+    conclusion: str = ""
+    notas: list = field(default_factory=list)
+    ruta: Optional[Path] = None
+
+    def texto(self, limite: int = 7000) -> str:
+        partes = ["INFORME FORENSE DE REAPER (evidencia real, no suposiciones)"]
+        if self.fallidos:
+            partes.append("Tests que fallan: " + ", ".join(self.fallidos[:10]))
+        if self.dependientes_de_orden:
+            partes.append("⚠ DEPENDENCIA DE ORDEN / ESTADO COMPARTIDO: " + ", ".join(self.dependientes_de_orden[:8]) +
+                          "\n  Pasan solos (o cambian según el orden) pero fallan en la suite: un test deja estado que "
+                          "afecta a otro (archivo o base de datos en una ruta fija, variable global, caché, datos de "
+                          "clase mutables, un fixture que no se limpia). Buscá ESO, no cambies la lógica a ciegas.")
+        if self.inestables:
+            partes.append("⚠ RESULTADO DISTINTO ENTRE CORRIDAS IDÉNTICAS (sin cambiar código):\n  " +
+                          "\n  ".join(self.inestables[:3]) +
+                          "\n  Hay estado que PERSISTE entre corridas (casi siempre un archivo o base de datos que los "
+                          "tests escriben en una ruta fija y nunca limpian): por eso los números crecen corrida a corrida. "
+                          "La corrección suele ser que cada test use su propia carpeta temporal (tempfile) y la borre.")
+        if self.archivos_tocados_por_tests:
+            datos = [r for r in self.archivos_tocados_por_tests
+                     if r.endswith((".db", ".sqlite", ".sqlite3", ".json", ".csv", ".txt", ".log", ".dat", ".bin", ".pkl"))]
+            partes.append("Archivos del PROYECTO que los tests crean o modifican al correr: " +
+                          ", ".join(self.archivos_tocados_por_tests[:10]) +
+                          "\n  (un test que escribe en el proyecto en vez de en una carpeta temporal contamina a los demás"
+                          + (f"; {', '.join(datos[:4])} parecen datos que se ACUMULAN entre corridas" if datos else "") + ")")
+        for a in self.aislados[:4]:
+            linea = f"- {a.get('nombre')}: SOLO → {a.get('estado')}"
+            for d in (a.get("detalles") or [])[:1]:
+                linea += f"\n  {d.get('error', '')[:400]}"
+                for fr in d.get("frames", [])[-3:]:
+                    locales = ", ".join(f"{k}={v}" for k, v in list(fr.get("locales", {}).items())[:8])
+                    linea += f"\n    en {fr['archivo']}:{fr['linea']} ({fr['funcion']}): {locales}"
+            partes.append(linea)
+        if self.culpables:
+            partes.append("CAMBIO QUE INTRODUJO LA REGRESIÓN (encontrado por bisección):\n" + "\n".join(self.culpables[:3]))
+        for i, h in enumerate(self.hipotesis, 1):
+            partes.append(f"H{i} [{h.estado.upper()}]: {h.texto}\n  experimento → {recortar(h.resultado or '(no se ejecutó)', 500)}")
+        if self.conclusion:
+            partes.append("CONCLUSIÓN:\n" + self.conclusion)
+        if self.notas:
+            partes.append("Notas: " + "; ".join(self.notas))
+        partes.append("Siguiente paso: arreglá la causa que muestra la evidencia con el cambio MÍNIMO y corré run_tests. "
+                      "Si un cambio empeora los tests, REAPER lo revierte solo.")
+        return recortar("\n\n".join(partes), limite)
+
+
+def _correr_arnes(ws: Workspace, modo: str, argumento, timeout: int = 120) -> Optional[dict]:
+    with tempfile.NamedTemporaryFile("w", suffix="_arnes.py", delete=False, encoding="utf-8") as f:
+        f.write(ARNES_UNITTEST)
+        ruta = f.name
+    try:
+        r = ejecutar([sys.executable, ruta, modo, json.dumps(argumento)], cwd=ws.raiz, timeout=timeout)
+    finally:
+        try:
+            os.unlink(ruta)
+        except OSError:
+            pass
+    salida = r.stdout or ""
+    if _MARCA_FORENSE not in salida:
+        return None
+    try:
+        return json.loads(salida.split(_MARCA_FORENSE, 1)[1].strip().splitlines()[0])
+    except (ValueError, IndexError):
+        return None
+
+
+def es_proyecto_unittest(ws: Workspace) -> bool:
+    detectado = detectar_comando_tests(ws, completo=True)
+    return bool(detectado) and detectado[1] in ("unittest", "pytest")
+
+
+def nombres_para_unittest(nombres: Iterable[str]) -> list[str]:
+    """'test_calc.T.test_suma' tal cual; 'tests/test_calc.py::T::test_suma' (pytest) → 'test_calc.T.test_suma'."""
+    salida = []
+    for n in nombres:
+        n = n.strip()
+        if "::" in n:
+            archivo, _, resto = n.partition("::")
+            modulo = Path(archivo).with_suffix("").name
+            n = ".".join([modulo] + [p for p in resto.split("::") if p and "[" not in p])
+        if re.fullmatch(r"[\w.]+", n) and n not in salida:
+            salida.append(n)
+    return salida
+
+
+def conteo_actual(ws: Workspace, timeout: int = 300) -> ConteoTests:
+    return conteo_de_resultado(ejecutar_tests(ws, timeout=timeout, completo=True))
+
+
+def _malos(c: ConteoTests) -> int:
+    return c.fallados + c.errores
+
+
+def es_peor(despues: ConteoTests, antes: ConteoTests) -> bool:
+    """¿El resultado de tests empeoró? (más fallos/errores o menos tests que pasan)."""
+    if not (despues.reconocido and antes.reconocido):
+        return False
+    return _malos(despues) > _malos(antes) or despues.pasados < antes.pasados
+
+
+def es_mejor(despues: ConteoTests, antes: ConteoTests) -> bool:
+    if not (despues.reconocido and antes.reconocido):
+        return False
+    return (_malos(despues) < _malos(antes) and despues.pasados >= antes.pasados) or \
+        (_malos(despues) == _malos(antes) and despues.pasados > antes.pasados)
+
+
+def biseccion(ws: Workspace, estado_bueno: dict, timeout: int = 300, max_archivos: int = 6,
+              max_bloques: int = 10) -> list[str]:
+    """
+    estado_bueno: {rel: contenido o None} de un momento con MENOS fallos. Revierte archivo por archivo y,
+    en el culpable, bloque por bloque, para encontrar el cambio que introdujo la regresión.
+    El proyecto SIEMPRE queda como estaba al empezar.
+    """
+    actuales: dict[str, Optional[str]] = {}
+    for rel in estado_bueno:
+        ruta = ws.raiz / rel
+        actuales[rel] = ruta.read_text(encoding="utf-8", errors="replace") if ruta.is_file() else None
+    cambiados = [rel for rel in estado_bueno if estado_bueno[rel] != actuales[rel]][:max_archivos]
+    if not cambiados:
+        return []
+    base = conteo_actual(ws, timeout)
+    culpables = []
+
+    def poner(rel: str, contenido: Optional[str]) -> None:
+        ruta = ws.raiz / rel
+        if contenido is None:
+            if ruta.exists():
+                ruta.unlink()
+        else:
+            escritura_atomica(ruta, contenido)
+
+    try:
+        for rel in cambiados:
+            poner(rel, estado_bueno[rel])
+            probado = conteo_actual(ws, timeout)
+            poner(rel, actuales[rel])
+            if not es_mejor(probado, base):
+                continue
+            antes, despues = (estado_bueno[rel] or ""), (actuales[rel] or "")
+            a_lineas, d_lineas = antes.splitlines(keepends=True), despues.splitlines(keepends=True)
+            grupos = [op for op in difflib.SequenceMatcher(None, a_lineas, d_lineas).get_opcodes() if op[0] != "equal"]
+            encontrado = False
+            for tag, i1, i2, j1, j2 in grupos[:max_bloques]:
+                version = "".join(d_lineas[:j1] + a_lineas[i1:i2] + d_lineas[j2:])
+                poner(rel, version)
+                probado_bloque = conteo_actual(ws, timeout)
+                poner(rel, actuales[rel])
+                if es_mejor(probado_bloque, base):
+                    quitado = "".join("- " + l for l in a_lineas[i1:i2])
+                    agregado = "".join("+ " + l for l in d_lineas[j1:j2])
+                    culpables.append(f"{rel} (líneas {j1 + 1}-{max(j1 + 1, j2)} actuales): revertir este bloque mejora "
+                                     f"de {base.texto()} a {probado_bloque.texto()}\n{quitado}{agregado}".rstrip())
+                    encontrado = True
+            if not encontrado:
+                culpables.append(f"{rel}: revertir el archivo entero mejora de {base.texto()} a {probado.texto()} "
+                                 "(el problema está en la combinación de varios bloques)")
+    finally:
+        for rel, contenido in actuales.items():
+            poner(rel, contenido)
+    return culpables
+
+
+_RE_HIPOTESIS = re.compile(
+    r"H\d+\s*[:.)-]\s*(?P<texto>.+?)\n\s*EXPERIMENTO\s*:?\s*\n?```(?:python)?\s*\n(?P<codigo>.*?)```\s*"
+    r"(?:SI ES VERDAD|SI ES CIERTA|ESPERADO)\s*:?\s*(?P<esperado>[^\n]*)",
+    re.S | re.I,
+)
+_INSEGURO = re.compile(r"\b(shutil\.rmtree|os\.remove|os\.unlink|os\.rmdir|os\.system|subprocess|socket|urllib|requests|"
+                       r"http\.client|ftplib|smtplib|__import__\(['\"]os['\"]\)\.system|\.unlink\(|rmtree)\b")
+
+PROMPT_HIPOTESIS = """Sos un depurador experto. Un modelo más chico no encuentra la causa de este fallo.
+No propongas un arreglo todavía: proponé de 2 a 3 HIPÓTESIS distintas sobre la causa raíz, cada una con un
+EXPERIMENTO corto en Python (se ejecuta en la raíz del proyecto; puede importar los módulos del proyecto)
+que IMPRIMA algo que la confirme o la descarte. Nada de borrar archivos ni usar la red.
+
+Formato EXACTO para cada una:
+H1: <hipótesis concreta>
+EXPERIMENTO:
+```python
+<código>
+```
+SI ES VERDAD: <qué imprimiría>
+
+EVIDENCIA RECOGIDA POR REAPER:
+{evidencia}
+
+CÓDIGO RELEVANTE:
+{codigo}
+"""
+
+PROMPT_CONCLUSION = """Estos son los resultados REALES de los experimentos:
+{resultados}
+
+Con esa evidencia escribí:
+CAUSA RAÍZ: <una o dos frases, solo lo que la evidencia respalda>
+ARREGLO: <cambio mínimo y exacto: archivo, función y qué cambiar>
+"""
+
+
+def _codigo_relevante(ws: Workspace, informe: InformeForense, limite: int = 6000) -> str:
+    archivos: list[str] = []
+    for a in informe.aislados:
+        for d in a.get("detalles") or []:
+            for fr in d.get("frames", []):
+                if fr["archivo"] not in archivos:
+                    archivos.append(fr["archivo"])
+    partes, usado = [], 0
+    for rel in archivos[:4]:
+        try:
+            texto = ws.leer(rel)
+        except (OSError, ErrorRuta, ValueError):
+            continue
+        bloque = f"### {rel}\n" + recortar(texto, 2500)
+        if usado + len(bloque) > limite:
+            break
+        partes.append(bloque)
+        usado += len(bloque)
+    return "\n\n".join(partes) or "(no se pudo ubicar código del proyecto en el traceback)"
+
+
+def correr_experimento(ws: Workspace, codigo: str, timeout: int = 30) -> tuple[bool, str]:
+    if _INSEGURO.search(codigo) or comando_bloqueado(codigo):
+        return False, "no ejecutado: el experimento hace algo inseguro (borrar, procesos o red)"
+    r = ejecutar([sys.executable, "-"], cwd=ws.raiz, timeout=timeout, entrada=codigo)
+    texto = (r.stdout + ("\n" + r.stderr if r.stderr.strip() else "")).strip()
+    return True, recortar(texto or f"(sin salida, exit {r.codigo})", 1500)
+
+
+class FotoProyecto:
+    """Guarda los archivos chicos del proyecto y al salir deshace lo que hayan cambiado las corridas de tests."""
+
+    def __init__(self, ws: Workspace, max_bytes: int = 2_000_000, limite: int = 3000):
+        self.ws = ws
+        self.max_bytes = max_bytes
+        self.limite = limite
+        self.contenidos: dict[str, bytes] = {}
+        self.restaurados: list[str] = []
+
+    def __enter__(self) -> "FotoProyecto":
+        for ruta in self.ws.iterar(limite=self.limite):
+            try:
+                if ruta.stat().st_size <= self.max_bytes:
+                    self.contenidos[self.ws.rel(ruta)] = ruta.read_bytes()
+            except OSError:
+                continue
+        return self
+
+    def __exit__(self, *exc) -> None:
+        actuales = {self.ws.rel(r) for r in self.ws.iterar(limite=self.limite)}
+        for rel in sorted(actuales - set(self.contenidos)):
+            if rel.startswith(".reaper/"):
+                continue
+            try:
+                (self.ws.raiz / rel).unlink()
+                self.restaurados.append(f"{rel} (creado por los tests, borrado)")
+            except OSError:
+                pass
+        for rel, contenido in self.contenidos.items():
+            ruta = self.ws.raiz / rel
+            try:
+                if not ruta.is_file() or ruta.read_bytes() != contenido:
+                    ruta.parent.mkdir(parents=True, exist_ok=True)
+                    ruta.write_bytes(contenido)
+                    self.restaurados.append(rel)
+            except OSError:
+                pass
+
+
+def investigar(ws: Workspace, settings: Settings, ui: UI, llm=None, *, fallidos: Iterable[str] = (),
+               estado_bueno: Optional[dict] = None, contexto: str = "", con_hipotesis: bool = True,
+               modelo: Optional[str] = None) -> InformeForense:
+    """Ejecuta el modo forense completo y devuelve el informe (también lo guarda en .reaper/forense/)."""
+    informe = InformeForense()
+    ui.linea(f"{Tema.acento}🔎 modo forense:{C.RESET} {Tema.tenue}investigo el fallo con experimentos en vez de "
+             f"seguir probando cambios{C.RESET}")
+    with FotoProyecto(ws) as foto:   # ni las corridas ni los experimentos pueden dejar cambios en el proyecto
+        _investigar_con_corridas(ws, settings, informe, fallidos, estado_bueno)
+        _hipotesis_y_conclusion(ws, informe, llm, contexto, con_hipotesis, modelo)
+    if foto.restaurados:
+        informe.notas.append("la investigación dejó el proyecto como estaba (restauré: "
+                             + ", ".join(foto.restaurados[:6]) + ")")
+    try:
+        carpeta = ws.raiz / ".reaper" / "forense"
+        carpeta.mkdir(parents=True, exist_ok=True)
+        informe.ruta = carpeta / f"forense_{datetime.now():%Y%m%d_%H%M%S}.md"
+        escritura_atomica(informe.ruta, informe.texto(20000) + "\n")
+    except OSError:
+        informe.ruta = None
+    ui.tenue(f"  🔎 informe forense listo ({len(informe.hipotesis)} hipótesis, "
+             f"{len(informe.dependientes_de_orden)} dependencias de orden, {len(informe.inestables)} inestables, "
+             f"{len(informe.culpables)} culpables)")
+    return informe
+
+
+def _investigar_con_corridas(ws: Workspace, settings: Settings, informe: InformeForense, fallidos, estado_bueno) -> None:
+    if not fallidos:
+        conteo = conteo_actual(ws, settings.tests_timeout)
+        fallidos = conteo.nombres_fallados
+    informe.fallidos = list(fallidos)[:20]
+
+    if es_proyecto_unittest(ws):
+        nombres = nombres_para_unittest(informe.fallidos)[:6]
+        for nombre in nombres:
+            # cada test en SU proceso: el estado en memoria de uno no contamina al otro
+            aislado = _correr_arnes(ws, "aislar", [nombre], timeout=settings.tests_timeout)
+            if not aislado or not aislado.get("tests"):
+                informe.notas.append(f"no pude aislar {nombre}")
+                continue
+            t = aislado["tests"][0]
+            informe.aislados.append(t)
+            if t.get("estado") == "pasa":
+                informe.dependientes_de_orden.append(t["nombre"])
+            for rel in t.get("archivos_tocados", []):
+                if rel not in informe.archivos_tocados_por_tests and not rel.endswith(".pyc"):
+                    informe.archivos_tocados_por_tests.append(rel)
+        if informe.aislados:
+            # la misma prueba otra vez, sin tocar el código: si el resultado cambia, hay estado que persiste
+            primero = informe.aislados[0]
+            otra = _correr_arnes(ws, "aislar", [primero["nombre"]], timeout=settings.tests_timeout)
+            segundo = ((otra or {}).get("tests") or [{}])[0]
+
+            def resumen(t: dict) -> str:
+                error = ((t.get("detalles") or [{}])[0]).get("error", "")
+                return f"{t.get('estado', '?')}" + (f" ({error[:150]})" if error else "")
+
+            if otra and resumen(primero) != resumen(segundo):
+                informe.inestables.append(f"{primero['nombre']}: 1ª corrida → {resumen(primero)} | "
+                                          f"2ª corrida → {resumen(segundo)}")
+        directo = _correr_arnes(ws, "orden", {"inverso": False}, timeout=settings.tests_timeout)
+        inverso = _correr_arnes(ws, "orden", {"inverso": True}, timeout=settings.tests_timeout)
+        if directo and inverso and set(directo["fallan"]) != set(inverso["fallan"]):
+            for n in sorted(set(directo["fallan"]) ^ set(inverso["fallan"])):
+                if n not in informe.dependientes_de_orden:
+                    informe.dependientes_de_orden.append(n)
+            informe.notas.append(f"en orden directo fallan {len(directo['fallan'])} y en orden inverso "
+                                 f"{len(inverso['fallan'])}: el resultado depende del orden")
+    else:
+        informe.notas.append("aislamiento detallado solo para Python (unittest/pytest); se usa el conteo general")
+
+    if estado_bueno:
+        try:
+            informe.culpables = biseccion(ws, estado_bueno, timeout=settings.tests_timeout)
+        except (OSError, ValueError) as e:
+            informe.notas.append(f"la bisección falló: {e}")
+
+
+def _hipotesis_y_conclusion(ws: Workspace, informe: InformeForense, llm, contexto: str, con_hipotesis: bool,
+                            modelo: Optional[str]) -> None:
+    if con_hipotesis and llm is not None:
+        evidencia = informe.texto(4000)
+        if contexto:
+            evidencia = recortar(contexto, 1500) + "\n\n" + evidencia
+        try:
+            respuesta = llm.chat_simple(PROMPT_HIPOTESIS.format(evidencia=evidencia, codigo=_codigo_relevante(ws, informe)),
+                                        modelo=modelo, temperatura=0.2, max_tokens=1800, rol="consultor")
+        except LLMError as e:
+            respuesta = ""
+            informe.notas.append(f"no pude pedir hipótesis: {e}")
+        for m in list(_RE_HIPOTESIS.finditer(respuesta or ""))[:3]:
+            h = Hipotesis(m.group("texto").strip(), m.group("codigo").strip(), m.group("esperado").strip())
+            ejecutado, salida = correr_experimento(ws, h.experimento)
+            h.resultado = salida
+            if not ejecutado:
+                h.estado = "no ejecutada"
+            elif h.esperado and h.esperado.strip("`'\" ").lower() in salida.lower():
+                h.estado = "confirmada"
+            elif "Traceback" in salida:
+                h.estado = "no concluyente"
+            else:
+                h.estado = "descartada?"
+            informe.hipotesis.append(h)
+        if informe.hipotesis:
+            resultados = "\n\n".join(f"H{i}: {h.texto}\nEXPERIMENTO:\n{h.experimento}\nSALIDA REAL:\n{h.resultado}"
+                                     for i, h in enumerate(informe.hipotesis, 1))
+            try:
+                informe.conclusion = (llm.chat_simple(PROMPT_CONCLUSION.format(resultados=resultados), modelo=modelo,
+                                                      temperatura=0.1, max_tokens=900, rol="consultor") or "").strip()
+            except LLMError as e:
+                informe.notas.append(f"no pude pedir la conclusión: {e}")
+
+
+# ======================================================================
 # MÓDULO: git
 # ======================================================================
 """
@@ -11560,6 +12278,13 @@ def dividir_por_interfaz(plan: Plan) -> Plan:
         tareas.append(Tarea(str(n), f"Implementá {rel} según la INTERFAZ del plan:\n{detalle}\n"
                                     f"Contexto general: {recortar(plan.objetivo, 300)}", [rel]))
     return Plan(plan.objetivo, tareas, plan.criterios, plan.texto, plan.interfaz)
+
+
+def verificacion_peor(despues: "Verificacion", antes: "Verificacion") -> bool:
+    """¿La verificación empeoró? Más validaciones rotas, o tests peores (más fallos o menos que pasan)."""
+    if len(fallos(despues.validaciones)) > len(fallos(antes.validaciones)):
+        return True
+    return es_peor(despues.conteo, antes.conteo)
 
 
 def veredicto(informe: str) -> tuple[bool, bool]:
@@ -11896,6 +12621,8 @@ class Orquestador:
         fallos_seguidos = 0
         intento = 0
         intentos_txt: list[str] = []
+        forense_hecho = False
+        informe_forense = ""
         while not verif.ok and intento < max_intentos:
             firma = _firma_error(verif.diagnostico)
             if diagnosticos_vistos.count(firma) >= 3:
@@ -11910,17 +12637,43 @@ class Orquestador:
                 if experto:
                     informe.escaladas += 1
                     fallos_seguidos = 0
-            self.ui.titulo(f"REPARACIÓN {etiqueta} {intento}/{max_intentos}" + (" · con experto" if experto else ""))
+            if (fallos_seguidos >= 1 and not forense_hecho and self.settings.forense
+                    and verif.tests is not None and not verif.tests.ok):
+                # el primer intento no alcanzó: antes de seguir probando, investigar con método
+                forense_hecho = True
+                try:
+                    informe_forense = investigar(
+                        self.ws, self.settings, self.ui, self.llm, fallidos=verif.conteo.nombres_fallados,
+                        contexto=verif.diagnostico,
+                        modelo=self.escalador.modelo if self.escalador.disponible() else None).texto()
+                    informe.notas.append(f"{etiqueta}: se usó el modo forense")
+                except (OSError, ValueError, LLMError) as e:
+                    self.ui.aviso(f"  el modo forense falló: {e}")
+            self.ui.titulo(f"REPARACIÓN {etiqueta} {intento}/{max_intentos}" + (" · con experto" if experto else "")
+                           + (" · con informe forense" if informe_forense else ""))
             rcid = self.ws.checkpoints.iniciar(f"reparación {etiqueta} {intento}", grupo=grupo)
             antes = verif
-            res = self.reparar(pedido, verif, rcid, base_fallaba, experto, contexto)
+            contexto_intento = contexto + (f"\n\n{informe_forense}" if informe_forense else "")
+            if intentos_txt:
+                contexto_intento += ("\n\nINTENTOS ANTERIORES QUE NO FUNCIONARON (no los repitas; entendé por qué fallaron):\n"
+                                     + "\n---\n".join(intentos_txt[-2:]))
+            res = self.reparar(pedido, verif, rcid, base_fallaba, experto, contexto_intento.strip())
             intentos_txt.append(recortar(res.resumen, 1200))
             verif = verificador()
             self._mostrar_verificacion(verif)
             if verif.ok:
                 self._aprender(antes.diagnostico, rcid, res.resumen, informe)
-            else:
-                fallos_seguidos += 1
+                continue
+            fallos_seguidos += 1
+            if self.settings.guardia_regresion and verificacion_peor(verif, antes):
+                # el intento EMPEORÓ las cosas (2 fallos → 13): se revierte entero y se sigue desde lo que había
+                revertidos = self.ws.checkpoints.deshacer(rcid)
+                self.ui.aviso(f"  ⟲ el intento {intento} empeoró la verificación ({antes.conteo.texto()} → "
+                              f"{verif.conteo.texto()}): lo revierto ({', '.join(revertidos[:5]) or 'sin archivos'})")
+                informe.notas.append(f"{etiqueta}: se revirtió el intento {intento} porque empeoró los tests")
+                intentos_txt[-1] += (f"\n(ESTE INTENTO EMPEORÓ LOS TESTS de {antes.conteo.texto()} a "
+                                     f"{verif.conteo.texto()} y se revirtió: no lo repitas)")
+                verif = antes
         return verif
 
     # ------------------------------------------------------------ flujos
@@ -36212,6 +36965,290 @@ class TestProcesosFondo(BaseTest):
 
 
 # ======================================================================
+# MÓDULO: autotest_forense
+# ======================================================================
+"""Autotests de la guardia de regresión y del modo forense (v8)."""
+
+_NEBULA = '''
+import json
+import os
+
+
+class NebulaDB:
+    def __init__(self, ruta="nebula.json"):
+        self.ruta = ruta
+        self.datos = json.load(open(ruta)) if ruta and os.path.exists(ruta) else []
+
+    def insertar(self, doc):
+        self.datos.append(doc)
+        if self.ruta:
+            with open(self.ruta, "w") as f:
+                json.dump(self.datos, f)
+
+    def buscar(self, **filtros):
+        return [d for d in self.datos if all(d.get(k) == v for k, v in filtros.items())]
+'''
+
+_TEST_NEBULA = '''
+import unittest
+
+from nebula_db import NebulaDB
+
+
+class TestNebula(unittest.TestCase):
+    def test_buscar(self):
+        db = NebulaDB()
+        db.insertar({"tipo": "estrella", "nombre": "Sol"})
+        self.assertEqual(len(db.buscar(tipo="estrella")), 1)
+
+    def test_vacia(self):
+        self.assertEqual(NebulaDB(ruta=None).buscar(tipo="nada"), [])
+'''
+
+_ORDEN = {
+    "registro.py": "EVENTOS = []\n\n\ndef registrar(e):\n    EVENTOS.append(e)\n    return len(EVENTOS)\n",
+    "tests/test_registro.py": (
+        "import unittest\nimport registro\n\n\nclass T(unittest.TestCase):\n"
+        "    def test_a_registrar(self):\n        self.assertEqual(registro.registrar('x'), 1)\n\n"
+        "    def test_b_vacio(self):\n        self.assertEqual(registro.EVENTOS, [])\n"),
+}
+
+# 13 tests que dependen de normalizar(); 1 falla al principio (el de los acentos)
+_TEXTO = (
+    "import unicodedata\n\n\ndef normalizar(t):\n    return t.strip().lower()\n\n\n"
+    "def sin_tildes(t):\n    return normalizar(t)\n"
+)
+_TESTS_TEXTO = "import unittest\nfrom texto import normalizar, sin_tildes\n\n\nclass T(unittest.TestCase):\n" + "".join(
+    f"    def test_normalizar_{i}(self):\n        self.assertEqual(normalizar('  Hola{i} '), 'hola{i}')\n\n" for i in range(12)
+) + "    def test_tildes(self):\n        self.assertEqual(sin_tildes('Canción'), 'cancion')\n"
+
+_FIX_MALO = "def normalizar(t):\n    return t"            # rompe los 12 de normalizar (y no arregla tildes)
+_FIX_BUENO = ("def sin_tildes(t):\n    return ''.join(c for c in unicodedata.normalize('NFKD', normalizar(t)) "
+              "if not unicodedata.combining(c))")
+
+
+def _obs(llm: "MockLLM") -> list:
+    return [MockLLM.ultimo_usuario(c["mensajes"]) for c in llm.llamadas]
+
+
+class TestForenseUnidad(BaseTest):
+    def test_comparaciones(self):
+        a = ConteoTests(pasados=10, fallados=1, reconocido=True)
+        b = ConteoTests(pasados=0, fallados=13, reconocido=True)
+        self.assertTrue(es_peor(b, a))
+        self.assertTrue(es_mejor(a, b))
+        self.assertFalse(es_peor(a, a))
+        self.assertFalse(es_peor(b, ConteoTests()))      # sin conteo reconocido no se compara
+
+    def test_nombres(self):
+        self.assertEqual(nombres_para_unittest(["test_x.T.test_a", "tests/test_y.py::T::test_b", "basura con espacios"]),
+                         ["test_x.T.test_a", "test_y.T.test_b"])
+
+    def test_estado_persistente_entre_corridas(self):
+        ws = self.proyecto({"nebula_db.py": _NEBULA, "tests/test_nebula_db.py": _TEST_NEBULA})
+        informe = investigar(ws, self.ajustes(), self.ui(), None, con_hipotesis=False,
+                             fallidos=["test_nebula_db.TestNebula.test_buscar"])
+        texto = informe.texto()
+        self.assertTrue(informe.inestables, texto)
+        self.assertIn("nebula.json", informe.archivos_tocados_por_tests)
+        self.assertIn("PERSISTE", texto)
+        self.assertFalse((ws.raiz / "nebula.json").exists(), "la investigación no debe dejar basura en el proyecto")
+        self.assertTrue(informe.ruta and informe.ruta.exists())
+
+    def test_dependencia_de_orden_por_global(self):
+        ws = self.proyecto(_ORDEN)
+        informe = investigar(ws, self.ajustes(), self.ui(), None, con_hipotesis=False)
+        self.assertIn("test_registro.T.test_b_vacio", informe.dependientes_de_orden)
+        self.assertIn("ESTADO COMPARTIDO", informe.texto())
+
+    def test_locales_y_atributos_en_el_fallo(self):
+        ws = self.proyecto({
+            "cuenta.py": "class Cuenta:\n    def __init__(self):\n        self.saldo = 5\n        self.titular = 'Ana'\n",
+            "tests/test_cuenta.py": "import unittest\nfrom cuenta import Cuenta\n\n\nclass T(unittest.TestCase):\n"
+                                    "    def test_saldo(self):\n        c = Cuenta()\n        esperado = 10\n"
+                                    "        self.assertEqual(c.saldo, esperado)\n",
+        })
+        informe = investigar(ws, self.ajustes(), self.ui(), None, con_hipotesis=False)
+        texto = informe.texto()
+        self.assertIn("esperado=10", texto)
+        self.assertIn("'saldo': 5", texto)
+        self.assertIn("'titular': 'Ana'", texto)
+
+    def test_biseccion_encuentra_el_bloque_culpable(self):
+        ws = self.proyecto({"texto.py": _TEXTO, "tests/test_texto.py": _TESTS_TEXTO,
+                            "otro.py": "X = 1\n"})
+        bueno = {"texto.py": _TEXTO, "otro.py": "X = 1\n"}
+        actual = _TEXTO.replace("def normalizar(t):\n    return t.strip().lower()", _FIX_MALO)
+        ws.escribir("texto.py", actual)
+        ws.escribir("otro.py", "X = 2\n")
+        culpables = biseccion(ws, bueno)
+        self.assertEqual(len(culpables), 1)
+        self.assertIn("texto.py", culpables[0])
+        self.assertIn("+     return t", culpables[0])
+        self.assertEqual(ws.leer("texto.py"), actual, "la bisección deja el proyecto como estaba")
+        self.assertEqual(ws.leer("otro.py"), "X = 2\n")
+
+    def test_hipotesis_con_experimentos_reales(self):
+        ws = self.proyecto({"nebula_db.py": _NEBULA, "tests/test_nebula_db.py": _TEST_NEBULA})
+        respuesta_hipotesis = (
+            "H1: la base se guarda en un archivo fijo y acumula datos\nEXPERIMENTO:\n```python\n"
+            "from nebula_db import NebulaDB\nprint('ruta', NebulaDB().ruta)\n```\nSI ES VERDAD: ruta nebula.json\n\n"
+            "H2: borra cosas\nEXPERIMENTO:\n```python\nimport shutil\nshutil.rmtree('.')\n```\nSI ES VERDAD: nada\n")
+
+        def guion(mensajes, kwargs):
+            if "Estos son los resultados REALES" in mensajes[-1]["content"]:
+                return "CAUSA RAÍZ: el valor por defecto ruta='nebula.json' persiste entre tests.\nARREGLO: ruta=None por defecto."
+            return respuesta_hipotesis
+
+        informe = investigar(ws, self.ajustes(), self.ui(), MockLLM(guion),
+                             fallidos=["test_nebula_db.TestNebula.test_buscar"])
+        self.assertEqual(informe.hipotesis[0].estado, "confirmada")
+        self.assertIn("ruta nebula.json", informe.hipotesis[0].resultado)
+        self.assertEqual(informe.hipotesis[1].estado, "no ejecutada")      # el experimento inseguro no corre
+        self.assertTrue((ws.raiz / "nebula_db.py").exists())
+        self.assertIn("CAUSA RAÍZ", informe.conclusion)
+
+
+class TestGuardiaRegresion(BaseTest):
+    def _agente(self, llm, ws, **ajustes):
+        return Agente("principal", llm, ws, self.ajustes(forense=False, **ajustes), self.ui(), memoria=None,
+                      mostrar_progreso=False)
+
+    def test_un_arreglo_que_empeora_se_revierte(self):
+        """El patrón visto en Termux: 1 fallo → el 'arreglo' rompe 13 → REAPER lo revierte → arreglo correcto."""
+        ws = self.proyecto({"texto.py": _TEXTO, "tests/test_texto.py": _TESTS_TEXTO})
+        llm = MockLLM([
+            herramienta_xml("run_tests"),
+            herramienta_xml("replace_symbol", path="texto.py", symbol="normalizar", content=_FIX_MALO),
+            herramienta_xml("run_tests"),
+            herramienta_xml("replace_symbol", path="texto.py", symbol="sin_tildes", content=_FIX_BUENO),
+            herramienta_xml("run_tests"),
+            terminar_xml("Arreglé sin_tildes; run_tests pasa."),
+        ])
+        res = self._agente(llm, ws).ejecutar("arreglá los tests")
+        obs = _obs(llm)
+        self.assertIn("GUARDIA DE REGRESIÓN", obs[3])
+        self.assertIn("12 pasaron, 1 fallaron", obs[3])
+        self.assertIn("return t.strip().lower()", ws.leer("texto.py"), "el arreglo malo tenía que revertirse")
+        self.assertIn("Tests PASARON", obs[5])
+        self.assertTrue(res.ok, res.resumen)
+
+    def test_tests_nuevos_no_disparan_la_guardia(self):
+        ws = self.proyecto({"texto.py": _TEXTO, "tests/test_texto.py": _TESTS_TEXTO})
+        nuevo = _TESTS_TEXTO + "\n    def test_nuevo(self):\n        self.assertEqual(normalizar('A'), 'b')\n"
+        llm = MockLLM([
+            herramienta_xml("run_tests"),
+            herramienta_xml("write_to_file", path="tests/test_texto.py", content=nuevo),
+            herramienta_xml("run_tests"),
+            terminar_xml("Agregué un test que todavía falla (TDD): falla test_nuevo."),
+        ])
+        self._agente(llm, ws).ejecutar("agregá un test")
+        self.assertNotIn("GUARDIA", " ".join(_obs(llm)))
+        self.assertIn("test_nuevo", ws.leer("tests/test_texto.py"))
+
+    def test_guardia_desactivada(self):
+        ws = self.proyecto({"texto.py": _TEXTO, "tests/test_texto.py": _TESTS_TEXTO})
+        llm = MockLLM([
+            herramienta_xml("run_tests"),
+            herramienta_xml("replace_symbol", path="texto.py", symbol="normalizar", content=_FIX_MALO),
+            herramienta_xml("run_tests"),
+            terminar_xml("No pude: ahora fallan 13."),
+        ])
+        self._agente(llm, ws, guardia_regresion=False).ejecutar("arreglá los tests")
+        self.assertIn("return t\n", ws.leer("texto.py"))
+
+
+class TestForenseEnElAgente(BaseTest):
+    def test_antes_de_rendirse_investiga(self):
+        ws = self.proyecto({"nebula_db.py": _NEBULA, "tests/test_nebula_db.py": _TEST_NEBULA})
+        (ws.raiz / "nebula.json").write_text('[{"tipo": "estrella"}]')        # basura de corridas anteriores
+        arreglo = _NEBULA.replace('def __init__(self, ruta="nebula.json"):', "def __init__(self, ruta=None):")
+
+        def guion(mensajes, kwargs):
+            if kwargs.get("rol") == "consultor":
+                return "sin hipótesis"
+            ultimo = MockLLM.ultimo_usuario(mensajes)
+            turno = MockLLM.turnos_asistente(mensajes)
+            if "INFORME FORENSE" in ultimo:
+                return herramienta_xml("write_to_file", path="nebula_db.py", content=arreglo)
+            if turno == 0:
+                return herramienta_xml("run_tests")
+            if turno == 1:  # un "arreglo" que no cambia nada útil
+                return herramienta_xml("replace_symbol", path="nebula_db.py", symbol="buscar",
+                                       content="def buscar(self, **filtros):\n    return [d for d in self.datos "
+                                               "if all(d.get(k) == v for k, v in filtros.items())]")
+            if turno == 2:
+                return herramienta_xml("run_tests")
+            if "Creé" in ultimo or "Modifiqué" in ultimo:
+                return herramienta_xml("run_tests")
+            if "Tests PASARON" in ultimo:
+                return terminar_xml("Arreglado: la base ya no persiste en un archivo fijo por defecto.")
+            return terminar_xml("No encontré la causa raíz.")
+
+        llm = MockLLM(guion)
+        res = Agente("principal", llm, ws, self.ajustes(escalar=False), self.ui(), memoria=None,
+                     mostrar_progreso=False).ejecutar("arreglá los tests de nebula")
+        todo = " ".join(_obs(llm))
+        self.assertIn("INFORME FORENSE", todo)
+        self.assertIn("nebula.json", todo)
+        self.assertTrue(res.ok, res.resumen)
+        self.assertIn("ruta=None", ws.leer("nebula_db.py"))
+
+
+class TestGuardiaEnLaReparacion(BaseTest):
+    def test_intento_que_empeora_se_revierte(self):
+        ws = self.proyecto({"texto.py": _TEXTO, "tests/test_texto.py": _TESTS_TEXTO})
+        intentos = []
+
+        def guion(mensajes, kwargs):
+            if MockLLM.rol_de(mensajes) != "reparador":
+                return terminar_xml("ok")
+            turno = MockLLM.turnos_asistente(mensajes)
+            if turno == 0:
+                intentos.append(mensajes[1]["content"])
+                contenido = _FIX_MALO if len(intentos) == 1 else _FIX_BUENO
+                simbolo = "normalizar" if len(intentos) == 1 else "sin_tildes"
+                return herramienta_xml("replace_symbol", path="texto.py", symbol=simbolo, content=contenido)
+            return terminar_xml("listo")
+
+        orq = Orquestador(MockLLM(guion), ws, self.ajustes(forense=False, escalar=False), self.ui())
+        orq._protegidos = {}
+        grupo = ws.checkpoints.iniciar("build")
+        informe = InformeBuild("fallida", cid=grupo)
+        verif = orq.verificar(grupo)
+        self.assertFalse(verif.ok)
+        final = orq._reparar_con_escalada("arreglá", verif, grupo, False, informe, "final", 3,
+                                          lambda: orq.verificar(grupo))
+        self.assertTrue(final.ok, final.diagnostico)
+        self.assertIn("return t.strip().lower()", ws.leer("texto.py"))
+        self.assertTrue(any("se revirtió el intento 1" in n for n in informe.notas))
+        self.assertIn("EMPEORÓ", intentos[1])
+
+    def test_forense_entra_al_segundo_intento(self):
+        ws = self.proyecto({"nebula_db.py": _NEBULA, "tests/test_nebula_db.py": _TEST_NEBULA})
+        (ws.raiz / "nebula.json").write_text('[{"tipo": "estrella"}]')
+        prompts = []
+
+        def guion(mensajes, kwargs):
+            if kwargs.get("rol") == "consultor":
+                return "sin hipótesis"
+            if MockLLM.rol_de(mensajes) == "reparador" and MockLLM.turnos_asistente(mensajes) == 0:
+                prompts.append(mensajes[1]["content"])
+            return terminar_xml("no pude")
+
+        orq = Orquestador(MockLLM(guion), ws, self.ajustes(escalar=False), self.ui())
+        orq._protegidos = {}
+        grupo = ws.checkpoints.iniciar("build")
+        informe = InformeBuild("fallida", cid=grupo)
+        orq._reparar_con_escalada("arreglá", orq.verificar(grupo), grupo, False, informe, "final", 2,
+                                  lambda: orq.verificar(grupo))
+        self.assertEqual(len(prompts), 2)
+        self.assertNotIn("INFORME FORENSE", prompts[0])
+        self.assertIn("INFORME FORENSE", prompts[1])
+        self.assertIn("nebula.json", prompts[1])
+
+
+# ======================================================================
 # MÓDULO: autotest_runner
 # ======================================================================
 """Ejecutor del autotest interno."""
@@ -38472,6 +39509,39 @@ def _cmd_manual(self: "App", arg: str) -> None:
 
 setattr(App, "cmd_manual", _cmd_manual)
 COMANDOS_AYUDA[0][1].insert(0, ("/manual [tema]", "manual: primeros pasos, modos, /construir, interactivos, problemas..."))
+
+
+# ======================================================================
+# MÓDULO: forense_cli
+# ======================================================================
+"""/forense [tests...]: corre el modo forense a mano sobre los tests que fallan (o los indicados)."""
+
+
+def _cmd_forense(self: "App", arg: str) -> None:
+    detectado = detectar_comando_tests(self.ws, completo=True)
+    if not detectado:
+        self.ui.aviso("No detecté tests en el proyecto: el modo forense necesita una suite que falle.")
+        return
+    fallidos = arg.split()
+    if not fallidos:
+        conteo = conteo_actual(self.ws, self.settings.tests_timeout)
+        if not (conteo.fallados or conteo.errores):
+            self.ui.ok(f"Los tests pasan ({conteo.texto()}): no hay nada que investigar.")
+            return
+        fallidos = conteo.nombres_fallados
+    modelo = self.escalador.modelo if self.escalador.disponible() else None
+    try:
+        informe = investigar(self.ws, self.settings, self.ui, self.llm, fallidos=fallidos, modelo=modelo)
+    except LLMError as e:
+        self.ui.error(f"Modelo: {e}")
+        return
+    mostrar_markdown(self.ui, informe.texto(20000))
+    if informe.ruta:
+        self.ui.tenue(f"  guardado en {self.ws.rel(informe.ruta)} · pedile al agente: \"arreglá según @{self.ws.rel(informe.ruta)}\"")
+
+
+setattr(App, "cmd_forense", _cmd_forense)
+COMANDOS_AYUDA[0][1].append(("/forense [tests]", "investiga un fallo con método: aislar, estado compartido, bisección, hipótesis"))
 
 
 # ======================================================================

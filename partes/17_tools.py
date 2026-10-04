@@ -28,6 +28,7 @@ class Contexto:
     notas_autofix: list = field(default_factory=list)
     permitidos: tuple = ()                          # globs de rutas escribibles (vacío = todas)
     llm: Any = None                                 # cliente del modelo (lo usa write_large_file)
+    ultimo_conteo: Any = None                       # ConteoTests del último run_tests (guardia de regresión)
 
     def tropiezo(self, tipo: str) -> None:
         if self.memoria is not None:
@@ -635,6 +636,7 @@ def run_tests(ctx: Contexto, p: dict) -> str:
     assert r is not None
     estado = "SIN TESTS" if r.omitido else ("PASARON" if r.ok else "FALLARON")
     conteo = conteo_de_resultado(r)
+    ctx.ultimo_conteo = conteo
     cabecera = f"Tests {estado} ({detectado[1]})" + (f": {conteo.texto()}" if conteo.reconocido else "") + "."
     if r.ok or r.omitido:
         return cabecera + "\n" + r.resumen(limite=1500)

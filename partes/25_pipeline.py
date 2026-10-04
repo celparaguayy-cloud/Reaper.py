@@ -166,6 +166,13 @@ def dividir_por_interfaz(plan: Plan) -> Plan:
     return Plan(plan.objetivo, tareas, plan.criterios, plan.texto, plan.interfaz)
 
 
+def verificacion_peor(despues: "Verificacion", antes: "Verificacion") -> bool:
+    """¿La verificación empeoró? Más validaciones rotas, o tests peores (más fallos o menos que pasan)."""
+    if len(fallos(despues.validaciones)) > len(fallos(antes.validaciones)):
+        return True
+    return es_peor(despues.conteo, antes.conteo)
+
+
 def veredicto(informe: str) -> tuple[bool, bool]:
     """(aprobado, claro). Si el revisor no respeta el formato se aprueba para no entrar en bucles."""
     m = _RE_VEREDICTO.search(informe or "")
@@ -500,6 +507,8 @@ class Orquestador:
         fallos_seguidos = 0
         intento = 0
         intentos_txt: list[str] = []
+        forense_hecho = False
+        informe_forense = ""
         while not verif.ok and intento < max_intentos:
             firma = _firma_error(verif.diagnostico)
             if diagnosticos_vistos.count(firma) >= 3:
@@ -514,17 +523,43 @@ class Orquestador:
                 if experto:
                     informe.escaladas += 1
                     fallos_seguidos = 0
-            self.ui.titulo(f"REPARACIÓN {etiqueta} {intento}/{max_intentos}" + (" · con experto" if experto else ""))
+            if (fallos_seguidos >= 1 and not forense_hecho and self.settings.forense
+                    and verif.tests is not None and not verif.tests.ok):
+                # el primer intento no alcanzó: antes de seguir probando, investigar con método
+                forense_hecho = True
+                try:
+                    informe_forense = investigar(
+                        self.ws, self.settings, self.ui, self.llm, fallidos=verif.conteo.nombres_fallados,
+                        contexto=verif.diagnostico,
+                        modelo=self.escalador.modelo if self.escalador.disponible() else None).texto()
+                    informe.notas.append(f"{etiqueta}: se usó el modo forense")
+                except (OSError, ValueError, LLMError) as e:
+                    self.ui.aviso(f"  el modo forense falló: {e}")
+            self.ui.titulo(f"REPARACIÓN {etiqueta} {intento}/{max_intentos}" + (" · con experto" if experto else "")
+                           + (" · con informe forense" if informe_forense else ""))
             rcid = self.ws.checkpoints.iniciar(f"reparación {etiqueta} {intento}", grupo=grupo)
             antes = verif
-            res = self.reparar(pedido, verif, rcid, base_fallaba, experto, contexto)
+            contexto_intento = contexto + (f"\n\n{informe_forense}" if informe_forense else "")
+            if intentos_txt:
+                contexto_intento += ("\n\nINTENTOS ANTERIORES QUE NO FUNCIONARON (no los repitas; entendé por qué fallaron):\n"
+                                     + "\n---\n".join(intentos_txt[-2:]))
+            res = self.reparar(pedido, verif, rcid, base_fallaba, experto, contexto_intento.strip())
             intentos_txt.append(recortar(res.resumen, 1200))
             verif = verificador()
             self._mostrar_verificacion(verif)
             if verif.ok:
                 self._aprender(antes.diagnostico, rcid, res.resumen, informe)
-            else:
-                fallos_seguidos += 1
+                continue
+            fallos_seguidos += 1
+            if self.settings.guardia_regresion and verificacion_peor(verif, antes):
+                # el intento EMPEORÓ las cosas (2 fallos → 13): se revierte entero y se sigue desde lo que había
+                revertidos = self.ws.checkpoints.deshacer(rcid)
+                self.ui.aviso(f"  ⟲ el intento {intento} empeoró la verificación ({antes.conteo.texto()} → "
+                              f"{verif.conteo.texto()}): lo revierto ({', '.join(revertidos[:5]) or 'sin archivos'})")
+                informe.notas.append(f"{etiqueta}: se revirtió el intento {intento} porque empeoró los tests")
+                intentos_txt[-1] += (f"\n(ESTE INTENTO EMPEORÓ LOS TESTS de {antes.conteo.texto()} a "
+                                     f"{verif.conteo.texto()} y se revirtió: no lo repitas)")
+                verif = antes
         return verif
 
     # ------------------------------------------------------------ flujos

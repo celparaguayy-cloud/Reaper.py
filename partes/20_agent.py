@@ -183,6 +183,7 @@ _RE_FENCE_VACIO = re.compile(r"```[\w+-]*[ \t]*\n?\s*```")
 _RE_BLOQUE_CODIGO = re.compile(r"```[\w+-]*\n(.*?)```", re.S)
 
 HERRAMIENTAS_COMANDO = ("execute_command", "run_python", "run_tests")
+ROLES_CON_GUARDIA = ("principal", "implementador", "reparador", "escritor")
 HERRAMIENTAS_REUTILIZABLES = ("execute_command", "run_python", "run_tests", "validate", "fetch_url", "view_diff",
                               "project_map", "list_files", "search_files", "code_outline", "find_references")
 HERRAMIENTAS_LECTURA_BARATA = ("read_file", "read_symbol")
@@ -348,6 +349,13 @@ class Agente:
         self._pide_cambios = True
         self._pregunta_simple = False
         self._aviso_pendiente = ""
+        # v8: guardia de regresión y modo forense
+        self._guardia: Optional[dict] = None     # {"conteo", "firma", "estado": {rel: contenido|None}}
+        self._reversiones = 0
+        self._sin_progreso = 0
+        self._escrituras_en_test = 0
+        self._forense_hecho = False
+        self._cid_propio: Optional[int] = None
         self._finish_actual: Optional[str] = None
         self._ultima_llamada: Optional[Llamada] = None
 
@@ -385,6 +393,15 @@ class Agente:
         self._evidencias = []
         self._reusos_seguidos = 0
         self._ultima_salida_ok = ""
+        self._guardia = None
+        self._reversiones = 0
+        self._sin_progreso = 0
+        self._escrituras_en_test = 0
+        self._forense_hecho = False
+        if self.ctx.cid_inicio is None and self.rol.nombre in ROLES_CON_GUARDIA and not self.rol.solo_lectura:
+            # sin checkpoint del llamador: uno propio, para poder volver al mejor estado si algo empeora
+            self._cid_propio = self.ws.checkpoints.iniciar(f"agente {self.etiqueta}")
+            self.ctx.cid_inicio = self._cid_propio
 
         sin_herramienta = 0
         anuncios = 0
@@ -488,9 +505,13 @@ class Agente:
                 )
             if respuesta.finish_reason == "length" and not any("SEGUÍ DESDE" in o for o in observaciones):
                 observaciones.append("(Tu mensaje se cortó por longitud: escribí menos por mensaje.)")
-            diagnostico = self._quizas_escalar(observaciones)
-            if diagnostico:
-                observaciones.append(diagnostico)
+            informe_forense = self._quizas_forense()
+            if informe_forense:
+                observaciones.append(informe_forense)
+            else:
+                diagnostico = self._quizas_escalar(observaciones)
+                if diagnostico:
+                    observaciones.append(diagnostico)
             restantes = self.max_pasos - paso
             if 0 < restantes <= 3:
                 observaciones.append(f"(Te quedan {restantes} pasos: cerrá pronto con attempt_completion.)")
@@ -538,6 +559,11 @@ class Agente:
 
     # ------------------------------------------------------------ internos
     def _cerrar(self, resumen: str, pasos: int, motivo: str, ok: Optional[bool] = None) -> ResultadoAgente:
+        if self._cid_propio is not None:
+            self.ws.checkpoints.descartar_si_vacio(self._cid_propio)
+            if self.ctx.cid_inicio == self._cid_propio:
+                self.ctx.cid_inicio = None
+            self._cid_propio = None
         if ok is None:
             ok = motivo in ("completado", "respuesta")
             if self.ctx.cambios:
@@ -657,6 +683,8 @@ class Agente:
 
         self.ui.herramienta(self.etiqueta, nombre, resumen_params(nombre, llamada.params))
         version_antes = self._version() if nombre in ("execute_command", "run_python") else ""
+        if nombre == "run_tests":
+            self.ctx.ultimo_conteo = None
         error = False
         try:
             salida = h.fn(self.ctx, llamada.params)
@@ -696,6 +724,10 @@ class Agente:
         if nombre in ("run_tests", "validate", "execute_command", "run_python"):
             self._registrar_evidencia(nombre, self._estado_evidencia(nombre, llamada.params, salida, error),
                                       llamada.params.get("command", ""))
+        if nombre == "run_tests" and self.ctx.ultimo_conteo is not None:
+            nota_guardia = self._guardia_tras_tests(self.ctx.ultimo_conteo)
+            if nota_guardia:
+                salida += "\n\n" + nota_guardia
         if not error and nombre in ("execute_command", "run_python", "fetch_url"):
             self._ultima_salida_ok = salida
         if not h.escribe:
@@ -710,6 +742,154 @@ class Agente:
             salida += ("\n\n(Si este resultado ya responde lo que te preguntaron, respondé AHORA en texto, sin más "
                        "herramientas. No repitas el comando.)")
         return obs(aviso_relectura + salida, attrs), error
+
+    # ------------------------------------------------------------ guardia de regresión y forense (v8)
+    def _firma_tests(self) -> str:
+        """Huella del contenido de los archivos de tests: si cambian, los conteos no son comparables."""
+        h = hashlib.sha1()
+        for ruta in self.ws.iterar(limite=3000):
+            rel = self.ws.rel(ruta)
+            if any(fnmatch.fnmatch(rel, p) for p in PATRONES_TESTS):
+                try:
+                    h.update(rel.encode() + b"\0" + ruta.read_bytes())
+                except OSError:
+                    continue
+        return h.hexdigest()
+
+    def _archivos_seguidos(self) -> set:
+        rels = set(self.ctx.cambios)
+        if self.ctx.cid_inicio is not None:
+            rels |= set(self.ws.checkpoints.archivos_desde(self.ctx.cid_inicio))
+        if self._guardia:
+            rels |= set(self._guardia["estado"])
+        return rels
+
+    def _contenido(self, rel: str) -> Optional[str]:
+        ruta = self.ws.raiz / rel
+        try:
+            return ruta.read_text(encoding="utf-8", errors="replace") if ruta.is_file() else None
+        except OSError:
+            return None
+
+    def _guardia_tras_tests(self, conteo: "ConteoTests") -> str:
+        if (not self.settings.guardia_regresion or self.rol.nombre not in ROLES_CON_GUARDIA
+                or conteo is None or not conteo.reconocido):
+            return ""
+        escribio = self._escrituras > self._escrituras_en_test
+        self._escrituras_en_test = self._escrituras
+        firma = self._firma_tests()
+        rels = self._archivos_seguidos()
+        if self._guardia is None or self._guardia["firma"] != firma:
+            self._guardia = {"conteo": conteo, "firma": firma, "estado": {r: self._contenido(r) for r in rels}}
+            return ""
+        mejor = self._guardia["conteo"]
+        if es_mejor(conteo, mejor):
+            self._guardia.update(conteo=conteo, estado={r: self._contenido(r) for r in rels})
+            self._sin_progreso = 0
+            return ""
+        if es_peor(conteo, mejor):
+            revertidos, diff = self._revertir_a_mejor(rels)
+            if not revertidos:
+                return ""
+            self._reversiones += 1
+            self.ctx.tropiezo("regresion_revertida")
+            self.ui.aviso(f"  [{self.etiqueta}] ⟲ guardia de regresión: {conteo.texto()} es peor que {mejor.texto()}; "
+                          f"revierto {', '.join(revertidos[:4])}")
+            return (f"⟲ GUARDIA DE REGRESIÓN DE REAPER: tus cambios EMPEORARON los tests (mejor estado: {mejor.texto()}; "
+                    f"ahora: {conteo.texto()}). REVERTÍ esos cambios: {', '.join(revertidos)} volvieron al mejor estado. "
+                    "No repitas ese enfoque. Antes de editar otra vez: leé el test que falla y el código que ejecuta, y "
+                    "formulá UNA hipótesis concreta de la causa. Si necesitás cambiar varias cosas juntas, hacé todas las "
+                    "ediciones antes de correr run_tests.\nLo que se revirtió:\n" + recortar(diff, 2500))
+        if escribio:
+            self._sin_progreso += 1
+        return ""
+
+    def _revertir_a_mejor(self, rels: set) -> tuple[list, str]:
+        estado = self._guardia["estado"]
+        revertidos, diffs = [], []
+        for rel in sorted(rels):
+            if rel in estado:
+                objetivo = estado[rel]
+            elif self.ctx.cid_inicio is not None:
+                objetivo = self.ws.checkpoints.original(rel, self.ctx.cid_inicio)   # no se había tocado antes del mejor estado
+            else:
+                continue
+            actual = self._contenido(rel)
+            if objetivo == actual:
+                continue
+            try:
+                if objetivo is None:
+                    self.ws.borrar(rel)
+                else:
+                    self.ws.escribir(rel, objetivo)
+            except (OSError, ErrorRuta):
+                continue
+            try:
+                indice_de(self.ws).invalidar(rel)
+            except (OSError, ValueError):
+                pass
+            self._marcar_lecturas_viejas(rel)
+            revertidos.append(rel)
+            diffs.append(diff_unificado(objetivo or "", actual or "", rel))
+        if revertidos:
+            self._escrituras += 1
+        return revertidos, "\n".join(diffs)
+
+    def _ultimo_test_falla(self) -> bool:
+        tests = [e for e in self._evidencias if e[0] == "run_tests"]
+        return bool(tests) and tests[-1][1] == "fallo"
+
+    def _correr_forense(self, motivo: str) -> str:
+        self._forense_hecho = True
+        self.ctx.tropiezo("forense")
+        self.ui.aviso(f"  [{self.etiqueta}] {motivo}: activo el modo forense")
+        conteo = self.ctx.ultimo_conteo
+        modelo = resolver_modelo(self.settings.modelo_fuerte) if self.settings.escalar and \
+            self.settings.modelo_fuerte.strip() else None
+        try:
+            informe = investigar(self.ws, self.settings, self.ui, self.llm,
+                                 fallidos=(conteo.nombres_fallados if conteo else ()),
+                                 contexto="\n\n".join(self._errores_texto[-2:]), modelo=modelo)
+        except (OSError, ValueError, LLMError) as e:
+            self.ui.aviso(f"  [{self.etiqueta}] el modo forense falló: {e}")
+            return ""
+        return f"MODO FORENSE ({motivo}).\n" + informe.texto()
+
+    def _quizas_forense(self) -> str:
+        if (not self.settings.forense or self._forense_hecho or self.rol.nombre not in ROLES_CON_GUARDIA
+                or not self._ultimo_test_falla()):
+            return ""
+        repetido = self._errores.most_common(1)[0][1] if self._errores else 0
+        if self._reversiones >= 2:
+            return self._correr_forense("dos intentos empeoraron los tests")
+        if self._sin_progreso >= 3:
+            return self._correr_forense("tres intentos sin mejorar los tests")
+        if repetido >= max(2, self.settings.umbral_forense):
+            return self._correr_forense("el mismo error se repite")
+        return ""
+
+    def _forense_antes_de_rendirse(self) -> str:
+        """Si el agente intentó arreglar algo y quiere terminar con tests fallando: primero, investigación forense."""
+        if not self.settings.forense or self._forense_hecho or self.rol.nombre not in ROLES_CON_GUARDIA \
+                or self._escrituras == 0:
+            return ""
+        corridas = [e for e in self._evidencias if e[0] == "run_tests"]
+        if not corridas:
+            return ""
+        if corridas[-1][2] < self._escrituras:
+            # editó después de la última corrida: lo que vale es el estado de AHORA
+            conteo = conteo_actual(self.ws, self.settings.tests_timeout)
+            if not conteo.reconocido or not (conteo.fallados or conteo.errores):
+                return ""
+            self.ctx.ultimo_conteo = conteo
+        elif corridas[-1][1] != "fallo":
+            return ""
+        informe = self._correr_forense("quiere terminar con tests fallando")
+        if not informe:
+            return ""
+        return ("Antes de rendirte: los tests siguen fallando, así que REAPER investigó con método. "
+                "Usá esta evidencia para encontrar la causa raíz y arreglarla (o explicá con precisión qué la causa "
+                "si no se puede arreglar desde acá).\n\n" + informe)
 
     # ------------------------------------------------------------ anti-bucles y evidencias (v7.1)
     def _version(self) -> str:
@@ -844,6 +1024,10 @@ class Agente:
                 self._aviso_pendiente = ("Antes de responder: la validación REAL de los archivos que cambiaste falla:\n"
                                          + anexar_pistas(resumen_validacion(resultados), 2))
                 return None
+        forense = self._forense_antes_de_rendirse()
+        if forense:
+            self._aviso_pendiente = forense
+            return None
         motivo = self._falta_evidencia(texto)
         if motivo and self._rechazos < 2 and not sin_tools:
             self._rechazos += 1
@@ -1052,6 +1236,9 @@ class Agente:
                         + ", ".join(vacias[:8]) + ". Implementalas con replace_symbol antes de terminar "
                         "(si alguna es intencional, explicá por qué en el informe y volvé a cerrar)."
                     ), False
+        forense = self._forense_antes_de_rendirse()
+        if forense:
+            return False, obs(forense), False
         motivo = self._falta_evidencia(informe)
         if motivo and self._rechazos < 3:
             self._rechazos += 1

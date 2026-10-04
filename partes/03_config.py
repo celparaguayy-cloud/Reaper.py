@@ -130,6 +130,11 @@ class Settings:
 
     # --- v7: escalada a un modelo más fuerte --------------------------
     escalar: bool = True
+    # v8: revertir solo las ediciones que dejan los tests peor que el mejor estado visto
+    guardia_regresion: bool = True
+    # v8: modo forense (aislar tests, estado compartido, bisección, hipótesis con experimentos)
+    forense: bool = True
+    umbral_forense: int = 3
     modelo_fuerte: str = "deepseek"
     umbral_escalada: int = 2
 
