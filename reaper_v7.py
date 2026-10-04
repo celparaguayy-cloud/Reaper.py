@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-REAPER v7.0.0 «Dragón» — agente de programación autónomo para Termux vía OpenRouter
+REAPER v7.1.0 «Dragón» — agente de programación autónomo para Termux vía OpenRouter
 (estilo Claude Code / Codex / Antigravity, pensado para sacarle el máximo a un modelo de 24B).
 
 Archivo único generado desde partes/ con empaquetar.py.
@@ -18,6 +18,24 @@ QUÉ TRAE LA v7
      cuando el modelo se corta, esqueleto + relleno por función (replace_symbol).
   5. read_symbol / replace_symbol / find_references, mapa de archivos relevantes
      según el pedido, arreglos automáticos sin modelo, snapshots git por build.
+
+v7.1 (bugs vistos en uso real)
+  - Tool loop: con "2+2" obtenía 4 y repetía execute_command. La respuesta en
+    texto después de una herramienta ahora ES la respuesta final; una llamada
+    idéntica sin cambios en el proyecto reutiliza el resultado y un bucle se corta.
+  - Repeticiones según el estado del workspace: después de editar, volver a
+    correr run_tests o releer un archivo está permitido.
+  - Cumplimiento falso: un informe que dice "validé / los tests pasan" sin una
+    ejecución real (o con la última fallida o bloqueada) se rechaza o se marca.
+  - "Responde únicamente cuánto es 5+5. No crees archivos ni ejecutes comandos."
+    → responde en texto; las prohibiciones explícitas del usuario se respetan.
+  - Programas interactivos: EOFError → pista "no lo modifiques, probalo con
+    <stdin>"; execute_command y run_python aceptan entrada estándar.
+  - /construir: re-pide el plan si el arquitecto devuelve una sola tarea gigante;
+    una tarea que no terminó tiene que mostrar progreso; no se revisa (ni se
+    aprueba) una tarea cuya verificación real falla.
+  - Parser: `python3 -c "print(2+2)"` ya no pierde la comilla final; se aceptan
+    llamadas con etiquetas de cierre olvidadas; se ocultan los ```xml``` vacíos.
 
 Instalar:
     pip install httpx pyflakes      (opcionales: sin httpx usa urllib)
@@ -37,7 +55,7 @@ Ejecutar:
 
 from __future__ import annotations
 
-__version__ = "7.0.0"
+__version__ = "7.1.0"
 __codename__ = "Dragón"
 
 import argparse
@@ -2340,6 +2358,7 @@ ALIAS_PARAMS = {
     "diff": ("diffs", "changes", "cambios", "edits"),
     "items": ("todos", "lista"),
     "paths": ("rutas",),
+    "stdin": ("input", "entrada", "user_input", "inputs", "entrada_estandar"),
 }
 
 _CORTE_RESULTADO = re.compile(
@@ -2391,6 +2410,20 @@ def limpiar_largo(valor: str) -> str:
     return v
 
 
+def sin_comillas(valor: str) -> str:
+    """
+    Quita comillas o backticks que ENVUELVEN el valor entero ("app.py", `ls -la`), nunca las de adentro:
+    antes se usaba strip('"') y `python3 -c "print(2+2)"` perdía la comilla final (el comando fallaba).
+    """
+    v = (valor or "").strip()
+    m = re.fullmatch(r"(`+)(.*?)\1", v, re.S)
+    if m and "`" not in m.group(2):
+        return m.group(2).strip()
+    if len(v) >= 2 and v[0] == v[-1] and v[0] in "'\"" and v[0] not in v[1:-1]:
+        return v[1:-1].strip()
+    return v
+
+
 def _apertura(tag: str) -> re.Pattern:
     return re.compile(r"<\s*" + re.escape(tag) + r"\s*>", re.I)
 
@@ -2426,7 +2459,7 @@ def _extraer_params(cuerpo: str, definicion: list) -> tuple[dict, bool]:
         for m in _RE_PARAMETER.finditer(cuerpo):
             nombre = _canonico_param(m.group(1))
             valor = m.group(2)
-            params[nombre] = limpiar_largo(valor) if nombre in largos else valor.strip().strip("`'\"").strip()
+            params[nombre] = limpiar_largo(valor) if nombre in largos else sin_comillas(valor)
         if params:
             return params, completa
 
@@ -2457,7 +2490,7 @@ def _extraer_params(cuerpo: str, definicion: list) -> tuple[dict, bool]:
                     valor = cuerpo[ap.end():c.start()]
                 else:
                     valor = cuerpo[ap.end():].split("\n", 1)[0]
-                params[nombre] = valor.strip().strip("`'\"").strip()
+                params[nombre] = sin_comillas(valor)
             break
 
     if not params and definicion and cuerpo.strip():
@@ -2541,11 +2574,13 @@ def analizar(texto: str, esquemas: Esquemas) -> Analisis:
         etiqueta_cierre = ("invoke" if "invoke" in m.group(0).lower()[:10] else "tool") if generico else tag
         cierre = _cierre(etiqueta_cierre)
 
+        c_encontrado = False
         if autocerrada:
             cuerpo = ""
             pos = m.end()
         else:
             c = cierre.search(limpio, m.end())
+            c_encontrado = c is not None
             if c:
                 cuerpo = limpio[m.end():c.start()]
                 pos = c.end()
@@ -2557,6 +2592,10 @@ def analizar(texto: str, esquemas: Esquemas) -> Analisis:
 
         definicion = esquemas.get(real, [])
         params, completa = _extraer_params(cuerpo, definicion) if cuerpo.strip() else ({}, True)
+        if not completa and not autocerrada and c_encontrado:
+            # Falta el cierre del parámetro (</content>) pero el de la herramienta está: el valor queda
+            # delimitado por </herramienta>, así que la llamada se entiende entera.
+            completa = True
         for clave, valor in atributos.items():
             canon = _canonico_param(clave)
             params.setdefault(canon, valor)
@@ -3281,6 +3320,17 @@ class Workspace:
                 contador += 1
                 if contador >= limite:
                     return
+
+    def huella(self, limite: int = 3000) -> str:
+        """Huella barata del estado del workspace (rutas, tamaños y fechas): cambia si algún archivo cambió."""
+        h = hashlib.sha1()
+        for ruta in self.iterar(limite=limite):
+            try:
+                st = ruta.stat()
+            except OSError:
+                continue
+            h.update(f"{ruta}\0{st.st_size}\0{st.st_mtime_ns}\n".encode("utf-8", "replace"))
+        return h.hexdigest()[:16]
 
     def es_texto(self, ruta: Path) -> bool:
         if ruta.name in ARCHIVOS_SENSIBLES:
@@ -7710,11 +7760,40 @@ def comando_seguro(comando: str) -> bool:
     return any(c == s.strip() or c.startswith(s) for s in _SEGUROS)
 
 
+PISTA_INTERACTIVO = (
+    "PISTA DE REAPER: el programa es INTERACTIVO (pide datos con input()/read) y en esta prueba no recibió "
+    "entrada, por eso EOFError / timeout. ESO NO ES UN BUG DEL PROGRAMA: NO lo modifiques para que deje de "
+    "pedir datos ni le cambies el comportamiento. Probalo pasándole las respuestas por entrada estándar con "
+    "<stdin> (una respuesta por línea), por ejemplo:\n"
+    "<execute_command>\n<command>python3 calculadora.py</command>\n<stdin>2\n3\n+\nsalir\n</stdin>\n</execute_command>"
+)
+
+_RE_INTERACTIVO = re.compile(r"EOFError|EOF when reading a line|end of file|Inappropriate ioctl for device|"
+                             r"read: .*: bad file descriptor|readline\(\) on closed|Tiempo agotado", re.I)
+
+
+def parece_interactivo(salida: str) -> bool:
+    return bool(_RE_INTERACTIVO.search(salida or ""))
+
+
+def _entrada_estandar(p: dict) -> Optional[str]:
+    """Texto para stdin. Acepta saltos reales o '\\n' escritos literalmente (algo que los modelos hacen)."""
+    entrada = p.get("stdin")
+    if entrada is None or str(entrada) == "":
+        return None
+    entrada = str(entrada)
+    if "\n" not in entrada.strip("\n") and "\\n" in entrada:
+        entrada = entrada.replace("\\n", "\n")
+    return entrada.strip("\n") + "\n"
+
+
 @herramienta(
     "execute_command",
-    "Ejecuta un comando de shell (bash) en la raíz del workspace, sin entrada interactiva. "
-    "Para tests preferí run_tests. Servidores o programas interactivos se cortan por timeout.",
+    "Ejecuta un comando de shell (bash) en la raíz del workspace. Para programas interactivos (input()) pasá "
+    "las respuestas en <stdin>, una por línea. Para tests preferí run_tests. Servidores se cortan por timeout.",
     [Param("command", "comando a ejecutar"),
+     Param("stdin", "entrada estándar para programas interactivos (opcional, una respuesta por línea)",
+           requerido=False, largo=True),
      Param("timeout", "segundos (opcional, máx 600)", requerido=False)],
     "<execute_command>\n<command>python3 main.py --ayuda</command>\n</execute_command>",
 )
@@ -7736,9 +7815,18 @@ def execute_command(ctx: Contexto, p: dict) -> str:
                 "Seguí sin él o usá run_tests / validate."
             )
     timeout = min(600, _entero(p.get("timeout"), ctx.settings.exec_timeout) or ctx.settings.exec_timeout)
-    r = ejecutar(comando, cwd=ctx.ws.raiz, timeout=timeout, shell=True)
+    entrada = _entrada_estandar(p)
+    r = ejecutar(comando, cwd=ctx.ws.raiz, timeout=timeout, shell=True, entrada=entrada)
     texto = r.resumen(limite=MAX_SALIDA // 2)
-    if not r.ok and ctx.settings.pistas_errores:
+    if entrada is not None:
+        texto = texto.replace("\n", f"\n(stdin: {len(entrada.splitlines())} línea(s))\n", 1)
+    if not r.ok and parece_interactivo(f"{r.stdout}\n{r.stderr}"):
+        if entrada is None:
+            texto += "\n\n" + PISTA_INTERACTIVO
+        else:
+            texto += ("\n\nPISTA DE REAPER: el programa pidió MÁS datos de los que pasaste en <stdin>. Agregá las "
+                      "respuestas que faltan (incluida la opción para salir, si el programa tiene un menú).")
+    elif not r.ok and ctx.settings.pistas_errores:
         texto = anexar_pistas(texto, 2)
     return texto
 
@@ -7894,7 +7982,7 @@ def resumen_params(nombre: str, params: dict) -> str:
     if nombre == "search_files":
         return f"/{params.get('regex', '')}/ {params.get('file_pattern', '')}"
     if nombre == "execute_command":
-        return params.get("command", "")
+        return params.get("command", "") + ("  < stdin" if params.get("stdin") else "")
     if nombre == "delegate":
         return f"{params.get('role', '?')}: {params.get('task', '')[:70]}"
     if nombre == "validate":
@@ -8410,16 +8498,21 @@ def learn_lesson(ctx: Contexto, p: dict) -> str:
 @herramienta(
     "run_python",
     "Ejecuta un fragmento corto de Python en la raíz del proyecto (para probar una función o inspeccionar datos). "
-    "Usa print() para ver resultados. Sin input(). Timeout 60 s.",
-    [Param("content", "código Python", largo=True)],
+    "Usa print() para ver resultados. Si el código usa input(), pasá las respuestas en <stdin>. Timeout 60 s.",
+    [Param("content", "código Python", largo=True),
+     Param("stdin", "entrada estándar para input() (opcional, una respuesta por línea)", requerido=False, largo=True)],
     "<run_python>\n<content>\nfrom app.carrito import Carrito\nc = Carrito()\nprint(c.total())\n</content>\n</run_python>",
 )
 def run_python(ctx: Contexto, p: dict) -> str:
     codigo = p.get("content") or ""
     if not codigo.strip():
         raise ErrorHerramienta("Falta el código.")
-    if re.search(r"\binput\s*\(", codigo):
-        raise ErrorHerramienta("El fragmento usa input(): no hay usuario para contestar. Pasá los valores directamente.")
+    entrada = _entrada_estandar(p)
+    if re.search(r"\binput\s*\(", codigo) and entrada is None:
+        raise ErrorHerramienta(
+            "El fragmento usa input() y no pasaste entrada. Pasá las respuestas en <stdin> (una por línea) o los "
+            "valores directamente en el código. No cambies el programa para quitarle el input()."
+        )
     for patron in _BLOQUEADOS:
         if patron.search(codigo):
             raise ErrorHerramienta(f"El código contiene algo bloqueado por seguridad ({patron.pattern}).")
@@ -8429,11 +8522,18 @@ def run_python(ctx: Contexto, p: dict) -> str:
         ctx.ui.codigo(recortar(codigo, 1200), "python")
         if not ctx.ui.confirmar("  ¿Ejecutar?"):
             raise ErrorHerramienta("El usuario no aprobó ejecutar ese código.")
-    # Por stdin ("python -"): así el directorio del proyecto queda en sys.path y los imports locales andan.
-    r = ejecutar([sys.executable, "-"], cwd=ctx.ws.raiz, timeout=60, entrada=codigo)
+    if entrada is None:
+        # Por stdin ("python -"): así el directorio del proyecto queda en sys.path y los imports locales andan.
+        r = ejecutar([sys.executable, "-"], cwd=ctx.ws.raiz, timeout=60, entrada=codigo)
+    else:
+        # Con entrada para input(): el código va por -c (sys.path[0] sigue siendo el proyecto) y stdin queda libre.
+        r = ejecutar([sys.executable, "-c", codigo], cwd=ctx.ws.raiz, timeout=60, entrada=entrada)
     r.comando = "run_python"
-    texto = r.resumen(limite=MAX_SALIDA // 2).replace('File "<stdin>"', 'File "<fragmento>"')
-    if not r.ok and ctx.settings.pistas_errores:
+    texto = r.resumen(limite=MAX_SALIDA // 2).replace('File "<stdin>"', 'File "<fragmento>"').replace(
+        'File "<string>"', 'File "<fragmento>"')
+    if not r.ok and parece_interactivo(f"{r.stdout}\n{r.stderr}"):
+        texto += "\n\n" + PISTA_INTERACTIVO
+    elif not r.ok and ctx.settings.pistas_errores:
         texto = anexar_pistas(texto, 2)
     return texto
 
@@ -8471,7 +8571,10 @@ ROLES = {
         "principal",
         """Sos el AGENTE PRINCIPAL. Resolvé el pedido del usuario de punta a punta: entender, explorar lo
 necesario, editar, verificar con herramientas reales y reportar.
-- Si el pedido es solo una pregunta que no requiere tocar archivos, respondé directo en texto, sin herramientas.
+- Si el pedido es una pregunta o un cálculo simple (ej. "cuánto es 5+5"), respondé directo en texto en tu
+  PRIMER mensaje, sin herramientas. Si el usuario dice "no ejecutes comandos" o "no crees archivos", obedecé.
+- Cuando una herramienta ya te dio lo que necesitabas (ej. ejecutaste 2+2 y viste 4), NO la repitas:
+  respondé al usuario en texto con el resultado. Repetir una llamada idéntica no da información nueva.
 - Para tareas de varios pasos, armá una lista con update_todo y mantenela al día.
 - REAPER ya te da los archivos probablemente relevantes: empezá por ahí con read_symbol / read_file.
 - Para entender un proyecto grande, delegá a subagentes 'explorador' EN PARALELO (varios <delegate> en el mismo
@@ -8533,6 +8636,8 @@ tus tests DEBEN fallar ahora y pasar cuando alguien implemente el plan correctam
 - JavaScript: node:test en tests/<modulo>.test.mjs (o el runner que ya exista).
 - Un test por criterio, con valores concretos (entrada → salida esperada) y casos borde. Deterministas,
   sin red, sin input(), rápidos; archivos temporales con tempfile.
+- Tests SIMPLES: assertEqual(funcion(entrada), esperado). Nada de cadenas de isinstance, ifs ni lógica
+  dentro del test; si un test se vuelve largo, partilo en varios.
 - NO implementes el código de la aplicación (solo podés escribir archivos de tests).
 - Corré run_tests: tienen que fallar por ImportError/AttributeError/assert (falta la implementación), NUNCA
   por un error de sintaxis o un bug del propio test. Si el test está roto, arreglalo.
@@ -8577,6 +8682,8 @@ Si es CAMBIOS, seguí con una lista numerada: archivo, problema concreto, correc
 - Python: unittest de la librería estándar en tests/test_<modulo>.py (salvo que el proyecto ya use pytest).
 - JavaScript: el runner que ya exista o node:test en tests/<modulo>.test.mjs.
 - Tests deterministas, sin red, sin input() y rápidos; usá archivos temporales (tempfile) si hace falta.
+- Tests SIMPLES: assertEqual(funcion(entrada), esperado). Nada de cadenas de isinstance ni lógica en el test.
+- Programas interactivos (input()): probalos con subprocess y entrada (input="2\n3\n"), sin modificarlos.
 Ejecutalos con run_tests. Si falla porque el TEST está mal, corregí el test. Si falla porque el CÓDIGO tiene
 un bug, NO toques el código ni debilites el test: describilo en el informe con el error real.""",
         LECTURA + ESCRITURA + VERIFICACION + ("execute_command", "attempt_completion"),
@@ -8630,7 +8737,8 @@ herramientas: leés, editás y ejecutás de verdad. Respondés siempre en españ
 
 PRINCIPIOS
 1. Verificá, no supongas: leé antes de editar. No inventes archivos, APIs, paquetes, comandos ni resultados.
-2. Nunca afirmes que algo funciona o que un test pasó si no lo viste en un <resultado> real.
+2. Nunca afirmes que algo funciona o que un test pasó si no lo viste en un <resultado> real. Si una
+   ejecución fue bloqueada o rechazada, NO cuenta como verificada: decilo.
 3. Cambios mínimos y precisos; no reescribas lo que ya funciona.
 4. Manejá errores de forma explícita (nada de `except: pass`).
 5. Entorno Termux/Android: sin sudo, sin systemd, sin /usr/bin; preferí la librería estándar.
@@ -8649,6 +8757,9 @@ CÓMO USAR LAS HERRAMIENTAS
   y te pide que sigas.
 - Cada edición devuelve la validación real (y arreglos automáticos triviales). Si dice VALIDACIÓN FALLÓ,
   corregí eso primero.
+- Programas INTERACTIVOS (input(), menús): un EOFError al ejecutarlos sin entrada NO es un bug. No los
+  modifiques para que dejen de pedir datos: probalos pasando las respuestas con <stdin> en execute_command.
+- No repitas una llamada idéntica si nada cambió: el resultado va a ser el mismo.
 - Al terminar usá attempt_completion con un informe concreto.
 
 EJEMPLO
@@ -8823,6 +8934,178 @@ def _firma_error(texto: str) -> str:
     return hashlib.sha1((clave or texto[:400]).encode("utf-8", "replace")).hexdigest()[:12]
 
 
+# ------------------------------------------------------------------ intención del pedido y del modelo
+# Estas heurísticas deciden cuándo el agente principal puede terminar con una respuesta en texto
+# (como Claude Code: si ya sabe la respuesta, contesta y listo) y cuándo un informe afirma una
+# verificación que nunca ocurrió.
+
+_PREGUNTA_INICIO = re.compile(
+    r"^\s*[¿¡(\"']*\s*(?:qu[ée]|cu[áa]l(?:es)?|cu[áa]nto[s]?|cu[áa]nta[s]?|c[óo]mo|por\s*qu[ée]|porqu[ée]|qui[ée]n(?:es)?|"
+    r"d[óo]nde|cu[áa]ndo|para\s+qu[ée]|explic[aá](?:me)?|expl[ií]came|defin[ií]|define|describ[ií]|"
+    r"resum[ií]|responde|respond[eé]|dec[ií]me|dime|calcul[aá]|es\s+|son\s+|existe|hay\s+|"
+    r"what|how|why|which|who|whom|when|where|is|are|does|do|did|can|could|explain|tell\s+me|compute)\b",
+    re.I,
+)
+_PIDE_ACCION = re.compile(
+    r"\b(?:cre[aáeé]|crear|crea|hac[eé]|haz|hacer|hace|escrib[ií]|escribe|escribir|gener[aáe]|generar|implement\w*|"
+    r"agreg\w*|añad\w*|a[ñn]ade|modific\w*|cambi[aáe]|cambiar|arregl\w*|corrig\w*|correg\w*|refactor\w*|borr[aáe]|"
+    r"borrar|elimin\w*|renombr\w*|actualiz\w*|instal\w*|constru\w*|program[aáe]|programar|desarroll\w*|"
+    r"migr[aáe]|mov[eé]|mueve|ejecut[aáe]|ejecutar|corr[eé]|correr|test[eé]a|prob[aá]|probar|compil\w*|"
+    r"edit[aáe]|editar|reescrib\w*|optimiz\w*|depur\w*|debugue\w*|"
+    r"create|make|write|build|implement|add|fix|change|update|refactor|delete|remove|rename|install|"
+    r"generate|run|execute|test|compile|edit|rewrite|optimi[sz]e|debug)\b",
+    re.I,
+)
+_PIDE_FAVOR = re.compile(r"\b(?:pod[eé]s|puedes|podr[ií]as|quer[eé]s|quieres|can\s+you|could\s+you|would\s+you|please)\b", re.I)
+_PROHIBE_COMANDOS = re.compile(
+    r"\b(?:no|sin|nunca)\s+(?:ejecutes|ejecutar|corras|correr|uses|usar|lances|lanzar|llames|llamar)\s+"
+    r"(?:ning[úu]n\w*\s+|nada\s+|otr[oa]s?\s+)?(?:comandos?|herramientas?|c[óo]digo|programas?|python|nada|tools?)\b"
+    r"|\b(?:do\s+not|don'?t|never|without)\s+(?:run(?:ning)?|execut\w*|us(?:e|ing))\s+(?:any\s+)?(?:commands?|tools?|code)\b"
+    r"|\bno\s+tools\b",
+    re.I,
+)
+_PROHIBE_HERRAMIENTAS = re.compile(
+    r"\b(?:no|sin)\s+(?:uses|usar)\s+(?:ning[úu]na\s+)?herramientas?\b|\b(?:don'?t|do\s+not|without)\s+(?:use|using)\s+(?:any\s+)?tools?\b"
+    r"|\bresponde\w*\s+(?:[úu]nicamente|solamente|solo|s[óo]lo)\b|\b(?:answer|reply)\s+only\b",
+    re.I,
+)
+_PROHIBE_ARCHIVOS = re.compile(
+    r"\b(?:no|sin|nunca)\s+(?:crees|crear|escribas|escribir|modifiques|modificar|toques|tocar|edites|editar|"
+    r"cambies|cambiar|borres|borrar)\s+(?:ning[úu]n\w*\s+|los\s+|el\s+|otros?\s+)?(?:archivos?|ficheros?|nada|c[óo]digo)\b"
+    r"|\b(?:do\s+not|don'?t|never|without)\s+(?:creat\w*|writ\w*|modify\w*|touch\w*|edit\w*|chang\w*)\s+(?:any\s+)?(?:files?|anything|code)\b",
+    re.I,
+)
+_RE_RUTA_ARCHIVO = re.compile(r"[\w./-]+\.(?:py|js|mjs|cjs|ts|tsx|jsx|html|css|json|md|sh|go|rs|c|h|cpp|java|php|rb|toml|ya?ml|txt|sql)\b")
+_RE_ARITMETICA = re.compile(r"\d+(?:[.,]\d+)?\s*(?:[-+*/x×÷^%]|\*\*|mas|más|menos|por|entre|dividido|plus|minus|times)\s*\d")
+
+_RE_ANUNCIA = re.compile(
+    r"(?:\b(?:voy\s+a|vamos\s+a|ahora\s+(?:voy|vamos|creo|escribo|ejecuto|corro|leo|reviso|edito|agrego|implemento|pruebo)|"
+    r"a\s+continuaci[óo]n|procedo\s+a|proceder[ée]|empiezo\s+(?:por|a)|primero\s+(?:voy|leo|reviso|creo)|"
+    r"luego\s+(?:voy|ejecuto|creo)|let\s+me|i'?ll|i\s+will|i\s+am\s+going\s+to|next,?\s+i|now\s+i'?ll|let'?s)\b"
+    r"(?:(?!\.\s)[^\n]){0,160}$)"
+    r"|:\s*$",
+    re.I,
+)
+
+_RE_AFIRMA = re.compile(
+    r"\b(?:valid[ée]|verifiqu[ée]|comprob[ée]|prob[ée]|teste[ée]|ejecut[ée]|corr[ií])\b"
+    r"|\b(?:he|hemos|fue|fueron|est[áa]n?|qued[óo]|quedaron|ya\s+est[áa])\s+(?:validad|probad|verificad|testead|comprobad|ejecutad)[oa]s?\b"
+    r"|\b(?:los\s+|todos\s+los\s+)?(?:tests?|pruebas?)\s+(?:pasan|pasaron|est[áa]n\s+en\s+verde|dan\s+ok|salen\s+bien)\b"
+    r"|\b(?:pasan|pasaron)\s+(?:todos\s+)?(?:los\s+|las\s+)?(?:tests|pruebas)\b"
+    r"|\b(?:funciona|anda)\s+(?:todo\s+)?(?:correctamente|bien|perfecto|perfectamente|sin\s+errores)\b"
+    r"|\btodo\s+(?:funciona|anda)\b"
+    r"|\b(?:verified|validated|tested|confirmed\s+(?:it|that)\s+works|all\s+tests\s+pass(?:ed)?|tests\s+pass(?:ed)?|works\s+correctly)\b",
+    re.I,
+)
+_RE_AFIRMA_TESTS = re.compile(
+    r"\b(?:tests?|pruebas?)\s+(?:pasan|pasaron|est[áa]n\s+en\s+verde|dan\s+ok)\b|\b(?:pasan|pasaron)\s+(?:todos\s+)?(?:los\s+|las\s+)?(?:tests|pruebas)\b"
+    r"|\b(?:all\s+)?tests\s+pass(?:ed)?\b",
+    re.I,
+)
+_RE_AFIRMA_EJECUCION = re.compile(r"\b(?:ejecut[ée]|corr[ií]|lanc[ée]|al\s+ejecutar(?:lo)?|ran\s+it|i\s+ran|executed)\b", re.I)
+_RE_NEGACION = re.compile(r"\b(?:no|sin|nunca|ni|todav[ií]a\s+no|a[úu]n\s+no|not|never|without|couldn'?t|didn'?t|haven'?t|no\s+pude)\s*\w*\s*\w*\s*$", re.I)
+_RE_FENCE_VACIO = re.compile(r"```[\w+-]*[ \t]*\n?\s*```")
+_RE_BLOQUE_CODIGO = re.compile(r"```[\w+-]*\n(.*?)```", re.S)
+
+HERRAMIENTAS_COMANDO = ("execute_command", "run_python", "run_tests")
+HERRAMIENTAS_REUTILIZABLES = ("execute_command", "run_python", "run_tests", "validate", "fetch_url", "view_diff",
+                              "project_map", "list_files", "search_files", "code_outline", "find_references")
+HERRAMIENTAS_LECTURA_BARATA = ("read_file", "read_symbol")
+_RE_COMANDO_VOLATIL = re.compile(r"\b(?:sleep|date|time|curl|wget|ping|ps|top|uptime|watch|free|df|tail\s+-f|"
+                                 r"git\s+(?:fetch|pull)|pip\s+(?:install|download)|npm\s+(?:install|i)|random)\b")
+
+
+def salida_fallida(nombre: str, salida: str) -> bool:
+    """¿El resultado (sin excepción) igual muestra un fallo? (exit code != 0, tests que fallan, validación rota)."""
+    if nombre in ("execute_command", "run_python"):
+        m = re.search(r"^exit code: (-?\d+)", salida or "", re.M)
+        return bool(m and m.group(1) != "0") or "estado: TIMEOUT" in (salida or "")
+    if nombre == "run_tests":
+        return (salida or "").startswith("Tests FALLARON")
+    if nombre == "validate":
+        return "DETALLE DE FALLOS" in (salida or "") or "VALIDACIÓN FALLÓ" in (salida or "")
+    return False
+
+
+_RE_COMANDO_TESTS = re.compile(r"\b(?:pytest|unittest|npm\s+(?:run\s+)?test|node\s+--test|go\s+test|cargo\s+test|"
+                               r"jest|vitest|mocha|phpunit|rspec|bats|ctest|make\s+test)\b")
+
+
+def limpiar_texto_visible(texto: str) -> str:
+    """Quita los ```xml``` vacíos que quedan cuando el modelo envuelve herramientas en bloques de código."""
+    texto = _RE_FENCE_VACIO.sub("", texto or "")
+    return re.sub(r"\n{3,}", "\n\n", texto).strip()
+
+
+def pide_cambios(tarea: str) -> bool:
+    """¿El pedido requiere crear/modificar/ejecutar algo? (si no, es una pregunta para responder en texto)."""
+    t = (tarea or "").strip()[:800]
+    if not t:
+        return False
+    if _PROHIBE_ARCHIVOS.search(t) and _PROHIBE_COMANDOS.search(t):
+        return False
+    if _PREGUNTA_INICIO.search(t) and not _PIDE_FAVOR.search(t[:60]):
+        return False
+    return bool(_PIDE_ACCION.search(t))
+
+
+def prohibiciones(tarea: str) -> set:
+    """Lo que el usuario prohibió explícitamente en el pedido: 'comandos', 'archivos' y/o 'herramientas'."""
+    t = (tarea or "")[:1500]
+    salida = set()
+    if _PROHIBE_HERRAMIENTAS.search(t):
+        salida.add("herramientas")
+    if _PROHIBE_COMANDOS.search(t):
+        salida.add("comandos")
+    if _PROHIBE_ARCHIVOS.search(t):
+        salida.add("archivos")
+    return salida
+
+
+def es_pregunta_simple(tarea: str) -> bool:
+    """Pregunta corta que el modelo puede contestar sin explorar el proyecto (ej. 'cuánto es 5+5')."""
+    t = (tarea or "").strip()
+    if not t or len(t) > 320 or _RE_RUTA_ARCHIVO.search(t):
+        return False
+    if prohibiciones(t) & {"herramientas", "comandos"}:
+        return True
+    if pide_cambios(t):
+        return False
+    return bool(_PREGUNTA_INICIO.search(t) or t.rstrip().endswith("?") or _RE_ARITMETICA.search(t))
+
+
+def anuncia_accion(texto: str) -> bool:
+    """El modelo dice que VA a hacer algo ('voy a crear el archivo:') pero no llamó ninguna herramienta."""
+    cola = (texto or "").strip()[-240:]
+    return bool(cola) and bool(_RE_ANUNCIA.search(cola))
+
+
+def afirma_verificacion(texto: str) -> bool:
+    """¿El texto afirma que algo se probó/validó/funciona? (ignora frases negadas: 'no pude probar')."""
+    for m in _RE_AFIRMA.finditer(texto or ""):
+        previo = texto[max(0, m.start() - 28):m.start()]
+        if _RE_NEGACION.search(previo):
+            continue
+        return True
+    return False
+
+
+def afirma_ejecucion(texto: str) -> bool:
+    """¿El texto dice que ejecutó algo ('lo ejecuté', 'corrí el programa')? (ignora frases negadas)."""
+    for m in _RE_AFIRMA_EJECUCION.finditer(texto or ""):
+        if not _RE_NEGACION.search(texto[max(0, m.start() - 28):m.start()]):
+            return True
+    return False
+
+
+def codigo_pegado(texto: str) -> bool:
+    """Bloque de código de varias líneas pegado en el chat (en vez de escrito con una herramienta)."""
+    for m in _RE_BLOQUE_CODIGO.finditer(texto or ""):
+        if len([l for l in m.group(1).splitlines() if l.strip()]) >= 3:
+            return True
+    return False
+
+
 class Agente:
     def __init__(
         self,
@@ -8879,11 +9162,27 @@ class Agente:
         self._escalado = False
         self._fallos_por_herramienta: collections.Counter = collections.Counter()
         self._factor_contexto = 1.0
+        # v7.1: anti-bucles por estado del workspace y control de afirmaciones
+        self._historial: dict[str, dict] = {}   # clave de llamada → {version, salida, error, veces}
+        self._escrituras = 0                     # se incrementa con cada escritura exitosa
+        self._evidencias: list[tuple[str, str, int]] = []  # (herramienta, ok|fallo|bloqueado|sin_tests, escrituras)
+        self._reusos_seguidos = 0
+        self._ultima_salida_ok = ""
+        self._prohibido: set = set()
+        self._pide_cambios = True
+        self._pregunta_simple = False
+        self._aviso_pendiente = ""
+        self._finish_actual: Optional[str] = None
+        self._ultima_llamada: Optional[Llamada] = None
 
     # ------------------------------------------------------------ API
     def ejecutar(self, tarea: str, cid_inicio: Optional[int] = None) -> ResultadoAgente:
         if cid_inicio is not None:
             self.ctx.cid_inicio = cid_inicio
+        principal = self.rol.nombre == "principal"
+        self._prohibido = prohibiciones(tarea) if principal else set()
+        self._pide_cambios = pide_cambios(tarea) if principal else True
+        self._pregunta_simple = principal and es_pregunta_simple(tarea)
         lecciones = ""
         if self.memoria is not None and self.settings.lecciones:
             try:
@@ -8905,8 +9204,14 @@ class Agente:
         self._errores = collections.Counter()
         self._errores_texto = []
         self._escalado = False
+        self._historial = {}
+        self._escrituras = 0
+        self._evidencias = []
+        self._reusos_seguidos = 0
+        self._ultima_salida_ok = ""
 
         sin_herramienta = 0
+        anuncios = 0
         repeticiones: dict = {}
         self._ultimo_texto = ""
 
@@ -8920,25 +9225,24 @@ class Agente:
                 "role": "assistant",
                 "content": analisis.respuesta_limpia.strip() or "(respuesta vacía)",
             })
-            if analisis.texto:
-                self._ultimo_texto = analisis.texto
-                self.ui.pensamiento(self.etiqueta, analisis.texto)
+            texto_visible = limpiar_texto_visible(analisis.texto)
+            if texto_visible:
+                self._ultimo_texto = texto_visible
+                self.ui.pensamiento(self.etiqueta, texto_visible)
 
             if not analisis.llamadas:
-                texto = analisis.texto.strip()
-                es_respuesta_directa = (
-                    self.rol.nombre == "principal"
-                    and texto
-                    and respuesta.finish_reason != "length"
-                    and ((paso == 1 and "```" not in texto) or sin_herramienta >= 1)
-                )
-                if es_respuesta_directa:
-                    return self._cerrar(texto, paso, "respuesta")
+                texto = texto_visible
+                if texto and respuesta.finish_reason != "length":
+                    cierre = self._cierre_en_texto(texto, paso, sin_herramienta, anuncios)
+                    if cierre is not None:
+                        return cierre
+                if texto and anuncia_accion(texto):
+                    anuncios += 1
                 sin_herramienta += 1
                 self.ctx.tropiezo("sin_herramienta")
                 if sin_herramienta > 2:
                     return self._cerrar(texto or "El agente no produjo un resultado.", paso, "sin_herramientas")
-                aviso = RECORDATORIO_EN if self.settings.idioma_prompts == "en" else RECORDATORIO
+                aviso = self._aviso_sin_herramienta(texto)
                 if respuesta.finish_reason == "length":
                     aviso = ("Tu respuesta se cortó por longitud. Escribí menos por mensaje: "
                              "archivos largos en partes (write_to_file con partial=true + append_to_file).\n\n") + aviso
@@ -8948,6 +9252,8 @@ class Agente:
             sin_herramienta = 0
             limite = max(1, self.settings.max_llamadas_turno)
             llamadas, excedentes = analisis.llamadas[:limite], analisis.llamadas[limite:]
+            self._finish_actual = respuesta.finish_reason
+            self._ultima_llamada = analisis.llamadas[-1]
             observaciones: list[str] = []
             hubo_error = False
             final: Optional[tuple[str, bool]] = None
@@ -8965,10 +9271,11 @@ class Agente:
                     i += len(grupo)
                     continue
                 if llamada.nombre == "attempt_completion" and "attempt_completion" in self.rol.herramientas:
-                    aceptado, obs, ok_final = self._intentar_terminar(hubo_error)
+                    informe = (llamada.params.get("result") or "").strip() or texto_visible
+                    aceptado, obs, ok_final = self._intentar_terminar(hubo_error, informe)
                     if aceptado:
-                        informe = (llamada.params.get("result") or "").strip() or analisis.texto
-                        final = (informe, ok_final)
+                        nota = self._nota_afirmacion(informe)
+                        final = (informe + nota, ok_final and not nota)
                         break
                     observaciones.append(obs)
                     i += 1
@@ -8987,6 +9294,16 @@ class Agente:
 
             if final is not None:
                 return self._cerrar(final[0], paso, "completado", ok=final[1])
+
+            if self._reusos_seguidos >= 2 and (self.rol.nombre == "principal" or self._reusos_seguidos >= 4):
+                # El modelo pide una y otra vez lo mismo que ya tiene: se corta el bucle. Si había obtenido
+                # un resultado (ej. 2+2 → 4) se responde con eso; Claude Code tampoco ejecuta tres veces "2+2".
+                self.ui.aviso(f"  [{self.etiqueta}] bucle de herramientas: corto y respondo con lo que ya tengo")
+                if self._ultima_salida_ok and self.rol.nombre == "principal" and not self.ctx.cambios:
+                    return self._cerrar(self._respuesta_por_bucle(), paso, "respuesta")
+                return self._cerrar(
+                    "El modelo repetía las mismas herramientas sin avanzar (nada cambió entre llamadas). "
+                    + self._respuesta_por_bucle(), paso, "bucle", ok=False)
 
             if excedentes:
                 observaciones.append(
@@ -9012,6 +9329,18 @@ class Agente:
 
     # ------------------------------------------------------------ preparación
     def _preparar_tarea(self, tarea: str) -> str:
+        if self.rol.nombre == "principal" and (self._pregunta_simple or self._prohibido):
+            notas = []
+            if "herramientas" in self._prohibido:
+                notas.append("el usuario pidió que respondas SIN usar herramientas")
+            elif "comandos" in self._prohibido:
+                notas.append("el usuario pidió que NO ejecutes comandos")
+            if "archivos" in self._prohibido:
+                notas.append("el usuario pidió que NO crees ni modifiques archivos")
+            if self._pregunta_simple:
+                notas.append("es una pregunta directa: si podés responderla con lo que sabés, respondé YA en "
+                             "texto, en tu primer mensaje y sin herramientas")
+            return tarea + "\n\n(REAPER: " + "; ".join(notas) + ".)"
         extras = []
         if self.settings.mapa_relevantes and self.rol.nombre in ("principal", "implementador", "reparador",
                                                                  "explorador", "especificador"):
@@ -9085,6 +9414,11 @@ class Agente:
             disponibles = ", ".join(self.rol.herramientas)
             self.ui.resultado_herramienta(False, f"herramienta no disponible: {nombre}")
             return obs(f"ERROR: '{nombre}' no existe o no está disponible para tu rol. Disponibles: {disponibles}"), True
+        if not llamada.completa and self._finish_actual != "length" and llamada is self._ultima_llamada \
+                and all(llamada.params.get(p.nombre) not in (None, "") for p in h.params if p.requerido):
+            # El mensaje terminó normal y la llamada es la última: el modelo solo olvidó cerrar las etiquetas.
+            # Se acepta (si el contenido quedó truncado, la validación real del archivo lo va a mostrar).
+            llamada = Llamada(llamada.nombre, llamada.params, True, llamada.crudo)
         if not llamada.completa:
             self.ui.resultado_herramienta(False, f"{nombre}: llamada incompleta")
             self.ctx.tropiezo("llamada_incompleta")
@@ -9105,16 +9439,47 @@ class Agente:
             self.ui.resultado_herramienta(False, f"{nombre}: faltan {', '.join(faltan)}")
             return obs(f"ERROR: faltan parámetros: {', '.join(faltan)}. Uso correcto:\n{h.ejemplo}"), True
 
-        clave = nombre + json.dumps(llamada.params, sort_keys=True, ensure_ascii=False)
-        repeticiones[clave] = repeticiones.get(clave, 0) + 1
-        if repeticiones[clave] >= 3 and not h.escribe:
-            self.ui.resultado_herramienta(False, f"{nombre}: llamada repetida")
+        prohibicion = self._prohibicion_para(nombre, h)
+        if prohibicion:
+            self.ui.resultado_herramienta(False, f"{nombre}: el usuario lo prohibió")
+            self._registrar_evidencia(nombre, "bloqueado")
             return obs(
-                f"ERROR: ya hiciste exactamente esta llamada {repeticiones[clave]} veces y el resultado no cambia. "
-                "Cambiá de enfoque o terminá con lo que sabés."
+                f"ERROR: {prohibicion} No uses herramientas para esto: respondé directamente en texto con lo que sabés."
             ), True
 
+        # Detector de repeticiones según el ESTADO del workspace: después de una escritura, releer o
+        # volver a correr los tests es legítimo; repetir lo mismo sin que nada cambie, no.
+        clave = nombre + json.dumps(llamada.params, sort_keys=True, ensure_ascii=False)
+        previo = self._historial.get(clave) if not h.escribe else None
+        aviso_relectura = ""
+        misma_version = previo is not None and previo["version"] == self._version()
+        seguir_contando = misma_version
+        if misma_version and previo.get("muta") and previo["veces"] < 5:
+            previo["veces"] += 1
+        elif misma_version:
+            previo["veces"] += 1
+            veces = previo["veces"]
+            volatil = nombre == "execute_command" and bool(_RE_COMANDO_VOLATIL.search(llamada.params.get("command", "")))
+            fallido = previo["error"] or salida_fallida(nombre, previo["salida"])
+            if nombre in HERRAMIENTAS_REUTILIZABLES and not fallido and not volatil:
+                self._reusos_seguidos += 1
+                self.ui.resultado_herramienta(True, f"{nombre}: llamada idéntica y nada cambió → reutilizo el resultado anterior")
+                return obs(self._texto_reuso(nombre, previo["salida"], veces), previo["attrs"]), False
+            if nombre in HERRAMIENTAS_LECTURA_BARATA and not previo["error"] and veces < 4:
+                if veces >= 3:
+                    aviso_relectura = (f"(Ya leíste esto {veces} veces y no cambió: no lo vuelvas a pedir; "
+                                       "usá lo que ya sabés y avanzá con el próximo paso.)\n")
+            elif veces >= 3:
+                self.ui.resultado_herramienta(False, f"{nombre}: llamada repetida")
+                self._registrar_evidencia(nombre, "bloqueado")
+                return obs(
+                    f"ERROR: ya hiciste exactamente esta llamada {veces} veces sin cambiar nada en el proyecto y el "
+                    "resultado no cambia (esta vez NO se ejecutó, así que no hay resultado nuevo: no afirmes que lo "
+                    "verificaste). Cambiá algo antes de repetirla, probá otro enfoque o terminá explicando qué falta."
+                ), True
+
         self.ui.herramienta(self.etiqueta, nombre, resumen_params(nombre, llamada.params))
+        version_antes = self._version() if nombre in ("execute_command", "run_python") else ""
         error = False
         try:
             salida = h.fn(self.ctx, llamada.params)
@@ -9148,7 +9513,196 @@ class Agente:
             self._lecturas.append((len(self.mensajes), ruta))
         if h.escribe and ruta and not salida.startswith("ERROR"):
             self._marcar_lecturas_viejas(ruta)
-        return obs(salida, attrs), error
+        if h.escribe and not error:
+            self._escrituras += 1
+        self._reusos_seguidos = 0
+        if nombre in ("run_tests", "validate", "execute_command", "run_python"):
+            self._registrar_evidencia(nombre, self._estado_evidencia(nombre, llamada.params, salida, error),
+                                      llamada.params.get("command", ""))
+        if not error and nombre in ("execute_command", "run_python", "fetch_url"):
+            self._ultima_salida_ok = salida
+        if not h.escribe:
+            version_despues = self._version()
+            self._historial[clave] = {"version": version_despues, "salida": salida, "error": error,
+                                      "veces": previo["veces"] if seguir_contando else 1, "attrs": attrs,
+                                      # un comando que cambió archivos al correr (append, mkdir...) es una
+                                      # acción, no una consulta: repetirlo no es un bucle de lectura
+                                      "muta": bool(version_antes) and version_antes != version_despues}
+        if (not error and self.rol.nombre == "principal" and nombre in ("execute_command", "run_python")
+                and not self.ctx.cambios and not self._pide_cambios and not salida_fallida(nombre, salida)):
+            salida += ("\n\n(Si este resultado ya responde lo que te preguntaron, respondé AHORA en texto, sin más "
+                       "herramientas. No repitas el comando.)")
+        return obs(aviso_relectura + salida, attrs), error
+
+    # ------------------------------------------------------------ anti-bucles y evidencias (v7.1)
+    def _version(self) -> str:
+        """Estado del workspace: cambia con cada escritura de una herramienta o si un comando tocó archivos."""
+        try:
+            huella = self.ws.huella()
+        except OSError:
+            huella = "?"
+        return f"{self._escrituras}:{huella}"
+
+    def _prohibicion_para(self, nombre: str, h) -> str:
+        if not self._prohibido or nombre == "attempt_completion":
+            return ""
+        if "herramientas" in self._prohibido:
+            return "el usuario pidió explícitamente que respondas SIN usar herramientas."
+        if "comandos" in self._prohibido and nombre in HERRAMIENTAS_COMANDO:
+            return "el usuario pidió explícitamente que NO ejecutes comandos ni código."
+        if "archivos" in self._prohibido and h.escribe:
+            return "el usuario pidió explícitamente que NO crees ni modifiques archivos."
+        return ""
+
+    def _texto_reuso(self, nombre: str, salida: str, veces: int) -> str:
+        cabecera = (f"YA HICISTE EXACTAMENTE ESTA LLAMADA ({veces} veces) y nada cambió en el proyecto desde "
+                    "entonces, así que no la repito. Resultado de la vez anterior:\n")
+        if salida_fallida(nombre, salida):
+            consejo = ("Ese resultado es un FALLO y repetir lo mismo da el mismo fallo. Cambiá el código o el "
+                       "comando antes de volver a probar, o explicá qué falta.")
+        elif self.rol.nombre == "principal":
+            consejo = ("YA TENÉS LO QUE NECESITABAS. Si esto responde el pedido, RESPONDÉ AHORA al usuario en texto "
+                       "(sin herramientas). Si falta algo, hacé OTRA cosa distinta.")
+        else:
+            consejo = ("Ya tenés este resultado: usalo y seguí con el próximo paso, o terminá con attempt_completion.")
+        return cabecera + recortar(salida, 4000) + "\n\n" + consejo
+
+    def _estado_evidencia(self, nombre: str, params: dict, salida: str, error: bool) -> str:
+        if error and re.search(r"bloquead|no aprob|prohibi|no se ejecut", salida, re.I):
+            return "bloqueado"
+        if nombre == "run_tests" and (salida.startswith("No hay tests") or salida.startswith("Tests SIN TESTS")):
+            return "sin_tests"
+        if error or salida_fallida(nombre, salida):
+            return "fallo"
+        return "ok"
+
+    def _registrar_evidencia(self, nombre: str, estado: str, comando: str = "") -> None:
+        if nombre not in ("run_tests", "validate", "execute_command", "run_python"):
+            return
+        tipo = "run_tests" if nombre == "execute_command" and _RE_COMANDO_TESTS.search(comando or "") else nombre
+        self._evidencias.append((tipo, estado, self._escrituras))
+        self._evidencias = self._evidencias[-30:]
+
+    def _falta_evidencia(self, texto: str) -> str:
+        """Si el texto afirma una verificación que no ocurrió (o que falló / fue bloqueada), devuelve el motivo."""
+        if self.rol.nombre not in ("principal", "implementador", "reparador", "escritor"):
+            return ""
+        texto = texto or ""
+        exito = afirma_verificacion(texto)
+        ejecucion = afirma_ejecucion(texto)
+        if not exito and not ejecucion:
+            return ""
+        reales = [e for e in self._evidencias if e[1] != "bloqueado"]
+        if not self._evidencias or (ejecucion and not exito and not reales):
+            if not self._evidencias:
+                return ("no corriste ninguna verificación en esta tarea (run_tests, validate, execute_command o "
+                        "run_python): ninguna ejecución tuya produjo un resultado real")
+            return "las ejecuciones que intentaste fueron BLOQUEADAS o rechazadas: no produjeron ningún resultado"
+        if not exito:
+            return ""
+        tipo, estado, version = self._evidencias[-1]
+        honesto = bool(re.search(r"\b(?:falla|fallan|fall[óo]|fallaron|error|errores|no\s+pasa|fail\w*)\b", texto, re.I))
+        if estado == "bloqueado":
+            return f"la última verificación ({tipo}) fue BLOQUEADA o rechazada como repetida: no se ejecutó"
+        if estado == "fallo" and not honesto:
+            return f"la última verificación ({tipo}) FALLÓ"
+        if _RE_AFIRMA_TESTS.search(texto):
+            tests = [e for e in self._evidencias if e[0] == "run_tests"]
+            if not tests:
+                return "decís que los tests pasan, pero no corriste los tests (run_tests)"
+            if tests[-1][1] == "sin_tests":
+                return "decís que los tests pasan, pero run_tests no encontró ningún test"
+            if tests[-1][1] != "ok" and not honesto:
+                return "decís que los tests pasan, pero el último run_tests " + (
+                    "FALLÓ" if tests[-1][1] == "fallo" else "fue bloqueado")
+        if version < self._escrituras and self.ctx.cambios:
+            return "cambiaste archivos DESPUÉS de la última verificación, así que ese resultado ya no vale"
+        return ""
+
+    def _rechazo_afirmacion(self, motivo: str) -> str:
+        return ("No acepto ese cierre: tu texto afirma que algo se verificó/probó/funciona, pero " + motivo + ". "
+                "Nunca afirmes una verificación que no viste en un <resultado> real. Corré la verificación ahora "
+                "(run_tests, validate o execute_command) o reescribí la respuesta diciendo con honestidad qué se "
+                "verificó y qué NO.")
+
+    def _nota_afirmacion(self, texto: str) -> str:
+        motivo = self._falta_evidencia(texto)
+        if not motivo:
+            return ""
+        self.ui.aviso(f"  [{self.etiqueta}] el informe afirma una verificación sin evidencia: {motivo}")
+        return f"\n\n⚠ REAPER: este informe afirma una verificación, pero {motivo}. Tomalo como NO verificado."
+
+    def _cierre_en_texto(self, texto: str, paso: int, sin_herramienta: int, anuncios: int) -> Optional[ResultadoAgente]:
+        """
+        ¿Una respuesta SIN herramientas es la respuesta final? Para el principal casi siempre sí: si ya tiene
+        el resultado (o la pregunta no necesitaba herramientas) contesta y termina, como Claude Code.
+        Antes, REAPER le contestaba "no usaste ninguna herramienta" y el modelo repetía el comando: ese era el
+        origen del bucle 2+2 → 4 → execute_command otra vez.
+        """
+        self._aviso_pendiente = ""
+        if self.rol.nombre != "principal":
+            if not self.rol.solo_lectura or "attempt_completion" not in self.rol.herramientas or anuncia_accion(texto):
+                return None
+            if (self.rol.nombre == "arquitecto" and "<plan" in texto and "</plan>" in texto) \
+                    or (self.rol.nombre == "revisor" and re.search(r"VEREDICTO\s*:", texto)) \
+                    or (sin_herramienta >= 1 and len(texto) >= 200):
+                return self._cerrar(texto, paso, "completado")
+            return None
+        sin_tools = bool(self._prohibido & {"herramientas", "comandos"})
+        if self.ctx.parciales:
+            pendientes = ", ".join(f"{r} ({n} líneas)" for r, n in self.ctx.parciales.items())
+            self._aviso_pendiente = (f"Hay archivos EN CONSTRUCCIÓN sin terminar: {pendientes}. Completalos con "
+                                     "append_to_file (la última parte con last=true) antes de responder.")
+            return None
+        if anuncia_accion(texto) and anuncios < 2 and not sin_tools:
+            return None
+        if codigo_pegado(texto) and self._pide_cambios and not self.ctx.cambios and sin_herramienta < 1 \
+                and "archivos" not in self._prohibido:
+            return None
+        if self.ctx.cambios:
+            resultados = validar_archivos(self.ws, sorted(self.ctx.cambios))
+            if fallos(resultados) and self._rechazos < 2:
+                self._rechazos += 1
+                self.ctx.tropiezo("cierre_rechazado")
+                self._aviso_pendiente = ("Antes de responder: la validación REAL de los archivos que cambiaste falla:\n"
+                                         + anexar_pistas(resumen_validacion(resultados), 2))
+                return None
+        motivo = self._falta_evidencia(texto)
+        if motivo and self._rechazos < 2 and not sin_tools:
+            self._rechazos += 1
+            self.ctx.tropiezo("cumplimiento_falso")
+            self.ui.aviso(f"  [{self.etiqueta}] respuesta rechazada: afirma una verificación sin evidencia")
+            self._aviso_pendiente = self._rechazo_afirmacion(motivo)
+            return None
+        return self._cerrar(texto + self._nota_afirmacion(texto), paso, "respuesta")
+
+    def _aviso_sin_herramienta(self, texto: str) -> str:
+        pendiente = self._aviso_pendiente
+        self._aviso_pendiente = ""
+        if pendiente:
+            return pendiente
+        base = RECORDATORIO_EN if self.settings.idioma_prompts == "en" else RECORDATORIO
+        if self.rol.nombre != "principal":
+            return base
+        if texto and anuncia_accion(texto):
+            return ("Dijiste lo que ibas a hacer, pero no llamaste ninguna herramienta. Si vas a actuar, escribí la "
+                    "herramienta en XML AHORA (no la anuncies). Si ya terminaste, escribí directamente la respuesta "
+                    "final para el usuario.\n\n" + base)
+        if texto and codigo_pegado(texto) and self._pide_cambios:
+            return ("Pegaste código en el chat, pero el pedido es crear/cambiar archivos: para que exista de verdad "
+                    "escribilo con write_to_file (archivo nuevo) o replace_symbol/replace_in_file (archivo existente)."
+                    "\n\n" + base)
+        return base + "\nSi el pedido era solo una pregunta, respondé directamente en texto (sin herramientas)."
+
+    def _respuesta_por_bucle(self) -> str:
+        partes = []
+        texto = (self._ultimo_texto or "").strip()
+        if texto and not anuncia_accion(texto):
+            partes.append(texto)
+        salida = (self._ultima_salida_ok or "").strip()
+        if salida:
+            partes.append("Resultado obtenido:\n" + recortar(salida, 1500))
+        return "\n\n".join(partes) or "Ya tenía el resultado, pero el modelo repetía la misma herramienta."
 
     def _registrar_error(self, herramienta: str, ruta: str, salida: str) -> None:
         firma = _firma_error(salida)
@@ -9269,7 +9823,7 @@ class Agente:
                 quedan.append((indice, r))
         self._lecturas = quedan
 
-    def _intentar_terminar(self, hubo_error: bool) -> tuple[bool, str, bool]:
+    def _intentar_terminar(self, hubo_error: bool, informe: str = "") -> tuple[bool, str, bool]:
         def obs(texto: str) -> str:
             return f'<resultado herramienta="attempt_completion">\n{texto}\n</resultado>'
 
@@ -9321,6 +9875,12 @@ class Agente:
                         + ", ".join(vacias[:8]) + ". Implementalas con replace_symbol antes de terminar "
                         "(si alguna es intencional, explicá por qué en el informe y volvé a cerrar)."
                     ), False
+        motivo = self._falta_evidencia(informe)
+        if motivo and self._rechazos < 3:
+            self._rechazos += 1
+            self.ctx.tropiezo("cumplimiento_falso")
+            self.ui.aviso(f"  [{self.etiqueta}] cierre rechazado: afirma una verificación sin evidencia")
+            return False, obs(self._rechazo_afirmacion(motivo)), False
         return True, "", ok
 
     def _delegar(self, grupo: list) -> tuple[list[str], bool]:
@@ -10610,6 +11170,50 @@ def parsear_plan(texto: str, pedido: str, max_tareas: int = 8) -> Plan:
     return Plan(objetivo, tareas, criterios, texto, interfaz)
 
 
+def _archivos_interfaz(interfaz: str) -> list[str]:
+    vistos: dict[str, None] = {}
+    for m in re.finditer(r"([\w./-]+\.(?:py|js|mjs|cjs|ts|tsx|jsx|html|css|sh|go|rs|java|php|rb|c|h|cpp))\b", interfaz or ""):
+        vistos.setdefault(m.group(1), None)
+    return list(vistos)
+
+
+def plan_degenerado(plan: Plan, pedido: str, texto: str = "") -> str:
+    """
+    Motivo si el plan no sirve para trabajar por partes: una sola tarea gigante que repite el pedido
+    (lo que se vio con NebulaDB). Vacío si el plan está bien. Un pedido chico SÍ puede tener una tarea.
+    """
+    if len(plan.tareas) != 1:
+        return ""
+    unica = plan.tareas[0]
+    archivos = set(unica.archivos) | set(_archivos_interfaz(plan.interfaz))
+    grande = len(pedido or "") >= 160 or len(archivos) >= 3
+    if not grande:
+        return ""
+    if not _RE_TAREA.search(texto or plan.texto or ""):
+        return "no usaste etiquetas <tarea>: el plan no se pudo leer"
+    parecido = difflib.SequenceMatcher(None, unica.descripcion.lower()[:1500], (pedido or "").lower()[:1500]).ratio()
+    if parecido >= 0.6:
+        return "tu única tarea repite el pedido completo"
+    if len(unica.archivos) >= 4 or len(archivos) >= 4:
+        return f"tu única tarea toca {len(archivos)} archivos"
+    return ""
+
+
+def dividir_por_interfaz(plan: Plan) -> Plan:
+    """Último recurso: una tarea por archivo de la interfaz (en el orden en que aparecen)."""
+    archivos = _archivos_interfaz(plan.interfaz) or (plan.tareas[0].archivos if plan.tareas else [])
+    if len(archivos) < 2:
+        return plan
+    lineas = [l.strip() for l in (plan.interfaz or "").splitlines() if l.strip()]
+    tareas = []
+    for n, rel in enumerate(archivos, 1):
+        propias = [l for l in lineas if rel in l]
+        detalle = "\n".join(propias) or "(ver la interfaz del plan)"
+        tareas.append(Tarea(str(n), f"Implementá {rel} según la INTERFAZ del plan:\n{detalle}\n"
+                                    f"Contexto general: {recortar(plan.objetivo, 300)}", [rel]))
+    return Plan(plan.objetivo, tareas, plan.criterios, plan.texto, plan.interfaz)
+
+
 def veredicto(informe: str) -> tuple[bool, bool]:
     """(aprobado, claro). Si el revisor no respeta el formato se aprueba para no entrar en bucles."""
     m = _RE_VEREDICTO.search(informe or "")
@@ -10758,6 +11362,28 @@ class Orquestador:
         plan = parsear_plan(texto, pedido, self.settings.max_tareas)
         if not res.ok:
             self.ui.aviso("El arquitecto no terminó limpio; uso lo que produjo.")
+        motivo = plan_degenerado(plan, pedido, texto)
+        if motivo:
+            # Un plan de UNA tarea gigante hace que un modelo de 24B se pierda (y que el revisor apruebe
+            # cualquier cosa): se pide de nuevo, y si sigue igual se divide por archivo de la interfaz.
+            self.ui.aviso(f"  Plan inútil ({motivo}): se lo pido de nuevo dividido en tareas chicas.")
+            tarea2 = (tarea + f"\n\nTU PLAN ANTERIOR NO SIRVE: {motivo}. Rehacelo con entre 3 y "
+                      f"{self.settings.max_tareas} tareas chicas, ordenadas por dependencia, cada una con "
+                      "<tarea id=\"N\" archivos=\"...\"> y como mucho 1-2 archivos. Usá EXACTAMENTE el formato <plan>.")
+            res2 = self._sub("arquitecto", tarea2, None, titulo="rehace el plan en tareas chicas")
+            texto2 = res2.resumen
+            if not _RE_TAREA.search(texto2) and _RE_TAREA.search(res2.contexto):
+                texto2 = res2.contexto + "\n" + texto2
+            plan2 = parsear_plan(texto2, pedido, self.settings.max_tareas)
+            if not plan_degenerado(plan2, pedido, texto2):
+                return plan2
+            if not plan2.interfaz and plan.interfaz:
+                plan2.interfaz = plan.interfaz
+            dividido = dividir_por_interfaz(plan2)
+            if len(dividido.tareas) > 1:
+                self.ui.aviso(f"  El arquitecto insistió con una sola tarea: la divido por archivo ({len(dividido.tareas)} tareas).")
+                return dividido
+            return plan2
         return plan
 
     def especificar(self, pedido: str, plan: Plan, cid: int) -> dict[str, Optional[str]]:
@@ -10846,6 +11472,10 @@ class Orquestador:
         aprobado, claro = veredicto(res.resumen)
         if not claro:
             self.ui.tenue("  (el revisor no usó el formato VEREDICTO: se toma como aprobado)")
+        if aprobado and validacion and not validacion.startswith(("OK", "sin validadores")):
+            self.ui.aviso("  El revisor aprobó, pero la validación real falla: lo tomo como CAMBIOS.")
+            return False, ("VEREDICTO: CAMBIOS\n1. La validación automática falla (corregilo antes que nada):\n"
+                           + validacion + "\n\n" + res.resumen)
         return aprobado, res.resumen
 
     def qa(self, pedido: str, plan: Plan, archivos: list, cid: int) -> ResultadoAgente:
@@ -10977,7 +11607,8 @@ class Orquestador:
         ))
         return ruta
 
-    def _verificar_tarea(self, tcid: int, antes: ConteoTests, nombres_antes: set) -> Verificacion:
+    def _verificar_tarea(self, tcid: int, antes: ConteoTests, nombres_antes: set,
+                         exigir_progreso: bool = False) -> Verificacion:
         """
         Una tarea intermedia no necesita que pasen TODOS los tests (los de tareas
         siguientes todavía fallan): alcanza con validadores OK y que no se rompa
@@ -11004,6 +11635,17 @@ class Orquestador:
                 )
         elif tests is not None and not tests.ok and not conteo.reconocido and antes.ok:
             problemas.append("TESTS: la suite pasaba antes de la tarea y ahora falla.\n" + tests.resumen(4000))
+        if exigir_progreso and not problemas:
+            # El implementador NO terminó (límite de pasos, error...). "No romper nada" no alcanza:
+            # tiene que haber cambios reales y, si hay tests fallando, alguno más tiene que pasar.
+            if not archivos:
+                problemas.append("SIN PROGRESO: el implementador no terminó y no cambió ningún archivo.")
+            elif tests is not None and not tests.ok and conteo.reconocido and conteo.pasados <= antes.pasados:
+                problemas.append(
+                    f"SIN PROGRESO: el implementador no terminó y los tests siguen igual (antes {antes.texto()}, "
+                    f"ahora {conteo.texto()}).\n"
+                    + fallos_relevantes(f"{tests.stdout}\n{tests.stderr}", maximo=3, limite=4000)
+                )
         diagnostico = "\n\n".join(problemas)
         if diagnostico and self.settings.pistas_errores:
             diagnostico = anexar_pistas(diagnostico, 2)
@@ -11047,17 +11689,25 @@ class Orquestador:
             if not resultado.ok:
                 informe.notas.append(f"Tarea {tarea.id}: la implementación no terminó limpia.")
 
-            verif_tarea = self._verificar_tarea(tcid, conteo_antes, nombres_antes)
+            exigir = not resultado.ok
+            verif_tarea = self._verificar_tarea(tcid, conteo_antes, nombres_antes, exigir_progreso=exigir)
             if not verif_tarea.ok:
                 self.ui.aviso(f"  La tarea {tarea.id} no pasó su verificación: la reparo con el error real.")
                 verif_tarea = self._reparar_con_escalada(
                     pedido, verif_tarea, grupo, base_fallaba, informe, f"tarea {tarea.id}",
                     max(1, self.settings.umbral_escalada + 1),
-                    lambda: self._verificar_tarea(tcid, conteo_antes, nombres_antes),
+                    lambda: self._verificar_tarea(tcid, conteo_antes, nombres_antes, exigir_progreso=exigir),
                     contexto=f"TAREA EN CURSO (#{tarea.id}): {tarea.descripcion}",
                 )
                 if not verif_tarea.ok:
                     informe.notas.append(f"Tarea {tarea.id}: quedó con fallos de verificación.")
+
+            if not verif_tarea.ok and self.settings.max_revisiones:
+                # Revisar código que no pasa su verificación no tiene sentido (y un revisor de 24B
+                # terminaba "aprobando" igual): el problema ya está diagnosticado por los tests.
+                self.ui.aviso(f"  No paso la tarea {tarea.id} al revisor: su verificación real falla.")
+                informe.notas.append(f"Tarea {tarea.id}: sin revisión porque la verificación real falla.")
+                continue
 
             for ronda in range(self.settings.max_revisiones):
                 diff = self.ws.checkpoints.diff_desde(tcid)
@@ -13755,6 +14405,3251 @@ if __name__ == "__main__":
     comando_tests=_PY_TESTS,
     comando_ejecutar="python3 -m chat.servidor  (y en otra sesión: python3 -m chat.cliente)",
     etiquetas=("chat", "asyncio", "socket", "tcp", "red", "servidor", "mensajes"),
+)
+
+
+# ======================================================================
+# MÓDULO: plantillas_py2
+# ======================================================================
+"""Plantillas Python (librería estándar). Lote 2: datos, utilidades y Termux."""
+
+# ======================================================================
+# kv-store
+# ======================================================================
+registrar_plantilla(
+    "kv-store",
+    "Base clave-valor persistente: log de solo-agregado (no se corrompe), compactación, TTL y CLI.",
+    "python",
+    {
+        "kvstore/__init__.py": "",
+        "kvstore/almacen.py": r'''
+"""Almacén clave-valor con log de operaciones (estilo Bitcask simplificado).
+
+Cada escritura agrega una línea JSON al final del archivo: si el proceso se
+corta, como mucho se pierde la última línea (que se ignora al cargar).
+compactar() reescribe el log con solo el último valor de cada clave.
+"""
+
+import json
+import os
+import time
+from pathlib import Path
+from typing import Any, Callable, Optional
+
+
+class Almacen:
+    def __init__(self, ruta: Path, reloj: Callable[[], float] = time.time):
+        self.ruta = Path(ruta)
+        self.reloj = reloj
+        self._datos: dict[str, tuple[Any, Optional[float]]] = {}
+        self._lineas = 0
+        self._cargar()
+
+    def _cargar(self) -> None:
+        if not self.ruta.exists():
+            return
+        with open(self.ruta, encoding="utf-8") as f:
+            for linea in f:
+                linea = linea.strip()
+                if not linea:
+                    continue
+                try:
+                    op = json.loads(linea)
+                except json.JSONDecodeError:
+                    continue  # línea cortada por un corte de energía: se ignora
+                self._lineas += 1
+                if op.get("op") == "set":
+                    self._datos[op["k"]] = (op["v"], op.get("exp"))
+                elif op.get("op") == "del":
+                    self._datos.pop(op["k"], None)
+
+    def _agregar(self, op: dict) -> None:
+        self.ruta.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.ruta, "a", encoding="utf-8") as f:
+            f.write(json.dumps(op, ensure_ascii=False) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        self._lineas += 1
+
+    def _vigente(self, clave: str) -> bool:
+        if clave not in self._datos:
+            return False
+        _valor, expira = self._datos[clave]
+        if expira is not None and self.reloj() >= expira:
+            self._datos.pop(clave, None)
+            return False
+        return True
+
+    def poner(self, clave: str, valor: Any, ttl: Optional[float] = None) -> None:
+        if not isinstance(clave, str) or not clave:
+            raise ValueError("la clave debe ser un texto no vacío")
+        expira = self.reloj() + ttl if ttl else None
+        self._agregar({"op": "set", "k": clave, "v": valor, "exp": expira})
+        self._datos[clave] = (valor, expira)
+
+    def obtener(self, clave: str, defecto: Any = None) -> Any:
+        return self._datos[clave][0] if self._vigente(clave) else defecto
+
+    def borrar(self, clave: str) -> bool:
+        if not self._vigente(clave):
+            return False
+        self._agregar({"op": "del", "k": clave})
+        self._datos.pop(clave, None)
+        return True
+
+    def claves(self, prefijo: str = "") -> list[str]:
+        return sorted(k for k in list(self._datos) if k.startswith(prefijo) and self._vigente(k))
+
+    def __len__(self) -> int:
+        return len(self.claves())
+
+    def __contains__(self, clave: str) -> bool:
+        return self._vigente(clave)
+
+    def desperdicio(self) -> float:
+        """Proporción de líneas del log que ya no sirven (0 a 1)."""
+        vivas = len(self)
+        return 0.0 if not self._lineas else 1 - vivas / self._lineas
+
+    def compactar(self) -> int:
+        """Reescribe el log solo con lo vigente. Devuelve cuántas líneas se ahorraron."""
+        antes = self._lineas
+        temporal = self.ruta.with_suffix(".compactando")
+        with open(temporal, "w", encoding="utf-8") as f:
+            for clave in self.claves():
+                valor, expira = self._datos[clave]
+                f.write(json.dumps({"op": "set", "k": clave, "v": valor, "exp": expira}, ensure_ascii=False) + "\n")
+        os.replace(temporal, self.ruta)
+        self._lineas = len(self.claves())
+        return antes - self._lineas
+''',
+        "kvstore/__main__.py": r'''
+"""Uso: python3 -m kvstore [--db archivo] poner clave valor | obtener clave | borrar clave | claves [prefijo] | compactar"""
+
+import json
+import os
+import sys
+from pathlib import Path
+
+from kvstore.almacen import Almacen
+
+
+def main(argv=None) -> int:
+    argv = sys.argv[1:] if argv is None else list(argv)
+    ruta = Path(os.environ.get("KV_DB", Path.home() / ".kvstore.log"))
+    if argv[:1] == ["--db"] and len(argv) > 1:
+        ruta, argv = Path(argv[1]), argv[2:]
+    if not argv:
+        print(__doc__, file=sys.stderr)
+        return 2
+    db = Almacen(ruta)
+    cmd, args = argv[0], argv[1:]
+    if cmd == "poner" and len(args) >= 2:
+        try:
+            valor = json.loads(args[1])
+        except json.JSONDecodeError:
+            valor = args[1]
+        db.poner(args[0], valor)
+    elif cmd == "obtener" and args:
+        valor = db.obtener(args[0])
+        if valor is None:
+            print("(no existe)", file=sys.stderr)
+            return 1
+        print(json.dumps(valor, ensure_ascii=False))
+    elif cmd == "borrar" and args:
+        return 0 if db.borrar(args[0]) else 1
+    elif cmd == "claves":
+        print("\n".join(db.claves(args[0] if args else "")))
+    elif cmd == "compactar":
+        print(f"ahorradas {db.compactar()} líneas")
+    else:
+        print(__doc__, file=sys.stderr)
+        return 2
+    return 0
+
+
+sys.exit(main())
+''',
+        "tests/__init__.py": "",
+        "tests/test_kvstore.py": r'''
+import tempfile
+import unittest
+from pathlib import Path
+
+from kvstore.almacen import Almacen
+
+
+class Reloj:
+    def __init__(self):
+        self.t = 1000.0
+
+    def __call__(self):
+        return self.t
+
+
+class TestAlmacen(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.ruta = Path(self.tmp.name) / "db.log"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_persistencia(self):
+        db = Almacen(self.ruta)
+        db.poner("a", 1)
+        db.poner("b", {"x": [1, 2]})
+        db.poner("a", 2)
+        db.borrar("b")
+        otra = Almacen(self.ruta)
+        self.assertEqual(otra.obtener("a"), 2)
+        self.assertNotIn("b", otra)
+        self.assertEqual(len(otra), 1)
+
+    def test_linea_cortada_se_ignora(self):
+        db = Almacen(self.ruta)
+        db.poner("ok", "sí")
+        with open(self.ruta, "a", encoding="utf-8") as f:
+            f.write('{"op": "set", "k": "cort')
+        self.assertEqual(Almacen(self.ruta).obtener("ok"), "sí")
+
+    def test_ttl(self):
+        reloj = Reloj()
+        db = Almacen(self.ruta, reloj)
+        db.poner("sesion", "abc", ttl=60)
+        self.assertEqual(db.obtener("sesion"), "abc")
+        reloj.t += 61
+        self.assertIsNone(db.obtener("sesion"))
+        self.assertEqual(db.claves(), [])
+
+    def test_compactar(self):
+        db = Almacen(self.ruta)
+        for i in range(10):
+            db.poner("contador", i)
+        self.assertGreater(db.desperdicio(), 0.8)
+        self.assertEqual(db.compactar(), 9)
+        self.assertEqual(len(self.ruta.read_text().splitlines()), 1)
+        self.assertEqual(Almacen(self.ruta).obtener("contador"), 9)
+
+    def test_claves_y_prefijos(self):
+        db = Almacen(self.ruta)
+        for k in ("user:1", "user:2", "post:1"):
+            db.poner(k, True)
+        self.assertEqual(db.claves("user:"), ["user:1", "user:2"])
+        with self.assertRaises(ValueError):
+            db.poner("", 1)
+        self.assertFalse(db.borrar("nada"))
+
+
+if __name__ == "__main__":
+    unittest.main()
+''',
+    },
+    comando_tests=_PY_TESTS,
+    comando_ejecutar="python3 -m kvstore poner saludo hola && python3 -m kvstore obtener saludo",
+    etiquetas=("base de datos", "clave", "valor", "cache", "persistencia", "almacenamiento", "kv"),
+)
+
+# ======================================================================
+# analizador de logs
+# ======================================================================
+registrar_plantilla(
+    "logs",
+    "Analizador de logs (formato Apache/Nginx y genérico): top IPs y rutas, errores por hora, filtros y reporte.",
+    "python",
+    {
+        "logs/__init__.py": "",
+        "logs/analisis.py": r'''
+"""Parseo y estadísticas de logs de acceso."""
+
+import re
+from collections import Counter, defaultdict
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Iterable, Iterator, Optional
+
+PATRON_COMBINADO = re.compile(
+    r'(?P<ip>\S+) \S+ \S+ \[(?P<fecha>[^\]]+)\] "(?P<metodo>[A-Z]+) (?P<ruta>\S+) [^"]*" '
+    r'(?P<estado>\d{3}) (?P<bytes>\d+|-)'
+)
+
+
+@dataclass(frozen=True)
+class Acceso:
+    ip: str
+    fecha: datetime
+    metodo: str
+    ruta: str
+    estado: int
+    bytes: int
+
+    @property
+    def es_error(self) -> bool:
+        return self.estado >= 400
+
+
+def parsear_linea(linea: str) -> Optional[Acceso]:
+    m = PATRON_COMBINADO.search(linea)
+    if not m:
+        return None
+    try:
+        fecha = datetime.strptime(m.group("fecha").split()[0], "%d/%b/%Y:%H:%M:%S")
+    except ValueError:
+        return None
+    tam = m.group("bytes")
+    return Acceso(m.group("ip"), fecha, m.group("metodo"), m.group("ruta").split("?")[0], int(m.group("estado")),
+                  0 if tam == "-" else int(tam))
+
+
+def parsear(lineas: Iterable[str]) -> tuple[list[Acceso], int]:
+    """(accesos válidos, cantidad de líneas que no se pudieron leer)."""
+    accesos, malas = [], 0
+    for linea in lineas:
+        if not linea.strip():
+            continue
+        acceso = parsear_linea(linea)
+        if acceso is None:
+            malas += 1
+        else:
+            accesos.append(acceso)
+    return accesos, malas
+
+
+def top(valores: Iterable[str], n: int = 5) -> list[tuple[str, int]]:
+    return sorted(Counter(valores).items(), key=lambda kv: (-kv[1], kv[0]))[:n]
+
+
+def errores_por_hora(accesos: Iterable[Acceso]) -> dict[str, int]:
+    por_hora: dict[str, int] = defaultdict(int)
+    for a in accesos:
+        if a.es_error:
+            por_hora[a.fecha.strftime("%Y-%m-%d %H:00")] += 1
+    return dict(sorted(por_hora.items()))
+
+
+def filtrar(accesos: Iterable[Acceso], estado: Optional[int] = None, ruta: str = "", ip: str = "") -> Iterator[Acceso]:
+    for a in accesos:
+        if estado is not None and a.estado != estado:
+            continue
+        if ruta and ruta not in a.ruta:
+            continue
+        if ip and a.ip != ip:
+            continue
+        yield a
+
+
+def reporte(accesos: list[Acceso], malas: int = 0) -> str:
+    if not accesos:
+        return "No hay accesos válidos."
+    total_bytes = sum(a.bytes for a in accesos)
+    errores = sum(1 for a in accesos if a.es_error)
+    lineas = [
+        f"Accesos: {len(accesos)} ({malas} líneas ilegibles)",
+        f"Errores: {errores} ({100 * errores / len(accesos):.1f}%)",
+        f"Transferido: {total_bytes / 1024:.1f} KB",
+        "Top IPs: " + ", ".join(f"{ip} ({n})" for ip, n in top(a.ip for a in accesos)),
+        "Top rutas: " + ", ".join(f"{r} ({n})" for r, n in top(a.ruta for a in accesos)),
+    ]
+    return "\n".join(lineas)
+''',
+        "logs/__main__.py": r'''
+"""Uso: python3 -m logs access.log [--estado 404] [--ruta /api]"""
+
+import sys
+from pathlib import Path
+
+from logs.analisis import errores_por_hora, filtrar, parsear, reporte
+
+
+def main(argv=None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    if not argv:
+        print(__doc__, file=sys.stderr)
+        return 2
+    try:
+        lineas = Path(argv[0]).read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    accesos, malas = parsear(lineas)
+    estado = int(argv[argv.index("--estado") + 1]) if "--estado" in argv else None
+    ruta = argv[argv.index("--ruta") + 1] if "--ruta" in argv else ""
+    accesos = list(filtrar(accesos, estado, ruta))
+    print(reporte(accesos, malas))
+    for hora, n in errores_por_hora(accesos).items():
+        print(f"  {hora}: {'█' * min(n, 50)} {n}")
+    return 0
+
+
+sys.exit(main())
+''',
+        "tests/__init__.py": "",
+        "tests/test_logs.py": r'''
+import unittest
+
+from logs.analisis import errores_por_hora, filtrar, parsear, parsear_linea, reporte, top
+
+LOG = """1.1.1.1 - - [10/Oct/2026:13:55:36 +0000] "GET /index.html HTTP/1.1" 200 2326
+2.2.2.2 - - [10/Oct/2026:13:56:01 +0000] "GET /api/x?y=1 HTTP/1.1" 404 120
+1.1.1.1 - - [10/Oct/2026:14:01:00 +0000] "POST /api/login HTTP/1.1" 500 -
+esto no es un log
+1.1.1.1 - - [10/Oct/2026:14:05:00 +0000] "GET /index.html HTTP/1.1" 200 1000
+"""
+
+
+class TestLogs(unittest.TestCase):
+    def setUp(self):
+        self.accesos, self.malas = parsear(LOG.splitlines())
+
+    def test_parseo(self):
+        self.assertEqual((len(self.accesos), self.malas), (4, 1))
+        a = parsear_linea(LOG.splitlines()[1])
+        self.assertEqual((a.ip, a.ruta, a.estado, a.bytes), ("2.2.2.2", "/api/x", 404, 120))
+        self.assertEqual(self.accesos[2].bytes, 0)
+
+    def test_top_y_errores(self):
+        self.assertEqual(top([a.ip for a in self.accesos], 1), [("1.1.1.1", 3)])
+        self.assertEqual(errores_por_hora(self.accesos), {"2026-10-10 13:00": 1, "2026-10-10 14:00": 1})
+
+    def test_filtros(self):
+        self.assertEqual(len(list(filtrar(self.accesos, estado=200))), 2)
+        self.assertEqual(len(list(filtrar(self.accesos, ruta="/api"))), 2)
+        self.assertEqual(len(list(filtrar(self.accesos, ip="2.2.2.2"))), 1)
+
+    def test_reporte(self):
+        texto = reporte(self.accesos, self.malas)
+        self.assertIn("Accesos: 4", texto)
+        self.assertIn("Errores: 2 (50.0%)", texto)
+        self.assertEqual(reporte([]), "No hay accesos válidos.")
+
+
+if __name__ == "__main__":
+    unittest.main()
+''',
+    },
+    comando_tests=_PY_TESTS,
+    comando_ejecutar="python3 -m logs /ruta/access.log",
+    etiquetas=("logs", "registro", "analizar", "estadisticas", "servidor", "nginx", "apache", "reporte"),
+)
+
+# ======================================================================
+# pomodoro
+# ======================================================================
+registrar_plantilla(
+    "pomodoro",
+    "Temporizador Pomodoro en la terminal: máquina de estados testeable con reloj inyectable y aviso de Android.",
+    "python",
+    {
+        "pomodoro/__init__.py": "",
+        "pomodoro/estado.py": r'''
+"""Máquina de estados del Pomodoro (sin sleeps ni prints: se testea con un reloj falso)."""
+
+from dataclasses import dataclass, field
+from typing import Callable
+
+TRABAJO, DESCANSO_CORTO, DESCANSO_LARGO = "trabajo", "descanso corto", "descanso largo"
+
+
+@dataclass
+class Config:
+    trabajo: int = 25 * 60
+    corto: int = 5 * 60
+    largo: int = 15 * 60
+    ciclos_para_largo: int = 4
+
+
+@dataclass
+class Pomodoro:
+    config: Config = field(default_factory=Config)
+    reloj: Callable[[], float] = None
+    fase: str = TRABAJO
+    completados: int = 0
+    inicio_fase: float = 0.0
+    pausado_en: float = None
+
+    def __post_init__(self):
+        import time
+        self.reloj = self.reloj or time.monotonic
+        self.inicio_fase = self.reloj()
+
+    def duracion(self) -> int:
+        return {TRABAJO: self.config.trabajo, DESCANSO_CORTO: self.config.corto,
+                DESCANSO_LARGO: self.config.largo}[self.fase]
+
+    def transcurrido(self) -> float:
+        fin = self.pausado_en if self.pausado_en is not None else self.reloj()
+        return fin - self.inicio_fase
+
+    def restante(self) -> int:
+        return max(0, int(round(self.duracion() - self.transcurrido())))
+
+    def pausar(self) -> None:
+        if self.pausado_en is None:
+            self.pausado_en = self.reloj()
+
+    def reanudar(self) -> None:
+        if self.pausado_en is not None:
+            self.inicio_fase += self.reloj() - self.pausado_en
+            self.pausado_en = None
+
+    def siguiente(self) -> str:
+        if self.fase == TRABAJO:
+            self.completados += 1
+            largo = self.completados % self.config.ciclos_para_largo == 0
+            self.fase = DESCANSO_LARGO if largo else DESCANSO_CORTO
+        else:
+            self.fase = TRABAJO
+        self.inicio_fase = self.reloj()
+        self.pausado_en = None
+        return self.fase
+
+    def actualizar(self) -> bool:
+        """Avanza de fase si se terminó el tiempo. Devuelve True si cambió."""
+        if self.pausado_en is None and self.restante() == 0:
+            self.siguiente()
+            return True
+        return False
+
+
+def formato(segundos: int) -> str:
+    return f"{segundos // 60:02d}:{segundos % 60:02d}"
+''',
+        "pomodoro/__main__.py": r'''
+"""Uso: python3 -m pomodoro [minutos_trabajo] [minutos_descanso]  (Ctrl+C para salir)"""
+
+import shutil
+import subprocess
+import sys
+import time
+
+from pomodoro.estado import Config, Pomodoro, formato
+
+
+def avisar(texto: str) -> None:
+    print("\a", end="")
+    if shutil.which("termux-notification"):
+        subprocess.run(["termux-notification", "--title", "Pomodoro", "--content", texto], timeout=10)
+
+
+def main() -> None:
+    args = [int(a) for a in sys.argv[1:3] if a.isdigit()]
+    config = Config(trabajo=(args[0] if args else 25) * 60, corto=(args[1] if len(args) > 1 else 5) * 60)
+    p = Pomodoro(config)
+    try:
+        while True:
+            print(f"\r{p.fase:<15} {formato(p.restante())}  completados: {p.completados}  ", end="", flush=True)
+            if p.actualizar():
+                avisar(f"Ahora: {p.fase}")
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print(f"\nPomodoros completados: {p.completados}")
+
+
+main()
+''',
+        "tests/__init__.py": "",
+        "tests/test_pomodoro.py": r'''
+import unittest
+
+from pomodoro.estado import DESCANSO_CORTO, DESCANSO_LARGO, TRABAJO, Config, Pomodoro, formato
+
+
+class Reloj:
+    def __init__(self):
+        self.t = 0.0
+
+    def __call__(self):
+        return self.t
+
+
+class TestPomodoro(unittest.TestCase):
+    def setUp(self):
+        self.reloj = Reloj()
+        self.p = Pomodoro(Config(trabajo=100, corto=10, largo=30, ciclos_para_largo=2), self.reloj)
+
+    def test_restante_y_cambio(self):
+        self.reloj.t = 40
+        self.assertEqual(self.p.restante(), 60)
+        self.assertFalse(self.p.actualizar())
+        self.reloj.t = 100
+        self.assertTrue(self.p.actualizar())
+        self.assertEqual((self.p.fase, self.p.completados), (DESCANSO_CORTO, 1))
+
+    def test_descanso_largo(self):
+        self.p.siguiente()
+        self.p.siguiente()
+        self.assertEqual(self.p.siguiente(), DESCANSO_LARGO)
+        self.assertEqual(self.p.siguiente(), TRABAJO)
+
+    def test_pausa(self):
+        self.reloj.t = 30
+        self.p.pausar()
+        self.reloj.t = 500
+        self.assertEqual(self.p.restante(), 70)
+        self.assertFalse(self.p.actualizar())
+        self.p.reanudar()
+        self.reloj.t = 510
+        self.assertEqual(self.p.restante(), 60)
+
+    def test_formato(self):
+        self.assertEqual(formato(1500), "25:00")
+        self.assertEqual(formato(65), "01:05")
+
+
+if __name__ == "__main__":
+    unittest.main()
+''',
+    },
+    comando_tests=_PY_TESTS,
+    comando_ejecutar="python3 -m pomodoro 25 5",
+    etiquetas=("pomodoro", "temporizador", "timer", "productividad", "reloj", "tiempo"),
+)
+
+# ======================================================================
+# conversor de unidades
+# ======================================================================
+registrar_plantilla(
+    "conversor",
+    "Conversor de unidades (longitud, masa, volumen, temperatura, datos, tiempo) con parser de texto '5 km a mi'.",
+    "python",
+    {
+        "conversor/__init__.py": "",
+        "conversor/unidades.py": r'''
+"""Conversión de unidades por categorías. Temperatura se trata aparte (no es lineal)."""
+
+import re
+from decimal import Decimal
+
+FACTORES = {
+    "longitud": {"mm": "0.001", "cm": "0.01", "m": "1", "km": "1000", "in": "0.0254", "ft": "0.3048",
+                 "yd": "0.9144", "mi": "1609.344"},
+    "masa": {"mg": "0.000001", "g": "0.001", "kg": "1", "t": "1000", "oz": "0.028349523125", "lb": "0.45359237"},
+    "volumen": {"ml": "0.001", "l": "1", "m3": "1000", "taza": "0.25", "gal": "3.785411784"},
+    "datos": {"b": "1", "kb": "1000", "mb": "1000000", "gb": "1000000000", "kib": "1024", "mib": "1048576",
+              "gib": "1073741824"},
+    "tiempo": {"s": "1", "min": "60", "h": "3600", "dia": "86400", "semana": "604800"},
+}
+ALIAS = {"metro": "m", "metros": "m", "kilometro": "km", "kilometros": "km", "milla": "mi", "millas": "mi",
+         "pie": "ft", "pies": "ft", "pulgada": "in", "pulgadas": "in", "gramo": "g", "gramos": "g",
+         "kilo": "kg", "kilos": "kg", "libra": "lb", "libras": "lb", "litro": "l", "litros": "l",
+         "hora": "h", "horas": "h", "minutos": "min", "segundos": "s", "dias": "dia", "días": "dia"}
+TEMPERATURAS = {"c", "f", "k"}
+
+
+def normalizar(unidad: str) -> str:
+    u = unidad.strip().lower().rstrip(".")
+    return ALIAS.get(u, u)
+
+
+def categoria(unidad: str) -> str:
+    u = normalizar(unidad)
+    if u in TEMPERATURAS:
+        return "temperatura"
+    for cat, tabla in FACTORES.items():
+        if u in tabla:
+            return cat
+    raise ValueError(f"unidad desconocida: {unidad}")
+
+
+def _temperatura(valor: Decimal, desde: str, hasta: str) -> Decimal:
+    celsius = {"c": valor, "f": (valor - 32) * 5 / 9, "k": valor - Decimal("273.15")}[desde]
+    return {"c": celsius, "f": celsius * 9 / 5 + 32, "k": celsius + Decimal("273.15")}[hasta]
+
+
+def convertir(valor, desde: str, hasta: str, decimales: int = 4) -> float:
+    d, h = normalizar(desde), normalizar(hasta)
+    cat_d, cat_h = categoria(d), categoria(h)
+    if cat_d != cat_h:
+        raise ValueError(f"no se puede convertir {cat_d} a {cat_h}")
+    valor = Decimal(str(valor))
+    if cat_d == "temperatura":
+        resultado = _temperatura(valor, d, h)
+    else:
+        tabla = FACTORES[cat_d]
+        resultado = valor * Decimal(tabla[d]) / Decimal(tabla[h])
+    return round(float(resultado), decimales)
+
+
+_PEDIDO = re.compile(r"^\s*(-?[\d.,]+)\s*([a-záéíóú0-9]+)\s+(?:a|en|to|->)\s+([a-záéíóú0-9]+)\s*$", re.I)
+
+
+def convertir_texto(pedido: str) -> str:
+    """'5 km a mi' → '5 km = 3.1069 mi'"""
+    m = _PEDIDO.match(pedido)
+    if not m:
+        raise ValueError("formato: <número> <unidad> a <unidad>   (ej: 5 km a mi)")
+    numero = m.group(1).replace(",", ".")
+    resultado = convertir(numero, m.group(2), m.group(3))
+    return f"{numero} {normalizar(m.group(2))} = {resultado:g} {normalizar(m.group(3))}"
+''',
+        "conversor/__main__.py": r'''
+"""Uso: python3 -m conversor "5 km a mi"   (sin argumentos: modo interactivo)"""
+
+import sys
+
+from conversor.unidades import convertir_texto
+
+
+def main() -> int:
+    if len(sys.argv) > 1:
+        try:
+            print(convertir_texto(" ".join(sys.argv[1:])))
+            return 0
+        except ValueError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
+    while True:
+        try:
+            pedido = input("convertir> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return 0
+        if pedido in ("salir", "q"):
+            return 0
+        try:
+            print(convertir_texto(pedido))
+        except ValueError as e:
+            print(e)
+
+
+sys.exit(main())
+''',
+        "tests/__init__.py": "",
+        "tests/test_conversor.py": r'''
+import unittest
+
+from conversor.unidades import categoria, convertir, convertir_texto
+
+
+class TestConversor(unittest.TestCase):
+    def test_lineales(self):
+        self.assertEqual(convertir(1, "km", "m"), 1000)
+        self.assertAlmostEqual(convertir(1, "mi", "km"), 1.6093, places=4)
+        self.assertEqual(convertir(2, "kilos", "g"), 2000)
+        self.assertEqual(convertir(1, "gib", "mib"), 1024)
+
+    def test_temperatura(self):
+        self.assertEqual(convertir(100, "c", "f"), 212)
+        self.assertEqual(convertir(32, "f", "c"), 0)
+        self.assertEqual(convertir(0, "k", "c"), -273.15)
+
+    def test_errores(self):
+        with self.assertRaises(ValueError):
+            convertir(1, "km", "kg")
+        with self.assertRaises(ValueError):
+            categoria("parsec")
+        with self.assertRaises(ValueError):
+            convertir_texto("cinco km a mi")
+
+    def test_texto(self):
+        self.assertEqual(convertir_texto("5 km a m"), "5 km = 5000 m")
+        self.assertEqual(convertir_texto("1,5 horas en min"), "1.5 h = 90 min")
+
+
+if __name__ == "__main__":
+    unittest.main()
+''',
+    },
+    comando_tests=_PY_TESTS,
+    comando_ejecutar='python3 -m conversor "5 km a mi"',
+    etiquetas=("conversor", "unidades", "convertir", "temperatura", "medidas", "calculadora"),
+)
+
+# ======================================================================
+# generador de contraseñas
+# ======================================================================
+registrar_plantilla(
+    "claves",
+    "Generador de contraseñas y frases de paso con `secrets`, cálculo de entropía y evaluación de fortaleza.",
+    "python",
+    {
+        "claves/__init__.py": "",
+        "claves/generador.py": r'''
+"""Contraseñas seguras con secrets (nunca random para esto)."""
+
+import math
+import secrets
+import string
+
+PALABRAS = (
+    "agua arbol barco bosque cafe campo cielo ciudad clave cobre dragon espejo faro fuego gato hierro isla "
+    "jardin lago lapiz libro luna mapa mar metal miel monte nieve nube oro papel perro piedra plata playa "
+    "puente radio reloj rio robot roca sal selva sol tierra tigre torre trigo valle vela viento volcan zorro"
+).split()
+AMBIGUOS = set("Il1O0o")
+
+
+def contrasena(largo: int = 16, mayusculas: bool = True, numeros: bool = True, simbolos: bool = True,
+               sin_ambiguos: bool = False) -> str:
+    if largo < 8:
+        raise ValueError("una contraseña segura tiene al menos 8 caracteres")
+    grupos = [string.ascii_lowercase]
+    if mayusculas:
+        grupos.append(string.ascii_uppercase)
+    if numeros:
+        grupos.append(string.digits)
+    if simbolos:
+        grupos.append("!@#$%&*-_=+?")
+    if sin_ambiguos:
+        grupos = ["".join(c for c in g if c not in AMBIGUOS) for g in grupos]
+    # Al menos un carácter de cada grupo pedido, el resto de cualquiera.
+    caracteres = [secrets.choice(g) for g in grupos]
+    todos = "".join(grupos)
+    caracteres += [secrets.choice(todos) for _ in range(largo - len(caracteres))]
+    secrets.SystemRandom().shuffle(caracteres)
+    return "".join(caracteres)
+
+
+def frase(palabras: int = 5, separador: str = "-", numero: bool = True) -> str:
+    if palabras < 3:
+        raise ValueError("usá al menos 3 palabras")
+    partes = [secrets.choice(PALABRAS) for _ in range(palabras)]
+    if numero:
+        partes.append(str(secrets.randbelow(100)))
+    return separador.join(partes)
+
+
+def entropia(clave: str) -> float:
+    """Bits de entropía estimados según los tipos de caracteres usados."""
+    universo = 0
+    if any(c.islower() for c in clave):
+        universo += 26
+    if any(c.isupper() for c in clave):
+        universo += 26
+    if any(c.isdigit() for c in clave):
+        universo += 10
+    if any(not c.isalnum() for c in clave):
+        universo += 32
+    return round(len(clave) * math.log2(universo), 1) if universo else 0.0
+
+
+def fortaleza(clave: str) -> str:
+    bits = entropia(clave)
+    if len(set(clave)) <= 2:
+        return "muy débil"
+    if bits < 40:
+        return "débil"
+    if bits < 60:
+        return "media"
+    if bits < 80:
+        return "fuerte"
+    return "muy fuerte"
+''',
+        "claves/__main__.py": r'''
+"""Uso: python3 -m claves [largo] | python3 -m claves frase [palabras] | python3 -m claves evaluar <clave>"""
+
+import sys
+
+from claves.generador import contrasena, entropia, fortaleza, frase
+
+
+def main(argv=None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    try:
+        if argv[:1] == ["frase"]:
+            print(frase(int(argv[1]) if len(argv) > 1 else 5))
+        elif argv[:1] == ["evaluar"] and len(argv) > 1:
+            print(f"{fortaleza(argv[1])} ({entropia(argv[1])} bits)")
+        else:
+            clave = contrasena(int(argv[0]) if argv else 16)
+            print(clave)
+            print(f"  {fortaleza(clave)} · {entropia(clave)} bits", file=sys.stderr)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    return 0
+
+
+sys.exit(main())
+''',
+        "tests/__init__.py": "",
+        "tests/test_claves.py": r'''
+import string
+import unittest
+
+from claves.generador import AMBIGUOS, contrasena, entropia, fortaleza, frase
+
+
+class TestClaves(unittest.TestCase):
+    def test_largo_y_grupos(self):
+        for _ in range(50):
+            c = contrasena(12)
+            self.assertEqual(len(c), 12)
+            self.assertTrue(any(ch.isupper() for ch in c))
+            self.assertTrue(any(ch.isdigit() for ch in c))
+            self.assertTrue(any(ch in "!@#$%&*-_=+?" for ch in c))
+
+    def test_opciones(self):
+        c = contrasena(20, mayusculas=False, numeros=False, simbolos=False)
+        self.assertTrue(all(ch in string.ascii_lowercase for ch in c))
+        self.assertFalse(set(contrasena(40, sin_ambiguos=True)) & AMBIGUOS)
+        with self.assertRaises(ValueError):
+            contrasena(5)
+
+    def test_no_se_repiten(self):
+        self.assertEqual(len({contrasena() for _ in range(100)}), 100)
+
+    def test_frase(self):
+        f = frase(4, separador=" ", numero=False)
+        self.assertEqual(len(f.split()), 4)
+        with self.assertRaises(ValueError):
+            frase(2)
+
+    def test_entropia_y_fortaleza(self):
+        self.assertEqual(entropia(""), 0.0)
+        self.assertEqual(fortaleza("aaaa"), "muy débil")
+        self.assertEqual(fortaleza("hola123"), "débil")
+        self.assertIn(fortaleza(contrasena(20)), ("fuerte", "muy fuerte"))
+
+
+if __name__ == "__main__":
+    unittest.main()
+''',
+    },
+    comando_tests=_PY_TESTS,
+    comando_ejecutar="python3 -m claves 20",
+    etiquetas=("contraseña", "password", "clave", "seguridad", "generador", "secrets"),
+)
+
+# ======================================================================
+# inventario (sqlite)
+# ======================================================================
+registrar_plantilla(
+    "inventario",
+    "Inventario con sqlite3: productos, movimientos de stock (entradas/salidas), alertas de stock bajo y reportes.",
+    "python",
+    {
+        "inventario/__init__.py": "",
+        "inventario/db.py": r'''
+"""Inventario con historial de movimientos. El stock se calcula a partir de los movimientos."""
+
+import sqlite3
+from datetime import datetime
+from typing import Optional
+
+ESQUEMA = """
+CREATE TABLE IF NOT EXISTS productos (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    codigo TEXT NOT NULL UNIQUE,
+    nombre TEXT NOT NULL,
+    precio REAL NOT NULL CHECK (precio >= 0),
+    minimo INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS movimientos (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    producto_id INTEGER NOT NULL REFERENCES productos(id),
+    cantidad INTEGER NOT NULL,
+    motivo TEXT NOT NULL DEFAULT '',
+    fecha TEXT NOT NULL
+);
+"""
+
+
+class ErrorInventario(ValueError):
+    pass
+
+
+class Inventario:
+    def __init__(self, ruta: str = ":memory:"):
+        self.con = sqlite3.connect(ruta)
+        self.con.row_factory = sqlite3.Row
+        self.con.execute("PRAGMA foreign_keys = ON")
+        self.con.executescript(ESQUEMA)
+
+    def agregar_producto(self, codigo: str, nombre: str, precio: float, minimo: int = 0) -> int:
+        try:
+            with self.con:
+                return self.con.execute(
+                    "INSERT INTO productos (codigo, nombre, precio, minimo) VALUES (?, ?, ?, ?)",
+                    (codigo.strip().upper(), nombre.strip(), precio, minimo),
+                ).lastrowid
+        except sqlite3.IntegrityError as e:
+            raise ErrorInventario(f"no se pudo agregar {codigo}: {e}") from None
+
+    def _producto(self, codigo: str) -> sqlite3.Row:
+        fila = self.con.execute("SELECT * FROM productos WHERE codigo = ?", (codigo.strip().upper(),)).fetchone()
+        if fila is None:
+            raise ErrorInventario(f"no existe el producto {codigo}")
+        return fila
+
+    def stock(self, codigo: str) -> int:
+        p = self._producto(codigo)
+        fila = self.con.execute("SELECT COALESCE(SUM(cantidad), 0) AS s FROM movimientos WHERE producto_id = ?",
+                                (p["id"],)).fetchone()
+        return int(fila["s"])
+
+    def mover(self, codigo: str, cantidad: int, motivo: str = "", fecha: Optional[str] = None) -> int:
+        if cantidad == 0:
+            raise ErrorInventario("la cantidad no puede ser cero")
+        p = self._producto(codigo)
+        if cantidad < 0 and self.stock(codigo) + cantidad < 0:
+            raise ErrorInventario(f"stock insuficiente de {codigo} (hay {self.stock(codigo)})")
+        with self.con:
+            self.con.execute("INSERT INTO movimientos (producto_id, cantidad, motivo, fecha) VALUES (?, ?, ?, ?)",
+                             (p["id"], cantidad, motivo, fecha or datetime.now().isoformat(timespec="seconds")))
+        return self.stock(codigo)
+
+    def entrada(self, codigo: str, cantidad: int, motivo: str = "compra") -> int:
+        return self.mover(codigo, abs(cantidad), motivo)
+
+    def salida(self, codigo: str, cantidad: int, motivo: str = "venta") -> int:
+        return self.mover(codigo, -abs(cantidad), motivo)
+
+    def stock_bajo(self) -> list[dict]:
+        filas = self.con.execute(
+            "SELECT p.codigo, p.nombre, p.minimo, COALESCE(SUM(m.cantidad), 0) AS stock FROM productos p "
+            "LEFT JOIN movimientos m ON m.producto_id = p.id GROUP BY p.id HAVING stock < p.minimo ORDER BY p.codigo"
+        ).fetchall()
+        return [dict(f) for f in filas]
+
+    def valorizado(self) -> float:
+        fila = self.con.execute(
+            "SELECT COALESCE(SUM(p.precio * s.stock), 0) AS total FROM productos p JOIN "
+            "(SELECT producto_id, SUM(cantidad) AS stock FROM movimientos GROUP BY producto_id) s ON s.producto_id = p.id"
+        ).fetchone()
+        return round(float(fila["total"]), 2)
+
+    def historial(self, codigo: str) -> list[dict]:
+        p = self._producto(codigo)
+        filas = self.con.execute("SELECT cantidad, motivo, fecha FROM movimientos WHERE producto_id = ? ORDER BY id",
+                                 (p["id"],)).fetchall()
+        return [dict(f) for f in filas]
+''',
+        "inventario/__main__.py": r'''
+"""Uso: python3 -m inventario alta COD "Nombre" precio [minimo] | entrada COD n | salida COD n | stock COD | bajo | valor"""
+
+import os
+import sys
+
+from inventario.db import ErrorInventario, Inventario
+
+
+def main(argv=None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    inv = Inventario(os.environ.get("INVENTARIO_DB", "inventario.db"))
+    try:
+        if argv[:1] == ["alta"] and len(argv) >= 4:
+            inv.agregar_producto(argv[1], argv[2], float(argv[3]), int(argv[4]) if len(argv) > 4 else 0)
+            print("producto agregado")
+        elif argv[:1] in (["entrada"], ["salida"]) and len(argv) == 3:
+            stock = (inv.entrada if argv[0] == "entrada" else inv.salida)(argv[1], int(argv[2]))
+            print(f"stock de {argv[1]}: {stock}")
+        elif argv[:1] == ["stock"] and len(argv) == 2:
+            print(inv.stock(argv[1]))
+        elif argv[:1] == ["bajo"]:
+            for p in inv.stock_bajo():
+                print(f"{p['codigo']} {p['nombre']}: {p['stock']} (mínimo {p['minimo']})")
+        elif argv[:1] == ["valor"]:
+            print(f"${inv.valorizado():.2f}")
+        else:
+            print(__doc__, file=sys.stderr)
+            return 2
+    except (ErrorInventario, ValueError) as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    return 0
+
+
+sys.exit(main())
+''',
+        "tests/__init__.py": "",
+        "tests/test_inventario.py": r'''
+import unittest
+
+from inventario.db import ErrorInventario, Inventario
+
+
+class TestInventario(unittest.TestCase):
+    def setUp(self):
+        self.inv = Inventario()
+        self.inv.agregar_producto("a1", "Arroz", 2.5, minimo=10)
+        self.inv.agregar_producto("B2", "Fideos", 1.0, minimo=0)
+
+    def test_movimientos(self):
+        self.assertEqual(self.inv.entrada("A1", 20), 20)
+        self.assertEqual(self.inv.salida("a1", 15), 5)
+        self.assertEqual(len(self.inv.historial("A1")), 2)
+
+    def test_stock_insuficiente_y_errores(self):
+        self.inv.entrada("A1", 3)
+        with self.assertRaises(ErrorInventario):
+            self.inv.salida("A1", 4)
+        with self.assertRaises(ErrorInventario):
+            self.inv.mover("A1", 0)
+        with self.assertRaises(ErrorInventario):
+            self.inv.stock("ZZ")
+        with self.assertRaises(ErrorInventario):
+            self.inv.agregar_producto("A1", "Duplicado", 1)
+
+    def test_stock_bajo_y_valor(self):
+        self.inv.entrada("A1", 4)
+        self.inv.entrada("B2", 10)
+        self.assertEqual([p["codigo"] for p in self.inv.stock_bajo()], ["A1"])
+        self.assertEqual(self.inv.valorizado(), 20.0)
+
+
+if __name__ == "__main__":
+    unittest.main()
+''',
+    },
+    comando_tests=_PY_TESTS,
+    comando_ejecutar='python3 -m inventario alta A1 "Arroz" 2.5 10',
+    etiquetas=("inventario", "stock", "productos", "sqlite", "negocio", "almacen", "ventas"),
+)
+
+# ======================================================================
+# notas markdown
+# ======================================================================
+registrar_plantilla(
+    "notas",
+    "Notas en archivos Markdown con etiquetas (#tag), búsqueda por texto/etiqueta, enlaces [[nota]] y backlinks.",
+    "python",
+    {
+        "notas/__init__.py": "",
+        "notas/boveda.py": r'''
+"""Bóveda de notas Markdown (estilo Obsidian minimalista)."""
+
+import re
+from dataclasses import dataclass, field
+from pathlib import Path
+
+_ETIQUETA = re.compile(r"(?<![\w#])#([a-záéíóúñ][\wáéíóúñ-]*)", re.I)
+_ENLACE = re.compile(r"\[\[([^\]|#]+)(?:[|#][^\]]*)?\]\]")
+
+
+def slug(titulo: str) -> str:
+    base = re.sub(r"[^\w\s-]", "", titulo.lower()).strip()
+    return re.sub(r"[\s_]+", "-", base) or "sin-titulo"
+
+
+@dataclass
+class Nota:
+    titulo: str
+    texto: str
+    ruta: Path = None
+    etiquetas: set = field(default_factory=set)
+    enlaces: set = field(default_factory=set)
+
+    @classmethod
+    def desde_texto(cls, titulo: str, texto: str, ruta: Path = None) -> "Nota":
+        etiquetas = {e.lower() for e in _ETIQUETA.findall(texto)}
+        enlaces = {slug(e) for e in _ENLACE.findall(texto)}
+        return cls(titulo, texto, ruta, etiquetas, enlaces)
+
+
+class Boveda:
+    def __init__(self, carpeta: Path):
+        self.carpeta = Path(carpeta)
+        self.carpeta.mkdir(parents=True, exist_ok=True)
+
+    def _ruta(self, titulo: str) -> Path:
+        return self.carpeta / f"{slug(titulo)}.md"
+
+    def guardar(self, titulo: str, texto: str) -> Nota:
+        if not titulo.strip():
+            raise ValueError("la nota necesita título")
+        ruta = self._ruta(titulo)
+        ruta.write_text(f"# {titulo.strip()}\n\n{texto.strip()}\n", encoding="utf-8")
+        return Nota.desde_texto(titulo.strip(), texto, ruta)
+
+    def leer(self, titulo_o_slug: str) -> Nota:
+        ruta = self.carpeta / f"{slug(titulo_o_slug)}.md"
+        if not ruta.exists():
+            raise FileNotFoundError(f"no existe la nota {titulo_o_slug}")
+        contenido = ruta.read_text(encoding="utf-8")
+        primera, _, resto = contenido.partition("\n")
+        titulo = primera.lstrip("# ").strip() or ruta.stem
+        return Nota.desde_texto(titulo, resto.strip(), ruta)
+
+    def todas(self) -> list[Nota]:
+        return [self.leer(r.stem) for r in sorted(self.carpeta.glob("*.md"))]
+
+    def buscar(self, texto: str = "", etiqueta: str = "") -> list[Nota]:
+        texto, etiqueta = texto.lower(), etiqueta.lower().lstrip("#")
+        salida = []
+        for n in self.todas():
+            if texto and texto not in (n.titulo + " " + n.texto).lower():
+                continue
+            if etiqueta and etiqueta not in n.etiquetas:
+                continue
+            salida.append(n)
+        return salida
+
+    def etiquetas(self) -> dict[str, int]:
+        conteo: dict[str, int] = {}
+        for n in self.todas():
+            for e in n.etiquetas:
+                conteo[e] = conteo.get(e, 0) + 1
+        return dict(sorted(conteo.items(), key=lambda kv: (-kv[1], kv[0])))
+
+    def backlinks(self, titulo: str) -> list[str]:
+        objetivo = slug(titulo)
+        return sorted(n.titulo for n in self.todas() if objetivo in n.enlaces)
+
+    def enlaces_rotos(self) -> list[tuple[str, str]]:
+        existentes = {r.stem for r in self.carpeta.glob("*.md")}
+        return sorted((n.titulo, e) for n in self.todas() for e in n.enlaces if e not in existentes)
+''',
+        "notas/__main__.py": r'''
+"""Uso: python3 -m notas nueva "Título" "texto con #etiquetas y [[enlaces]]" | ver T | buscar texto | tag nombre | tags"""
+
+import os
+import sys
+from pathlib import Path
+
+from notas.boveda import Boveda
+
+
+def main(argv=None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    b = Boveda(Path(os.environ.get("NOTAS_DIR", Path.home() / "notas")))
+    try:
+        if argv[:1] == ["nueva"] and len(argv) >= 3:
+            print(f"guardada: {b.guardar(argv[1], argv[2]).ruta}")
+        elif argv[:1] == ["ver"] and len(argv) == 2:
+            n = b.leer(argv[1])
+            print(f"# {n.titulo}\n\n{n.texto}\n")
+            refs = b.backlinks(n.titulo)
+            if refs:
+                print("Mencionada en: " + ", ".join(refs))
+        elif argv[:1] == ["buscar"] and len(argv) == 2:
+            for n in b.buscar(texto=argv[1]):
+                print(n.titulo)
+        elif argv[:1] == ["tag"] and len(argv) == 2:
+            for n in b.buscar(etiqueta=argv[1]):
+                print(n.titulo)
+        elif argv[:1] == ["tags"]:
+            for etiqueta, n in b.etiquetas().items():
+                print(f"#{etiqueta} ({n})")
+        else:
+            print(__doc__, file=sys.stderr)
+            return 2
+    except (ValueError, FileNotFoundError) as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    return 0
+
+
+sys.exit(main())
+''',
+        "tests/__init__.py": "",
+        "tests/test_notas.py": r'''
+import tempfile
+import unittest
+from pathlib import Path
+
+from notas.boveda import Boveda, Nota, slug
+
+
+class TestNotas(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.b = Boveda(Path(self.tmp.name))
+        self.b.guardar("Recetas de cocina", "Ideas para la semana #cocina #casa. Ver [[Lista de compras]].")
+        self.b.guardar("Lista de compras", "Pan, leche #casa")
+        self.b.guardar("Proyecto REAPER", "Agente para Termux #codigo, depende de [[Inexistente]]")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_slug_y_parseo(self):
+        self.assertEqual(slug("¡Hola, Mundo!"), "hola-mundo")
+        n = Nota.desde_texto("x", "texto #Uno y #dos-tres, no#esto [[Otra Nota|alias]]")
+        self.assertEqual(n.etiquetas, {"uno", "dos-tres"})
+        self.assertEqual(n.enlaces, {"otra-nota"})
+
+    def test_leer_y_buscar(self):
+        self.assertEqual(self.b.leer("lista de compras").titulo, "Lista de compras")
+        self.assertEqual([n.titulo for n in self.b.buscar(texto="leche")], ["Lista de compras"])
+        self.assertEqual(len(self.b.buscar(etiqueta="#casa")), 2)
+        with self.assertRaises(FileNotFoundError):
+            self.b.leer("no existe")
+
+    def test_etiquetas_backlinks_rotos(self):
+        self.assertEqual(list(self.b.etiquetas().items())[0], ("casa", 2))
+        self.assertEqual(self.b.backlinks("Lista de compras"), ["Recetas de cocina"])
+        self.assertEqual(self.b.enlaces_rotos(), [("Proyecto REAPER", "inexistente")])
+
+    def test_titulo_obligatorio(self):
+        with self.assertRaises(ValueError):
+            self.b.guardar("  ", "x")
+
+
+if __name__ == "__main__":
+    unittest.main()
+''',
+    },
+    comando_tests=_PY_TESTS,
+    comando_ejecutar='python3 -m notas nueva "Mi primera nota" "Hola #reaper"',
+    etiquetas=("notas", "markdown", "apuntes", "etiquetas", "obsidian", "wiki", "conocimiento"),
+)
+
+# ======================================================================
+# sitio estático
+# ======================================================================
+registrar_plantilla(
+    "sitio-estatico",
+    "Generador de sitios estáticos: Markdown (subconjunto) → HTML con plantilla, índice de páginas y estilos.",
+    "python",
+    {
+        "sitio/__init__.py": "",
+        "sitio/markdown.py": r'''
+"""Conversor Markdown → HTML (subconjunto: títulos, párrafos, listas, código, énfasis, links)."""
+
+import html
+import re
+
+
+def _en_linea(texto: str) -> str:
+    texto = html.escape(texto, quote=False)
+    texto = re.sub(r"`([^`]+)`", r"<code>\1</code>", texto)
+    texto = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", texto)
+    texto = re.sub(r"(?<!\*)\*([^*]+)\*(?!\*)", r"<em>\1</em>", texto)
+    texto = re.sub(r"\[([^\]]+)\]\(([^)\s]+)\)", r'<a href="\2">\1</a>', texto)
+    return texto
+
+
+def a_html(markdown: str) -> str:
+    salida, parrafo, lista = [], [], None
+    en_codigo, codigo = False, []
+
+    def cerrar_parrafo():
+        if parrafo:
+            salida.append("<p>" + _en_linea(" ".join(parrafo)) + "</p>")
+            parrafo.clear()
+
+    def cerrar_lista():
+        nonlocal lista
+        if lista:
+            salida.append(f"</{lista}>")
+            lista = None
+
+    for linea in markdown.splitlines():
+        if linea.strip().startswith("```"):
+            if en_codigo:
+                salida.append("<pre><code>" + html.escape("\n".join(codigo)) + "</code></pre>")
+                codigo, en_codigo = [], False
+            else:
+                cerrar_parrafo()
+                cerrar_lista()
+                en_codigo = True
+            continue
+        if en_codigo:
+            codigo.append(linea)
+            continue
+        m = re.match(r"^(#{1,6})\s+(.*)$", linea)
+        if m:
+            cerrar_parrafo()
+            cerrar_lista()
+            nivel = len(m.group(1))
+            salida.append(f"<h{nivel}>{_en_linea(m.group(2).strip())}</h{nivel}>")
+            continue
+        m = re.match(r"^\s*([-*]|\d+\.)\s+(.*)$", linea)
+        if m:
+            cerrar_parrafo()
+            tipo = "ol" if m.group(1)[0].isdigit() else "ul"
+            if lista != tipo:
+                cerrar_lista()
+                salida.append(f"<{tipo}>")
+                lista = tipo
+            salida.append(f"<li>{_en_linea(m.group(2))}</li>")
+            continue
+        if not linea.strip():
+            cerrar_parrafo()
+            cerrar_lista()
+            continue
+        cerrar_lista()
+        parrafo.append(linea.strip())
+    if en_codigo:
+        salida.append("<pre><code>" + html.escape("\n".join(codigo)) + "</code></pre>")
+    cerrar_parrafo()
+    cerrar_lista()
+    return "\n".join(salida)
+''',
+        "sitio/generador.py": r'''
+"""Construye el sitio: contenido/*.md → publico/*.html + index.html."""
+
+import html
+import shutil
+from pathlib import Path
+
+from sitio.markdown import a_html
+
+PLANTILLA = """<!doctype html>
+<html lang="es"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{titulo} · {sitio}</title><link rel="stylesheet" href="estilo.css"></head>
+<body><header><a href="index.html">{sitio}</a></header><main>{contenido}</main></body></html>
+"""
+
+ESTILO = "body{font-family:system-ui,sans-serif;max-width:46rem;margin:auto;padding:1rem;line-height:1.6}" \
+         "header{border-bottom:1px solid #ccc;margin-bottom:1rem}pre{background:#f4f4f4;padding:.8rem;overflow:auto}"
+
+
+def titulo_de(markdown: str, defecto: str) -> str:
+    for linea in markdown.splitlines():
+        if linea.startswith("# "):
+            return linea[2:].strip()
+    return defecto
+
+
+def construir(contenido: Path, publico: Path, nombre_sitio: str = "__TITULO__") -> list[Path]:
+    contenido, publico = Path(contenido), Path(publico)
+    if publico.exists():
+        shutil.rmtree(publico)
+    publico.mkdir(parents=True)
+    (publico / "estilo.css").write_text(ESTILO, encoding="utf-8")
+    paginas = []
+    for md in sorted(contenido.glob("*.md")):
+        texto = md.read_text(encoding="utf-8")
+        titulo = titulo_de(texto, md.stem)
+        destino = publico / f"{md.stem}.html"
+        destino.write_text(PLANTILLA.format(titulo=html.escape(titulo), sitio=html.escape(nombre_sitio),
+                                            contenido=a_html(texto)), encoding="utf-8")
+        paginas.append((titulo, destino))
+    indice = "<h1>Páginas</h1><ul>" + "".join(
+        f'<li><a href="{d.name}">{html.escape(t)}</a></li>' for t, d in paginas if d.stem != "index") + "</ul>"
+    if not (contenido / "index.md").exists():
+        (publico / "index.html").write_text(PLANTILLA.format(titulo="Inicio", sitio=html.escape(nombre_sitio),
+                                                             contenido=indice), encoding="utf-8")
+    return [d for _, d in paginas]
+''',
+        "sitio/__main__.py": r'''
+"""Uso: python3 -m sitio [contenido] [publico]   y después: python3 -m http.server -d publico"""
+
+import sys
+from pathlib import Path
+
+from sitio.generador import construir
+
+args = sys.argv[1:]
+paginas = construir(Path(args[0] if args else "contenido"), Path(args[1] if len(args) > 1 else "publico"))
+print(f"{len(paginas)} páginas generadas")
+''',
+        "contenido/bienvenida.md": "# Bienvenida\n\nEste sitio se generó con **REAPER**.\n\n- rápido\n- sin dependencias\n",
+        "tests/__init__.py": "",
+        "tests/test_sitio.py": r'''
+import tempfile
+import unittest
+from pathlib import Path
+
+from sitio.generador import construir, titulo_de
+from sitio.markdown import a_html
+
+
+class TestMarkdown(unittest.TestCase):
+    def test_bloques(self):
+        html = a_html("# Título\n\nUn **párrafo** con `código` y [link](http://x).\n\n- a\n- b\n\n1. uno\n")
+        self.assertIn("<h1>Título</h1>", html)
+        self.assertIn("<strong>párrafo</strong>", html)
+        self.assertIn("<code>código</code>", html)
+        self.assertIn('<a href="http://x">link</a>', html)
+        self.assertIn("<ul>\n<li>a</li>\n<li>b</li>\n</ul>", html)
+        self.assertIn("<ol>", html)
+
+    def test_codigo_escapado(self):
+        html = a_html("```\n<script>alert(1)</script>\n```")
+        self.assertIn("&lt;script&gt;", html)
+        self.assertNotIn("<script>", html)
+
+    def test_titulo(self):
+        self.assertEqual(titulo_de("texto\n# Hola\n", "x"), "Hola")
+        self.assertEqual(titulo_de("sin título", "defecto"), "defecto")
+
+
+class TestGenerador(unittest.TestCase):
+    def test_construir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            (base / "c").mkdir()
+            (base / "c" / "a.md").write_text("# Página A\n\nhola", encoding="utf-8")
+            paginas = construir(base / "c", base / "p", "Mi sitio")
+            self.assertEqual([p.name for p in paginas], ["a.html"])
+            indice = (base / "p" / "index.html").read_text(encoding="utf-8")
+            self.assertIn('href="a.html"', indice)
+            self.assertTrue((base / "p" / "estilo.css").exists())
+
+
+if __name__ == "__main__":
+    unittest.main()
+''',
+    },
+    comando_tests=_PY_TESTS,
+    comando_ejecutar="python3 -m sitio && python3 -m http.server -d publico 8080",
+    etiquetas=("sitio", "web", "estatico", "blog", "markdown", "html", "generador", "pagina"),
+)
+
+# ======================================================================
+# termux-api
+# ======================================================================
+registrar_plantilla(
+    "termux-api",
+    "Envoltorio Python de termux-api (notificaciones, toast, portapapeles, batería, vibración, TTS) con tests sin Android.",
+    "python",
+    {
+        "termuxapi/__init__.py": "",
+        "termuxapi/api.py": r'''
+"""Llamadas a los comandos termux-* con errores claros. El ejecutor es inyectable para testear."""
+
+import json
+import shutil
+import subprocess
+from typing import Callable, Optional
+
+Ejecutor = Callable[[list, Optional[str]], str]
+
+
+class ErrorTermuxAPI(RuntimeError):
+    pass
+
+
+def ejecutor_real(args: list, entrada: Optional[str] = None) -> str:
+    if not shutil.which(args[0]):
+        raise ErrorTermuxAPI(f"falta {args[0]}: pkg install termux-api (y la app Termux:API de F-Droid)")
+    try:
+        r = subprocess.run(args, input=entrada, capture_output=True, text=True, timeout=15)
+    except subprocess.TimeoutExpired:
+        raise ErrorTermuxAPI(f"{args[0]} no respondió (¿la app Termux:API tiene permisos?)") from None
+    if r.returncode != 0:
+        raise ErrorTermuxAPI(f"{args[0]} falló: {r.stderr.strip()[:200]}")
+    return r.stdout
+
+
+class TermuxAPI:
+    def __init__(self, ejecutor: Ejecutor = ejecutor_real):
+        self._ejecutar = ejecutor
+
+    def notificar(self, titulo: str, texto: str, id_: str = "app") -> None:
+        self._ejecutar(["termux-notification", "--id", id_, "--title", titulo, "--content", texto], None)
+
+    def toast(self, texto: str, corto: bool = True) -> None:
+        args = ["termux-toast"] + (["-s"] if corto else []) + [texto]
+        self._ejecutar(args, None)
+
+    def copiar(self, texto: str) -> None:
+        self._ejecutar(["termux-clipboard-set"], texto)
+
+    def pegar(self) -> str:
+        return self._ejecutar(["termux-clipboard-get"], None)
+
+    def bateria(self) -> dict:
+        datos = json.loads(self._ejecutar(["termux-battery-status"], None) or "{}")
+        return {"porcentaje": datos.get("percentage"), "estado": datos.get("status"),
+                "temperatura": datos.get("temperature"), "enchufado": datos.get("plugged") not in (None, "UNPLUGGED")}
+
+    def vibrar(self, ms: int = 300) -> None:
+        if not 1 <= ms <= 5000:
+            raise ValueError("la vibración va de 1 a 5000 ms")
+        self._ejecutar(["termux-vibrate", "-d", str(ms)], None)
+
+    def hablar(self, texto: str) -> None:
+        self._ejecutar(["termux-tts-speak"], texto)
+''',
+        "termuxapi/__main__.py": r'''
+"""Demo: python3 -m termuxapi"""
+
+from termuxapi.api import ErrorTermuxAPI, TermuxAPI
+
+api = TermuxAPI()
+try:
+    b = api.bateria()
+    api.notificar("__TITULO__", f"Batería: {b['porcentaje']}% ({b['estado']})")
+    print("notificación enviada")
+except ErrorTermuxAPI as e:
+    print(f"no disponible: {e}")
+''',
+        "tests/__init__.py": "",
+        "tests/test_api.py": r'''
+import json
+import unittest
+
+from termuxapi.api import ErrorTermuxAPI, TermuxAPI
+
+
+class Falso:
+    def __init__(self, respuestas=None):
+        self.llamadas = []
+        self.respuestas = respuestas or {}
+
+    def __call__(self, args, entrada):
+        self.llamadas.append((args, entrada))
+        return self.respuestas.get(args[0], "")
+
+
+class TestTermuxAPI(unittest.TestCase):
+    def test_notificar_y_toast(self):
+        f = Falso()
+        api = TermuxAPI(f)
+        api.notificar("T", "hola")
+        api.toast("x")
+        self.assertEqual(f.llamadas[0][0][:3], ["termux-notification", "--id", "app"])
+        self.assertEqual(f.llamadas[1][0], ["termux-toast", "-s", "x"])
+
+    def test_portapapeles(self):
+        f = Falso({"termux-clipboard-get": "pegado"})
+        api = TermuxAPI(f)
+        api.copiar("copiado")
+        self.assertEqual(f.llamadas[0], (["termux-clipboard-set"], "copiado"))
+        self.assertEqual(api.pegar(), "pegado")
+
+    def test_bateria(self):
+        datos = {"percentage": 80, "status": "CHARGING", "plugged": "PLUGGED_USB", "temperature": 30.1}
+        b = TermuxAPI(Falso({"termux-battery-status": json.dumps(datos)})).bateria()
+        self.assertEqual((b["porcentaje"], b["enchufado"]), (80, True))
+
+    def test_vibrar_valida(self):
+        with self.assertRaises(ValueError):
+            TermuxAPI(Falso()).vibrar(0)
+
+    def test_error_propagado(self):
+        def roto(args, entrada):
+            raise ErrorTermuxAPI("falta termux-toast")
+        with self.assertRaises(ErrorTermuxAPI):
+            TermuxAPI(roto).toast("x")
+
+
+if __name__ == "__main__":
+    unittest.main()
+''',
+    },
+    comando_tests=_PY_TESTS,
+    comando_ejecutar="python3 -m termuxapi",
+    etiquetas=("termux", "android", "notificacion", "bateria", "portapapeles", "vibrar", "api"),
+)
+
+# ======================================================================
+# paquete python (pyproject)
+# ======================================================================
+registrar_plantilla(
+    "paquete",
+    "Paquete Python instalable (pyproject.toml, layout src/, entry point de consola) con tests.",
+    "python",
+    {
+        "pyproject.toml": r'''
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "__PROYECTO__"
+version = "0.1.0"
+description = "__TITULO__"
+requires-python = ">=3.9"
+readme = "README.md"
+
+[project.scripts]
+__PROYECTO__ = "__PROYECTO__.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+''',
+        "README.md": "# __TITULO__\n\nInstalar en modo desarrollo: `pip install -e .`\n\nUsar: `__PROYECTO__ --ayuda`\n",
+        "src/__PROYECTO__/__init__.py": r'''
+"""__TITULO__."""
+
+__version__ = "0.1.0"
+
+from __PROYECTO__.nucleo import slugificar, truncar  # noqa: F401
+''',
+        "src/__PROYECTO__/nucleo.py": r'''
+import re
+import unicodedata
+
+
+def slugificar(texto: str, separador: str = "-") -> str:
+    """'¡Hola Mundo!' → 'hola-mundo'"""
+    normal = unicodedata.normalize("NFKD", texto)
+    sin_tildes = "".join(c for c in normal if not unicodedata.combining(c))
+    palabras = re.findall(r"[a-z0-9]+", sin_tildes.lower())
+    return separador.join(palabras)
+
+
+def truncar(texto: str, largo: int, sufijo: str = "…") -> str:
+    """Corta en el último espacio antes del límite."""
+    if largo < len(sufijo) + 1:
+        raise ValueError("largo demasiado chico")
+    if len(texto) <= largo:
+        return texto
+    corte = texto[: largo - len(sufijo)]
+    espacio = corte.rfind(" ")
+    return (corte[:espacio] if espacio > 0 else corte).rstrip() + sufijo
+''',
+        "src/__PROYECTO__/cli.py": r'''
+import argparse
+import sys
+
+from __PROYECTO__ import __version__
+from __PROYECTO__.nucleo import slugificar, truncar
+
+
+def main(argv=None) -> int:
+    p = argparse.ArgumentParser(prog="__PROYECTO__")
+    p.add_argument("--version", action="version", version=__version__)
+    sub = p.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("slug").add_argument("texto")
+    t = sub.add_parser("truncar")
+    t.add_argument("texto")
+    t.add_argument("largo", type=int)
+    args = p.parse_args(argv)
+    if args.cmd == "slug":
+        print(slugificar(args.texto))
+    else:
+        try:
+            print(truncar(args.texto, args.largo))
+        except ValueError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
+    return 0
+''',
+        "tests/__init__.py": "",
+        "tests/test_paquete.py": r'''
+import io
+import sys
+import unittest
+from contextlib import redirect_stdout
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+
+from __PROYECTO__ import slugificar, truncar  # noqa: E402
+from __PROYECTO__.cli import main  # noqa: E402
+
+
+class TestNucleo(unittest.TestCase):
+    def test_slug(self):
+        self.assertEqual(slugificar("¡Hola, Señor Ñandú!"), "hola-senor-nandu")
+        self.assertEqual(slugificar("a b", "_"), "a_b")
+
+    def test_truncar(self):
+        self.assertEqual(truncar("hola mundo cruel", 12), "hola mundo…")
+        self.assertEqual(truncar("corto", 10), "corto")
+        with self.assertRaises(ValueError):
+            truncar("x", 1)
+
+    def test_cli(self):
+        salida = io.StringIO()
+        with redirect_stdout(salida):
+            self.assertEqual(main(["slug", "Año Nuevo"]), 0)
+        self.assertEqual(salida.getvalue().strip(), "ano-nuevo")
+
+
+if __name__ == "__main__":
+    unittest.main()
+''',
+    },
+    comando_tests=_PY_TESTS,
+    comando_ejecutar="pip install -e . && __PROYECTO__ slug 'Hola Mundo'",
+    etiquetas=("paquete", "libreria", "pyproject", "pip", "instalable", "modulo", "biblioteca"),
+)
+
+# ======================================================================
+# agenda de contactos
+# ======================================================================
+registrar_plantilla(
+    "agenda",
+    "Agenda de contactos con validación de email/teléfono, búsqueda difusa, cumpleaños próximos y exportación vCard.",
+    "python",
+    {
+        "agenda/__init__.py": "",
+        "agenda/contactos.py": r'''
+"""Contactos con validación, búsqueda tolerante a errores y exportación vCard 3.0."""
+
+import difflib
+import json
+import re
+from dataclasses import asdict, dataclass, field
+from datetime import date
+from pathlib import Path
+from typing import Optional
+
+_EMAIL = re.compile(r"^[\w.+-]+@[\w-]+(\.[\w-]+)+$")
+
+
+def normalizar_telefono(texto: str) -> str:
+    digitos = re.sub(r"[^\d+]", "", texto)
+    if digitos.count("+") > 1 or ("+" in digitos and not digitos.startswith("+")):
+        raise ValueError(f"teléfono inválido: {texto}")
+    if len(re.sub(r"\D", "", digitos)) < 6:
+        raise ValueError(f"teléfono demasiado corto: {texto}")
+    return digitos
+
+
+@dataclass
+class Contacto:
+    nombre: str
+    telefono: str = ""
+    email: str = ""
+    cumple: Optional[str] = None  # AAAA-MM-DD o MM-DD
+    etiquetas: list = field(default_factory=list)
+
+    def __post_init__(self):
+        self.nombre = " ".join(self.nombre.split())
+        if not self.nombre:
+            raise ValueError("el contacto necesita nombre")
+        if self.telefono:
+            self.telefono = normalizar_telefono(self.telefono)
+        if self.email and not _EMAIL.match(self.email.strip()):
+            raise ValueError(f"email inválido: {self.email}")
+        self.email = self.email.strip().lower()
+        if self.cumple:
+            self.mes_dia()  # valida
+
+    def mes_dia(self) -> tuple[int, int]:
+        partes = self.cumple.split("-")
+        mes, dia = int(partes[-2]), int(partes[-1])
+        date(2000, mes, dia)  # lanza ValueError si no existe
+        return mes, dia
+
+    def dias_para_cumple(self, hoy: date) -> Optional[int]:
+        if not self.cumple:
+            return None
+        mes, dia = self.mes_dia()
+        anio = hoy.year
+        while True:
+            try:
+                proximo = date(anio, mes, dia)
+            except ValueError:  # 29 de febrero en año no bisiesto
+                proximo = date(anio, 3, 1)
+            if proximo >= hoy:
+                return (proximo - hoy).days
+            anio += 1
+
+    def vcard(self) -> str:
+        lineas = ["BEGIN:VCARD", "VERSION:3.0", f"FN:{self.nombre}", f"N:{self.nombre};;;;"]
+        if self.telefono:
+            lineas.append(f"TEL;TYPE=CELL:{self.telefono}")
+        if self.email:
+            lineas.append(f"EMAIL:{self.email}")
+        if self.cumple and len(self.cumple) == 10:
+            lineas.append(f"BDAY:{self.cumple}")
+        lineas.append("END:VCARD")
+        return "\r\n".join(lineas)
+
+
+class Agenda:
+    def __init__(self, ruta: Path):
+        self.ruta = Path(ruta)
+        self.contactos: list[Contacto] = []
+        if self.ruta.exists():
+            self.contactos = [Contacto(**d) for d in json.loads(self.ruta.read_text(encoding="utf-8") or "[]")]
+
+    def guardar(self) -> None:
+        self.ruta.write_text(json.dumps([asdict(c) for c in self.contactos], ensure_ascii=False, indent=1),
+                             encoding="utf-8")
+
+    def agregar(self, contacto: Contacto) -> Contacto:
+        if any(c.nombre.lower() == contacto.nombre.lower() for c in self.contactos):
+            raise ValueError(f"ya existe {contacto.nombre}")
+        self.contactos.append(contacto)
+        return contacto
+
+    def buscar(self, texto: str) -> list[Contacto]:
+        texto = texto.lower().strip()
+        exactos = [c for c in self.contactos if texto in c.nombre.lower() or texto in c.email or texto in c.telefono]
+        if exactos:
+            return exactos
+        nombres = {c.nombre.lower(): c for c in self.contactos}
+        return [nombres[n] for n in difflib.get_close_matches(texto, list(nombres), n=3, cutoff=0.6)]
+
+    def proximos_cumples(self, hoy: date, dias: int = 30) -> list[tuple[int, Contacto]]:
+        lista = [(c.dias_para_cumple(hoy), c) for c in self.contactos if c.cumple]
+        return sorted([(d, c) for d, c in lista if d is not None and d <= dias], key=lambda t: (t[0], t[1].nombre))
+
+    def exportar_vcf(self, destino: Path) -> int:
+        Path(destino).write_text("\r\n".join(c.vcard() for c in self.contactos) + "\r\n", encoding="utf-8")
+        return len(self.contactos)
+''',
+        "agenda/__main__.py": r'''
+"""Uso: python3 -m agenda agregar "Nombre" [telefono] [email] [cumple] | buscar texto | cumples | vcf archivo.vcf"""
+
+import os
+import sys
+from datetime import date
+from pathlib import Path
+
+from agenda.contactos import Agenda, Contacto
+
+
+def main(argv=None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    agenda = Agenda(Path(os.environ.get("AGENDA_ARCHIVO", Path.home() / ".agenda.json")))
+    try:
+        if argv[:1] == ["agregar"] and len(argv) >= 2:
+            extras = argv[2:] + ["", "", ""]
+            agenda.agregar(Contacto(argv[1], extras[0], extras[1], extras[2] or None))
+            agenda.guardar()
+            print("contacto agregado")
+        elif argv[:1] == ["buscar"] and len(argv) == 2:
+            for c in agenda.buscar(argv[1]):
+                print(f"{c.nombre}  {c.telefono}  {c.email}")
+        elif argv[:1] == ["cumples"]:
+            for dias, c in agenda.proximos_cumples(date.today()):
+                print(f"{'¡hoy!' if dias == 0 else f'en {dias} días'}: {c.nombre}")
+        elif argv[:1] == ["vcf"] and len(argv) == 2:
+            print(f"{agenda.exportar_vcf(Path(argv[1]))} contactos exportados")
+        else:
+            print(__doc__, file=sys.stderr)
+            return 2
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    return 0
+
+
+sys.exit(main())
+''',
+        "tests/__init__.py": "",
+        "tests/test_agenda.py": r'''
+import tempfile
+import unittest
+from datetime import date
+from pathlib import Path
+
+from agenda.contactos import Agenda, Contacto, normalizar_telefono
+
+
+class TestContacto(unittest.TestCase):
+    def test_validaciones(self):
+        self.assertEqual(normalizar_telefono("+54 9 (341) 555-1234"), "+5493415551234")
+        for malo in ("12", "54+9"):
+            with self.assertRaises(ValueError):
+                normalizar_telefono(malo)
+        with self.assertRaises(ValueError):
+            Contacto("Ana", email="no-es-mail")
+        with self.assertRaises(ValueError):
+            Contacto("   ")
+        with self.assertRaises(ValueError):
+            Contacto("Ana", cumple="02-30")
+
+    def test_cumple(self):
+        c = Contacto("Leo", cumple="1990-12-25")
+        self.assertEqual(c.dias_para_cumple(date(2026, 12, 20)), 5)
+        self.assertEqual(c.dias_para_cumple(date(2026, 12, 26)), 364)
+        bisiesto = Contacto("Feb", cumple="02-29")
+        self.assertEqual(bisiesto.dias_para_cumple(date(2027, 2, 28)), 1)
+
+    def test_vcard(self):
+        v = Contacto("Ana Pérez", "123456789", "ANA@x.com", "1990-01-02").vcard()
+        self.assertIn("FN:Ana Pérez", v)
+        self.assertIn("EMAIL:ana@x.com", v)
+        self.assertIn("BDAY:1990-01-02", v)
+
+
+class TestAgenda(unittest.TestCase):
+    def test_flujo(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ruta = Path(tmp) / "a.json"
+            a = Agenda(ruta)
+            a.agregar(Contacto("Ana Gómez", "3415551234", cumple="05-10"))
+            a.agregar(Contacto("Bruno Díaz", email="b@d.com", cumple="05-02"))
+            with self.assertRaises(ValueError):
+                a.agregar(Contacto("ana gómez"))
+            a.guardar()
+            b = Agenda(ruta)
+            self.assertEqual([c.nombre for c in b.buscar("ana")], ["Ana Gómez"])
+            self.assertEqual([c.nombre for c in b.buscar("bruno dias")], ["Bruno Díaz"])
+            proximos = b.proximos_cumples(date(2026, 5, 1), dias=15)
+            self.assertEqual([c.nombre for _, c in proximos], ["Bruno Díaz", "Ana Gómez"])
+            self.assertEqual(b.exportar_vcf(Path(tmp) / "x.vcf"), 2)
+
+
+if __name__ == "__main__":
+    unittest.main()
+''',
+    },
+    comando_tests=_PY_TESTS,
+    comando_ejecutar='python3 -m agenda agregar "Ana" 3415551234 ana@mail.com 05-10',
+    etiquetas=("agenda", "contactos", "telefono", "email", "cumpleaños", "vcard"),
+)
+
+# ======================================================================
+# planificador tipo cron
+# ======================================================================
+registrar_plantilla(
+    "cron",
+    "Planificador de tareas en Python con expresiones cron (*/5, rangos, listas), próximo disparo y ejecución en bucle.",
+    "python",
+    {
+        "cron/__init__.py": "",
+        "cron/expresion.py": r'''
+"""Parser de expresiones cron de 5 campos y cálculo del próximo disparo."""
+
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+
+RANGOS = [("minuto", 0, 59), ("hora", 0, 23), ("dia", 1, 31), ("mes", 1, 12), ("semana", 0, 6)]
+ALIAS = {"@hourly": "0 * * * *", "@daily": "0 0 * * *", "@weekly": "0 0 * * 0", "@monthly": "0 0 1 * *",
+         "@cadahora": "0 * * * *", "@diario": "0 0 * * *"}
+
+
+def parsear_campo(texto: str, minimo: int, maximo: int, nombre: str) -> frozenset:
+    valores = set()
+    for parte in texto.split(","):
+        paso = 1
+        if "/" in parte:
+            parte, paso_txt = parte.split("/", 1)
+            if not paso_txt.isdigit() or int(paso_txt) < 1:
+                raise ValueError(f"paso inválido en {nombre}: {paso_txt}")
+            paso = int(paso_txt)
+        if parte in ("*", ""):
+            inicio, fin = minimo, maximo
+        elif "-" in parte:
+            a, b = parte.split("-", 1)
+            inicio, fin = int(a), int(b)
+        else:
+            inicio = fin = int(parte)
+            if paso > 1:
+                fin = maximo
+        if not (minimo <= inicio <= maximo and minimo <= fin <= maximo and inicio <= fin):
+            raise ValueError(f"{nombre} fuera de rango ({minimo}-{maximo}): {parte}")
+        valores.update(range(inicio, fin + 1, paso))
+    return frozenset(valores)
+
+
+@dataclass(frozen=True)
+class Cron:
+    minutos: frozenset
+    horas: frozenset
+    dias: frozenset
+    meses: frozenset
+    semana: frozenset
+    texto: str
+
+    @classmethod
+    def parsear(cls, texto: str) -> "Cron":
+        expresion = ALIAS.get(texto.strip(), texto.strip())
+        campos = expresion.split()
+        if len(campos) != 5:
+            raise ValueError("una expresión cron tiene 5 campos: minuto hora día mes día_semana")
+        conjuntos = []
+        for valor, (nombre, minimo, maximo) in zip(campos, RANGOS):
+            try:
+                conjuntos.append(parsear_campo(valor, minimo, maximo, nombre))
+            except ValueError as e:
+                raise ValueError(str(e)) from None
+        return cls(*conjuntos, texto)
+
+    def coincide(self, momento: datetime) -> bool:
+        dia_semana = (momento.weekday() + 1) % 7  # cron: 0 = domingo
+        return (momento.minute in self.minutos and momento.hour in self.horas and momento.month in self.meses
+                and momento.day in self.dias and dia_semana in self.semana)
+
+    def proximo(self, desde: datetime, limite_dias: int = 366 * 4) -> datetime:
+        momento = desde.replace(second=0, microsecond=0) + timedelta(minutes=1)
+        fin = desde + timedelta(days=limite_dias)
+        while momento <= fin:
+            if momento.month not in self.meses:
+                momento = (momento.replace(day=1, hour=0, minute=0) + timedelta(days=32)).replace(day=1)
+                continue
+            if momento.day not in self.dias or (momento.weekday() + 1) % 7 not in self.semana:
+                momento = momento.replace(hour=0, minute=0) + timedelta(days=1)
+                continue
+            if momento.hour not in self.horas:
+                momento = momento.replace(minute=0) + timedelta(hours=1)
+                continue
+            if momento.minute in self.minutos:
+                return momento
+            momento += timedelta(minutes=1)
+        raise ValueError(f"la expresión {self.texto} no se dispara en {limite_dias} días")
+''',
+        "cron/planificador.py": r'''
+"""Planificador en proceso: registra funciones con expresiones cron y las corre a su hora."""
+
+import time
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Callable
+
+from cron.expresion import Cron
+
+
+@dataclass
+class Trabajo:
+    nombre: str
+    cron: Cron
+    funcion: Callable[[], object]
+    proximo: datetime
+    ejecuciones: int = 0
+    ultimo_error: str = ""
+
+
+class Planificador:
+    def __init__(self, ahora: Callable[[], datetime] = datetime.now):
+        self.ahora = ahora
+        self.trabajos: list[Trabajo] = []
+
+    def agregar(self, nombre: str, expresion: str, funcion: Callable[[], object]) -> Trabajo:
+        cron = Cron.parsear(expresion)
+        trabajo = Trabajo(nombre, cron, funcion, cron.proximo(self.ahora()))
+        self.trabajos.append(trabajo)
+        return trabajo
+
+    def pendientes(self) -> list[Trabajo]:
+        ahora = self.ahora()
+        return [t for t in self.trabajos if t.proximo <= ahora]
+
+    def tick(self) -> list[str]:
+        """Corre lo que toca. Un trabajo que falla no frena a los demás."""
+        ejecutados = []
+        for t in self.pendientes():
+            try:
+                t.funcion()
+                t.ultimo_error = ""
+            except Exception as e:  # se registra y se sigue
+                t.ultimo_error = f"{type(e).__name__}: {e}"
+            t.ejecuciones += 1
+            t.proximo = t.cron.proximo(self.ahora())
+            ejecutados.append(t.nombre)
+        return ejecutados
+
+    def correr(self, intervalo: float = 20.0) -> None:
+        while True:
+            self.tick()
+            time.sleep(intervalo)
+''',
+        "cron/__main__.py": r'''
+"""Demo: python3 -m cron "*/5 * * * *"  → muestra los próximos 5 disparos"""
+
+import sys
+from datetime import datetime
+
+from cron.expresion import Cron
+
+expresion = " ".join(sys.argv[1:]) or "*/15 9-18 * * 1-5"
+try:
+    c = Cron.parsear(expresion)
+except ValueError as e:
+    sys.exit(f"error: {e}")
+momento = datetime.now()
+for _ in range(5):
+    momento = c.proximo(momento)
+    print(momento.strftime("%a %Y-%m-%d %H:%M"))
+''',
+        "tests/__init__.py": "",
+        "tests/test_cron.py": r'''
+import unittest
+from datetime import datetime
+
+from cron.expresion import Cron, parsear_campo
+from cron.planificador import Planificador
+
+
+class TestExpresion(unittest.TestCase):
+    def test_campos(self):
+        self.assertEqual(parsear_campo("*/15", 0, 59, "m"), frozenset({0, 15, 30, 45}))
+        self.assertEqual(parsear_campo("1-3,10", 0, 59, "m"), frozenset({1, 2, 3, 10}))
+        self.assertEqual(parsear_campo("5/20", 0, 59, "m"), frozenset({5, 25, 45}))
+        for malo in ("70", "5-2", "*/0"):
+            with self.assertRaises(ValueError):
+                parsear_campo(malo, 0, 59, "m")
+
+    def test_proximo(self):
+        c = Cron.parsear("30 9 * * 1-5")
+        self.assertEqual(c.proximo(datetime(2026, 10, 2, 10, 0)), datetime(2026, 10, 5, 9, 30))  # viernes → lunes
+        self.assertEqual(Cron.parsear("@daily").proximo(datetime(2026, 1, 31, 23, 59)), datetime(2026, 2, 1, 0, 0))
+        self.assertEqual(Cron.parsear("0 0 29 2 *").proximo(datetime(2026, 3, 1)), datetime(2028, 2, 29, 0, 0))
+
+    def test_coincide_y_errores(self):
+        self.assertTrue(Cron.parsear("* * * * 0").coincide(datetime(2026, 10, 4, 12, 0)))  # domingo
+        with self.assertRaises(ValueError):
+            Cron.parsear("* * *")
+
+
+class TestPlanificador(unittest.TestCase):
+    def test_tick(self):
+        ahora = [datetime(2026, 1, 1, 10, 0, 30)]
+        p = Planificador(lambda: ahora[0])
+        corridas = []
+        p.agregar("cada5", "*/5 * * * *", lambda: corridas.append(1))
+        p.agregar("roto", "* * * * *", lambda: 1 / 0)
+        self.assertEqual(p.tick(), [])
+        ahora[0] = datetime(2026, 1, 1, 10, 5)
+        self.assertEqual(sorted(p.tick()), ["cada5", "roto"])
+        self.assertEqual(corridas, [1])
+        self.assertIn("ZeroDivisionError", p.trabajos[1].ultimo_error)
+        self.assertEqual(p.trabajos[0].proximo, datetime(2026, 1, 1, 10, 10))
+
+
+if __name__ == "__main__":
+    unittest.main()
+''',
+    },
+    comando_tests=_PY_TESTS,
+    comando_ejecutar='python3 -m cron "*/5 * * * *"',
+    etiquetas=("cron", "planificador", "programar", "tareas", "horario", "scheduler", "automatizar"),
+)
+
+
+# ======================================================================
+# MÓDULO: plantillas_web
+# ======================================================================
+"""Plantillas web y Node.js (sin dependencias de npm): lógica pura testeable con node:test."""
+
+_NODE_TESTS = "node --test"
+_PAQUETE_NODE = r'''
+{
+  "name": "__PROYECTO__",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "test": "node --test",
+    "start": "__INICIO__"
+  }
+}
+'''
+
+# ======================================================================
+# web-tareas
+# ======================================================================
+registrar_plantilla(
+    "web-tareas",
+    "App web de tareas (HTML/CSS/JS sin frameworks): filtros, edición, guardado en localStorage y lógica testeada.",
+    "javascript",
+    {
+        "package.json": _PAQUETE_NODE.replace("__INICIO__", "python3 -m http.server 8080"),
+        "index.html": r'''
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>__TITULO__</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <main class="app">
+    <h1>__TITULO__</h1>
+    <form id="form-nueva">
+      <input id="texto" placeholder="¿Qué hay que hacer?" autocomplete="off" required maxlength="200">
+      <button type="submit">Agregar</button>
+    </form>
+    <nav class="filtros">
+      <button data-filtro="todas" class="activo">Todas</button>
+      <button data-filtro="pendientes">Pendientes</button>
+      <button data-filtro="hechas">Hechas</button>
+    </nav>
+    <ul id="lista"></ul>
+    <footer><span id="contador"></span><button id="limpiar">Borrar hechas</button></footer>
+  </main>
+  <script type="module" src="app.js"></script>
+</body>
+</html>
+''',
+        "style.css": r'''
+:root { --fondo: #14141c; --tarjeta: #1f1f2b; --texto: #ececf1; --acento: #ff8c28; --tenue: #8a8aa0; }
+* { box-sizing: border-box; }
+body { margin: 0; font-family: system-ui, sans-serif; background: var(--fondo); color: var(--texto); }
+.app { max-width: 34rem; margin: 0 auto; padding: 1rem; }
+h1 { color: var(--acento); }
+form { display: flex; gap: .5rem; }
+input { flex: 1; padding: .7rem; border-radius: .5rem; border: 1px solid #333; background: var(--tarjeta); color: inherit; }
+button { padding: .6rem .9rem; border: 0; border-radius: .5rem; background: var(--acento); color: #111; cursor: pointer; }
+.filtros { display: flex; gap: .4rem; margin: 1rem 0; }
+.filtros button { background: var(--tarjeta); color: var(--tenue); }
+.filtros button.activo { color: var(--texto); outline: 1px solid var(--acento); }
+ul { list-style: none; padding: 0; }
+li { display: flex; align-items: center; gap: .6rem; padding: .6rem; margin-bottom: .4rem; background: var(--tarjeta); border-radius: .5rem; }
+li.hecha span { text-decoration: line-through; color: var(--tenue); }
+li span { flex: 1; word-break: break-word; }
+li .borrar { background: transparent; color: var(--tenue); }
+footer { display: flex; justify-content: space-between; color: var(--tenue); }
+''',
+        "src/tareas.js": r'''
+// Lógica pura (sin DOM): se testea con node:test.
+
+let siguienteId = 1;
+
+export function crearTarea(texto, ahora = Date.now()) {
+  const limpio = String(texto ?? '').trim().replace(/\s+/g, ' ');
+  if (!limpio) throw new Error('la tarea no puede estar vacía');
+  if (limpio.length > 200) throw new Error('máximo 200 caracteres');
+  return { id: `${ahora}-${siguienteId++}`, texto: limpio, hecha: false, creada: ahora };
+}
+
+export function agregar(tareas, texto, ahora) {
+  return [...tareas, crearTarea(texto, ahora)];
+}
+
+export function alternar(tareas, id) {
+  return tareas.map((t) => (t.id === id ? { ...t, hecha: !t.hecha } : t));
+}
+
+export function editar(tareas, id, texto) {
+  const limpio = String(texto ?? '').trim();
+  if (!limpio) return tareas.filter((t) => t.id !== id);
+  return tareas.map((t) => (t.id === id ? { ...t, texto: limpio } : t));
+}
+
+export function borrar(tareas, id) {
+  return tareas.filter((t) => t.id !== id);
+}
+
+export function borrarHechas(tareas) {
+  return tareas.filter((t) => !t.hecha);
+}
+
+export function filtrar(tareas, filtro) {
+  if (filtro === 'pendientes') return tareas.filter((t) => !t.hecha);
+  if (filtro === 'hechas') return tareas.filter((t) => t.hecha);
+  return tareas;
+}
+
+export function contarPendientes(tareas) {
+  const n = tareas.filter((t) => !t.hecha).length;
+  return n === 1 ? '1 pendiente' : `${n} pendientes`;
+}
+
+export function serializar(tareas) {
+  return JSON.stringify(tareas);
+}
+
+export function deserializar(texto) {
+  try {
+    const datos = JSON.parse(texto ?? '[]');
+    return Array.isArray(datos) ? datos.filter((t) => t && typeof t.texto === 'string') : [];
+  } catch {
+    return [];
+  }
+}
+''',
+        "app.js": r'''
+// Conecta la lógica con el DOM y localStorage.
+import * as T from './src/tareas.js';
+
+const CLAVE = '__PROYECTO__-tareas';
+let tareas = T.deserializar(localStorage.getItem(CLAVE));
+let filtro = 'todas';
+
+const $ = (sel) => document.querySelector(sel);
+
+function guardar() {
+  localStorage.setItem(CLAVE, T.serializar(tareas));
+}
+
+function render() {
+  const lista = $('#lista');
+  lista.replaceChildren();
+  for (const t of T.filtrar(tareas, filtro)) {
+    const li = document.createElement('li');
+    li.className = t.hecha ? 'hecha' : '';
+    const check = document.createElement('input');
+    check.type = 'checkbox';
+    check.checked = t.hecha;
+    check.addEventListener('change', () => { tareas = T.alternar(tareas, t.id); guardar(); render(); });
+    const span = document.createElement('span');
+    span.textContent = t.texto;
+    span.addEventListener('dblclick', () => {
+      const nuevo = prompt('Editar tarea', t.texto);
+      if (nuevo !== null) { tareas = T.editar(tareas, t.id, nuevo); guardar(); render(); }
+    });
+    const borrar = document.createElement('button');
+    borrar.className = 'borrar';
+    borrar.textContent = '✕';
+    borrar.addEventListener('click', () => { tareas = T.borrar(tareas, t.id); guardar(); render(); });
+    li.append(check, span, borrar);
+    lista.append(li);
+  }
+  $('#contador').textContent = T.contarPendientes(tareas);
+}
+
+$('#form-nueva').addEventListener('submit', (e) => {
+  e.preventDefault();
+  try {
+    tareas = T.agregar(tareas, $('#texto').value);
+    $('#texto').value = '';
+    guardar();
+    render();
+  } catch (error) {
+    alert(error.message);
+  }
+});
+
+document.querySelectorAll('[data-filtro]').forEach((boton) => {
+  boton.addEventListener('click', () => {
+    filtro = boton.dataset.filtro;
+    document.querySelectorAll('[data-filtro]').forEach((b) => b.classList.toggle('activo', b === boton));
+    render();
+  });
+});
+
+$('#limpiar').addEventListener('click', () => { tareas = T.borrarHechas(tareas); guardar(); render(); });
+render();
+''',
+        "tests/tareas.test.mjs": r'''
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import * as T from '../src/tareas.js';
+
+test('crear normaliza y valida', () => {
+  assert.equal(T.crearTarea('  comprar   pan ').texto, 'comprar pan');
+  assert.throws(() => T.crearTarea('   '), /vacía/);
+  assert.throws(() => T.crearTarea('x'.repeat(201)), /200/);
+});
+
+test('agregar, alternar y borrar no mutan', () => {
+  const vacia = [];
+  const una = T.agregar(vacia, 'a', 1);
+  assert.equal(vacia.length, 0);
+  const id = una[0].id;
+  const hecha = T.alternar(una, id);
+  assert.equal(una[0].hecha, false);
+  assert.equal(hecha[0].hecha, true);
+  assert.equal(T.borrar(hecha, id).length, 0);
+});
+
+test('filtros, contador y limpiar', () => {
+  let ts = T.agregar(T.agregar([], 'a'), 'b');
+  ts = T.alternar(ts, ts[0].id);
+  assert.equal(T.filtrar(ts, 'hechas').length, 1);
+  assert.equal(T.filtrar(ts, 'pendientes').length, 1);
+  assert.equal(T.filtrar(ts, 'todas').length, 2);
+  assert.equal(T.contarPendientes(ts), '1 pendiente');
+  assert.equal(T.borrarHechas(ts).length, 1);
+});
+
+test('editar vacío borra la tarea', () => {
+  const ts = T.agregar([], 'a');
+  assert.equal(T.editar(ts, ts[0].id, 'b')[0].texto, 'b');
+  assert.equal(T.editar(ts, ts[0].id, '  ').length, 0);
+});
+
+test('serializar es tolerante a datos rotos', () => {
+  const ts = T.agregar([], 'persistir');
+  assert.deepEqual(T.deserializar(T.serializar(ts)), ts);
+  assert.deepEqual(T.deserializar('{roto'), []);
+  assert.deepEqual(T.deserializar(null), []);
+  assert.deepEqual(T.deserializar('[{"x":1}]'), []);
+});
+''',
+    },
+    comando_tests=_NODE_TESTS,
+    comando_ejecutar="python3 -m http.server 8080  (y abrí http://127.0.0.1:8080)",
+    etiquetas=("web", "html", "javascript", "tareas", "todo", "localstorage", "frontend", "pagina"),
+    requiere=("node",),
+)
+
+# ======================================================================
+# node-cli
+# ======================================================================
+registrar_plantilla(
+    "node-cli",
+    "CLI en Node.js (ESM, sin dependencias): parser de argumentos propio, subcomandos, colores y tests.",
+    "javascript",
+    {
+        "package.json": _PAQUETE_NODE.replace("__INICIO__", "node bin/cli.mjs --ayuda"),
+        "src/argumentos.js": r'''
+// Parser de argumentos mínimo: posicionales, --flag, --clave=valor, --clave valor y -abc.
+export function parsear(argv, { booleanos = [] } = {}) {
+  const resultado = { _: [], opciones: {} };
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg === '--') {
+      resultado._.push(...argv.slice(i + 1));
+      break;
+    }
+    if (arg.startsWith('--')) {
+      const [clave, valor] = arg.slice(2).split(/=(.*)/s);
+      if (valor !== undefined) resultado.opciones[clave] = valor;
+      else if (booleanos.includes(clave) || i + 1 >= argv.length || argv[i + 1].startsWith('-')) resultado.opciones[clave] = true;
+      else resultado.opciones[clave] = argv[++i];
+    } else if (arg.startsWith('-') && arg.length > 1) {
+      for (const letra of arg.slice(1)) resultado.opciones[letra] = true;
+    } else {
+      resultado._.push(arg);
+    }
+  }
+  return resultado;
+}
+''',
+        "src/comandos.js": r'''
+export function contarPalabras(texto) {
+  const palabras = texto.toLowerCase().match(/[\p{L}\p{N}']+/gu) ?? [];
+  const conteo = new Map();
+  for (const p of palabras) conteo.set(p, (conteo.get(p) ?? 0) + 1);
+  return [...conteo.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+}
+
+export function invertir(texto) {
+  return [...texto].reverse().join('');
+}
+
+export function capitalizar(texto) {
+  return texto.replace(/(^|\s)(\p{L})/gu, (_, espacio, letra) => espacio + letra.toUpperCase());
+}
+
+export const COMANDOS = {
+  contar: { ayuda: 'palabras más frecuentes', correr: (texto, op) => contarPalabras(texto).slice(0, Number(op.n ?? 5)).map(([p, n]) => `${n} ${p}`).join('\n') },
+  invertir: { ayuda: 'invierte el texto', correr: (texto) => invertir(texto) },
+  capitalizar: { ayuda: 'mayúscula inicial en cada palabra', correr: (texto) => capitalizar(texto) },
+};
+''',
+        "bin/cli.mjs": r'''
+#!/usr/bin/env node
+import { readFileSync } from 'node:fs';
+import { parsear } from '../src/argumentos.js';
+import { COMANDOS } from '../src/comandos.js';
+
+const { _: [comando, ...resto], opciones } = parsear(process.argv.slice(2), { booleanos: ['ayuda'] });
+if (!comando || opciones.ayuda || !COMANDOS[comando]) {
+  console.log('uso: cli <comando> [texto | --archivo ruta] [--n 5]\n');
+  for (const [nombre, c] of Object.entries(COMANDOS)) console.log(`  ${nombre.padEnd(12)} ${c.ayuda}`);
+  process.exit(comando && !COMANDOS[comando] ? 1 : 0);
+}
+let texto = resto.join(' ');
+if (opciones.archivo) {
+  try {
+    texto = readFileSync(opciones.archivo, 'utf8');
+  } catch (e) {
+    console.error(`error: no pude leer ${opciones.archivo}`);
+    process.exit(1);
+  }
+}
+console.log(COMANDOS[comando].correr(texto, opciones));
+''',
+        "tests/cli.test.mjs": r'''
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
+import { parsear } from '../src/argumentos.js';
+import { capitalizar, contarPalabras, invertir } from '../src/comandos.js';
+
+test('parsear argumentos', () => {
+  const r = parsear(['contar', '--n', '3', '--archivo=a.txt', '-vx', 'hola', '--', '--literal'], { booleanos: [] });
+  assert.deepEqual(r._, ['contar', 'hola', '--literal']);
+  assert.deepEqual(r.opciones, { n: '3', archivo: 'a.txt', v: true, x: true });
+  assert.equal(parsear(['--ayuda', 'x'], { booleanos: ['ayuda'] }).opciones.ayuda, true);
+});
+
+test('comandos de texto', () => {
+  assert.deepEqual(contarPalabras('Sol luna SOL')[0], ['sol', 2]);
+  assert.equal(invertir('ñandú'), 'údnañ');
+  assert.equal(capitalizar('hola árbol viejo'), 'Hola Árbol Viejo');
+});
+
+test('cli de punta a punta', () => {
+  const salida = execFileSync(process.execPath, ['bin/cli.mjs', 'invertir', 'abc'], { encoding: 'utf8' });
+  assert.equal(salida.trim(), 'cba');
+});
+''',
+    },
+    comando_tests=_NODE_TESTS,
+    comando_ejecutar="node bin/cli.mjs contar 'hola hola mundo'",
+    etiquetas=("node", "javascript", "cli", "terminal", "comandos", "argumentos"),
+    requiere=("node",),
+)
+
+# ======================================================================
+# node-api
+# ======================================================================
+registrar_plantilla(
+    "node-api",
+    "API REST en Node.js con el módulo http (sin Express): router, JSON, validación, CORS y tests con fetch.",
+    "javascript",
+    {
+        "package.json": _PAQUETE_NODE.replace("__INICIO__", "node src/servidor.js"),
+        "src/router.js": r'''
+// Router mínimo con parámetros (/items/:id).
+export class Router {
+  constructor() {
+    this.rutas = [];
+  }
+
+  agregar(metodo, patron, manejador) {
+    const nombres = [];
+    const regex = new RegExp('^' + patron.replace(/:(\w+)/g, (_, n) => { nombres.push(n); return '([^/]+)'; }) + '/?$');
+    this.rutas.push({ metodo, regex, nombres, manejador });
+    return this;
+  }
+
+  buscar(metodo, ruta) {
+    let metodoIncorrecto = false;
+    for (const r of this.rutas) {
+      const m = ruta.match(r.regex);
+      if (!m) continue;
+      if (r.metodo !== metodo) { metodoIncorrecto = true; continue; }
+      const params = Object.fromEntries(r.nombres.map((n, i) => [n, decodeURIComponent(m[i + 1])]));
+      return { manejador: r.manejador, params };
+    }
+    return { estado: metodoIncorrecto ? 405 : 404 };
+  }
+}
+''',
+        "src/almacen.js": r'''
+export class Almacen {
+  constructor() {
+    this.items = new Map();
+    this.siguiente = 1;
+  }
+
+  validar(datos) {
+    if (!datos || typeof datos.nombre !== 'string' || !datos.nombre.trim()) throw new Error('nombre es obligatorio');
+    if (datos.precio !== undefined && (typeof datos.precio !== 'number' || datos.precio < 0)) throw new Error('precio inválido');
+    return { nombre: datos.nombre.trim(), precio: datos.precio ?? 0 };
+  }
+
+  crear(datos) {
+    const item = { id: this.siguiente++, ...this.validar(datos) };
+    this.items.set(item.id, item);
+    return item;
+  }
+
+  listar() { return [...this.items.values()]; }
+  obtener(id) { return this.items.get(Number(id)) ?? null; }
+
+  actualizar(id, datos) {
+    const actual = this.obtener(id);
+    if (!actual) return null;
+    const nuevo = { ...actual, ...this.validar({ ...actual, ...datos }) };
+    this.items.set(actual.id, nuevo);
+    return nuevo;
+  }
+
+  borrar(id) { return this.items.delete(Number(id)); }
+}
+''',
+        "src/servidor.js": r'''
+import http from 'node:http';
+import { pathToFileURL } from 'node:url';
+import { Almacen } from './almacen.js';
+import { Router } from './router.js';
+
+async function leerJSON(req, limite = 1_000_000) {
+  let cuerpo = '';
+  for await (const trozo of req) {
+    cuerpo += trozo;
+    if (cuerpo.length > limite) throw new Error('cuerpo demasiado grande');
+  }
+  return cuerpo ? JSON.parse(cuerpo) : {};
+}
+
+export function crearApp(almacen = new Almacen()) {
+  const router = new Router()
+    .agregar('GET', '/items', () => [200, almacen.listar()])
+    .agregar('POST', '/items', (_p, datos) => [201, almacen.crear(datos)])
+    .agregar('GET', '/items/:id', ({ id }) => { const i = almacen.obtener(id); return i ? [200, i] : [404, { error: 'no existe' }]; })
+    .agregar('PUT', '/items/:id', ({ id }, datos) => { const i = almacen.actualizar(id, datos); return i ? [200, i] : [404, { error: 'no existe' }]; })
+    .agregar('DELETE', '/items/:id', ({ id }) => (almacen.borrar(id) ? [204, null] : [404, { error: 'no existe' }]));
+
+  return http.createServer(async (req, res) => {
+    const enviar = (estado, datos) => {
+      res.writeHead(estado, { 'Content-Type': 'application/json; charset=utf-8', 'Access-Control-Allow-Origin': '*' });
+      res.end(datos === null ? '' : JSON.stringify(datos));
+    };
+    if (req.method === 'OPTIONS') return enviar(204, null);
+    const { pathname } = new URL(req.url, 'http://localhost');
+    const encontrado = router.buscar(req.method, pathname);
+    if (!encontrado.manejador) return enviar(encontrado.estado, { error: encontrado.estado === 405 ? 'método no permitido' : 'ruta desconocida' });
+    try {
+      const datos = ['POST', 'PUT'].includes(req.method) ? await leerJSON(req) : undefined;
+      const [estado, cuerpo] = encontrado.manejador(encontrado.params, datos);
+      enviar(estado, cuerpo);
+    } catch (e) {
+      enviar(400, { error: e instanceof SyntaxError ? 'JSON inválido' : e.message });
+    }
+  });
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1] ?? '').href) {
+  const puerto = Number(process.env.PUERTO ?? 3000);
+  crearApp().listen(puerto, () => console.log(`API en http://127.0.0.1:${puerto}/items`));
+}
+''',
+        "tests/api.test.mjs": r'''
+import { test, before, after } from 'node:test';
+import assert from 'node:assert/strict';
+import { crearApp } from '../src/servidor.js';
+import { Router } from '../src/router.js';
+
+let servidor;
+let base;
+
+before(async () => {
+  servidor = crearApp();
+  await new Promise((ok) => servidor.listen(0, '127.0.0.1', ok));
+  base = `http://127.0.0.1:${servidor.address().port}`;
+});
+after(() => new Promise((ok) => servidor.close(ok)));
+
+const pedir = async (metodo, ruta, datos) => {
+  const r = await fetch(base + ruta, { method: metodo, headers: { 'Content-Type': 'application/json' }, body: datos === undefined ? undefined : (typeof datos === 'string' ? datos : JSON.stringify(datos)) });
+  const texto = await r.text();
+  return [r.status, texto ? JSON.parse(texto) : null];
+};
+
+test('router con parámetros y 405', () => {
+  const r = new Router().agregar('GET', '/a/:id', () => 'ok');
+  assert.deepEqual(r.buscar('GET', '/a/7').params, { id: '7' });
+  assert.equal(r.buscar('POST', '/a/7').estado, 405);
+  assert.equal(r.buscar('GET', '/b').estado, 404);
+});
+
+test('CRUD completo', async () => {
+  const [estado, item] = await pedir('POST', '/items', { nombre: ' Mate ', precio: 10 });
+  assert.equal(estado, 201);
+  assert.equal(item.nombre, 'Mate');
+  assert.equal((await pedir('GET', `/items/${item.id}`))[1].precio, 10);
+  assert.equal((await pedir('PUT', `/items/${item.id}`, { precio: 12 }))[1].precio, 12);
+  assert.equal((await pedir('GET', '/items'))[1].length, 1);
+  assert.equal((await pedir('DELETE', `/items/${item.id}`))[0], 204);
+  assert.equal((await pedir('GET', `/items/${item.id}`))[0], 404);
+});
+
+test('errores', async () => {
+  assert.equal((await pedir('POST', '/items', { precio: 1 }))[0], 400);
+  assert.equal((await pedir('POST', '/items', '{roto'))[1].error, 'JSON inválido');
+  assert.equal((await pedir('PATCH', '/items'))[0], 405);
+  assert.equal((await pedir('GET', '/nada'))[0], 404);
+});
+''',
+    },
+    comando_tests=_NODE_TESTS,
+    comando_ejecutar="node src/servidor.js",
+    etiquetas=("node", "api", "rest", "servidor", "backend", "http", "javascript"),
+    requiere=("node",),
+)
+
+# ======================================================================
+# juego-canvas (breakout)
+# ======================================================================
+registrar_plantilla(
+    "juego-canvas",
+    "Juego Breakout en canvas para el navegador del celular (táctil y teclado) con física testeada en Node.",
+    "javascript",
+    {
+        "package.json": _PAQUETE_NODE.replace("__INICIO__", "python3 -m http.server 8080"),
+        "index.html": r'''
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+  <title>__TITULO__</title>
+  <style>
+    body { margin: 0; background: #0d0d14; display: flex; flex-direction: column; align-items: center; color: #eee; font-family: system-ui; }
+    canvas { background: #14141f; max-width: 100vw; touch-action: none; }
+    #info { padding: .5rem; }
+  </style>
+</head>
+<body>
+  <div id="info">Puntaje: <span id="puntaje">0</span> · Vidas: <span id="vidas">3</span></div>
+  <canvas id="lienzo" width="360" height="480"></canvas>
+  <script type="module" src="app.js"></script>
+</body>
+</html>
+''',
+        "src/motor.js": r'''
+// Física y reglas del Breakout, sin DOM ni tiempo real.
+export function crearJuego(ancho = 360, alto = 480, filas = 5, columnas = 7) {
+  const ladrillos = [];
+  const anchoLadrillo = (ancho - 20) / columnas;
+  for (let f = 0; f < filas; f++) {
+    for (let c = 0; c < columnas; c++) {
+      ladrillos.push({ x: 10 + c * anchoLadrillo, y: 40 + f * 22, w: anchoLadrillo - 4, h: 18, vivo: true, puntos: (filas - f) * 10 });
+    }
+  }
+  return {
+    ancho, alto, ladrillos, puntaje: 0, vidas: 3, estado: 'jugando',
+    paleta: { x: ancho / 2 - 40, y: alto - 30, w: 80, h: 10 },
+    pelota: { x: ancho / 2, y: alto - 50, r: 6, vx: 3, vy: -3 },
+  };
+}
+
+export function moverPaleta(juego, x) {
+  juego.paleta.x = Math.max(0, Math.min(juego.ancho - juego.paleta.w, x - juego.paleta.w / 2));
+}
+
+function choca(p, r) {
+  return p.x + p.r > r.x && p.x - p.r < r.x + r.w && p.y + p.r > r.y && p.y - p.r < r.y + r.h;
+}
+
+export function paso(juego) {
+  if (juego.estado !== 'jugando') return juego;
+  const p = juego.pelota;
+  p.x += p.vx;
+  p.y += p.vy;
+  if (p.x - p.r < 0 || p.x + p.r > juego.ancho) { p.vx = -p.vx; p.x = Math.max(p.r, Math.min(juego.ancho - p.r, p.x)); }
+  if (p.y - p.r < 0) { p.vy = Math.abs(p.vy); p.y = p.r; }
+  const paleta = juego.paleta;
+  if (p.vy > 0 && choca(p, paleta)) {
+    const desde_centro = (p.x - (paleta.x + paleta.w / 2)) / (paleta.w / 2);
+    p.vx = desde_centro * 4;
+    p.vy = -Math.abs(p.vy);
+  }
+  for (const l of juego.ladrillos) {
+    if (l.vivo && choca(p, l)) {
+      l.vivo = false;
+      juego.puntaje += l.puntos;
+      p.vy = -p.vy;
+      break;
+    }
+  }
+  if (p.y - p.r > juego.alto) {
+    juego.vidas -= 1;
+    if (juego.vidas <= 0) juego.estado = 'perdido';
+    else Object.assign(p, { x: juego.ancho / 2, y: juego.alto - 50, vx: 3, vy: -3 });
+  }
+  if (juego.ladrillos.every((l) => !l.vivo)) juego.estado = 'ganado';
+  return juego;
+}
+''',
+        "app.js": r'''
+import { crearJuego, moverPaleta, paso } from './src/motor.js';
+
+const lienzo = document.getElementById('lienzo');
+const ctx = lienzo.getContext('2d');
+let juego = crearJuego(lienzo.width, lienzo.height);
+
+function dibujar() {
+  ctx.clearRect(0, 0, lienzo.width, lienzo.height);
+  for (const l of juego.ladrillos) {
+    if (!l.vivo) continue;
+    ctx.fillStyle = `hsl(${l.y * 2}, 80%, 60%)`;
+    ctx.fillRect(l.x, l.y, l.w, l.h);
+  }
+  ctx.fillStyle = '#ff8c28';
+  ctx.fillRect(juego.paleta.x, juego.paleta.y, juego.paleta.w, juego.paleta.h);
+  ctx.beginPath();
+  ctx.arc(juego.pelota.x, juego.pelota.y, juego.pelota.r, 0, Math.PI * 2);
+  ctx.fillStyle = '#fff';
+  ctx.fill();
+  document.getElementById('puntaje').textContent = juego.puntaje;
+  document.getElementById('vidas').textContent = juego.vidas;
+  if (juego.estado !== 'jugando') {
+    ctx.fillStyle = '#fff';
+    ctx.font = '24px system-ui';
+    ctx.fillText(juego.estado === 'ganado' ? '¡Ganaste! Tocá para jugar' : 'Fin. Tocá para reiniciar', 40, lienzo.height / 2);
+  }
+}
+
+function bucle() {
+  paso(juego);
+  dibujar();
+  requestAnimationFrame(bucle);
+}
+
+const posicion = (e) => {
+  const rect = lienzo.getBoundingClientRect();
+  const x = (e.touches ? e.touches[0].clientX : e.clientX) - rect.left;
+  return x * (lienzo.width / rect.width);
+};
+lienzo.addEventListener('pointermove', (e) => moverPaleta(juego, posicion(e)));
+lienzo.addEventListener('touchmove', (e) => moverPaleta(juego, posicion(e)), { passive: true });
+lienzo.addEventListener('click', () => { if (juego.estado !== 'jugando') juego = crearJuego(lienzo.width, lienzo.height); });
+document.addEventListener('keydown', (e) => {
+  const delta = { ArrowLeft: -25, ArrowRight: 25 }[e.key];
+  if (delta) moverPaleta(juego, juego.paleta.x + juego.paleta.w / 2 + delta);
+});
+bucle();
+''',
+        "tests/motor.test.mjs": r'''
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { crearJuego, moverPaleta, paso } from '../src/motor.js';
+
+test('crea el tablero', () => {
+  const j = crearJuego(360, 480, 2, 3);
+  assert.equal(j.ladrillos.length, 6);
+  assert.equal(j.estado, 'jugando');
+});
+
+test('la paleta no se sale', () => {
+  const j = crearJuego();
+  moverPaleta(j, -500);
+  assert.equal(j.paleta.x, 0);
+  moverPaleta(j, 5000);
+  assert.equal(j.paleta.x, j.ancho - j.paleta.w);
+});
+
+test('rebota en la pared y en la paleta', () => {
+  const j = crearJuego();
+  Object.assign(j.pelota, { x: 3, vx: -3, vy: 0, y: 300 });
+  paso(j);
+  assert.ok(j.pelota.vx > 0);
+  Object.assign(j.pelota, { x: j.paleta.x + j.paleta.w / 2, y: j.paleta.y - 4, vx: 0, vy: 3 });
+  paso(j);
+  assert.ok(j.pelota.vy < 0);
+});
+
+test('romper ladrillos suma y gana', () => {
+  const j = crearJuego(360, 480, 1, 1);
+  const l = j.ladrillos[0];
+  Object.assign(j.pelota, { x: l.x + 10, y: l.y + l.h + 5, vx: 0, vy: -3 });
+  for (let i = 0; i < 5 && j.estado === 'jugando'; i++) paso(j);
+  assert.equal(j.puntaje, 10);
+  assert.equal(j.estado, 'ganado');
+});
+
+test('perder vidas', () => {
+  const j = crearJuego();
+  for (let v = 0; v < 3; v++) {
+    Object.assign(j.pelota, { x: 10, y: j.alto + 20, vx: 0, vy: 1 });
+    paso(j);
+  }
+  assert.equal(j.estado, 'perdido');
+});
+''',
+    },
+    comando_tests=_NODE_TESTS,
+    comando_ejecutar="python3 -m http.server 8080  (abrí http://127.0.0.1:8080 en el navegador)",
+    etiquetas=("juego", "canvas", "web", "breakout", "arkanoid", "javascript", "navegador", "html"),
+    requiere=("node",),
+)
+
+# ======================================================================
+# calculadora-web
+# ======================================================================
+registrar_plantilla(
+    "calculadora-web",
+    "Calculadora web con evaluador de expresiones propio (tokenizador + shunting-yard, sin eval) e historial.",
+    "javascript",
+    {
+        "package.json": _PAQUETE_NODE.replace("__INICIO__", "python3 -m http.server 8080"),
+        "src/evaluador.js": r'''
+// Evaluador seguro de expresiones: + - * / ^ %, paréntesis, unario, sqrt(), y constantes pi/e. Sin eval().
+const PRECEDENCIA = { '+': 1, '-': 1, '*': 2, '/': 2, '%': 2, '^': 3, 'neg': 4 };
+const DERECHA = new Set(['^', 'neg']);
+const FUNCIONES = { sqrt: Math.sqrt, sin: Math.sin, cos: Math.cos, abs: Math.abs, ln: Math.log };
+const CONSTANTES = { pi: Math.PI, e: Math.E };
+
+export function tokenizar(texto) {
+  const tokens = [];
+  const re = /\s*(\d+(?:[.,]\d+)?|[a-z]+|[-+*/^%()])/giy;
+  let m;
+  let pos = 0;
+  while (pos < texto.length) {
+    re.lastIndex = pos;
+    m = re.exec(texto);
+    if (!m) {
+      if (/^\s*$/.test(texto.slice(pos))) break;
+      throw new Error(`carácter inesperado: "${texto[pos]}"`);
+    }
+    tokens.push(m[1].replace(',', '.'));
+    pos = re.lastIndex;
+  }
+  return tokens;
+}
+
+export function aPostfija(tokens) {
+  const salida = [];
+  const pila = [];
+  let previo = null;
+  for (const t of tokens) {
+    if (/^\d/.test(t)) salida.push(Number(t));
+    else if (t in CONSTANTES) salida.push(CONSTANTES[t]);
+    else if (t in FUNCIONES) pila.push(t);
+    else if (t === '(') pila.push(t);
+    else if (t === ')') {
+      while (pila.length && pila.at(-1) !== '(') salida.push(pila.pop());
+      if (!pila.length) throw new Error('paréntesis sin abrir');
+      pila.pop();
+      if (pila.length && pila.at(-1) in FUNCIONES) salida.push(pila.pop());
+    } else if (t in PRECEDENCIA) {
+      const unario = t === '-' && (previo === null || previo in PRECEDENCIA || previo === '(');
+      const op = unario ? 'neg' : t;
+      if (unario || t !== '+' || !(previo === null || previo in PRECEDENCIA || previo === '(')) {
+        while (pila.length && pila.at(-1) in PRECEDENCIA &&
+               (PRECEDENCIA[pila.at(-1)] > PRECEDENCIA[op] || (PRECEDENCIA[pila.at(-1)] === PRECEDENCIA[op] && !DERECHA.has(op)))) {
+          salida.push(pila.pop());
+        }
+        pila.push(op);
+      }
+    } else {
+      throw new Error(`no conozco "${t}"`);
+    }
+    previo = t;
+  }
+  while (pila.length) {
+    const op = pila.pop();
+    if (op === '(') throw new Error('falta cerrar un paréntesis');
+    salida.push(op);
+  }
+  return salida;
+}
+
+export function evaluarPostfija(postfija) {
+  const pila = [];
+  for (const t of postfija) {
+    if (typeof t === 'number') pila.push(t);
+    else if (t === 'neg') pila.push(-pila.pop());
+    else if (t in FUNCIONES) pila.push(FUNCIONES[t](pila.pop()));
+    else {
+      const b = pila.pop();
+      const a = pila.pop();
+      if (a === undefined || b === undefined) throw new Error('expresión incompleta');
+      if ((t === '/' || t === '%') && b === 0) throw new Error('división por cero');
+      pila.push({ '+': a + b, '-': a - b, '*': a * b, '/': a / b, '%': a % b, '^': a ** b }[t]);
+    }
+  }
+  if (pila.length !== 1 || Number.isNaN(pila[0])) throw new Error('expresión inválida');
+  return pila[0];
+}
+
+export function calcular(texto) {
+  const resultado = evaluarPostfija(aPostfija(tokenizar(texto.toLowerCase())));
+  return Math.round(resultado * 1e10) / 1e10;
+}
+''',
+        "index.html": r'''
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>__TITULO__</title>
+  <style>
+    body { font-family: system-ui; background: #111; color: #eee; max-width: 24rem; margin: auto; padding: 1rem; }
+    #pantalla { width: 100%; font-size: 1.6rem; padding: .6rem; background: #1d1d26; color: #fff; border: 0; border-radius: .5rem; }
+    #resultado { font-size: 2rem; text-align: right; min-height: 2.4rem; color: #ff8c28; }
+    .teclas { display: grid; grid-template-columns: repeat(4, 1fr); gap: .4rem; }
+    button { padding: 1rem; font-size: 1.2rem; border: 0; border-radius: .5rem; background: #262633; color: #fff; }
+    ol { color: #999; }
+  </style>
+</head>
+<body>
+  <input id="pantalla" placeholder="2*(3+4)^2" autocomplete="off">
+  <div id="resultado"></div>
+  <div class="teclas" id="teclas"></div>
+  <ol id="historial"></ol>
+  <script type="module">
+    import { calcular } from './src/evaluador.js';
+    const pantalla = document.getElementById('pantalla');
+    const resultado = document.getElementById('resultado');
+    for (const t of ['7', '8', '9', '/', '4', '5', '6', '*', '1', '2', '3', '-', '0', '.', '(', '+', ')', '^', 'C', '=']) {
+      const b = document.createElement('button');
+      b.textContent = t;
+      b.onclick = () => {
+        if (t === 'C') pantalla.value = '';
+        else if (t === '=') resolver();
+        else pantalla.value += t;
+      };
+      document.getElementById('teclas').append(b);
+    }
+    function resolver() {
+      try {
+        const r = calcular(pantalla.value);
+        resultado.textContent = r;
+        const li = document.createElement('li');
+        li.textContent = `${pantalla.value} = ${r}`;
+        document.getElementById('historial').prepend(li);
+      } catch (e) {
+        resultado.textContent = e.message;
+      }
+    }
+    pantalla.addEventListener('keydown', (e) => { if (e.key === 'Enter') resolver(); });
+  </script>
+</body>
+</html>
+''',
+        "tests/evaluador.test.mjs": r'''
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { calcular, tokenizar } from '../src/evaluador.js';
+
+test('precedencia y asociatividad', () => {
+  assert.equal(calcular('2+3*4'), 14);
+  assert.equal(calcular('(2+3)*4'), 20);
+  assert.equal(calcular('2^3^2'), 512);
+  assert.equal(calcular('10-4-3'), 3);
+  assert.equal(calcular('7 % 4'), 3);
+});
+
+test('unarios, decimales con coma y funciones', () => {
+  assert.equal(calcular('-3+5'), 2);
+  assert.equal(calcular('2*-3'), -6);
+  assert.equal(calcular('-(2+3)'), -5);
+  assert.equal(calcular('1,5*2'), 3);
+  assert.equal(calcular('sqrt(16)+abs(-2)'), 6);
+  assert.equal(calcular('2*pi'), 6.2831853072);
+  assert.equal(calcular('+4'), 4);
+});
+
+test('errores claros', () => {
+  assert.throws(() => calcular('1/0'), /cero/);
+  assert.throws(() => calcular('(1+2'), /paréntesis/);
+  assert.throws(() => calcular('1+2)'), /paréntesis/);
+  assert.throws(() => calcular('2 $ 3'), /inesperado/);
+  assert.throws(() => calcular('2+'), /incompleta|inválida/);
+  assert.throws(() => calcular('alert(1)'), /no conozco/);
+});
+
+test('tokenizar', () => {
+  assert.deepEqual(tokenizar('12.5*(3)'), ['12.5', '*', '(', '3', ')']);
+});
+''',
+    },
+    comando_tests=_NODE_TESTS,
+    comando_ejecutar="python3 -m http.server 8080",
+    etiquetas=("calculadora", "web", "javascript", "expresiones", "matematica", "html"),
+    requiere=("node",),
+)
+
+# ======================================================================
+# pwa-notas
+# ======================================================================
+registrar_plantilla(
+    "pwa-notas",
+    "PWA de notas que funciona offline (manifest + service worker), instalable en Android, con búsqueda y exportación.",
+    "javascript",
+    {
+        "package.json": _PAQUETE_NODE.replace("__INICIO__", "python3 -m http.server 8080"),
+        "manifest.webmanifest": r'''
+{
+  "name": "__TITULO__",
+  "short_name": "Notas",
+  "start_url": "./index.html",
+  "display": "standalone",
+  "background_color": "#14141c",
+  "theme_color": "#ff8c28",
+  "icons": []
+}
+''',
+        "sw.js": r'''
+// Service worker: guarda la app en caché para usarla sin conexión.
+const CACHE = '__PROYECTO__-v1';
+const ARCHIVOS = ['./', './index.html', './app.js', './src/notas.js', './manifest.webmanifest'];
+
+self.addEventListener('install', (e) => {
+  e.waitUntil(caches.open(CACHE).then((c) => c.addAll(ARCHIVOS)));
+});
+
+self.addEventListener('activate', (e) => {
+  e.waitUntil(caches.keys().then((claves) => Promise.all(claves.filter((k) => k !== CACHE).map((k) => caches.delete(k)))));
+});
+
+self.addEventListener('fetch', (e) => {
+  e.respondWith(caches.match(e.request).then((r) => r ?? fetch(e.request)));
+});
+''',
+        "src/notas.js": r'''
+export function nuevaNota(titulo, cuerpo = '', ahora = Date.now()) {
+  const t = String(titulo ?? '').trim();
+  if (!t) throw new Error('la nota necesita título');
+  return { id: `n${ahora}${Math.floor(Math.random() * 1000)}`, titulo: t, cuerpo: String(cuerpo), creada: ahora, editada: ahora, fijada: false };
+}
+
+export function actualizar(notas, id, cambios, ahora = Date.now()) {
+  return notas.map((n) => (n.id === id ? { ...n, ...cambios, editada: ahora } : n));
+}
+
+export function ordenar(notas) {
+  return [...notas].sort((a, b) => Number(b.fijada) - Number(a.fijada) || b.editada - a.editada);
+}
+
+export function buscar(notas, texto) {
+  const q = texto.trim().toLowerCase();
+  if (!q) return ordenar(notas);
+  return ordenar(notas.filter((n) => `${n.titulo}\n${n.cuerpo}`.toLowerCase().includes(q)));
+}
+
+export function exportarMarkdown(notas) {
+  return ordenar(notas).map((n) => `# ${n.titulo}\n\n${n.cuerpo}`.trim()).join('\n\n---\n\n') + '\n';
+}
+''',
+        "index.html": r'''
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#ff8c28">
+  <link rel="manifest" href="manifest.webmanifest">
+  <title>__TITULO__</title>
+  <style>
+    body { font-family: system-ui; background: #14141c; color: #eee; max-width: 36rem; margin: auto; padding: 1rem; }
+    input, textarea { width: 100%; box-sizing: border-box; background: #1f1f2b; color: #eee; border: 1px solid #333; border-radius: .4rem; padding: .6rem; margin-bottom: .5rem; }
+    button { background: #ff8c28; border: 0; border-radius: .4rem; padding: .5rem .8rem; }
+    article { background: #1f1f2b; border-radius: .5rem; padding: .6rem; margin: .5rem 0; }
+  </style>
+</head>
+<body>
+  <input id="buscar" placeholder="Buscar...">
+  <input id="titulo" placeholder="Título">
+  <textarea id="cuerpo" rows="4" placeholder="Escribí..."></textarea>
+  <button id="guardar">Guardar</button> <button id="exportar">Exportar .md</button>
+  <section id="lista"></section>
+  <script type="module" src="app.js"></script>
+</body>
+</html>
+''',
+        "app.js": r'''
+import { buscar, exportarMarkdown, nuevaNota } from './src/notas.js';
+
+const CLAVE = '__PROYECTO__-notas';
+let notas = JSON.parse(localStorage.getItem(CLAVE) ?? '[]');
+const $ = (id) => document.getElementById(id);
+
+function render() {
+  $('lista').replaceChildren(...buscar(notas, $('buscar').value).map((n) => {
+    const a = document.createElement('article');
+    const h = document.createElement('h3');
+    h.textContent = (n.fijada ? '📌 ' : '') + n.titulo;
+    const p = document.createElement('p');
+    p.textContent = n.cuerpo;
+    a.append(h, p);
+    a.onclick = () => { notas = notas.map((x) => (x.id === n.id ? { ...x, fijada: !x.fijada } : x)); guardar(); };
+    return a;
+  }));
+}
+
+function guardar() {
+  localStorage.setItem(CLAVE, JSON.stringify(notas));
+  render();
+}
+
+$('guardar').onclick = () => {
+  try {
+    notas = [...notas, nuevaNota($('titulo').value, $('cuerpo').value)];
+    $('titulo').value = $('cuerpo').value = '';
+    guardar();
+  } catch (e) {
+    alert(e.message);
+  }
+};
+$('buscar').oninput = render;
+$('exportar').onclick = () => {
+  const enlace = document.createElement('a');
+  enlace.href = URL.createObjectURL(new Blob([exportarMarkdown(notas)], { type: 'text/markdown' }));
+  enlace.download = 'notas.md';
+  enlace.click();
+};
+if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js');
+render();
+''',
+        "tests/notas.test.mjs": r'''
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { actualizar, buscar, exportarMarkdown, nuevaNota, ordenar } from '../src/notas.js';
+
+test('crear y validar', () => {
+  assert.equal(nuevaNota(' Compras ', 'pan', 1).titulo, 'Compras');
+  assert.throws(() => nuevaNota(''), /título/);
+});
+
+test('ordenar con fijadas primero', () => {
+  const a = nuevaNota('a', '', 1);
+  const b = { ...nuevaNota('b', '', 2), fijada: true };
+  const c = nuevaNota('c', '', 3);
+  assert.deepEqual(ordenar([a, b, c]).map((n) => n.titulo), ['b', 'c', 'a']);
+});
+
+test('buscar y actualizar', () => {
+  let notas = [nuevaNota('Receta', 'harina y huevos', 1), nuevaNota('Ideas', 'app de notas', 2)];
+  assert.deepEqual(buscar(notas, 'HUEVO').map((n) => n.titulo), ['Receta']);
+  notas = actualizar(notas, notas[0].id, { cuerpo: 'nuevo' }, 10);
+  assert.equal(notas[0].editada, 10);
+  assert.equal(buscar(notas, '').length, 2);
+});
+
+test('exportar markdown', () => {
+  const md = exportarMarkdown([nuevaNota('Uno', 'texto', 1)]);
+  assert.equal(md, '# Uno\n\ntexto\n');
+});
+''',
+    },
+    comando_tests=_NODE_TESTS,
+    comando_ejecutar="python3 -m http.server 8080  (abrí en Chrome y 'Agregar a la pantalla de inicio')",
+    etiquetas=("pwa", "web", "notas", "offline", "android", "service worker", "javascript", "app"),
+    requiere=("node",),
 )
 
 
@@ -16535,6 +20430,1299 @@ def transporte_falso(eventos: Sequence[Union[str, dict, Exception]]) -> Callable
 
 
 # ======================================================================
+# MÓDULO: plantillas_juegos
+# ======================================================================
+"""Plantillas de juegos para la terminal: motor puro testeable + interfaz de texto."""
+
+# ======================================================================
+# ahorcado
+# ======================================================================
+registrar_plantilla(
+    "ahorcado",
+    "Ahorcado en la terminal: palabras por categoría, tildes equivalentes, dibujo ASCII y pistas.",
+    "python",
+    {
+        "ahorcado/__init__.py": "",
+        "ahorcado/motor.py": r'''
+import random
+import unicodedata
+from dataclasses import dataclass, field
+from typing import Optional
+
+PALABRAS = {
+    "animales": ["murciélago", "pingüino", "jirafa", "cocodrilo", "mariposa", "tiburón", "ñandú"],
+    "programación": ["variable", "función", "algoritmo", "recursión", "compilador", "terminal", "depurar"],
+    "frutas": ["frutilla", "durazno", "mandarina", "ananá", "pomelo", "arándano", "sandía"],
+}
+DIBUJOS = [
+    "\n\n\n\n\n=====", "\n |\n |\n |\n |\n=====", " +---+\n |\n |\n |\n |\n=====",
+    " +---+\n |   O\n |\n |\n |\n=====", " +---+\n |   O\n |   |\n |\n |\n=====",
+    " +---+\n |   O\n |  /|\n |\n |\n=====", " +---+\n |   O\n |  /|\\\n |\n |\n=====",
+    " +---+\n |   O\n |  /|\\\n |  /\n |\n=====", " +---+\n |   O\n |  /|\\\n |  / \\\n |\n=====",
+]
+
+
+def base(letra: str) -> str:
+    """Letra sin tilde (la ñ se mantiene)."""
+    if letra.lower() == "ñ":
+        return "ñ"
+    return "".join(c for c in unicodedata.normalize("NFD", letra.lower()) if not unicodedata.combining(c))
+
+
+@dataclass
+class Partida:
+    palabra: str
+    intentos: int = 8
+    usadas: set = field(default_factory=set)
+    fallos: int = 0
+
+    @classmethod
+    def nueva(cls, categoria: Optional[str] = None, semilla: Optional[int] = None) -> "Partida":
+        azar = random.Random(semilla)
+        categoria = categoria or azar.choice(sorted(PALABRAS))
+        if categoria not in PALABRAS:
+            raise ValueError(f"categoría desconocida: {categoria}")
+        return cls(azar.choice(PALABRAS[categoria]))
+
+    def adivinar(self, letra: str) -> bool:
+        letra = base(letra.strip())
+        if len(letra) != 1 or not letra.isalpha():
+            raise ValueError("escribí una sola letra")
+        if letra in self.usadas:
+            raise ValueError(f"ya usaste la {letra}")
+        if self.terminada:
+            raise ValueError("la partida terminó")
+        self.usadas.add(letra)
+        acierto = any(base(c) == letra for c in self.palabra)
+        if not acierto:
+            self.fallos += 1
+        return acierto
+
+    def oculta(self) -> str:
+        return " ".join(c if base(c) in self.usadas or not c.isalpha() else "_" for c in self.palabra)
+
+    @property
+    def ganada(self) -> bool:
+        return all(base(c) in self.usadas for c in self.palabra if c.isalpha())
+
+    @property
+    def perdida(self) -> bool:
+        return self.fallos >= self.intentos
+
+    @property
+    def terminada(self) -> bool:
+        return self.ganada or self.perdida
+
+    def dibujo(self) -> str:
+        indice = min(len(DIBUJOS) - 1, self.fallos * (len(DIBUJOS) - 1) // self.intentos)
+        return DIBUJOS[indice]
+
+    def pista(self) -> str:
+        faltan = sorted({base(c) for c in self.palabra if c.isalpha() and base(c) not in self.usadas})
+        return faltan[0] if faltan else ""
+''',
+        "ahorcado/__main__.py": r'''
+from ahorcado.motor import Partida
+
+p = Partida.nueva()
+while not p.terminada:
+    print(p.dibujo())
+    print(f"\n{p.oculta()}   fallos: {p.fallos}/{p.intentos}   usadas: {' '.join(sorted(p.usadas))}")
+    try:
+        entrada = input("letra (? = pista): ").strip()
+    except (EOFError, KeyboardInterrupt):
+        break
+    if entrada == "?":
+        print(f"pista: probá con la {p.pista()}")
+        continue
+    try:
+        print("¡bien!" if p.adivinar(entrada) else "no está")
+    except ValueError as e:
+        print(e)
+print(p.dibujo())
+print(("¡GANASTE! " if p.ganada else "Perdiste. ") + f"La palabra era: {p.palabra}")
+''',
+        "tests/__init__.py": "",
+        "tests/test_ahorcado.py": r'''
+import unittest
+
+from ahorcado.motor import PALABRAS, Partida, base
+
+
+class TestAhorcado(unittest.TestCase):
+    def test_tildes_equivalentes(self):
+        self.assertEqual(base("Á"), "a")
+        self.assertEqual(base("ñ"), "ñ")
+        p = Partida("canción")
+        self.assertTrue(p.adivinar("o"))
+        self.assertIn("ó", p.oculta())
+
+    def test_ganar(self):
+        p = Partida("sol")
+        for letra in "sol":
+            p.adivinar(letra)
+        self.assertTrue(p.ganada)
+        self.assertEqual(p.oculta(), "s o l")
+        with self.assertRaises(ValueError):
+            p.adivinar("x")
+
+    def test_perder_y_dibujo(self):
+        p = Partida("sol", intentos=3)
+        for letra in "xyz":
+            self.assertFalse(p.adivinar(letra))
+        self.assertTrue(p.perdida)
+        self.assertIn("/ \\", p.dibujo())
+
+    def test_validaciones_y_pista(self):
+        p = Partida("luna")
+        with self.assertRaises(ValueError):
+            p.adivinar("ab")
+        p.adivinar("a")
+        with self.assertRaises(ValueError):
+            p.adivinar("A")
+        self.assertEqual(p.pista(), "l")
+
+    def test_nueva(self):
+        p = Partida.nueva("frutas", semilla=1)
+        self.assertIn(p.palabra, PALABRAS["frutas"])
+        with self.assertRaises(ValueError):
+            Partida.nueva("planetas")
+
+
+if __name__ == "__main__":
+    unittest.main()
+''',
+    },
+    comando_tests=_PY_TESTS,
+    comando_ejecutar="python3 -m ahorcado",
+    etiquetas=("juego", "ahorcado", "palabras", "adivinar", "terminal"),
+)
+
+# ======================================================================
+# tateti con minimax
+# ======================================================================
+registrar_plantilla(
+    "tateti",
+    "Ta-te-ti contra la computadora imbatible (minimax con poda alfa-beta) y modo dos jugadores.",
+    "python",
+    {
+        "tateti/__init__.py": "",
+        "tateti/motor.py": r'''
+from functools import lru_cache
+from typing import Optional
+
+LINEAS = [(0, 1, 2), (3, 4, 5), (6, 7, 8), (0, 3, 6), (1, 4, 7), (2, 5, 8), (0, 4, 8), (2, 4, 6)]
+
+
+def ganador(tablero: str) -> Optional[str]:
+    """'X', 'O', 'empate' o None si sigue. El tablero es un string de 9 caracteres ('.' = vacío)."""
+    for a, b, c in LINEAS:
+        if tablero[a] != "." and tablero[a] == tablero[b] == tablero[c]:
+            return tablero[a]
+    return "empate" if "." not in tablero else None
+
+
+def turno(tablero: str) -> str:
+    return "X" if tablero.count("X") == tablero.count("O") else "O"
+
+
+def jugar(tablero: str, casilla: int) -> str:
+    if not 0 <= casilla <= 8:
+        raise ValueError("casilla entre 1 y 9")
+    if tablero[casilla] != ".":
+        raise ValueError("casilla ocupada")
+    if ganador(tablero):
+        raise ValueError("la partida terminó")
+    return tablero[:casilla] + turno(tablero) + tablero[casilla + 1:]
+
+
+@lru_cache(maxsize=None)
+def _minimax(tablero: str, alfa: int, beta: int) -> int:
+    resultado = ganador(tablero)
+    if resultado == "X":
+        return 10 - tablero.count(".") * 0 - (9 - tablero.count("."))
+    if resultado == "O":
+        return -10 + (9 - tablero.count("."))
+    if resultado == "empate":
+        return 0
+    maximizar = turno(tablero) == "X"
+    mejor = -100 if maximizar else 100
+    for i in range(9):
+        if tablero[i] != ".":
+            continue
+        valor = _minimax(jugar(tablero, i), alfa, beta)
+        if maximizar:
+            mejor = max(mejor, valor)
+            alfa = max(alfa, valor)
+        else:
+            mejor = min(mejor, valor)
+            beta = min(beta, valor)
+        if beta <= alfa:
+            break
+    return mejor
+
+
+def mejor_jugada(tablero: str) -> int:
+    if ganador(tablero):
+        raise ValueError("la partida terminó")
+    maximizar = turno(tablero) == "X"
+    opciones = []
+    for i in range(9):
+        if tablero[i] == ".":
+            opciones.append((_minimax(jugar(tablero, i), -100, 100), i))
+    opciones.sort(key=lambda t: (-t[0], t[1]) if maximizar else (t[0], t[1]))
+    return opciones[0][1]
+
+
+def dibujar(tablero: str) -> str:
+    filas = []
+    for f in range(3):
+        celdas = [tablero[f * 3 + c] if tablero[f * 3 + c] != "." else str(f * 3 + c + 1) for c in range(3)]
+        filas.append(" " + " │ ".join(celdas))
+    return "\n───┼───┼───\n".join(filas)
+''',
+        "tateti/__main__.py": r'''
+from tateti.motor import dibujar, ganador, jugar, mejor_jugada
+
+tablero = "........."
+contra_pc = input("¿Jugar contra la computadora? (S/n) ").strip().lower() != "n"
+while not ganador(tablero):
+    print("\n" + dibujar(tablero))
+    if contra_pc and tablero.count(".") % 2 == 0:
+        tablero = jugar(tablero, mejor_jugada(tablero))
+        continue
+    try:
+        tablero = jugar(tablero, int(input("casilla (1-9): ")) - 1)
+    except (ValueError, IndexError) as e:
+        print(f"inválido: {e}")
+    except (EOFError, KeyboardInterrupt):
+        raise SystemExit
+print("\n" + dibujar(tablero))
+resultado = ganador(tablero)
+print("¡Empate!" if resultado == "empate" else f"Ganó {resultado}")
+''',
+        "tests/__init__.py": "",
+        "tests/test_tateti.py": r'''
+import itertools
+import unittest
+
+from tateti.motor import dibujar, ganador, jugar, mejor_jugada, turno
+
+
+class TestTateti(unittest.TestCase):
+    def test_ganador(self):
+        self.assertEqual(ganador("XXX......"), "X")
+        self.assertEqual(ganador("O...O...O"), "O")
+        self.assertEqual(ganador("XOXXOOOXX"), "empate")
+        self.assertIsNone(ganador("........."))
+
+    def test_jugar_y_errores(self):
+        t = jugar(".........", 4)
+        self.assertEqual((t, turno(t)), ("....X....", "O"))
+        with self.assertRaises(ValueError):
+            jugar(t, 4)
+        with self.assertRaises(ValueError):
+            jugar(t, 9)
+
+    def test_ia_gana_o_bloquea(self):
+        self.assertEqual(mejor_jugada("XX.OO...."), 2)   # X gana
+        self.assertEqual(mejor_jugada("XX..O...."), 2)   # O bloquea
+
+    def test_ia_nunca_pierde(self):
+        """La IA juega de O contra todas las secuencias de un rival al azar sistemático."""
+        for primera in range(9):
+            tablero = jugar(".........", primera)
+            for orden in itertools.islice(itertools.permutations(range(9)), 0, 2000, 37):
+                t = tablero
+                while not ganador(t):
+                    if turno(t) == "O":
+                        t = jugar(t, mejor_jugada(t))
+                    else:
+                        t = jugar(t, next(i for i in orden if t[i] == "."))
+                self.assertNotEqual(ganador(t), "X", t)
+
+    def test_dibujo(self):
+        self.assertIn("X │ 2 │ 3", dibujar("X........"))
+
+
+if __name__ == "__main__":
+    unittest.main()
+''',
+    },
+    comando_tests=_PY_TESTS,
+    comando_ejecutar="python3 -m tateti",
+    etiquetas=("juego", "tateti", "tres en raya", "minimax", "ia", "tablero"),
+)
+
+# ======================================================================
+# buscaminas
+# ======================================================================
+registrar_plantilla(
+    "buscaminas",
+    "Buscaminas en la terminal: primer clic seguro, apertura en cascada, banderas y detección de victoria.",
+    "python",
+    {
+        "buscaminas/__init__.py": "",
+        "buscaminas/motor.py": r'''
+import random
+from collections import deque
+from typing import Optional
+
+
+class Tablero:
+    def __init__(self, filas: int = 9, columnas: int = 9, minas: int = 10, semilla: Optional[int] = None):
+        if minas >= filas * columnas:
+            raise ValueError("demasiadas minas para el tablero")
+        self.filas, self.columnas, self.cantidad_minas = filas, columnas, minas
+        self.azar = random.Random(semilla)
+        self.minas: set = set()
+        self.abiertas: set = set()
+        self.banderas: set = set()
+        self.exploto = False
+
+    def _vecinos(self, f: int, c: int):
+        for df in (-1, 0, 1):
+            for dc in (-1, 0, 1):
+                if (df or dc) and 0 <= f + df < self.filas and 0 <= c + dc < self.columnas:
+                    yield f + df, c + dc
+
+    def _sembrar(self, seguro: tuple) -> None:
+        prohibidas = {seguro, *self._vecinos(*seguro)}
+        libres = [(f, c) for f in range(self.filas) for c in range(self.columnas) if (f, c) not in prohibidas]
+        if len(libres) < self.cantidad_minas:
+            libres = [(f, c) for f in range(self.filas) for c in range(self.columnas) if (f, c) != seguro]
+        self.minas = set(self.azar.sample(libres, self.cantidad_minas))
+
+    def numero(self, f: int, c: int) -> int:
+        return sum(1 for v in self._vecinos(f, c) if v in self.minas)
+
+    def abrir(self, f: int, c: int) -> int:
+        """Abre una casilla. Devuelve cuántas se abrieron (0 si era bandera o ya estaba abierta)."""
+        if not (0 <= f < self.filas and 0 <= c < self.columnas):
+            raise ValueError("casilla fuera del tablero")
+        if self.terminado or (f, c) in self.banderas or (f, c) in self.abiertas:
+            return 0
+        if not self.minas:
+            self._sembrar((f, c))
+        if (f, c) in self.minas:
+            self.exploto = True
+            self.abiertas.add((f, c))
+            return 1
+        abiertas = 0
+        cola = deque([(f, c)])
+        while cola:
+            actual = cola.popleft()
+            if actual in self.abiertas or actual in self.banderas:
+                continue
+            self.abiertas.add(actual)
+            abiertas += 1
+            if self.numero(*actual) == 0:
+                cola.extend(v for v in self._vecinos(*actual) if v not in self.abiertas)
+        return abiertas
+
+    def bandera(self, f: int, c: int) -> bool:
+        if (f, c) in self.abiertas:
+            return False
+        if (f, c) in self.banderas:
+            self.banderas.discard((f, c))
+            return False
+        self.banderas.add((f, c))
+        return True
+
+    @property
+    def ganado(self) -> bool:
+        return bool(self.minas) and not self.exploto and \
+            len(self.abiertas) == self.filas * self.columnas - self.cantidad_minas
+
+    @property
+    def terminado(self) -> bool:
+        return self.exploto or self.ganado
+
+    def dibujar(self, revelar: bool = False) -> str:
+        lineas = ["   " + " ".join(f"{c % 10}" for c in range(self.columnas))]
+        for f in range(self.filas):
+            celdas = []
+            for c in range(self.columnas):
+                if (f, c) in self.abiertas or (revelar and (f, c) in self.minas):
+                    celdas.append("*" if (f, c) in self.minas else (str(self.numero(f, c)) if self.numero(f, c) else " "))
+                else:
+                    celdas.append("⚑" if (f, c) in self.banderas else "■")
+            lineas.append(f"{f:>2} " + " ".join(celdas))
+        return "\n".join(lineas)
+''',
+        "buscaminas/__main__.py": r'''
+from buscaminas.motor import Tablero
+
+t = Tablero()
+while not t.terminado:
+    print(t.dibujar())
+    try:
+        partes = input("fila columna (b fila columna = bandera): ").split()
+        if partes and partes[0] == "b":
+            t.bandera(int(partes[1]), int(partes[2]))
+        else:
+            t.abrir(int(partes[0]), int(partes[1]))
+    except (ValueError, IndexError):
+        print("formato: 3 4   o   b 3 4")
+    except (EOFError, KeyboardInterrupt):
+        raise SystemExit
+print(t.dibujar(revelar=True))
+print("¡GANASTE!" if t.ganado else "💥 Boom")
+''',
+        "tests/__init__.py": "",
+        "tests/test_buscaminas.py": r'''
+import unittest
+
+from buscaminas.motor import Tablero
+
+
+class TestBuscaminas(unittest.TestCase):
+    def test_primer_clic_seguro(self):
+        for semilla in range(30):
+            t = Tablero(9, 9, 10, semilla)
+            t.abrir(4, 4)
+            self.assertFalse(t.exploto)
+            self.assertEqual(len(t.minas), 10)
+            self.assertNotIn((4, 4), t.minas)
+
+    def test_cascada(self):
+        t = Tablero(5, 5, 1, semilla=1)
+        t.minas = {(0, 0)}
+        abiertas = t.abrir(4, 4)
+        self.assertEqual(abiertas, 24)
+        self.assertTrue(t.ganado)
+
+    def test_explotar(self):
+        t = Tablero(3, 3, 1)
+        t.minas = {(1, 1)}
+        t.abrir(1, 1)
+        self.assertTrue(t.exploto)
+        self.assertEqual(t.abrir(0, 0), 0)
+        self.assertIn("*", t.dibujar(revelar=True))
+
+    def test_banderas_y_numeros(self):
+        t = Tablero(3, 3, 2)
+        t.minas = {(0, 0), (0, 2)}
+        self.assertEqual(t.numero(1, 1), 2)
+        self.assertTrue(t.bandera(0, 0))
+        self.assertEqual(t.abrir(0, 0), 0)
+        self.assertFalse(t.bandera(0, 0))
+        with self.assertRaises(ValueError):
+            t.abrir(5, 5)
+        with self.assertRaises(ValueError):
+            Tablero(2, 2, 4)
+
+
+if __name__ == "__main__":
+    unittest.main()
+''',
+    },
+    comando_tests=_PY_TESTS,
+    comando_ejecutar="python3 -m buscaminas",
+    etiquetas=("juego", "buscaminas", "minas", "tablero", "puzzle"),
+)
+
+# ======================================================================
+# 2048
+# ======================================================================
+registrar_plantilla(
+    "2048",
+    "El juego 2048 en la terminal: movimientos, fusiones correctas, puntaje y detección de fin.",
+    "python",
+    {
+        "juego2048/__init__.py": "",
+        "juego2048/motor.py": r'''
+import random
+from typing import Optional
+
+
+def deslizar_fila(fila: list) -> tuple[list, int]:
+    """Desliza una fila hacia la izquierda fusionando una vez por casilla. Devuelve (fila, puntos)."""
+    numeros = [n for n in fila if n]
+    resultado, puntos, i = [], 0, 0
+    while i < len(numeros):
+        if i + 1 < len(numeros) and numeros[i] == numeros[i + 1]:
+            resultado.append(numeros[i] * 2)
+            puntos += numeros[i] * 2
+            i += 2
+        else:
+            resultado.append(numeros[i])
+            i += 1
+    return resultado + [0] * (len(fila) - len(resultado)), puntos
+
+
+class Juego:
+    def __init__(self, tamano: int = 4, semilla: Optional[int] = None):
+        self.tamano = tamano
+        self.azar = random.Random(semilla)
+        self.tablero = [[0] * tamano for _ in range(tamano)]
+        self.puntaje = 0
+        self.agregar_ficha()
+        self.agregar_ficha()
+
+    def agregar_ficha(self) -> bool:
+        vacias = [(f, c) for f in range(self.tamano) for c in range(self.tamano) if not self.tablero[f][c]]
+        if not vacias:
+            return False
+        f, c = self.azar.choice(vacias)
+        self.tablero[f][c] = 4 if self.azar.random() < 0.1 else 2
+        return True
+
+    def _rotar(self, veces: int) -> None:
+        for _ in range(veces % 4):
+            self.tablero = [list(fila) for fila in zip(*self.tablero[::-1])]
+
+    def mover(self, direccion: str) -> bool:
+        """direccion: izquierda, derecha, arriba, abajo. Devuelve True si algo se movió."""
+        rotaciones = {"izquierda": 0, "abajo": 1, "derecha": 2, "arriba": 3}
+        if direccion not in rotaciones:
+            raise ValueError("dirección inválida")
+        antes = [fila[:] for fila in self.tablero]
+        self._rotar(rotaciones[direccion])
+        for i, fila in enumerate(self.tablero):
+            self.tablero[i], puntos = deslizar_fila(fila)
+            self.puntaje += puntos
+        self._rotar(-rotaciones[direccion])
+        movio = self.tablero != antes
+        if movio:
+            self.agregar_ficha()
+        return movio
+
+    def maximo(self) -> int:
+        return max(max(fila) for fila in self.tablero)
+
+    def puede_moverse(self) -> bool:
+        for f in range(self.tamano):
+            for c in range(self.tamano):
+                valor = self.tablero[f][c]
+                if not valor:
+                    return True
+                if c + 1 < self.tamano and self.tablero[f][c + 1] == valor:
+                    return True
+                if f + 1 < self.tamano and self.tablero[f + 1][c] == valor:
+                    return True
+        return False
+
+    def dibujar(self) -> str:
+        return "\n".join(" ".join(f"{n:>5}" if n else "    ·" for n in fila) for fila in self.tablero)
+''',
+        "juego2048/__main__.py": r'''
+from juego2048.motor import Juego
+
+TECLAS = {"a": "izquierda", "d": "derecha", "w": "arriba", "s": "abajo"}
+j = Juego()
+while j.puede_moverse():
+    print(f"\n{j.dibujar()}\npuntaje: {j.puntaje}")
+    try:
+        tecla = input("w/a/s/d (q sale): ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        break
+    if tecla == "q":
+        break
+    if tecla in TECLAS:
+        j.mover(TECLAS[tecla])
+print(f"Fin. Puntaje {j.puntaje}, ficha máxima {j.maximo()}")
+''',
+        "tests/__init__.py": "",
+        "tests/test_2048.py": r'''
+import unittest
+
+from juego2048.motor import Juego, deslizar_fila
+
+
+class Test2048(unittest.TestCase):
+    def test_deslizar(self):
+        self.assertEqual(deslizar_fila([2, 2, 2, 2]), ([4, 4, 0, 0], 8))
+        self.assertEqual(deslizar_fila([2, 0, 2, 4]), ([4, 4, 0, 0], 4))
+        self.assertEqual(deslizar_fila([4, 4, 8, 0]), ([8, 8, 0, 0], 8))
+        self.assertEqual(deslizar_fila([2, 4, 8, 16]), ([2, 4, 8, 16], 0))
+
+    def test_mover_en_todas_direcciones(self):
+        j = Juego(semilla=1)
+        j.tablero = [[2, 0, 0, 2], [0, 0, 0, 0], [0, 0, 0, 0], [2, 0, 0, 0]]
+        self.assertTrue(j.mover("izquierda"))
+        self.assertEqual(j.tablero[0][0], 4)
+        self.assertEqual(j.puntaje, 4)
+        j.tablero = [[2, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], [2, 0, 0, 0]]
+        j.mover("arriba")
+        self.assertEqual(j.tablero[0][0], 4)
+        with self.assertRaises(ValueError):
+            j.mover("diagonal")
+
+    def test_sin_movimiento_no_agrega(self):
+        j = Juego(semilla=2)
+        j.tablero = [[2, 4, 2, 4], [4, 2, 4, 2], [2, 4, 2, 4], [4, 2, 4, 2]]
+        self.assertFalse(j.mover("izquierda"))
+        self.assertFalse(j.puede_moverse())
+
+    def test_inicio(self):
+        j = Juego(semilla=3)
+        self.assertEqual(sum(1 for fila in j.tablero for n in fila if n), 2)
+        self.assertIn(j.maximo(), (2, 4))
+
+
+if __name__ == "__main__":
+    unittest.main()
+''',
+    },
+    comando_tests=_PY_TESTS,
+    comando_ejecutar="python3 -m juego2048",
+    etiquetas=("juego", "2048", "puzzle", "numeros", "fichas"),
+)
+
+# ======================================================================
+# conecta 4
+# ======================================================================
+registrar_plantilla(
+    "conecta4",
+    "Conecta 4 contra la computadora (minimax con heurística de ventanas y poda alfa-beta).",
+    "python",
+    {
+        "conecta4/__init__.py": "",
+        "conecta4/motor.py": r'''
+import math
+from typing import Optional
+
+FILAS, COLUMNAS = 6, 7
+VACIO = "."
+
+
+def nuevo() -> list:
+    return [[VACIO] * COLUMNAS for _ in range(FILAS)]
+
+
+def columnas_validas(t: list) -> list:
+    return [c for c in range(COLUMNAS) if t[0][c] == VACIO]
+
+
+def soltar(t: list, columna: int, ficha: str) -> int:
+    """Suelta una ficha; devuelve la fila donde cayó. Modifica t."""
+    if columna not in columnas_validas(t):
+        raise ValueError("columna llena o inválida")
+    for fila in range(FILAS - 1, -1, -1):
+        if t[fila][columna] == VACIO:
+            t[fila][columna] = ficha
+            return fila
+    raise ValueError("columna llena")
+
+
+def gano(t: list, ficha: str) -> bool:
+    for f in range(FILAS):
+        for c in range(COLUMNAS):
+            for df, dc in ((0, 1), (1, 0), (1, 1), (1, -1)):
+                if all(0 <= f + i * df < FILAS and 0 <= c + i * dc < COLUMNAS and t[f + i * df][c + i * dc] == ficha
+                       for i in range(4)):
+                    return True
+    return False
+
+
+def _puntuar_ventana(ventana: list, ficha: str, rival: str) -> int:
+    if ventana.count(ficha) == 4:
+        return 100
+    if ventana.count(ficha) == 3 and ventana.count(VACIO) == 1:
+        return 5
+    if ventana.count(ficha) == 2 and ventana.count(VACIO) == 2:
+        return 2
+    if ventana.count(rival) == 3 and ventana.count(VACIO) == 1:
+        return -4
+    return 0
+
+
+def evaluar(t: list, ficha: str) -> int:
+    rival = "O" if ficha == "X" else "X"
+    puntaje = sum(3 for f in range(FILAS) if t[f][COLUMNAS // 2] == ficha)
+    for f in range(FILAS):
+        for c in range(COLUMNAS):
+            for df, dc in ((0, 1), (1, 0), (1, 1), (1, -1)):
+                celdas = [(f + i * df, c + i * dc) for i in range(4)]
+                if all(0 <= a < FILAS and 0 <= b < COLUMNAS for a, b in celdas):
+                    puntaje += _puntuar_ventana([t[a][b] for a, b in celdas], ficha, rival)
+    return puntaje
+
+
+def minimax(t: list, profundidad: int, alfa: float, beta: float, maximizar: bool, ficha: str) -> tuple:
+    rival = "O" if ficha == "X" else "X"
+    validas = columnas_validas(t)
+    if gano(t, ficha):
+        return None, 10 ** 6 + profundidad
+    if gano(t, rival):
+        return None, -(10 ** 6) - profundidad
+    if not validas or profundidad == 0:
+        return None, evaluar(t, ficha)
+    orden = sorted(validas, key=lambda c: abs(c - COLUMNAS // 2))
+    mejor_col = orden[0]
+    if maximizar:
+        valor = -math.inf
+        for c in orden:
+            fila = soltar(t, c, ficha)
+            puntaje = minimax(t, profundidad - 1, alfa, beta, False, ficha)[1]
+            t[fila][c] = VACIO
+            if puntaje > valor:
+                valor, mejor_col = puntaje, c
+            alfa = max(alfa, valor)
+            if alfa >= beta:
+                break
+    else:
+        valor = math.inf
+        for c in orden:
+            fila = soltar(t, c, rival)
+            puntaje = minimax(t, profundidad - 1, alfa, beta, True, ficha)[1]
+            t[fila][c] = VACIO
+            if puntaje < valor:
+                valor, mejor_col = puntaje, c
+            beta = min(beta, valor)
+            if alfa >= beta:
+                break
+    return mejor_col, valor
+
+
+def jugada_ia(t: list, ficha: str = "O", profundidad: int = 4) -> int:
+    return minimax(t, profundidad, -math.inf, math.inf, True, ficha)[0]
+
+
+def dibujar(t: list) -> str:
+    return "\n".join(" ".join(fila) for fila in t) + "\n" + " ".join(str(c + 1) for c in range(COLUMNAS))
+''',
+        "conecta4/__main__.py": r'''
+from conecta4.motor import columnas_validas, dibujar, gano, jugada_ia, nuevo, soltar
+
+t = nuevo()
+while columnas_validas(t):
+    print("\n" + dibujar(t))
+    try:
+        soltar(t, int(input("columna (1-7): ")) - 1, "X")
+    except ValueError as e:
+        print(e)
+        continue
+    except (EOFError, KeyboardInterrupt):
+        raise SystemExit
+    if gano(t, "X"):
+        print(dibujar(t) + "\n¡Ganaste!")
+        break
+    soltar(t, jugada_ia(t), "O")
+    if gano(t, "O"):
+        print(dibujar(t) + "\nGanó la computadora")
+        break
+else:
+    print("Empate")
+''',
+        "tests/__init__.py": "",
+        "tests/test_conecta4.py": r'''
+import unittest
+
+from conecta4.motor import columnas_validas, gano, jugada_ia, nuevo, soltar
+
+
+class TestConecta4(unittest.TestCase):
+    def test_soltar_y_columna_llena(self):
+        t = nuevo()
+        self.assertEqual(soltar(t, 3, "X"), 5)
+        self.assertEqual(soltar(t, 3, "O"), 4)
+        for _ in range(4):
+            soltar(t, 3, "X")
+        self.assertNotIn(3, columnas_validas(t))
+        with self.assertRaises(ValueError):
+            soltar(t, 3, "O")
+
+    def test_victorias(self):
+        t = nuevo()
+        for c in range(4):
+            soltar(t, c, "X")
+        self.assertTrue(gano(t, "X"))
+        t = nuevo()
+        for i in range(4):
+            for _ in range(i):
+                soltar(t, i, "O")
+            soltar(t, i, "X")
+        self.assertTrue(gano(t, "X"))  # diagonal
+
+    def test_ia_gana_y_bloquea(self):
+        t = nuevo()
+        for c in range(3):
+            soltar(t, c, "O")
+        self.assertEqual(jugada_ia(t, "O"), 3)
+        t = nuevo()
+        for c in range(3):
+            soltar(t, c, "X")
+        self.assertEqual(jugada_ia(t, "O"), 3)
+
+
+if __name__ == "__main__":
+    unittest.main()
+''',
+    },
+    comando_tests=_PY_TESTS,
+    comando_ejecutar="python3 -m conecta4",
+    etiquetas=("juego", "conecta 4", "cuatro en linea", "ia", "minimax", "tablero"),
+)
+
+# ======================================================================
+# sudoku
+# ======================================================================
+registrar_plantilla(
+    "sudoku",
+    "Sudoku: solucionador por backtracking con candidatos, generador con solución única y validación de jugadas.",
+    "python",
+    {
+        "sudoku/__init__.py": "",
+        "sudoku/motor.py": r'''
+import random
+from typing import Optional
+
+Tablero = list  # 9x9 de enteros, 0 = vacío
+
+
+def parsear(texto: str) -> Tablero:
+    digitos = [0 if c in ".0" else int(c) for c in texto if c.isdigit() or c == "."]
+    if len(digitos) != 81:
+        raise ValueError("un sudoku tiene 81 casillas")
+    return [digitos[i * 9:(i + 1) * 9] for i in range(9)]
+
+
+def candidatos(t: Tablero, f: int, c: int) -> set:
+    if t[f][c]:
+        return set()
+    usados = set(t[f]) | {t[i][c] for i in range(9)}
+    bf, bc = 3 * (f // 3), 3 * (c // 3)
+    usados |= {t[i][j] for i in range(bf, bf + 3) for j in range(bc, bc + 3)}
+    return set(range(1, 10)) - usados
+
+
+def valido(t: Tablero) -> bool:
+    for i in range(9):
+        fila = [n for n in t[i] if n]
+        col = [t[j][i] for j in range(9) if t[j][i]]
+        caja = [t[3 * (i // 3) + a][3 * (i % 3) + b] for a in range(3) for b in range(3)
+                if t[3 * (i // 3) + a][3 * (i % 3) + b]]
+        if any(len(g) != len(set(g)) for g in (fila, col, caja)):
+            return False
+    return True
+
+
+def resolver(t: Tablero, contar_hasta: int = 1) -> tuple[Optional[Tablero], int]:
+    """Devuelve (una solución, cantidad de soluciones encontradas hasta contar_hasta)."""
+    if not valido(t):
+        return None, 0
+    tablero = [fila[:] for fila in t]
+    soluciones = []
+
+    def paso() -> bool:
+        mejor, opciones = None, None
+        for f in range(9):
+            for c in range(9):
+                if not tablero[f][c]:
+                    cand = candidatos(tablero, f, c)
+                    if not cand:
+                        return False
+                    if opciones is None or len(cand) < len(opciones):
+                        mejor, opciones = (f, c), cand
+        if mejor is None:
+            soluciones.append([fila[:] for fila in tablero])
+            return len(soluciones) >= contar_hasta
+        f, c = mejor
+        for n in sorted(opciones):
+            tablero[f][c] = n
+            if paso():
+                return True
+        tablero[f][c] = 0
+        return False
+
+    paso()
+    return (soluciones[0] if soluciones else None), len(soluciones)
+
+
+def generar(pistas: int = 30, semilla: Optional[int] = None) -> tuple[Tablero, Tablero]:
+    """(sudoku con solución única, solución)."""
+    azar = random.Random(semilla)
+    base = [[0] * 9 for _ in range(9)]
+    for caja in range(0, 9, 3):
+        numeros = list(range(1, 10))
+        azar.shuffle(numeros)
+        for i in range(9):
+            base[caja + i // 3][caja + i % 3] = numeros[i]
+    solucion, _ = resolver(base)
+    sudoku = [fila[:] for fila in solucion]
+    casillas = [(f, c) for f in range(9) for c in range(9)]
+    azar.shuffle(casillas)
+    for f, c in casillas:
+        if sum(1 for fila in sudoku for n in fila if n) <= pistas:
+            break
+        guardado, sudoku[f][c] = sudoku[f][c], 0
+        if resolver(sudoku, contar_hasta=2)[1] != 1:
+            sudoku[f][c] = guardado
+    return sudoku, solucion
+
+
+def dibujar(t: Tablero) -> str:
+    lineas = []
+    for f in range(9):
+        if f and f % 3 == 0:
+            lineas.append("------+-------+------")
+        fila = ""
+        for c in range(9):
+            if c and c % 3 == 0:
+                fila += "| "
+            fila += (str(t[f][c]) if t[f][c] else ".") + " "
+        lineas.append(fila.rstrip())
+    return "\n".join(lineas)
+''',
+        "sudoku/__main__.py": r'''
+from sudoku.motor import candidatos, dibujar, generar
+
+sudoku, solucion = generar(32)
+while any(0 in fila for fila in sudoku):
+    print("\n" + dibujar(sudoku))
+    try:
+        entrada = input("fila columna número (1-9), o 'ver' para la solución: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        break
+    if entrada == "ver":
+        print(dibujar(solucion))
+        break
+    try:
+        f, c, n = (int(x) - 1 if i < 2 else int(x) for i, x in enumerate(entrada.split()))
+        if n not in candidatos(sudoku, f, c):
+            print("ese número no va ahí")
+        else:
+            sudoku[f][c] = n
+    except ValueError:
+        print("formato: 1 3 7")
+''',
+        "tests/__init__.py": "",
+        "tests/test_sudoku.py": r'''
+import unittest
+
+from sudoku.motor import candidatos, dibujar, generar, parsear, resolver, valido
+
+FACIL = "53..7....6..195....98....6.8...6...34..8.3..17...2...6.6....28....419..5....8..79"
+
+
+class TestSudoku(unittest.TestCase):
+    def test_parsear_y_candidatos(self):
+        t = parsear(FACIL)
+        self.assertEqual(t[0][:2], [5, 3])
+        self.assertEqual(candidatos(t, 0, 2), {1, 2, 4})
+        with self.assertRaises(ValueError):
+            parsear("123")
+
+    def test_resolver(self):
+        solucion, n = resolver(parsear(FACIL))
+        self.assertEqual(n, 1)
+        self.assertTrue(valido(solucion))
+        self.assertEqual(solucion[0], [5, 3, 4, 6, 7, 8, 9, 1, 2])
+
+    def test_invalido(self):
+        t = parsear(FACIL)
+        t[0][2] = 5
+        self.assertFalse(valido(t))
+        self.assertEqual(resolver(t), (None, 0))
+
+    def test_generar_unico(self):
+        sudoku, solucion = generar(32, semilla=4)
+        self.assertGreaterEqual(sum(1 for f in sudoku for n in f if n), 32)
+        self.assertEqual(resolver(sudoku, contar_hasta=2)[1], 1)
+        self.assertEqual(resolver(sudoku)[0], solucion)
+        self.assertIn("|", dibujar(sudoku))
+
+
+if __name__ == "__main__":
+    unittest.main()
+''',
+    },
+    comando_tests=_PY_TESTS,
+    comando_ejecutar="python3 -m sudoku",
+    etiquetas=("juego", "sudoku", "puzzle", "backtracking", "resolver"),
+)
+
+# ======================================================================
+# blackjack
+# ======================================================================
+registrar_plantilla(
+    "blackjack",
+    "Blackjack (21) en la terminal: mazo con semilla, ases flexibles, crupier que se planta en 17 y apuestas.",
+    "python",
+    {
+        "blackjack/__init__.py": "",
+        "blackjack/motor.py": r'''
+import random
+from dataclasses import dataclass, field
+from typing import Optional
+
+PALOS = "♠♥♦♣"
+VALORES = ["A", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K"]
+
+
+def valor_mano(cartas: list) -> int:
+    total = sum(10 if v in "JQK" or v == "10" else (11 if v == "A" else int(v)) for v, _ in cartas)
+    ases = sum(1 for v, _ in cartas if v == "A")
+    while total > 21 and ases:
+        total -= 10
+        ases -= 1
+    return total
+
+
+def es_blackjack(cartas: list) -> bool:
+    return len(cartas) == 2 and valor_mano(cartas) == 21
+
+
+@dataclass
+class Ronda:
+    apuesta: int
+    semilla: Optional[int] = None
+    mazo: list = field(default_factory=list)
+    jugador: list = field(default_factory=list)
+    crupier: list = field(default_factory=list)
+    terminada: bool = False
+
+    def __post_init__(self):
+        if self.apuesta <= 0:
+            raise ValueError("la apuesta debe ser positiva")
+        if not self.mazo:
+            self.mazo = [(v, p) for p in PALOS for v in VALORES]
+            random.Random(self.semilla).shuffle(self.mazo)
+        self.jugador = [self.mazo.pop(), self.mazo.pop()]
+        self.crupier = [self.mazo.pop(), self.mazo.pop()]
+        if es_blackjack(self.jugador):
+            self.terminada = True
+
+    def pedir(self) -> int:
+        if self.terminada:
+            raise ValueError("la ronda terminó")
+        self.jugador.append(self.mazo.pop())
+        total = valor_mano(self.jugador)
+        if total >= 21:
+            self.terminada = True
+        return total
+
+    def plantarse(self) -> None:
+        self.terminada = True
+
+    def juega_crupier(self) -> None:
+        if valor_mano(self.jugador) > 21:
+            return
+        while valor_mano(self.crupier) < 17:
+            self.crupier.append(self.mazo.pop())
+
+    def resultado(self) -> tuple[str, int]:
+        """(texto, ganancia neta)."""
+        if not self.terminada:
+            raise ValueError("la ronda sigue")
+        self.juega_crupier()
+        j, c = valor_mano(self.jugador), valor_mano(self.crupier)
+        if j > 21:
+            return "te pasaste", -self.apuesta
+        if es_blackjack(self.jugador) and not es_blackjack(self.crupier):
+            return "¡blackjack!", int(self.apuesta * 1.5)
+        if c > 21 or j > c:
+            return "ganaste", self.apuesta
+        if j == c:
+            return "empate", 0
+        return "ganó la banca", -self.apuesta
+
+
+def mostrar(cartas: list, ocultar_segunda: bool = False) -> str:
+    return " ".join("🂠" if ocultar_segunda and i == 1 else f"{v}{p}" for i, (v, p) in enumerate(cartas))
+''',
+        "blackjack/__main__.py": r'''
+from blackjack.motor import Ronda, mostrar, valor_mano
+
+fichas = 100
+while fichas > 0:
+    try:
+        apuesta = int(input(f"\nFichas: {fichas}. Apuesta (0 sale): ") or 0)
+    except (ValueError, EOFError, KeyboardInterrupt):
+        break
+    if apuesta <= 0 or apuesta > fichas:
+        break
+    r = Ronda(apuesta)
+    while not r.terminada:
+        print(f"Crupier: {mostrar(r.crupier, True)}   Vos: {mostrar(r.jugador)} ({valor_mano(r.jugador)})")
+        if input("¿(p)edir o (s)plantarse? ").strip().lower().startswith("p"):
+            r.pedir()
+        else:
+            r.plantarse()
+    texto, ganancia = r.resultado()
+    fichas += ganancia
+    print(f"Crupier: {mostrar(r.crupier)} ({valor_mano(r.crupier)})  Vos: {mostrar(r.jugador)} → {texto}")
+print(f"Te vas con {fichas} fichas")
+''',
+        "tests/__init__.py": "",
+        "tests/test_blackjack.py": r'''
+import unittest
+
+from blackjack.motor import Ronda, es_blackjack, valor_mano
+
+
+def mano(*valores):
+    return [(v, "♠") for v in valores]
+
+
+class TestBlackjack(unittest.TestCase):
+    def test_valores(self):
+        self.assertEqual(valor_mano(mano("A", "K")), 21)
+        self.assertEqual(valor_mano(mano("A", "A", "9")), 21)
+        self.assertEqual(valor_mano(mano("K", "Q", "5")), 25)
+        self.assertTrue(es_blackjack(mano("A", "J")))
+        self.assertFalse(es_blackjack(mano("7", "7", "7")))
+
+    def test_ronda_controlada(self):
+        # El mazo se reparte desde el final: jugador, jugador, crupier, crupier.
+        mazo = [("2", "♠"), ("K", "♣"), ("9", "♦"), ("10", "♥"), ("Q", "♠")]
+        r = Ronda(10, mazo=mazo[:])
+        self.assertEqual(valor_mano(r.jugador), 20)
+        self.assertEqual(valor_mano(r.crupier), 19)
+        r.plantarse()
+        self.assertEqual(r.resultado(), ("ganaste", 10))
+
+    def test_pasarse(self):
+        mazo = [("K", "♦"), ("8", "♣"), ("9", "♦"), ("6", "♥"), ("Q", "♠")]
+        r = Ronda(10, mazo=mazo[:])
+        r.pedir()
+        self.assertTrue(r.terminada)
+        self.assertEqual(r.resultado(), ("te pasaste", -10))
+        with self.assertRaises(ValueError):
+            r.pedir()
+
+    def test_crupier_se_planta_en_17(self):
+        r = Ronda(10, semilla=5)
+        r.plantarse()
+        r.juega_crupier()
+        self.assertGreaterEqual(valor_mano(r.crupier), 17)
+        with self.assertRaises(ValueError):
+            Ronda(0)
+
+
+if __name__ == "__main__":
+    unittest.main()
+''',
+    },
+    comando_tests=_PY_TESTS,
+    comando_ejecutar="python3 -m blackjack",
+    etiquetas=("juego", "blackjack", "cartas", "21", "casino", "naipes"),
+)
+
+# ======================================================================
+# memoria
+# ======================================================================
+registrar_plantilla(
+    "memoria",
+    "Juego de memoria (pares) en la terminal: tablero configurable, intentos, mejor puntaje y emojis.",
+    "python",
+    {
+        "memoria/__init__.py": "",
+        "memoria/motor.py": r'''
+import random
+from typing import Optional
+
+SIMBOLOS = list("🐉🍎🚀🎲🎧🌵🐙🍕⚽🎈🔑🌙")
+
+
+class Memoria:
+    def __init__(self, pares: int = 8, semilla: Optional[int] = None):
+        if not 2 <= pares <= len(SIMBOLOS):
+            raise ValueError(f"pares entre 2 y {len(SIMBOLOS)}")
+        cartas = SIMBOLOS[:pares] * 2
+        random.Random(semilla).shuffle(cartas)
+        self.cartas = cartas
+        self.descubiertas: set = set()
+        self.intentos = 0
+        self._primera: Optional[int] = None
+
+    def elegir(self, posicion: int) -> Optional[bool]:
+        """Primera carta → None. Segunda → True si es par, False si no."""
+        if not 0 <= posicion < len(self.cartas):
+            raise ValueError("posición inválida")
+        if posicion in self.descubiertas or posicion == self._primera:
+            raise ValueError("esa carta ya está visible")
+        if self._primera is None:
+            self._primera = posicion
+            return None
+        primera, self._primera = self._primera, None
+        self.intentos += 1
+        if self.cartas[primera] == self.cartas[posicion]:
+            self.descubiertas |= {primera, posicion}
+            return True
+        return False
+
+    @property
+    def terminado(self) -> bool:
+        return len(self.descubiertas) == len(self.cartas)
+
+    def puntaje(self) -> int:
+        pares = len(self.cartas) // 2
+        return max(0, 100 - (self.intentos - pares) * 5) if self.terminado else 0
+
+    def dibujar(self, mostrar: tuple = ()) -> str:
+        celdas = [self.cartas[i] if i in self.descubiertas or i in mostrar else f"{i:>2}" for i in range(len(self.cartas))]
+        return "\n".join(" ".join(celdas[i:i + 4]) for i in range(0, len(celdas), 4))
+''',
+        "memoria/__main__.py": r'''
+import time
+
+from memoria.motor import Memoria
+
+m = Memoria()
+while not m.terminado:
+    print("\n" + m.dibujar())
+    try:
+        a = int(input("primera carta: "))
+        m.elegir(a)
+        print(m.dibujar(mostrar=(a,)))
+        b = int(input("segunda carta: "))
+        par = m.elegir(b)
+        print(m.dibujar(mostrar=(a, b)))
+        print("¡Par!" if par else "No...")
+        time.sleep(1)
+    except ValueError as e:
+        print(e)
+    except (EOFError, KeyboardInterrupt):
+        raise SystemExit
+print(f"¡Terminaste en {m.intentos} intentos! Puntaje: {m.puntaje()}")
+''',
+        "tests/__init__.py": "",
+        "tests/test_memoria.py": r'''
+import unittest
+
+from memoria.motor import Memoria
+
+
+class TestMemoria(unittest.TestCase):
+    def test_partida_perfecta(self):
+        m = Memoria(4, semilla=1)
+        posiciones = {}
+        for i, simbolo in enumerate(m.cartas):
+            posiciones.setdefault(simbolo, []).append(i)
+        for a, b in posiciones.values():
+            self.assertIsNone(m.elegir(a))
+            self.assertTrue(m.elegir(b))
+        self.assertTrue(m.terminado)
+        self.assertEqual((m.intentos, m.puntaje()), (4, 100))
+
+    def test_fallo_y_errores(self):
+        m = Memoria(2, semilla=3)
+        distinta = next(i for i in range(1, 4) if m.cartas[i] != m.cartas[0])
+        m.elegir(0)
+        with self.assertRaises(ValueError):
+            m.elegir(0)
+        self.assertFalse(m.elegir(distinta))
+        with self.assertRaises(ValueError):
+            m.elegir(99)
+        with self.assertRaises(ValueError):
+            Memoria(1)
+        self.assertEqual(m.puntaje(), 0)
+
+
+if __name__ == "__main__":
+    unittest.main()
+''',
+    },
+    comando_tests=_PY_TESTS,
+    comando_ejecutar="python3 -m memoria",
+    etiquetas=("juego", "memoria", "pares", "cartas", "memotest"),
+)
+
+
+# ======================================================================
 # MÓDULO: autotest_base
 # ======================================================================
 """
@@ -18008,10 +23196,17 @@ class TestAgente(BaseTest):
         self.assertTrue(res.ok)
 
     def test_limite_de_pasos(self):
-        llm = MockLLM(lambda m, k: herramienta_xml("list_files", path=".", recursive=str(_turno(m) % 2 == 0)))
+        llm = MockLLM(lambda m, k: herramienta_xml("search_files", regex=f"cosa{_turno(m)}"))
         res = self.agente(llm, self.proyecto({"a.py": "1"}), max_pasos=4).ejecutar("dá vueltas")
         self.assertEqual(res.motivo, "max_pasos")
         self.assertFalse(res.ok)
+
+    def test_bucle_alternado_se_corta(self):
+        llm = MockLLM(lambda m, k: herramienta_xml("list_files", path=".", recursive=str(_turno(m) % 2 == 0)))
+        res = self.agente(llm, self.proyecto({"a.py": "1"}), max_pasos=10).ejecutar("dá vueltas")
+        self.assertEqual(res.motivo, "bucle")
+        self.assertFalse(res.ok)
+        self.assertLess(res.pasos, 6)
 
     def test_compactacion(self):
         ws = self.proyecto()
@@ -19013,6 +24208,557 @@ class TestComandosExtra(BaseTest):
 
 
 # ======================================================================
+# MÓDULO: autotest_bucles
+# ======================================================================
+"""
+Autotests de los bugs vistos en uso real (v7.1):
+
+  1. Tool loop: con 2+2 el modelo obtenía 4 y volvía a llamar execute_command. La causa era REAPER:
+     una respuesta en texto después de una herramienta recibía "no usaste ninguna herramienta" y el
+     modelo, obediente, repetía el comando. Ahora el principal termina con su respuesta, una llamada
+     idéntica sin cambios reutiliza el resultado y un bucle se corta.
+  2. Cumplimiento falso: afirmaba haber validado algo cuando la ejecución había sido rechazada.
+  3. Verificación interactiva: un EOFError hacía que modificara el programa en vez de probarlo con entrada.
+  4. "Responde únicamente cuánto es 5+5. No crees archivos ni ejecutes comandos." → responde sin herramientas.
+"""
+
+
+def _comando(cmd: str, **extra: str) -> str:
+    return herramienta_xml("execute_command", command=cmd, **extra)
+
+
+def _ultimas_observaciones(llm: "MockLLM") -> list:
+    """Último mensaje de usuario que vio el modelo en cada llamada (observaciones de REAPER)."""
+    return [MockLLM.ultimo_usuario(ll["mensajes"]) for ll in llm.llamadas]
+
+
+CALCULADORA_INTERACTIVA = '''\
+def calcular(a, b, op):
+    if op == "+":
+        return a + b
+    if op == "-":
+        return a - b
+    if op == "*":
+        return a * b
+    if op == "/":
+        return a / b
+    raise ValueError(op)
+
+
+def main():
+    while True:
+        texto = input("primer número (o salir): ")
+        if texto.strip() == "salir":
+            print("chau")
+            break
+        a = float(texto)
+        b = float(input("segundo número: "))
+        op = input("operación: ")
+        print("resultado:", calcular(a, b, op))
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+
+class TestHeuristicasPedido(BaseTest):
+    def test_pide_cambios(self):
+        self.assertTrue(pide_cambios("Creá una calculadora en calc.py"))
+        self.assertTrue(pide_cambios("arreglá el bug de login"))
+        self.assertTrue(pide_cambios("¿Podés crear un archivo hola.py?"))
+        self.assertTrue(pide_cambios("can you fix the tests?"))
+        self.assertFalse(pide_cambios("¿cuánto es 5+5?"))
+        self.assertFalse(pide_cambios("Responde únicamente cuánto es 5+5. No crees archivos ni ejecutes comandos."))
+        self.assertFalse(pide_cambios("¿cómo invierto una lista en python?"))
+        self.assertFalse(pide_cambios("explicame qué es una closure"))
+        self.assertFalse(pide_cambios(""))
+
+    def test_prohibiciones(self):
+        p = prohibiciones("Responde únicamente cuánto es 5+5. No crees archivos ni ejecutes comandos.")
+        self.assertIn("herramientas", p)
+        self.assertIn("archivos", p)
+        self.assertEqual(prohibiciones("no ejecutes comandos, solo leé el código"), {"comandos"})
+        self.assertEqual(prohibiciones("don't run any commands"), {"comandos"})
+        self.assertEqual(prohibiciones("creá calc.py"), set())
+        self.assertIn("archivos", prohibiciones("revisalo pero no modifiques ningún archivo"))
+
+    def test_pregunta_simple(self):
+        self.assertTrue(es_pregunta_simple("cuánto es 5+5"))
+        self.assertTrue(es_pregunta_simple("¿qué es una lista enlazada?"))
+        self.assertTrue(es_pregunta_simple("2+2"))
+        self.assertTrue(es_pregunta_simple("Responde únicamente cuánto es 5+5. No crees archivos ni ejecutes comandos."))
+        self.assertFalse(es_pregunta_simple("¿qué hace main.py?"))      # necesita leer el archivo
+        self.assertFalse(es_pregunta_simple("creá una calculadora"))
+        self.assertFalse(es_pregunta_simple("x" * 400 + "?"))
+
+    def test_afirma_verificacion(self):
+        self.assertTrue(afirma_verificacion("Listo, validé el programa y funciona correctamente."))
+        self.assertTrue(afirma_verificacion("Los tests pasan."))
+        self.assertTrue(afirma_verificacion("He verificado el resultado"))
+        self.assertTrue(afirma_verificacion("All tests passed."))
+        self.assertFalse(afirma_verificacion("No pude probarlo porque el comando fue bloqueado."))
+        self.assertFalse(afirma_verificacion("No verifiqué nada todavía."))
+        self.assertFalse(afirma_verificacion("El resultado de 5+5 es 10."))
+        self.assertFalse(afirma_verificacion("Deberías probar el programa con entrada."))
+
+    def test_afirma_ejecucion(self):
+        self.assertTrue(afirma_ejecucion("Ejecuté el programa y muestra 4"))
+        self.assertTrue(afirma_ejecucion("corrí python y dio 4"))
+        self.assertFalse(afirma_ejecucion("no ejecuté nada"))
+        self.assertFalse(afirma_ejecucion("El resultado es 4"))
+
+    def test_anuncia_accion(self):
+        self.assertTrue(anuncia_accion("Ahora voy a crear el archivo calc.py"))
+        self.assertTrue(anuncia_accion("Voy a ejecutar el programa para probarlo:"))
+        self.assertTrue(anuncia_accion("Let me check the file"))
+        self.assertFalse(anuncia_accion("5 + 5 = 10"))
+        self.assertFalse(anuncia_accion("Listo: creé calc.py con suma y resta. Probalo con python3 calc.py."))
+
+    def test_codigo_pegado(self):
+        self.assertTrue(codigo_pegado("```python\na = 1\nb = 2\nc = 3\nprint(a + b + c)\n```"))
+        self.assertFalse(codigo_pegado("Usá `lista[::-1]`"))
+        self.assertFalse(codigo_pegado("```bash\npython3 calc.py\n```"))
+
+    def test_fences_vacios(self):
+        self.assertEqual(limpiar_texto_visible("Ejecuto el comando:\n```xml\n\n```"), "Ejecuto el comando:")
+        self.assertEqual(limpiar_texto_visible("```xml\n```\n\n\n\nlisto"), "listo")
+        self.assertEqual(limpiar_texto_visible("```python\nprint(1)\n```"), "```python\nprint(1)\n```")
+
+    def test_salida_fallida(self):
+        self.assertTrue(salida_fallida("execute_command", "$ x\nexit code: 1\nSTDERR:\nboom"))
+        self.assertFalse(salida_fallida("execute_command", "$ x\nexit code: 0\nSTDOUT:\n4"))
+        self.assertTrue(salida_fallida("run_tests", "Tests FALLARON (pytest): 1 fallaron."))
+        self.assertFalse(salida_fallida("run_tests", "Tests PASARON (pytest)."))
+
+
+class TestBucleHerramientas(BaseTest):
+    def agente(self, llm, ws, rol="principal", **ajustes) -> Agente:
+        return Agente(rol, llm, ws, self.ajustes(**ajustes), self.ui(), memoria=None, mostrar_progreso=False)
+
+    # ---------------------------------------------------------------- 5+5
+    def test_5mas5_responde_sin_herramientas(self):
+        llm = MockLLM(["10"])
+        res = self.agente(llm, self.proyecto()).ejecutar(
+            "Responde únicamente cuánto es 5+5. No crees archivos ni ejecutes comandos.")
+        self.assertEqual(res.motivo, "respuesta")
+        self.assertEqual(res.resumen, "10")
+        self.assertEqual(res.pasos, 1)
+        self.assertTrue(res.ok)
+        # la tarea llega con la aclaración de REAPER y SIN mapa de archivos ni guías (no hay nada que explorar)
+        tarea = llm.llamadas[0]["mensajes"][1]["content"]
+        self.assertIn("SIN usar herramientas", tarea)
+        self.assertNotIn("GUÍA RÁPIDA", tarea)
+
+    def test_5mas5_bloquea_el_comando_prohibido(self):
+        ws = self.proyecto()
+        llm = MockLLM([_comando("python3 -c 'print(5+5)' > hecho.txt"), "10"])
+        res = self.agente(llm, ws).ejecutar(
+            "Responde únicamente cuánto es 5+5. No crees archivos ni ejecutes comandos.")
+        self.assertEqual(res.resumen, "10")
+        self.assertFalse((ws.raiz / "hecho.txt").exists(), "el comando prohibido no debía ejecutarse")
+        self.assertIn("respondé directamente en texto", _ultimas_observaciones(llm)[1])
+
+    def test_pregunta_simple_con_codigo_se_acepta(self):
+        llm = MockLLM(["Con slicing:\n```python\nlista = [1, 2, 3]\ninvertida = lista[::-1]\nprint(invertida)\n# [3, 2, 1]\n```"])
+        res = self.agente(llm, self.proyecto()).ejecutar("¿cómo invierto una lista en python?")
+        self.assertEqual(res.motivo, "respuesta")
+        self.assertEqual(res.pasos, 1)
+
+    # ---------------------------------------------------------------- 2+2
+    def test_2mas2_responde_despues_de_la_herramienta(self):
+        """El bug central: después de obtener 4, la respuesta en texto ES la respuesta final."""
+        llm = MockLLM([_comando('python3 -c "print(2+2)"'), "2+2 = 4"])
+        res = self.agente(llm, self.proyecto()).ejecutar("cuánto es 2+2? calculalo con python")
+        self.assertEqual(res.motivo, "respuesta")
+        self.assertEqual(res.resumen, "2+2 = 4")
+        self.assertEqual(res.pasos, 2)
+        self.assertEqual(len(llm.llamadas), 2)
+        # la observación le recuerda que ya puede responder
+        self.assertIn("respondé AHORA en texto", _ultimas_observaciones(llm)[1])
+
+    def test_2mas2_llamada_identica_reutiliza_el_resultado(self):
+        ws = self.proyecto()
+        llm = MockLLM([_comando('python3 -c "print(2+2)"'), _comando('python3 -c "print(2+2)"'), "4"])
+        res = self.agente(llm, ws).ejecutar("cuánto es 2+2? usá python")
+        self.assertEqual(res.resumen, "4")
+        obs = _ultimas_observaciones(llm)[2]
+        self.assertIn("YA HICISTE EXACTAMENTE ESTA LLAMADA", obs)
+        self.assertIn("4", obs)
+        self.assertIn("YA TENÉS LO QUE NECESITABAS", obs)
+
+    def test_2mas2_bucle_infinito_se_corta_con_la_respuesta(self):
+        llm = MockLLM(lambda m, k: _comando('python3 -c "print(2+2)"'))
+        res = self.agente(llm, self.proyecto(), max_pasos=12).ejecutar("cuánto es 2+2? usá python")
+        self.assertEqual(res.motivo, "respuesta")
+        self.assertIn("4", res.resumen)
+        self.assertLessEqual(res.pasos, 3)
+
+    def test_comando_que_cambia_archivos_se_puede_repetir(self):
+        ws = self.proyecto()
+        cmd = "echo x >> log.txt && wc -l < log.txt"
+        llm = MockLLM([_comando(cmd), _comando(cmd), "listo"])
+        self.agente(llm, ws).ejecutar("agregá dos líneas a log.txt con el comando")
+        self.assertEqual((ws.raiz / "log.txt").read_text().count("x"), 2)
+
+    def test_comando_fallido_identico_se_bloquea_al_tercero(self):
+        ws = self.proyecto({"roto.py": "raise SystemExit(3)\n"})
+        llm = MockLLM([_comando("python3 roto.py")] * 3 + ["No pude: el programa sale con código 3."])
+        self.agente(llm, ws).ejecutar("ejecutá roto.py")
+        obs = _ultimas_observaciones(llm)
+        self.assertIn("exit code: 3", obs[1])
+        self.assertIn("exit code: 3", obs[2])
+        self.assertIn("NO se ejecutó", obs[3])
+
+    # ---------------------------------------------------------------- run_tests / read_file tras editar
+    def test_run_tests_permitido_despues_de_editar(self):
+        ws = self.proyecto({
+            "calc.py": "def suma(a, b):\n    return a - b\n",
+            "tests/test_calc.py": "import unittest\nfrom calc import suma\n\n\nclass T(unittest.TestCase):\n"
+                                  "    def test_suma(self):\n        self.assertEqual(suma(2, 3), 5)\n",
+        })
+        llm = MockLLM([
+            herramienta_xml("run_tests"),
+            herramienta_xml("replace_symbol", path="calc.py", symbol="suma", content="def suma(a, b):\n    return a * b"),
+            herramienta_xml("run_tests"),
+            herramienta_xml("replace_symbol", path="calc.py", symbol="suma", content="def suma(a, b):\n    return a + b"),
+            herramienta_xml("run_tests"),
+            terminar_xml("Arreglé suma; run_tests pasa."),
+        ])
+        res = self.agente(llm, ws).ejecutar("arreglá suma")
+        self.assertTrue(res.ok, res.resumen)
+        obs = _ultimas_observaciones(llm)
+        self.assertIn("Tests FALLARON", obs[1])
+        self.assertIn("Tests FALLARON", obs[3])
+        self.assertIn("Tests PASARON", obs[5])
+        self.assertFalse(any("llamada repetida" in o or "YA HICISTE" in o for o in obs))
+
+    def test_relectura_tras_cambio_trae_contenido_nuevo(self):
+        ws = self.proyecto({"a.py": "X = 1\n"})
+        llm = MockLLM([
+            herramienta_xml("read_file", path="a.py"),
+            herramienta_xml("write_to_file", path="a.py", content="X = 2\n"),
+            herramienta_xml("read_file", path="a.py"),
+            terminar_xml("X vale 2."),
+        ])
+        self.agente(llm, ws).ejecutar("cambiá X a 2")
+        self.assertIn("X = 2", _ultimas_observaciones(llm)[3])
+
+    # ---------------------------------------------------------------- cumplimiento falso
+    def test_afirmacion_sin_evidencia_se_rechaza(self):
+        ws = self.proyecto({"a.py": "X = 1\n"})
+        llm = MockLLM([
+            herramienta_xml("write_to_file", path="a.py", content="X = 2\n"),
+            terminar_xml("Listo, validé el cambio y funciona correctamente."),
+            herramienta_xml("validate"),
+            terminar_xml("Cambié X a 2 y validate da OK."),
+        ])
+        res = self.agente(llm, ws).ejecutar("cambiá X a 2")
+        self.assertIn("No acepto ese cierre", _ultimas_observaciones(llm)[2])
+        self.assertEqual(res.resumen, "Cambié X a 2 y validate da OK.")
+        self.assertTrue(res.ok)
+
+    def test_afirmacion_tras_ejecucion_bloqueada_se_rechaza(self):
+        """El caso real: dijo 'validé' cuando la ejecución había sido rechazada como repetida."""
+        ws = self.proyecto({"roto.py": "raise SystemExit(1)\n"})
+        llm = MockLLM([_comando("python3 roto.py")] * 3 + [
+            "Validé el programa y funciona correctamente.",
+            "No pude validarlo: el programa termina con código 1.",
+        ])
+        res = self.agente(llm, ws).ejecutar("probá roto.py")
+        self.assertIn("BLOQUEADA", _ultimas_observaciones(llm)[4])
+        self.assertTrue(res.resumen.startswith("No pude validarlo"))
+
+    def test_tests_que_fallan_no_se_pueden_dar_por_pasados(self):
+        ws = self.proyecto({
+            "calc.py": "def suma(a, b):\n    return a - b\n",
+            "tests/test_calc.py": "import unittest\nfrom calc import suma\n\n\nclass T(unittest.TestCase):\n"
+                                  "    def test_suma(self):\n        self.assertEqual(suma(2, 3), 5)\n",
+        })
+        llm = MockLLM([herramienta_xml("run_tests")] + [terminar_xml("Todos los tests pasan.")] * 5)
+        res = self.agente(llm, ws).ejecutar("arreglá suma")
+        self.assertIn("⚠ REAPER", res.resumen)
+        self.assertIn("FALLÓ", res.resumen)
+
+    def test_informe_honesto_con_fallo_se_acepta(self):
+        ws = self.proyecto({
+            "calc.py": "def suma(a, b):\n    return a - b\n",
+            "tests/test_calc.py": "import unittest\nfrom calc import suma\n\n\nclass T(unittest.TestCase):\n"
+                                  "    def test_suma(self):\n        self.assertEqual(suma(2, 3), 5)\n",
+        })
+        llm = MockLLM([herramienta_xml("run_tests"), terminar_xml("Corrí los tests: test_suma falla (devuelve -1).")])
+        res = self.agente(llm, ws).ejecutar("diagnosticá suma")
+        self.assertEqual(res.pasos, 2)
+        self.assertNotIn("⚠ REAPER", res.resumen)
+
+    def test_respuesta_con_ejecucion_real_se_acepta(self):
+        llm = MockLLM([_comando('python3 -c "print(2+2)"'), "Lo ejecuté con python y da 4."])
+        res = self.agente(llm, self.proyecto()).ejecutar("cuánto es 2+2? usá python")
+        self.assertEqual(res.resumen, "Lo ejecuté con python y da 4.")
+
+    # ---------------------------------------------------------------- anuncios y código pegado
+    def test_anuncio_sin_herramienta_pide_actuar(self):
+        ws = self.proyecto()
+        llm = MockLLM([
+            "Voy a crear el archivo hola.py:",
+            herramienta_xml("write_to_file", path="hola.py", content='print("hola")\n'),
+            terminar_xml("Creé hola.py."),
+        ])
+        res = self.agente(llm, ws).ejecutar("creá hola.py que imprima hola")
+        self.assertTrue((ws.raiz / "hola.py").exists())
+        self.assertIn("no llamaste ninguna herramienta", _ultimas_observaciones(llm)[1])
+        self.assertEqual(res.motivo, "completado")
+
+    def test_codigo_pegado_en_pedido_de_cambios(self):
+        ws = self.proyecto()
+        llm = MockLLM([
+            "Acá está:\n```python\ndef hola():\n    return 'hola'\n\nprint(hola())\n```",
+            herramienta_xml("write_to_file", path="hola.py", content="def hola():\n    return 'hola'\n"),
+            terminar_xml("Creé hola.py."),
+        ])
+        self.agente(llm, ws).ejecutar("creá hola.py con una función hola")
+        self.assertIn("Pegaste código en el chat", _ultimas_observaciones(llm)[1])
+        self.assertTrue((ws.raiz / "hola.py").exists())
+
+    def test_respuesta_final_tras_trabajo_se_acepta_sin_attempt_completion(self):
+        ws = self.proyecto()
+        llm = MockLLM([
+            herramienta_xml("write_to_file", path="hola.py", content='print("hola")\n'),
+            "Listo: creé hola.py, que imprime hola.",
+        ])
+        res = self.agente(llm, ws).ejecutar("creá hola.py que imprima hola")
+        self.assertEqual(res.motivo, "respuesta")
+        self.assertTrue(res.ok)
+        self.assertEqual(res.cambios, ["hola.py"])
+
+    def test_respuesta_con_archivo_roto_no_se_acepta(self):
+        ws = self.proyecto()
+        llm = MockLLM([
+            herramienta_xml("write_to_file", path="mal.py", content="def f(:\n    pass\n"),
+            "Listo.",
+            herramienta_xml("write_to_file", path="mal.py", content="def f():\n    return 1\n"),
+            "Listo, mal.py define f().",
+        ])
+        res = self.agente(llm, ws).ejecutar("creá mal.py con una función f")
+        self.assertIn("validación REAL", _ultimas_observaciones(llm)[2])
+        self.assertTrue(res.ok)
+
+    def test_fences_vacios_no_se_muestran(self):
+        ui = self.ui()
+        llm = MockLLM(["Ejecuto:\n```xml\n" + _comando('python3 -c "print(1)"') + "\n```", "1"])
+        Agente("principal", llm, self.proyecto(), self.ajustes(), ui, memoria=None,
+               mostrar_progreso=False).ejecutar("cuánto da print(1)? probalo")
+        self.assertNotIn("```xml", ui.texto_registrado())
+
+    # ---------------------------------------------------------------- roles de solo lectura
+    def test_arquitecto_que_escribe_el_plan_en_texto(self):
+        plan = ("<plan>\n<objetivo>calc</objetivo>\n<interfaz>\n- calc.py: def suma(a, b) -> int\n</interfaz>\n"
+                '<tarea id="1" archivos="calc.py">suma</tarea>\n<criterios>\n- suma(2, 3) == 5\n</criterios>\n</plan>')
+        res = self.agente(MockLLM([plan]), self.proyecto(), rol="arquitecto").ejecutar("planificá una calculadora")
+        self.assertEqual(res.motivo, "completado")
+        self.assertIn("<plan>", res.resumen)
+
+    def test_revisor_con_veredicto_en_texto(self):
+        res = self.agente(MockLLM(["VEREDICTO: APROBADO\nTodo bien."]), self.proyecto(), rol="revisor").ejecutar("revisá")
+        self.assertEqual(res.motivo, "completado")
+
+
+class TestProgramasInteractivos(BaseTest):
+    def test_eof_da_pista_de_programa_interactivo(self):
+        ws = self.proyecto({"calculadora.py": CALCULADORA_INTERACTIVA})
+        salida = self.herramienta(self.contexto(ws), "execute_command", command="python3 calculadora.py")
+        self.assertIn("EOFError", salida)
+        self.assertIn("INTERACTIVO", salida)
+        self.assertIn("NO lo modifiques", salida)
+        self.assertIn("<stdin>", salida)
+
+    def test_execute_command_con_stdin(self):
+        ws = self.proyecto({"calculadora.py": CALCULADORA_INTERACTIVA})
+        salida = self.herramienta(self.contexto(ws), "execute_command", command="python3 calculadora.py",
+                                  stdin="2\n3\n+\nsalir")
+        self.assertIn("exit code: 0", salida)
+        self.assertIn("resultado: 5.0", salida)
+        self.assertIn("chau", salida)
+
+    def test_stdin_con_barras_literales(self):
+        ws = self.proyecto({"calculadora.py": CALCULADORA_INTERACTIVA})
+        salida = self.herramienta(self.contexto(ws), "execute_command", command="python3 calculadora.py",
+                                  stdin="6\\n2\\n/\\nsalir")
+        self.assertIn("resultado: 3.0", salida)
+
+    def test_stdin_insuficiente(self):
+        ws = self.proyecto({"calculadora.py": CALCULADORA_INTERACTIVA})
+        salida = self.herramienta(self.contexto(ws), "execute_command", command="python3 calculadora.py", stdin="2")
+        self.assertIn("MÁS datos", salida)
+
+    def test_run_python_con_input_y_stdin(self):
+        ws = self.proyecto({"calculadora.py": CALCULADORA_INTERACTIVA})
+        salida = self.herramienta(self.contexto(ws), "run_python",
+                                  content="from calculadora import main\nmain()", stdin="4\n5\n*\nsalir\n")
+        self.assertIn("resultado: 20.0", salida)
+
+    def test_run_python_con_input_sin_stdin(self):
+        with self.assertRaises(ErrorHerramienta) as cm:
+            self.herramienta(self.contexto(self.proyecto()), "run_python", content="x = input()")
+        self.assertIn("<stdin>", str(cm.exception))
+
+    def test_alias_input_para_stdin(self):
+        llamada = analizar("<execute_command>\n<command>python3 c.py</command>\n<input>1\n2</input>\n</execute_command>",
+                           esquemas()).llamadas[0]
+        self.assertEqual(llamada.params.get("stdin"), "1\n2")
+
+    def test_agente_prueba_con_entrada_y_no_modifica(self):
+        ws = self.proyecto({"calculadora.py": CALCULADORA_INTERACTIVA})
+        llm = MockLLM([
+            _comando("python3 calculadora.py"),
+            _comando("python3 calculadora.py", stdin="2\n3\n+\nsalir"),
+            "Funciona: con 2, 3 y + muestra resultado: 5.0 (lo ejecuté con entrada).",
+        ])
+        res = Agente("principal", llm, ws, self.ajustes(), self.ui(), memoria=None,
+                     mostrar_progreso=False).ejecutar("probá la calculadora")
+        self.assertEqual(res.motivo, "respuesta")
+        self.assertEqual((ws.raiz / "calculadora.py").read_text(), CALCULADORA_INTERACTIVA)
+        self.assertIn("INTERACTIVO", _ultimas_observaciones(llm)[1])
+
+
+PEDIDO_GRANDE = ("Creá NebulaDB: una base de datos clave-valor en Python con almacenamiento en disco (storage.py), "
+                 "índice en memoria (index.py), un parser de consultas tipo SQL (query.py) y una CLI (cli.py) "
+                 "con comandos put, get, delete y scan.")
+
+PLAN_DEGENERADO = f"""<plan>
+<objetivo>NebulaDB</objetivo>
+<interfaz>
+- nebula/storage.py: class Storage(ruta) con put(k, v), get(k), delete(k)
+- nebula/index.py: class Index() con add(k, pos), find(k) -> int | None
+- nebula/query.py: def parse(texto) -> dict
+- nebula/cli.py: def main(argv) -> int
+</interfaz>
+<tarea id="1" archivos="nebula/storage.py, nebula/index.py, nebula/query.py, nebula/cli.py">{PEDIDO_GRANDE}</tarea>
+<criterios>
+- Storage.get devuelve lo guardado con put
+</criterios>
+</plan>"""
+
+PLAN_BUENO = """<plan>
+<objetivo>NebulaDB</objetivo>
+<interfaz>
+- nebula/storage.py: class Storage(ruta)
+- nebula/index.py: class Index()
+- nebula/cli.py: def main(argv) -> int
+</interfaz>
+<tarea id="1" archivos="nebula/storage.py">Storage con put/get/delete en disco.</tarea>
+<tarea id="2" archivos="nebula/index.py">Index en memoria.</tarea>
+<tarea id="3" archivos="nebula/cli.py">CLI con put, get, delete y scan.</tarea>
+<criterios>
+- Storage.get devuelve lo guardado con put
+</criterios>
+</plan>"""
+
+
+class TestPipelinePlanYRevision(BaseTest):
+    def test_plan_degenerado(self):
+        plan = parsear_plan(PLAN_DEGENERADO, PEDIDO_GRANDE)
+        self.assertTrue(plan_degenerado(plan, PEDIDO_GRANDE, PLAN_DEGENERADO))
+        self.assertEqual(plan_degenerado(parsear_plan(PLAN_BUENO, PEDIDO_GRANDE), PEDIDO_GRANDE, PLAN_BUENO), "")
+        chico = parsear_plan('<plan><tarea id="1" archivos="calc.py">Agregar resta a calc.py</tarea></plan>', "agregá resta")
+        self.assertEqual(plan_degenerado(chico, "agregá resta"), "", "un pedido chico puede tener una sola tarea")
+        sin_formato = parsear_plan("hacé todo", PEDIDO_GRANDE)
+        self.assertIn("<tarea>", plan_degenerado(sin_formato, PEDIDO_GRANDE, "hacé todo"))
+
+    def test_dividir_por_interfaz(self):
+        plan = dividir_por_interfaz(parsear_plan(PLAN_DEGENERADO, PEDIDO_GRANDE))
+        self.assertEqual([t.archivos for t in plan.tareas],
+                         [["nebula/storage.py"], ["nebula/index.py"], ["nebula/query.py"], ["nebula/cli.py"]])
+        self.assertIn("class Index", plan.tareas[1].descripcion)
+
+    def _orquestador(self, respuestas_arquitecto: list) -> tuple:
+        pendientes = list(respuestas_arquitecto)
+
+        def guion(mensajes, kwargs):
+            if MockLLM.rol_de(mensajes) == "arquitecto":
+                return terminar_xml(pendientes.pop(0))
+            return terminar_xml("ok")
+
+        llm = MockLLM(guion)
+        return Orquestador(llm, self.proyecto(), self.ajustes(), self.ui()), llm
+
+    def test_arquitecto_reintenta_un_plan_de_una_sola_tarea(self):
+        orq, llm = self._orquestador([PLAN_DEGENERADO, PLAN_BUENO])
+        plan = orq.planificar(PEDIDO_GRANDE, "")
+        self.assertEqual(len(plan.tareas), 3)
+        segunda = [c for c in llm.llamadas if MockLLM.rol_de(c["mensajes"]) == "arquitecto"][-1]
+        self.assertIn("TU PLAN ANTERIOR NO SIRVE", segunda["mensajes"][1]["content"])
+
+    def test_arquitecto_que_insiste_se_divide_por_archivo(self):
+        orq, _ = self._orquestador([PLAN_DEGENERADO, PLAN_DEGENERADO])
+        plan = orq.planificar(PEDIDO_GRANDE, "")
+        self.assertEqual(len(plan.tareas), 4)
+
+    def test_tarea_sin_progreso_no_pasa(self):
+        ws = self.proyecto({"a.py": "X = 1\n"})
+        orq = Orquestador(MockLLM([]), ws, self.ajustes(), self.ui())
+        orq._protegidos = {}
+        tcid = ws.checkpoints.iniciar("tarea 1")
+        verif = orq._verificar_tarea(tcid, ConteoTests(), set(), exigir_progreso=True)
+        self.assertFalse(verif.ok)
+        self.assertIn("SIN PROGRESO", verif.diagnostico)
+        self.assertTrue(orq._verificar_tarea(tcid, ConteoTests(), set()).ok)
+
+    def test_revisor_no_aprueba_una_tarea_que_rompe_tests(self):
+        ws = self.proyecto({
+            "calc.py": "def suma(a, b):\n    return a + b\n",
+            "tests/test_calc.py": "import unittest\nfrom calc import suma\n\n\nclass T(unittest.TestCase):\n"
+                                  "    def test_suma(self):\n        self.assertEqual(suma(2, 3), 5)\n",
+        })
+        plan = ('<plan><objetivo>resta</objetivo><tarea id="1" archivos="calc.py">Agregar resta a calc.py</tarea>'
+                "<criterios>\n- resta(5, 3) == 2\n</criterios></plan>")
+
+        def guion(mensajes, kwargs):
+            rol = MockLLM.rol_de(mensajes)
+            turno = _turno(mensajes)
+            if rol == "arquitecto":
+                return terminar_xml(plan)
+            if rol == "implementador" and turno == 0:
+                return herramienta_xml("write_to_file", path="calc.py",
+                                       content="def suma(a, b):\n    return a - b\n\n\ndef resta(a, b):\n    return a - b\n")
+            if rol == "revisor":
+                return terminar_xml("VEREDICTO: APROBADO")
+            return terminar_xml("No pude arreglarlo.")
+
+        llm = MockLLM(guion)
+        ajustes = self.ajustes(max_revisiones=1, max_reparaciones=1, umbral_escalada=0)
+        informe = Orquestador(llm, ws, ajustes, self.ui()).construir("agregá resta", confirmar=False)
+        roles = [MockLLM.rol_de(c["mensajes"]) for c in llm.llamadas]
+        self.assertNotIn("revisor", roles, "una tarea que rompe tests no se manda a revisar")
+        self.assertTrue(any("sin revisión" in n for n in informe.notas), informe.notas)
+        self.assertNotEqual(informe.estado, "verificada")
+
+
+class TestLlamadasSinCerrar(BaseTest):
+    def test_parser_acepta_contenido_sin_cierre_si_cierra_la_herramienta(self):
+        llamada = analizar("<write_to_file>\n<path>a.py</path>\n<content>\nx = 1\n</write_to_file>", esquemas()).llamadas[0]
+        self.assertTrue(llamada.completa)
+        self.assertEqual(llamada.params["content"].strip(), "x = 1")
+
+    def test_comillas_internas_se_conservan(self):
+        llamada = analizar('<execute_command><command>python3 -c "print(2+2)"</command></execute_command>',
+                           esquemas()).llamadas[0]
+        self.assertEqual(llamada.params["command"], 'python3 -c "print(2+2)"')
+        self.assertEqual(sin_comillas('"app.py"'), "app.py")
+        self.assertEqual(sin_comillas("`ls -la`"), "ls -la")
+        self.assertEqual(sin_comillas("'a' && echo 'b'"), "'a' && echo 'b'")
+
+    def test_agente_acepta_etiquetas_olvidadas_si_el_mensaje_termino_normal(self):
+        ws = self.proyecto()
+        llm = MockLLM(["Creo el archivo.\n<write_to_file>\n<path>a.py</path>\n<content>\nX = 1\n",
+                       terminar_xml("Creé a.py.")])
+        res = Agente("principal", llm, ws, self.ajustes(), self.ui(), memoria=None,
+                     mostrar_progreso=False).ejecutar("creá a.py con X = 1")
+        self.assertEqual(ws.leer("a.py").strip(), "X = 1")
+        self.assertTrue(res.ok)
+
+
+# ======================================================================
 # MÓDULO: autotest_runner
 # ======================================================================
 """Ejecutor del autotest interno."""
@@ -19765,7 +25511,8 @@ you really read, edit and run things. Always answer the user in SPANISH (Rioplat
 
 PRINCIPLES
 1. Verify, don't assume: read before editing. Never invent files, APIs, packages, commands or results.
-2. Never claim something works or that a test passed unless you saw it in a real <resultado>.
+2. Never claim something works or that a test passed unless you saw it in a real <resultado>. A blocked or
+   rejected run does NOT count as verified: say so.
 3. Minimal, precise changes; don't rewrite what already works.
 4. Handle errors explicitly (no `except: pass`).
 5. Termux/Android environment: no sudo, no systemd, no /usr/bin; prefer the standard library.
@@ -19783,6 +25530,9 @@ HOW TO USE TOOLS
   you wrote and asks you to continue.
 - Every edit returns the real validation (and trivial automatic fixes). If it says VALIDACIÓN FALLÓ,
   fix that first.
+- INTERACTIVE programs (input(), menus): an EOFError when run without input is NOT a bug. Don't change them
+  to stop asking for input: test them by passing the answers with <stdin> in execute_command.
+- Don't repeat an identical call if nothing changed: the result will be the same.
 - When done, call attempt_completion with a concrete report (in Spanish).
 
 EXAMPLE
@@ -19806,7 +25556,9 @@ def resta(a, b):
 MISIONES_EN = {
     "principal": """You are the MAIN AGENT. Solve the user's request end to end: understand, explore what is needed,
 edit, verify with real tools and report.
-- If the request is just a question that needs no file changes, answer directly in text, without tools.
+- If the request is a question or a simple calculation (e.g. "how much is 5+5"), answer directly in text in your
+  FIRST message, without tools. If the user says "don't run commands" or "don't create files", obey.
+- Once a tool gave you what you needed (e.g. you ran 2+2 and saw 4), DON'T repeat it: answer the user in text.
 - For multi-step work, keep a list with update_todo.
 - REAPER already gives you the most likely relevant files: start there with read_symbol / read_file.
 - To understand a big project, delegate to 'explorador' subagents IN PARALLEL (several <delegate> in the same
@@ -19942,11 +25694,13 @@ DOCS_EN = {
                   {"path": "current file", "new_path": "new path"}),
     "revert_file": ("Restores a file to how it was when this task started (if you broke it and want to start over).",
                     {"path": "file"}),
-    "execute_command": ("Runs a shell (bash) command at the workspace root, non-interactive. Prefer run_tests for tests. "
-                        "Servers or interactive programs are cut by timeout.",
-                        {"command": "command to run", "timeout": "seconds (optional, max 600)"}),
+    "execute_command": ("Runs a shell (bash) command at the workspace root. For interactive programs (input()) pass the "
+                        "answers in <stdin>, one per line. Prefer run_tests for tests. Servers are cut by timeout.",
+                        {"command": "command to run", "stdin": "standard input for interactive programs (optional)",
+                         "timeout": "seconds (optional, max 600)"}),
     "run_python": ("Runs a short Python snippet at the project root (to try a function or inspect data). Use print(). "
-                   "No input(). 60 s timeout.", {"content": "Python code"}),
+                   "If it uses input(), pass the answers in <stdin>. 60 s timeout.",
+                   {"content": "Python code", "stdin": "standard input for input() (optional)"}),
     "run_tests": ("Detects and runs the project's test suite (pytest, unittest, npm test, node --test...).", {}),
     "validate": ("Runs the real validators (syntax, imports, undefined names, node --check, JSON) on files. Without "
                  "paths it validates what you changed in this task.", {"paths": "comma-separated paths (optional)"}),

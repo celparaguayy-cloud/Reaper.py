@@ -503,16 +503,21 @@ def learn_lesson(ctx: Contexto, p: dict) -> str:
 @herramienta(
     "run_python",
     "Ejecuta un fragmento corto de Python en la raíz del proyecto (para probar una función o inspeccionar datos). "
-    "Usa print() para ver resultados. Sin input(). Timeout 60 s.",
-    [Param("content", "código Python", largo=True)],
+    "Usa print() para ver resultados. Si el código usa input(), pasá las respuestas en <stdin>. Timeout 60 s.",
+    [Param("content", "código Python", largo=True),
+     Param("stdin", "entrada estándar para input() (opcional, una respuesta por línea)", requerido=False, largo=True)],
     "<run_python>\n<content>\nfrom app.carrito import Carrito\nc = Carrito()\nprint(c.total())\n</content>\n</run_python>",
 )
 def run_python(ctx: Contexto, p: dict) -> str:
     codigo = p.get("content") or ""
     if not codigo.strip():
         raise ErrorHerramienta("Falta el código.")
-    if re.search(r"\binput\s*\(", codigo):
-        raise ErrorHerramienta("El fragmento usa input(): no hay usuario para contestar. Pasá los valores directamente.")
+    entrada = _entrada_estandar(p)
+    if re.search(r"\binput\s*\(", codigo) and entrada is None:
+        raise ErrorHerramienta(
+            "El fragmento usa input() y no pasaste entrada. Pasá las respuestas en <stdin> (una por línea) o los "
+            "valores directamente en el código. No cambies el programa para quitarle el input()."
+        )
     for patron in _BLOQUEADOS:
         if patron.search(codigo):
             raise ErrorHerramienta(f"El código contiene algo bloqueado por seguridad ({patron.pattern}).")
@@ -522,10 +527,17 @@ def run_python(ctx: Contexto, p: dict) -> str:
         ctx.ui.codigo(recortar(codigo, 1200), "python")
         if not ctx.ui.confirmar("  ¿Ejecutar?"):
             raise ErrorHerramienta("El usuario no aprobó ejecutar ese código.")
-    # Por stdin ("python -"): así el directorio del proyecto queda en sys.path y los imports locales andan.
-    r = ejecutar([sys.executable, "-"], cwd=ctx.ws.raiz, timeout=60, entrada=codigo)
+    if entrada is None:
+        # Por stdin ("python -"): así el directorio del proyecto queda en sys.path y los imports locales andan.
+        r = ejecutar([sys.executable, "-"], cwd=ctx.ws.raiz, timeout=60, entrada=codigo)
+    else:
+        # Con entrada para input(): el código va por -c (sys.path[0] sigue siendo el proyecto) y stdin queda libre.
+        r = ejecutar([sys.executable, "-c", codigo], cwd=ctx.ws.raiz, timeout=60, entrada=entrada)
     r.comando = "run_python"
-    texto = r.resumen(limite=MAX_SALIDA // 2).replace('File "<stdin>"', 'File "<fragmento>"')
-    if not r.ok and ctx.settings.pistas_errores:
+    texto = r.resumen(limite=MAX_SALIDA // 2).replace('File "<stdin>"', 'File "<fragmento>"').replace(
+        'File "<string>"', 'File "<fragmento>"')
+    if not r.ok and parece_interactivo(f"{r.stdout}\n{r.stderr}"):
+        texto += "\n\n" + PISTA_INTERACTIVO
+    elif not r.ok and ctx.settings.pistas_errores:
         texto = anexar_pistas(texto, 2)
     return texto

@@ -109,6 +109,178 @@ def _firma_error(texto: str) -> str:
     return hashlib.sha1((clave or texto[:400]).encode("utf-8", "replace")).hexdigest()[:12]
 
 
+# ------------------------------------------------------------------ intención del pedido y del modelo
+# Estas heurísticas deciden cuándo el agente principal puede terminar con una respuesta en texto
+# (como Claude Code: si ya sabe la respuesta, contesta y listo) y cuándo un informe afirma una
+# verificación que nunca ocurrió.
+
+_PREGUNTA_INICIO = re.compile(
+    r"^\s*[¿¡(\"']*\s*(?:qu[ée]|cu[áa]l(?:es)?|cu[áa]nto[s]?|cu[áa]nta[s]?|c[óo]mo|por\s*qu[ée]|porqu[ée]|qui[ée]n(?:es)?|"
+    r"d[óo]nde|cu[áa]ndo|para\s+qu[ée]|explic[aá](?:me)?|expl[ií]came|defin[ií]|define|describ[ií]|"
+    r"resum[ií]|responde|respond[eé]|dec[ií]me|dime|calcul[aá]|es\s+|son\s+|existe|hay\s+|"
+    r"what|how|why|which|who|whom|when|where|is|are|does|do|did|can|could|explain|tell\s+me|compute)\b",
+    re.I,
+)
+_PIDE_ACCION = re.compile(
+    r"\b(?:cre[aáeé]|crear|crea|hac[eé]|haz|hacer|hace|escrib[ií]|escribe|escribir|gener[aáe]|generar|implement\w*|"
+    r"agreg\w*|añad\w*|a[ñn]ade|modific\w*|cambi[aáe]|cambiar|arregl\w*|corrig\w*|correg\w*|refactor\w*|borr[aáe]|"
+    r"borrar|elimin\w*|renombr\w*|actualiz\w*|instal\w*|constru\w*|program[aáe]|programar|desarroll\w*|"
+    r"migr[aáe]|mov[eé]|mueve|ejecut[aáe]|ejecutar|corr[eé]|correr|test[eé]a|prob[aá]|probar|compil\w*|"
+    r"edit[aáe]|editar|reescrib\w*|optimiz\w*|depur\w*|debugue\w*|"
+    r"create|make|write|build|implement|add|fix|change|update|refactor|delete|remove|rename|install|"
+    r"generate|run|execute|test|compile|edit|rewrite|optimi[sz]e|debug)\b",
+    re.I,
+)
+_PIDE_FAVOR = re.compile(r"\b(?:pod[eé]s|puedes|podr[ií]as|quer[eé]s|quieres|can\s+you|could\s+you|would\s+you|please)\b", re.I)
+_PROHIBE_COMANDOS = re.compile(
+    r"\b(?:no|sin|nunca)\s+(?:ejecutes|ejecutar|corras|correr|uses|usar|lances|lanzar|llames|llamar)\s+"
+    r"(?:ning[úu]n\w*\s+|nada\s+|otr[oa]s?\s+)?(?:comandos?|herramientas?|c[óo]digo|programas?|python|nada|tools?)\b"
+    r"|\b(?:do\s+not|don'?t|never|without)\s+(?:run(?:ning)?|execut\w*|us(?:e|ing))\s+(?:any\s+)?(?:commands?|tools?|code)\b"
+    r"|\bno\s+tools\b",
+    re.I,
+)
+_PROHIBE_HERRAMIENTAS = re.compile(
+    r"\b(?:no|sin)\s+(?:uses|usar)\s+(?:ning[úu]na\s+)?herramientas?\b|\b(?:don'?t|do\s+not|without)\s+(?:use|using)\s+(?:any\s+)?tools?\b"
+    r"|\bresponde\w*\s+(?:[úu]nicamente|solamente|solo|s[óo]lo)\b|\b(?:answer|reply)\s+only\b",
+    re.I,
+)
+_PROHIBE_ARCHIVOS = re.compile(
+    r"\b(?:no|sin|nunca)\s+(?:crees|crear|escribas|escribir|modifiques|modificar|toques|tocar|edites|editar|"
+    r"cambies|cambiar|borres|borrar)\s+(?:ning[úu]n\w*\s+|los\s+|el\s+|otros?\s+)?(?:archivos?|ficheros?|nada|c[óo]digo)\b"
+    r"|\b(?:do\s+not|don'?t|never|without)\s+(?:creat\w*|writ\w*|modify\w*|touch\w*|edit\w*|chang\w*)\s+(?:any\s+)?(?:files?|anything|code)\b",
+    re.I,
+)
+_RE_RUTA_ARCHIVO = re.compile(r"[\w./-]+\.(?:py|js|mjs|cjs|ts|tsx|jsx|html|css|json|md|sh|go|rs|c|h|cpp|java|php|rb|toml|ya?ml|txt|sql)\b")
+_RE_ARITMETICA = re.compile(r"\d+(?:[.,]\d+)?\s*(?:[-+*/x×÷^%]|\*\*|mas|más|menos|por|entre|dividido|plus|minus|times)\s*\d")
+
+_RE_ANUNCIA = re.compile(
+    r"(?:\b(?:voy\s+a|vamos\s+a|ahora\s+(?:voy|vamos|creo|escribo|ejecuto|corro|leo|reviso|edito|agrego|implemento|pruebo)|"
+    r"a\s+continuaci[óo]n|procedo\s+a|proceder[ée]|empiezo\s+(?:por|a)|primero\s+(?:voy|leo|reviso|creo)|"
+    r"luego\s+(?:voy|ejecuto|creo)|let\s+me|i'?ll|i\s+will|i\s+am\s+going\s+to|next,?\s+i|now\s+i'?ll|let'?s)\b"
+    r"(?:(?!\.\s)[^\n]){0,160}$)"
+    r"|:\s*$",
+    re.I,
+)
+
+_RE_AFIRMA = re.compile(
+    r"\b(?:valid[ée]|verifiqu[ée]|comprob[ée]|prob[ée]|teste[ée]|ejecut[ée]|corr[ií])\b"
+    r"|\b(?:he|hemos|fue|fueron|est[áa]n?|qued[óo]|quedaron|ya\s+est[áa])\s+(?:validad|probad|verificad|testead|comprobad|ejecutad)[oa]s?\b"
+    r"|\b(?:los\s+|todos\s+los\s+)?(?:tests?|pruebas?)\s+(?:pasan|pasaron|est[áa]n\s+en\s+verde|dan\s+ok|salen\s+bien)\b"
+    r"|\b(?:pasan|pasaron)\s+(?:todos\s+)?(?:los\s+|las\s+)?(?:tests|pruebas)\b"
+    r"|\b(?:funciona|anda)\s+(?:todo\s+)?(?:correctamente|bien|perfecto|perfectamente|sin\s+errores)\b"
+    r"|\btodo\s+(?:funciona|anda)\b"
+    r"|\b(?:verified|validated|tested|confirmed\s+(?:it|that)\s+works|all\s+tests\s+pass(?:ed)?|tests\s+pass(?:ed)?|works\s+correctly)\b",
+    re.I,
+)
+_RE_AFIRMA_TESTS = re.compile(
+    r"\b(?:tests?|pruebas?)\s+(?:pasan|pasaron|est[áa]n\s+en\s+verde|dan\s+ok)\b|\b(?:pasan|pasaron)\s+(?:todos\s+)?(?:los\s+|las\s+)?(?:tests|pruebas)\b"
+    r"|\b(?:all\s+)?tests\s+pass(?:ed)?\b",
+    re.I,
+)
+_RE_AFIRMA_EJECUCION = re.compile(r"\b(?:ejecut[ée]|corr[ií]|lanc[ée]|al\s+ejecutar(?:lo)?|ran\s+it|i\s+ran|executed)\b", re.I)
+_RE_NEGACION = re.compile(r"\b(?:no|sin|nunca|ni|todav[ií]a\s+no|a[úu]n\s+no|not|never|without|couldn'?t|didn'?t|haven'?t|no\s+pude)\s*\w*\s*\w*\s*$", re.I)
+_RE_FENCE_VACIO = re.compile(r"```[\w+-]*[ \t]*\n?\s*```")
+_RE_BLOQUE_CODIGO = re.compile(r"```[\w+-]*\n(.*?)```", re.S)
+
+HERRAMIENTAS_COMANDO = ("execute_command", "run_python", "run_tests")
+HERRAMIENTAS_REUTILIZABLES = ("execute_command", "run_python", "run_tests", "validate", "fetch_url", "view_diff",
+                              "project_map", "list_files", "search_files", "code_outline", "find_references")
+HERRAMIENTAS_LECTURA_BARATA = ("read_file", "read_symbol")
+_RE_COMANDO_VOLATIL = re.compile(r"\b(?:sleep|date|time|curl|wget|ping|ps|top|uptime|watch|free|df|tail\s+-f|"
+                                 r"git\s+(?:fetch|pull)|pip\s+(?:install|download)|npm\s+(?:install|i)|random)\b")
+
+
+def salida_fallida(nombre: str, salida: str) -> bool:
+    """¿El resultado (sin excepción) igual muestra un fallo? (exit code != 0, tests que fallan, validación rota)."""
+    if nombre in ("execute_command", "run_python"):
+        m = re.search(r"^exit code: (-?\d+)", salida or "", re.M)
+        return bool(m and m.group(1) != "0") or "estado: TIMEOUT" in (salida or "")
+    if nombre == "run_tests":
+        return (salida or "").startswith("Tests FALLARON")
+    if nombre == "validate":
+        return "DETALLE DE FALLOS" in (salida or "") or "VALIDACIÓN FALLÓ" in (salida or "")
+    return False
+
+
+_RE_COMANDO_TESTS = re.compile(r"\b(?:pytest|unittest|npm\s+(?:run\s+)?test|node\s+--test|go\s+test|cargo\s+test|"
+                               r"jest|vitest|mocha|phpunit|rspec|bats|ctest|make\s+test)\b")
+
+
+def limpiar_texto_visible(texto: str) -> str:
+    """Quita los ```xml``` vacíos que quedan cuando el modelo envuelve herramientas en bloques de código."""
+    texto = _RE_FENCE_VACIO.sub("", texto or "")
+    return re.sub(r"\n{3,}", "\n\n", texto).strip()
+
+
+def pide_cambios(tarea: str) -> bool:
+    """¿El pedido requiere crear/modificar/ejecutar algo? (si no, es una pregunta para responder en texto)."""
+    t = (tarea or "").strip()[:800]
+    if not t:
+        return False
+    if _PROHIBE_ARCHIVOS.search(t) and _PROHIBE_COMANDOS.search(t):
+        return False
+    if _PREGUNTA_INICIO.search(t) and not _PIDE_FAVOR.search(t[:60]):
+        return False
+    return bool(_PIDE_ACCION.search(t))
+
+
+def prohibiciones(tarea: str) -> set:
+    """Lo que el usuario prohibió explícitamente en el pedido: 'comandos', 'archivos' y/o 'herramientas'."""
+    t = (tarea or "")[:1500]
+    salida = set()
+    if _PROHIBE_HERRAMIENTAS.search(t):
+        salida.add("herramientas")
+    if _PROHIBE_COMANDOS.search(t):
+        salida.add("comandos")
+    if _PROHIBE_ARCHIVOS.search(t):
+        salida.add("archivos")
+    return salida
+
+
+def es_pregunta_simple(tarea: str) -> bool:
+    """Pregunta corta que el modelo puede contestar sin explorar el proyecto (ej. 'cuánto es 5+5')."""
+    t = (tarea or "").strip()
+    if not t or len(t) > 320 or _RE_RUTA_ARCHIVO.search(t):
+        return False
+    if prohibiciones(t) & {"herramientas", "comandos"}:
+        return True
+    if pide_cambios(t):
+        return False
+    return bool(_PREGUNTA_INICIO.search(t) or t.rstrip().endswith("?") or _RE_ARITMETICA.search(t))
+
+
+def anuncia_accion(texto: str) -> bool:
+    """El modelo dice que VA a hacer algo ('voy a crear el archivo:') pero no llamó ninguna herramienta."""
+    cola = (texto or "").strip()[-240:]
+    return bool(cola) and bool(_RE_ANUNCIA.search(cola))
+
+
+def afirma_verificacion(texto: str) -> bool:
+    """¿El texto afirma que algo se probó/validó/funciona? (ignora frases negadas: 'no pude probar')."""
+    for m in _RE_AFIRMA.finditer(texto or ""):
+        previo = texto[max(0, m.start() - 28):m.start()]
+        if _RE_NEGACION.search(previo):
+            continue
+        return True
+    return False
+
+
+def afirma_ejecucion(texto: str) -> bool:
+    """¿El texto dice que ejecutó algo ('lo ejecuté', 'corrí el programa')? (ignora frases negadas)."""
+    for m in _RE_AFIRMA_EJECUCION.finditer(texto or ""):
+        if not _RE_NEGACION.search(texto[max(0, m.start() - 28):m.start()]):
+            return True
+    return False
+
+
+def codigo_pegado(texto: str) -> bool:
+    """Bloque de código de varias líneas pegado en el chat (en vez de escrito con una herramienta)."""
+    for m in _RE_BLOQUE_CODIGO.finditer(texto or ""):
+        if len([l for l in m.group(1).splitlines() if l.strip()]) >= 3:
+            return True
+    return False
+
+
 class Agente:
     def __init__(
         self,
@@ -165,11 +337,27 @@ class Agente:
         self._escalado = False
         self._fallos_por_herramienta: collections.Counter = collections.Counter()
         self._factor_contexto = 1.0
+        # v7.1: anti-bucles por estado del workspace y control de afirmaciones
+        self._historial: dict[str, dict] = {}   # clave de llamada → {version, salida, error, veces}
+        self._escrituras = 0                     # se incrementa con cada escritura exitosa
+        self._evidencias: list[tuple[str, str, int]] = []  # (herramienta, ok|fallo|bloqueado|sin_tests, escrituras)
+        self._reusos_seguidos = 0
+        self._ultima_salida_ok = ""
+        self._prohibido: set = set()
+        self._pide_cambios = True
+        self._pregunta_simple = False
+        self._aviso_pendiente = ""
+        self._finish_actual: Optional[str] = None
+        self._ultima_llamada: Optional[Llamada] = None
 
     # ------------------------------------------------------------ API
     def ejecutar(self, tarea: str, cid_inicio: Optional[int] = None) -> ResultadoAgente:
         if cid_inicio is not None:
             self.ctx.cid_inicio = cid_inicio
+        principal = self.rol.nombre == "principal"
+        self._prohibido = prohibiciones(tarea) if principal else set()
+        self._pide_cambios = pide_cambios(tarea) if principal else True
+        self._pregunta_simple = principal and es_pregunta_simple(tarea)
         lecciones = ""
         if self.memoria is not None and self.settings.lecciones:
             try:
@@ -191,8 +379,14 @@ class Agente:
         self._errores = collections.Counter()
         self._errores_texto = []
         self._escalado = False
+        self._historial = {}
+        self._escrituras = 0
+        self._evidencias = []
+        self._reusos_seguidos = 0
+        self._ultima_salida_ok = ""
 
         sin_herramienta = 0
+        anuncios = 0
         repeticiones: dict = {}
         self._ultimo_texto = ""
 
@@ -206,25 +400,24 @@ class Agente:
                 "role": "assistant",
                 "content": analisis.respuesta_limpia.strip() or "(respuesta vacía)",
             })
-            if analisis.texto:
-                self._ultimo_texto = analisis.texto
-                self.ui.pensamiento(self.etiqueta, analisis.texto)
+            texto_visible = limpiar_texto_visible(analisis.texto)
+            if texto_visible:
+                self._ultimo_texto = texto_visible
+                self.ui.pensamiento(self.etiqueta, texto_visible)
 
             if not analisis.llamadas:
-                texto = analisis.texto.strip()
-                es_respuesta_directa = (
-                    self.rol.nombre == "principal"
-                    and texto
-                    and respuesta.finish_reason != "length"
-                    and ((paso == 1 and "```" not in texto) or sin_herramienta >= 1)
-                )
-                if es_respuesta_directa:
-                    return self._cerrar(texto, paso, "respuesta")
+                texto = texto_visible
+                if texto and respuesta.finish_reason != "length":
+                    cierre = self._cierre_en_texto(texto, paso, sin_herramienta, anuncios)
+                    if cierre is not None:
+                        return cierre
+                if texto and anuncia_accion(texto):
+                    anuncios += 1
                 sin_herramienta += 1
                 self.ctx.tropiezo("sin_herramienta")
                 if sin_herramienta > 2:
                     return self._cerrar(texto or "El agente no produjo un resultado.", paso, "sin_herramientas")
-                aviso = RECORDATORIO_EN if self.settings.idioma_prompts == "en" else RECORDATORIO
+                aviso = self._aviso_sin_herramienta(texto)
                 if respuesta.finish_reason == "length":
                     aviso = ("Tu respuesta se cortó por longitud. Escribí menos por mensaje: "
                              "archivos largos en partes (write_to_file con partial=true + append_to_file).\n\n") + aviso
@@ -234,6 +427,8 @@ class Agente:
             sin_herramienta = 0
             limite = max(1, self.settings.max_llamadas_turno)
             llamadas, excedentes = analisis.llamadas[:limite], analisis.llamadas[limite:]
+            self._finish_actual = respuesta.finish_reason
+            self._ultima_llamada = analisis.llamadas[-1]
             observaciones: list[str] = []
             hubo_error = False
             final: Optional[tuple[str, bool]] = None
@@ -251,10 +446,11 @@ class Agente:
                     i += len(grupo)
                     continue
                 if llamada.nombre == "attempt_completion" and "attempt_completion" in self.rol.herramientas:
-                    aceptado, obs, ok_final = self._intentar_terminar(hubo_error)
+                    informe = (llamada.params.get("result") or "").strip() or texto_visible
+                    aceptado, obs, ok_final = self._intentar_terminar(hubo_error, informe)
                     if aceptado:
-                        informe = (llamada.params.get("result") or "").strip() or analisis.texto
-                        final = (informe, ok_final)
+                        nota = self._nota_afirmacion(informe)
+                        final = (informe + nota, ok_final and not nota)
                         break
                     observaciones.append(obs)
                     i += 1
@@ -273,6 +469,16 @@ class Agente:
 
             if final is not None:
                 return self._cerrar(final[0], paso, "completado", ok=final[1])
+
+            if self._reusos_seguidos >= 2 and (self.rol.nombre == "principal" or self._reusos_seguidos >= 4):
+                # El modelo pide una y otra vez lo mismo que ya tiene: se corta el bucle. Si había obtenido
+                # un resultado (ej. 2+2 → 4) se responde con eso; Claude Code tampoco ejecuta tres veces "2+2".
+                self.ui.aviso(f"  [{self.etiqueta}] bucle de herramientas: corto y respondo con lo que ya tengo")
+                if self._ultima_salida_ok and self.rol.nombre == "principal" and not self.ctx.cambios:
+                    return self._cerrar(self._respuesta_por_bucle(), paso, "respuesta")
+                return self._cerrar(
+                    "El modelo repetía las mismas herramientas sin avanzar (nada cambió entre llamadas). "
+                    + self._respuesta_por_bucle(), paso, "bucle", ok=False)
 
             if excedentes:
                 observaciones.append(
@@ -298,6 +504,18 @@ class Agente:
 
     # ------------------------------------------------------------ preparación
     def _preparar_tarea(self, tarea: str) -> str:
+        if self.rol.nombre == "principal" and (self._pregunta_simple or self._prohibido):
+            notas = []
+            if "herramientas" in self._prohibido:
+                notas.append("el usuario pidió que respondas SIN usar herramientas")
+            elif "comandos" in self._prohibido:
+                notas.append("el usuario pidió que NO ejecutes comandos")
+            if "archivos" in self._prohibido:
+                notas.append("el usuario pidió que NO crees ni modifiques archivos")
+            if self._pregunta_simple:
+                notas.append("es una pregunta directa: si podés responderla con lo que sabés, respondé YA en "
+                             "texto, en tu primer mensaje y sin herramientas")
+            return tarea + "\n\n(REAPER: " + "; ".join(notas) + ".)"
         extras = []
         if self.settings.mapa_relevantes and self.rol.nombre in ("principal", "implementador", "reparador",
                                                                  "explorador", "especificador"):
@@ -371,6 +589,11 @@ class Agente:
             disponibles = ", ".join(self.rol.herramientas)
             self.ui.resultado_herramienta(False, f"herramienta no disponible: {nombre}")
             return obs(f"ERROR: '{nombre}' no existe o no está disponible para tu rol. Disponibles: {disponibles}"), True
+        if not llamada.completa and self._finish_actual != "length" and llamada is self._ultima_llamada \
+                and all(llamada.params.get(p.nombre) not in (None, "") for p in h.params if p.requerido):
+            # El mensaje terminó normal y la llamada es la última: el modelo solo olvidó cerrar las etiquetas.
+            # Se acepta (si el contenido quedó truncado, la validación real del archivo lo va a mostrar).
+            llamada = Llamada(llamada.nombre, llamada.params, True, llamada.crudo)
         if not llamada.completa:
             self.ui.resultado_herramienta(False, f"{nombre}: llamada incompleta")
             self.ctx.tropiezo("llamada_incompleta")
@@ -391,16 +614,47 @@ class Agente:
             self.ui.resultado_herramienta(False, f"{nombre}: faltan {', '.join(faltan)}")
             return obs(f"ERROR: faltan parámetros: {', '.join(faltan)}. Uso correcto:\n{h.ejemplo}"), True
 
-        clave = nombre + json.dumps(llamada.params, sort_keys=True, ensure_ascii=False)
-        repeticiones[clave] = repeticiones.get(clave, 0) + 1
-        if repeticiones[clave] >= 3 and not h.escribe:
-            self.ui.resultado_herramienta(False, f"{nombre}: llamada repetida")
+        prohibicion = self._prohibicion_para(nombre, h)
+        if prohibicion:
+            self.ui.resultado_herramienta(False, f"{nombre}: el usuario lo prohibió")
+            self._registrar_evidencia(nombre, "bloqueado")
             return obs(
-                f"ERROR: ya hiciste exactamente esta llamada {repeticiones[clave]} veces y el resultado no cambia. "
-                "Cambiá de enfoque o terminá con lo que sabés."
+                f"ERROR: {prohibicion} No uses herramientas para esto: respondé directamente en texto con lo que sabés."
             ), True
 
+        # Detector de repeticiones según el ESTADO del workspace: después de una escritura, releer o
+        # volver a correr los tests es legítimo; repetir lo mismo sin que nada cambie, no.
+        clave = nombre + json.dumps(llamada.params, sort_keys=True, ensure_ascii=False)
+        previo = self._historial.get(clave) if not h.escribe else None
+        aviso_relectura = ""
+        misma_version = previo is not None and previo["version"] == self._version()
+        seguir_contando = misma_version
+        if misma_version and previo.get("muta") and previo["veces"] < 5:
+            previo["veces"] += 1
+        elif misma_version:
+            previo["veces"] += 1
+            veces = previo["veces"]
+            volatil = nombre == "execute_command" and bool(_RE_COMANDO_VOLATIL.search(llamada.params.get("command", "")))
+            fallido = previo["error"] or salida_fallida(nombre, previo["salida"])
+            if nombre in HERRAMIENTAS_REUTILIZABLES and not fallido and not volatil:
+                self._reusos_seguidos += 1
+                self.ui.resultado_herramienta(True, f"{nombre}: llamada idéntica y nada cambió → reutilizo el resultado anterior")
+                return obs(self._texto_reuso(nombre, previo["salida"], veces), previo["attrs"]), False
+            if nombre in HERRAMIENTAS_LECTURA_BARATA and not previo["error"] and veces < 4:
+                if veces >= 3:
+                    aviso_relectura = (f"(Ya leíste esto {veces} veces y no cambió: no lo vuelvas a pedir; "
+                                       "usá lo que ya sabés y avanzá con el próximo paso.)\n")
+            elif veces >= 3:
+                self.ui.resultado_herramienta(False, f"{nombre}: llamada repetida")
+                self._registrar_evidencia(nombre, "bloqueado")
+                return obs(
+                    f"ERROR: ya hiciste exactamente esta llamada {veces} veces sin cambiar nada en el proyecto y el "
+                    "resultado no cambia (esta vez NO se ejecutó, así que no hay resultado nuevo: no afirmes que lo "
+                    "verificaste). Cambiá algo antes de repetirla, probá otro enfoque o terminá explicando qué falta."
+                ), True
+
         self.ui.herramienta(self.etiqueta, nombre, resumen_params(nombre, llamada.params))
+        version_antes = self._version() if nombre in ("execute_command", "run_python") else ""
         error = False
         try:
             salida = h.fn(self.ctx, llamada.params)
@@ -434,7 +688,196 @@ class Agente:
             self._lecturas.append((len(self.mensajes), ruta))
         if h.escribe and ruta and not salida.startswith("ERROR"):
             self._marcar_lecturas_viejas(ruta)
-        return obs(salida, attrs), error
+        if h.escribe and not error:
+            self._escrituras += 1
+        self._reusos_seguidos = 0
+        if nombre in ("run_tests", "validate", "execute_command", "run_python"):
+            self._registrar_evidencia(nombre, self._estado_evidencia(nombre, llamada.params, salida, error),
+                                      llamada.params.get("command", ""))
+        if not error and nombre in ("execute_command", "run_python", "fetch_url"):
+            self._ultima_salida_ok = salida
+        if not h.escribe:
+            version_despues = self._version()
+            self._historial[clave] = {"version": version_despues, "salida": salida, "error": error,
+                                      "veces": previo["veces"] if seguir_contando else 1, "attrs": attrs,
+                                      # un comando que cambió archivos al correr (append, mkdir...) es una
+                                      # acción, no una consulta: repetirlo no es un bucle de lectura
+                                      "muta": bool(version_antes) and version_antes != version_despues}
+        if (not error and self.rol.nombre == "principal" and nombre in ("execute_command", "run_python")
+                and not self.ctx.cambios and not self._pide_cambios and not salida_fallida(nombre, salida)):
+            salida += ("\n\n(Si este resultado ya responde lo que te preguntaron, respondé AHORA en texto, sin más "
+                       "herramientas. No repitas el comando.)")
+        return obs(aviso_relectura + salida, attrs), error
+
+    # ------------------------------------------------------------ anti-bucles y evidencias (v7.1)
+    def _version(self) -> str:
+        """Estado del workspace: cambia con cada escritura de una herramienta o si un comando tocó archivos."""
+        try:
+            huella = self.ws.huella()
+        except OSError:
+            huella = "?"
+        return f"{self._escrituras}:{huella}"
+
+    def _prohibicion_para(self, nombre: str, h) -> str:
+        if not self._prohibido or nombre == "attempt_completion":
+            return ""
+        if "herramientas" in self._prohibido:
+            return "el usuario pidió explícitamente que respondas SIN usar herramientas."
+        if "comandos" in self._prohibido and nombre in HERRAMIENTAS_COMANDO:
+            return "el usuario pidió explícitamente que NO ejecutes comandos ni código."
+        if "archivos" in self._prohibido and h.escribe:
+            return "el usuario pidió explícitamente que NO crees ni modifiques archivos."
+        return ""
+
+    def _texto_reuso(self, nombre: str, salida: str, veces: int) -> str:
+        cabecera = (f"YA HICISTE EXACTAMENTE ESTA LLAMADA ({veces} veces) y nada cambió en el proyecto desde "
+                    "entonces, así que no la repito. Resultado de la vez anterior:\n")
+        if salida_fallida(nombre, salida):
+            consejo = ("Ese resultado es un FALLO y repetir lo mismo da el mismo fallo. Cambiá el código o el "
+                       "comando antes de volver a probar, o explicá qué falta.")
+        elif self.rol.nombre == "principal":
+            consejo = ("YA TENÉS LO QUE NECESITABAS. Si esto responde el pedido, RESPONDÉ AHORA al usuario en texto "
+                       "(sin herramientas). Si falta algo, hacé OTRA cosa distinta.")
+        else:
+            consejo = ("Ya tenés este resultado: usalo y seguí con el próximo paso, o terminá con attempt_completion.")
+        return cabecera + recortar(salida, 4000) + "\n\n" + consejo
+
+    def _estado_evidencia(self, nombre: str, params: dict, salida: str, error: bool) -> str:
+        if error and re.search(r"bloquead|no aprob|prohibi|no se ejecut", salida, re.I):
+            return "bloqueado"
+        if nombre == "run_tests" and (salida.startswith("No hay tests") or salida.startswith("Tests SIN TESTS")):
+            return "sin_tests"
+        if error or salida_fallida(nombre, salida):
+            return "fallo"
+        return "ok"
+
+    def _registrar_evidencia(self, nombre: str, estado: str, comando: str = "") -> None:
+        if nombre not in ("run_tests", "validate", "execute_command", "run_python"):
+            return
+        tipo = "run_tests" if nombre == "execute_command" and _RE_COMANDO_TESTS.search(comando or "") else nombre
+        self._evidencias.append((tipo, estado, self._escrituras))
+        self._evidencias = self._evidencias[-30:]
+
+    def _falta_evidencia(self, texto: str) -> str:
+        """Si el texto afirma una verificación que no ocurrió (o que falló / fue bloqueada), devuelve el motivo."""
+        if self.rol.nombre not in ("principal", "implementador", "reparador", "escritor"):
+            return ""
+        texto = texto or ""
+        exito = afirma_verificacion(texto)
+        ejecucion = afirma_ejecucion(texto)
+        if not exito and not ejecucion:
+            return ""
+        reales = [e for e in self._evidencias if e[1] != "bloqueado"]
+        if not self._evidencias or (ejecucion and not exito and not reales):
+            if not self._evidencias:
+                return ("no corriste ninguna verificación en esta tarea (run_tests, validate, execute_command o "
+                        "run_python): ninguna ejecución tuya produjo un resultado real")
+            return "las ejecuciones que intentaste fueron BLOQUEADAS o rechazadas: no produjeron ningún resultado"
+        if not exito:
+            return ""
+        tipo, estado, version = self._evidencias[-1]
+        honesto = bool(re.search(r"\b(?:falla|fallan|fall[óo]|fallaron|error|errores|no\s+pasa|fail\w*)\b", texto, re.I))
+        if estado == "bloqueado":
+            return f"la última verificación ({tipo}) fue BLOQUEADA o rechazada como repetida: no se ejecutó"
+        if estado == "fallo" and not honesto:
+            return f"la última verificación ({tipo}) FALLÓ"
+        if _RE_AFIRMA_TESTS.search(texto):
+            tests = [e for e in self._evidencias if e[0] == "run_tests"]
+            if not tests:
+                return "decís que los tests pasan, pero no corriste los tests (run_tests)"
+            if tests[-1][1] == "sin_tests":
+                return "decís que los tests pasan, pero run_tests no encontró ningún test"
+            if tests[-1][1] != "ok" and not honesto:
+                return "decís que los tests pasan, pero el último run_tests " + (
+                    "FALLÓ" if tests[-1][1] == "fallo" else "fue bloqueado")
+        if version < self._escrituras and self.ctx.cambios:
+            return "cambiaste archivos DESPUÉS de la última verificación, así que ese resultado ya no vale"
+        return ""
+
+    def _rechazo_afirmacion(self, motivo: str) -> str:
+        return ("No acepto ese cierre: tu texto afirma que algo se verificó/probó/funciona, pero " + motivo + ". "
+                "Nunca afirmes una verificación que no viste en un <resultado> real. Corré la verificación ahora "
+                "(run_tests, validate o execute_command) o reescribí la respuesta diciendo con honestidad qué se "
+                "verificó y qué NO.")
+
+    def _nota_afirmacion(self, texto: str) -> str:
+        motivo = self._falta_evidencia(texto)
+        if not motivo:
+            return ""
+        self.ui.aviso(f"  [{self.etiqueta}] el informe afirma una verificación sin evidencia: {motivo}")
+        return f"\n\n⚠ REAPER: este informe afirma una verificación, pero {motivo}. Tomalo como NO verificado."
+
+    def _cierre_en_texto(self, texto: str, paso: int, sin_herramienta: int, anuncios: int) -> Optional[ResultadoAgente]:
+        """
+        ¿Una respuesta SIN herramientas es la respuesta final? Para el principal casi siempre sí: si ya tiene
+        el resultado (o la pregunta no necesitaba herramientas) contesta y termina, como Claude Code.
+        Antes, REAPER le contestaba "no usaste ninguna herramienta" y el modelo repetía el comando: ese era el
+        origen del bucle 2+2 → 4 → execute_command otra vez.
+        """
+        self._aviso_pendiente = ""
+        if self.rol.nombre != "principal":
+            if not self.rol.solo_lectura or "attempt_completion" not in self.rol.herramientas or anuncia_accion(texto):
+                return None
+            if (self.rol.nombre == "arquitecto" and "<plan" in texto and "</plan>" in texto) \
+                    or (self.rol.nombre == "revisor" and re.search(r"VEREDICTO\s*:", texto)) \
+                    or (sin_herramienta >= 1 and len(texto) >= 200):
+                return self._cerrar(texto, paso, "completado")
+            return None
+        sin_tools = bool(self._prohibido & {"herramientas", "comandos"})
+        if self.ctx.parciales:
+            pendientes = ", ".join(f"{r} ({n} líneas)" for r, n in self.ctx.parciales.items())
+            self._aviso_pendiente = (f"Hay archivos EN CONSTRUCCIÓN sin terminar: {pendientes}. Completalos con "
+                                     "append_to_file (la última parte con last=true) antes de responder.")
+            return None
+        if anuncia_accion(texto) and anuncios < 2 and not sin_tools:
+            return None
+        if codigo_pegado(texto) and self._pide_cambios and not self.ctx.cambios and sin_herramienta < 1 \
+                and "archivos" not in self._prohibido:
+            return None
+        if self.ctx.cambios:
+            resultados = validar_archivos(self.ws, sorted(self.ctx.cambios))
+            if fallos(resultados) and self._rechazos < 2:
+                self._rechazos += 1
+                self.ctx.tropiezo("cierre_rechazado")
+                self._aviso_pendiente = ("Antes de responder: la validación REAL de los archivos que cambiaste falla:\n"
+                                         + anexar_pistas(resumen_validacion(resultados), 2))
+                return None
+        motivo = self._falta_evidencia(texto)
+        if motivo and self._rechazos < 2 and not sin_tools:
+            self._rechazos += 1
+            self.ctx.tropiezo("cumplimiento_falso")
+            self.ui.aviso(f"  [{self.etiqueta}] respuesta rechazada: afirma una verificación sin evidencia")
+            self._aviso_pendiente = self._rechazo_afirmacion(motivo)
+            return None
+        return self._cerrar(texto + self._nota_afirmacion(texto), paso, "respuesta")
+
+    def _aviso_sin_herramienta(self, texto: str) -> str:
+        pendiente = self._aviso_pendiente
+        self._aviso_pendiente = ""
+        if pendiente:
+            return pendiente
+        base = RECORDATORIO_EN if self.settings.idioma_prompts == "en" else RECORDATORIO
+        if self.rol.nombre != "principal":
+            return base
+        if texto and anuncia_accion(texto):
+            return ("Dijiste lo que ibas a hacer, pero no llamaste ninguna herramienta. Si vas a actuar, escribí la "
+                    "herramienta en XML AHORA (no la anuncies). Si ya terminaste, escribí directamente la respuesta "
+                    "final para el usuario.\n\n" + base)
+        if texto and codigo_pegado(texto) and self._pide_cambios:
+            return ("Pegaste código en el chat, pero el pedido es crear/cambiar archivos: para que exista de verdad "
+                    "escribilo con write_to_file (archivo nuevo) o replace_symbol/replace_in_file (archivo existente)."
+                    "\n\n" + base)
+        return base + "\nSi el pedido era solo una pregunta, respondé directamente en texto (sin herramientas)."
+
+    def _respuesta_por_bucle(self) -> str:
+        partes = []
+        texto = (self._ultimo_texto or "").strip()
+        if texto and not anuncia_accion(texto):
+            partes.append(texto)
+        salida = (self._ultima_salida_ok or "").strip()
+        if salida:
+            partes.append("Resultado obtenido:\n" + recortar(salida, 1500))
+        return "\n\n".join(partes) or "Ya tenía el resultado, pero el modelo repetía la misma herramienta."
 
     def _registrar_error(self, herramienta: str, ruta: str, salida: str) -> None:
         firma = _firma_error(salida)
@@ -555,7 +998,7 @@ class Agente:
                 quedan.append((indice, r))
         self._lecturas = quedan
 
-    def _intentar_terminar(self, hubo_error: bool) -> tuple[bool, str, bool]:
+    def _intentar_terminar(self, hubo_error: bool, informe: str = "") -> tuple[bool, str, bool]:
         def obs(texto: str) -> str:
             return f'<resultado herramienta="attempt_completion">\n{texto}\n</resultado>'
 
@@ -607,6 +1050,12 @@ class Agente:
                         + ", ".join(vacias[:8]) + ". Implementalas con replace_symbol antes de terminar "
                         "(si alguna es intencional, explicá por qué en el informe y volvé a cerrar)."
                     ), False
+        motivo = self._falta_evidencia(informe)
+        if motivo and self._rechazos < 3:
+            self._rechazos += 1
+            self.ctx.tropiezo("cumplimiento_falso")
+            self.ui.aviso(f"  [{self.etiqueta}] cierre rechazado: afirma una verificación sin evidencia")
+            return False, obs(self._rechazo_afirmacion(motivo)), False
         return True, "", ok
 
     def _delegar(self, grupo: list) -> tuple[list[str], bool]:

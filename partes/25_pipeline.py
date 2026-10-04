@@ -122,6 +122,50 @@ def parsear_plan(texto: str, pedido: str, max_tareas: int = 8) -> Plan:
     return Plan(objetivo, tareas, criterios, texto, interfaz)
 
 
+def _archivos_interfaz(interfaz: str) -> list[str]:
+    vistos: dict[str, None] = {}
+    for m in re.finditer(r"([\w./-]+\.(?:py|js|mjs|cjs|ts|tsx|jsx|html|css|sh|go|rs|java|php|rb|c|h|cpp))\b", interfaz or ""):
+        vistos.setdefault(m.group(1), None)
+    return list(vistos)
+
+
+def plan_degenerado(plan: Plan, pedido: str, texto: str = "") -> str:
+    """
+    Motivo si el plan no sirve para trabajar por partes: una sola tarea gigante que repite el pedido
+    (lo que se vio con NebulaDB). Vacío si el plan está bien. Un pedido chico SÍ puede tener una tarea.
+    """
+    if len(plan.tareas) != 1:
+        return ""
+    unica = plan.tareas[0]
+    archivos = set(unica.archivos) | set(_archivos_interfaz(plan.interfaz))
+    grande = len(pedido or "") >= 160 or len(archivos) >= 3
+    if not grande:
+        return ""
+    if not _RE_TAREA.search(texto or plan.texto or ""):
+        return "no usaste etiquetas <tarea>: el plan no se pudo leer"
+    parecido = difflib.SequenceMatcher(None, unica.descripcion.lower()[:1500], (pedido or "").lower()[:1500]).ratio()
+    if parecido >= 0.6:
+        return "tu única tarea repite el pedido completo"
+    if len(unica.archivos) >= 4 or len(archivos) >= 4:
+        return f"tu única tarea toca {len(archivos)} archivos"
+    return ""
+
+
+def dividir_por_interfaz(plan: Plan) -> Plan:
+    """Último recurso: una tarea por archivo de la interfaz (en el orden en que aparecen)."""
+    archivos = _archivos_interfaz(plan.interfaz) or (plan.tareas[0].archivos if plan.tareas else [])
+    if len(archivos) < 2:
+        return plan
+    lineas = [l.strip() for l in (plan.interfaz or "").splitlines() if l.strip()]
+    tareas = []
+    for n, rel in enumerate(archivos, 1):
+        propias = [l for l in lineas if rel in l]
+        detalle = "\n".join(propias) or "(ver la interfaz del plan)"
+        tareas.append(Tarea(str(n), f"Implementá {rel} según la INTERFAZ del plan:\n{detalle}\n"
+                                    f"Contexto general: {recortar(plan.objetivo, 300)}", [rel]))
+    return Plan(plan.objetivo, tareas, plan.criterios, plan.texto, plan.interfaz)
+
+
 def veredicto(informe: str) -> tuple[bool, bool]:
     """(aprobado, claro). Si el revisor no respeta el formato se aprueba para no entrar en bucles."""
     m = _RE_VEREDICTO.search(informe or "")
@@ -270,6 +314,28 @@ class Orquestador:
         plan = parsear_plan(texto, pedido, self.settings.max_tareas)
         if not res.ok:
             self.ui.aviso("El arquitecto no terminó limpio; uso lo que produjo.")
+        motivo = plan_degenerado(plan, pedido, texto)
+        if motivo:
+            # Un plan de UNA tarea gigante hace que un modelo de 24B se pierda (y que el revisor apruebe
+            # cualquier cosa): se pide de nuevo, y si sigue igual se divide por archivo de la interfaz.
+            self.ui.aviso(f"  Plan inútil ({motivo}): se lo pido de nuevo dividido en tareas chicas.")
+            tarea2 = (tarea + f"\n\nTU PLAN ANTERIOR NO SIRVE: {motivo}. Rehacelo con entre 3 y "
+                      f"{self.settings.max_tareas} tareas chicas, ordenadas por dependencia, cada una con "
+                      "<tarea id=\"N\" archivos=\"...\"> y como mucho 1-2 archivos. Usá EXACTAMENTE el formato <plan>.")
+            res2 = self._sub("arquitecto", tarea2, None, titulo="rehace el plan en tareas chicas")
+            texto2 = res2.resumen
+            if not _RE_TAREA.search(texto2) and _RE_TAREA.search(res2.contexto):
+                texto2 = res2.contexto + "\n" + texto2
+            plan2 = parsear_plan(texto2, pedido, self.settings.max_tareas)
+            if not plan_degenerado(plan2, pedido, texto2):
+                return plan2
+            if not plan2.interfaz and plan.interfaz:
+                plan2.interfaz = plan.interfaz
+            dividido = dividir_por_interfaz(plan2)
+            if len(dividido.tareas) > 1:
+                self.ui.aviso(f"  El arquitecto insistió con una sola tarea: la divido por archivo ({len(dividido.tareas)} tareas).")
+                return dividido
+            return plan2
         return plan
 
     def especificar(self, pedido: str, plan: Plan, cid: int) -> dict[str, Optional[str]]:
@@ -358,6 +424,10 @@ class Orquestador:
         aprobado, claro = veredicto(res.resumen)
         if not claro:
             self.ui.tenue("  (el revisor no usó el formato VEREDICTO: se toma como aprobado)")
+        if aprobado and validacion and not validacion.startswith(("OK", "sin validadores")):
+            self.ui.aviso("  El revisor aprobó, pero la validación real falla: lo tomo como CAMBIOS.")
+            return False, ("VEREDICTO: CAMBIOS\n1. La validación automática falla (corregilo antes que nada):\n"
+                           + validacion + "\n\n" + res.resumen)
         return aprobado, res.resumen
 
     def qa(self, pedido: str, plan: Plan, archivos: list, cid: int) -> ResultadoAgente:
@@ -489,7 +559,8 @@ class Orquestador:
         ))
         return ruta
 
-    def _verificar_tarea(self, tcid: int, antes: ConteoTests, nombres_antes: set) -> Verificacion:
+    def _verificar_tarea(self, tcid: int, antes: ConteoTests, nombres_antes: set,
+                         exigir_progreso: bool = False) -> Verificacion:
         """
         Una tarea intermedia no necesita que pasen TODOS los tests (los de tareas
         siguientes todavía fallan): alcanza con validadores OK y que no se rompa
@@ -516,6 +587,17 @@ class Orquestador:
                 )
         elif tests is not None and not tests.ok and not conteo.reconocido and antes.ok:
             problemas.append("TESTS: la suite pasaba antes de la tarea y ahora falla.\n" + tests.resumen(4000))
+        if exigir_progreso and not problemas:
+            # El implementador NO terminó (límite de pasos, error...). "No romper nada" no alcanza:
+            # tiene que haber cambios reales y, si hay tests fallando, alguno más tiene que pasar.
+            if not archivos:
+                problemas.append("SIN PROGRESO: el implementador no terminó y no cambió ningún archivo.")
+            elif tests is not None and not tests.ok and conteo.reconocido and conteo.pasados <= antes.pasados:
+                problemas.append(
+                    f"SIN PROGRESO: el implementador no terminó y los tests siguen igual (antes {antes.texto()}, "
+                    f"ahora {conteo.texto()}).\n"
+                    + fallos_relevantes(f"{tests.stdout}\n{tests.stderr}", maximo=3, limite=4000)
+                )
         diagnostico = "\n\n".join(problemas)
         if diagnostico and self.settings.pistas_errores:
             diagnostico = anexar_pistas(diagnostico, 2)
@@ -559,17 +641,25 @@ class Orquestador:
             if not resultado.ok:
                 informe.notas.append(f"Tarea {tarea.id}: la implementación no terminó limpia.")
 
-            verif_tarea = self._verificar_tarea(tcid, conteo_antes, nombres_antes)
+            exigir = not resultado.ok
+            verif_tarea = self._verificar_tarea(tcid, conteo_antes, nombres_antes, exigir_progreso=exigir)
             if not verif_tarea.ok:
                 self.ui.aviso(f"  La tarea {tarea.id} no pasó su verificación: la reparo con el error real.")
                 verif_tarea = self._reparar_con_escalada(
                     pedido, verif_tarea, grupo, base_fallaba, informe, f"tarea {tarea.id}",
                     max(1, self.settings.umbral_escalada + 1),
-                    lambda: self._verificar_tarea(tcid, conteo_antes, nombres_antes),
+                    lambda: self._verificar_tarea(tcid, conteo_antes, nombres_antes, exigir_progreso=exigir),
                     contexto=f"TAREA EN CURSO (#{tarea.id}): {tarea.descripcion}",
                 )
                 if not verif_tarea.ok:
                     informe.notas.append(f"Tarea {tarea.id}: quedó con fallos de verificación.")
+
+            if not verif_tarea.ok and self.settings.max_revisiones:
+                # Revisar código que no pasa su verificación no tiene sentido (y un revisor de 24B
+                # terminaba "aprobando" igual): el problema ya está diagnosticado por los tests.
+                self.ui.aviso(f"  No paso la tarea {tarea.id} al revisor: su verificación real falla.")
+                informe.notas.append(f"Tarea {tarea.id}: sin revisión porque la verificación real falla.")
+                continue
 
             for ronda in range(self.settings.max_revisiones):
                 diff = self.ws.checkpoints.diff_desde(tcid)

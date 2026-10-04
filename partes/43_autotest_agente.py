@@ -154,10 +154,17 @@ class TestAgente(BaseTest):
         self.assertTrue(res.ok)
 
     def test_limite_de_pasos(self):
-        llm = MockLLM(lambda m, k: herramienta_xml("list_files", path=".", recursive=str(_turno(m) % 2 == 0)))
+        llm = MockLLM(lambda m, k: herramienta_xml("search_files", regex=f"cosa{_turno(m)}"))
         res = self.agente(llm, self.proyecto({"a.py": "1"}), max_pasos=4).ejecutar("dá vueltas")
         self.assertEqual(res.motivo, "max_pasos")
         self.assertFalse(res.ok)
+
+    def test_bucle_alternado_se_corta(self):
+        llm = MockLLM(lambda m, k: herramienta_xml("list_files", path=".", recursive=str(_turno(m) % 2 == 0)))
+        res = self.agente(llm, self.proyecto({"a.py": "1"}), max_pasos=10).ejecutar("dá vueltas")
+        self.assertEqual(res.motivo, "bucle")
+        self.assertFalse(res.ok)
+        self.assertLess(res.pasos, 6)
 
     def test_compactacion(self):
         ws = self.proyecto()

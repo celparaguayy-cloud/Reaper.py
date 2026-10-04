@@ -255,6 +255,17 @@ class Workspace:
                 if contador >= limite:
                     return
 
+    def huella(self, limite: int = 3000) -> str:
+        """Huella barata del estado del workspace (rutas, tamaños y fechas): cambia si algún archivo cambió."""
+        h = hashlib.sha1()
+        for ruta in self.iterar(limite=limite):
+            try:
+                st = ruta.stat()
+            except OSError:
+                continue
+            h.update(f"{ruta}\0{st.st_size}\0{st.st_mtime_ns}\n".encode("utf-8", "replace"))
+        return h.hexdigest()[:16]
+
     def es_texto(self, ruta: Path) -> bool:
         if ruta.name in ARCHIVOS_SENSIBLES:
             return False

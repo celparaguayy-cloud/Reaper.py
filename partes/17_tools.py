@@ -544,11 +544,40 @@ def comando_seguro(comando: str) -> bool:
     return any(c == s.strip() or c.startswith(s) for s in _SEGUROS)
 
 
+PISTA_INTERACTIVO = (
+    "PISTA DE REAPER: el programa es INTERACTIVO (pide datos con input()/read) y en esta prueba no recibió "
+    "entrada, por eso EOFError / timeout. ESO NO ES UN BUG DEL PROGRAMA: NO lo modifiques para que deje de "
+    "pedir datos ni le cambies el comportamiento. Probalo pasándole las respuestas por entrada estándar con "
+    "<stdin> (una respuesta por línea), por ejemplo:\n"
+    "<execute_command>\n<command>python3 calculadora.py</command>\n<stdin>2\n3\n+\nsalir\n</stdin>\n</execute_command>"
+)
+
+_RE_INTERACTIVO = re.compile(r"EOFError|EOF when reading a line|end of file|Inappropriate ioctl for device|"
+                             r"read: .*: bad file descriptor|readline\(\) on closed|Tiempo agotado", re.I)
+
+
+def parece_interactivo(salida: str) -> bool:
+    return bool(_RE_INTERACTIVO.search(salida or ""))
+
+
+def _entrada_estandar(p: dict) -> Optional[str]:
+    """Texto para stdin. Acepta saltos reales o '\\n' escritos literalmente (algo que los modelos hacen)."""
+    entrada = p.get("stdin")
+    if entrada is None or str(entrada) == "":
+        return None
+    entrada = str(entrada)
+    if "\n" not in entrada.strip("\n") and "\\n" in entrada:
+        entrada = entrada.replace("\\n", "\n")
+    return entrada.strip("\n") + "\n"
+
+
 @herramienta(
     "execute_command",
-    "Ejecuta un comando de shell (bash) en la raíz del workspace, sin entrada interactiva. "
-    "Para tests preferí run_tests. Servidores o programas interactivos se cortan por timeout.",
+    "Ejecuta un comando de shell (bash) en la raíz del workspace. Para programas interactivos (input()) pasá "
+    "las respuestas en <stdin>, una por línea. Para tests preferí run_tests. Servidores se cortan por timeout.",
     [Param("command", "comando a ejecutar"),
+     Param("stdin", "entrada estándar para programas interactivos (opcional, una respuesta por línea)",
+           requerido=False, largo=True),
      Param("timeout", "segundos (opcional, máx 600)", requerido=False)],
     "<execute_command>\n<command>python3 main.py --ayuda</command>\n</execute_command>",
 )
@@ -570,9 +599,18 @@ def execute_command(ctx: Contexto, p: dict) -> str:
                 "Seguí sin él o usá run_tests / validate."
             )
     timeout = min(600, _entero(p.get("timeout"), ctx.settings.exec_timeout) or ctx.settings.exec_timeout)
-    r = ejecutar(comando, cwd=ctx.ws.raiz, timeout=timeout, shell=True)
+    entrada = _entrada_estandar(p)
+    r = ejecutar(comando, cwd=ctx.ws.raiz, timeout=timeout, shell=True, entrada=entrada)
     texto = r.resumen(limite=MAX_SALIDA // 2)
-    if not r.ok and ctx.settings.pistas_errores:
+    if entrada is not None:
+        texto = texto.replace("\n", f"\n(stdin: {len(entrada.splitlines())} línea(s))\n", 1)
+    if not r.ok and parece_interactivo(f"{r.stdout}\n{r.stderr}"):
+        if entrada is None:
+            texto += "\n\n" + PISTA_INTERACTIVO
+        else:
+            texto += ("\n\nPISTA DE REAPER: el programa pidió MÁS datos de los que pasaste en <stdin>. Agregá las "
+                      "respuestas que faltan (incluida la opción para salir, si el programa tiene un menú).")
+    elif not r.ok and ctx.settings.pistas_errores:
         texto = anexar_pistas(texto, 2)
     return texto
 
@@ -728,7 +766,7 @@ def resumen_params(nombre: str, params: dict) -> str:
     if nombre == "search_files":
         return f"/{params.get('regex', '')}/ {params.get('file_pattern', '')}"
     if nombre == "execute_command":
-        return params.get("command", "")
+        return params.get("command", "") + ("  < stdin" if params.get("stdin") else "")
     if nombre == "delegate":
         return f"{params.get('role', '?')}: {params.get('task', '')[:70]}"
     if nombre == "validate":

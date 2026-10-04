@@ -70,6 +70,7 @@ ALIAS_PARAMS = {
     "diff": ("diffs", "changes", "cambios", "edits"),
     "items": ("todos", "lista"),
     "paths": ("rutas",),
+    "stdin": ("input", "entrada", "user_input", "inputs", "entrada_estandar"),
 }
 
 _CORTE_RESULTADO = re.compile(
@@ -121,6 +122,20 @@ def limpiar_largo(valor: str) -> str:
     return v
 
 
+def sin_comillas(valor: str) -> str:
+    """
+    Quita comillas o backticks que ENVUELVEN el valor entero ("app.py", `ls -la`), nunca las de adentro:
+    antes se usaba strip('"') y `python3 -c "print(2+2)"` perdía la comilla final (el comando fallaba).
+    """
+    v = (valor or "").strip()
+    m = re.fullmatch(r"(`+)(.*?)\1", v, re.S)
+    if m and "`" not in m.group(2):
+        return m.group(2).strip()
+    if len(v) >= 2 and v[0] == v[-1] and v[0] in "'\"" and v[0] not in v[1:-1]:
+        return v[1:-1].strip()
+    return v
+
+
 def _apertura(tag: str) -> re.Pattern:
     return re.compile(r"<\s*" + re.escape(tag) + r"\s*>", re.I)
 
@@ -156,7 +171,7 @@ def _extraer_params(cuerpo: str, definicion: list) -> tuple[dict, bool]:
         for m in _RE_PARAMETER.finditer(cuerpo):
             nombre = _canonico_param(m.group(1))
             valor = m.group(2)
-            params[nombre] = limpiar_largo(valor) if nombre in largos else valor.strip().strip("`'\"").strip()
+            params[nombre] = limpiar_largo(valor) if nombre in largos else sin_comillas(valor)
         if params:
             return params, completa
 
@@ -187,7 +202,7 @@ def _extraer_params(cuerpo: str, definicion: list) -> tuple[dict, bool]:
                     valor = cuerpo[ap.end():c.start()]
                 else:
                     valor = cuerpo[ap.end():].split("\n", 1)[0]
-                params[nombre] = valor.strip().strip("`'\"").strip()
+                params[nombre] = sin_comillas(valor)
             break
 
     if not params and definicion and cuerpo.strip():
@@ -271,11 +286,13 @@ def analizar(texto: str, esquemas: Esquemas) -> Analisis:
         etiqueta_cierre = ("invoke" if "invoke" in m.group(0).lower()[:10] else "tool") if generico else tag
         cierre = _cierre(etiqueta_cierre)
 
+        c_encontrado = False
         if autocerrada:
             cuerpo = ""
             pos = m.end()
         else:
             c = cierre.search(limpio, m.end())
+            c_encontrado = c is not None
             if c:
                 cuerpo = limpio[m.end():c.start()]
                 pos = c.end()
@@ -287,6 +304,10 @@ def analizar(texto: str, esquemas: Esquemas) -> Analisis:
 
         definicion = esquemas.get(real, [])
         params, completa = _extraer_params(cuerpo, definicion) if cuerpo.strip() else ({}, True)
+        if not completa and not autocerrada and c_encontrado:
+            # Falta el cierre del parámetro (</content>) pero el de la herramienta está: el valor queda
+            # delimitado por </herramienta>, así que la llamada se entiende entera.
+            completa = True
         for clave, valor in atributos.items():
             canon = _canonico_param(clave)
             params.setdefault(canon, valor)

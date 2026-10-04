@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-REAPER v7.0.0 «Dragón» — agente de programación autónomo para Termux vía OpenRouter
+REAPER v7.1.0 «Dragón» — agente de programación autónomo para Termux vía OpenRouter
 (estilo Claude Code / Codex / Antigravity, pensado para sacarle el máximo a un modelo de 24B).
 
 Archivo único generado desde partes/ con empaquetar.py.
@@ -18,6 +18,24 @@ QUÉ TRAE LA v7
      cuando el modelo se corta, esqueleto + relleno por función (replace_symbol).
   5. read_symbol / replace_symbol / find_references, mapa de archivos relevantes
      según el pedido, arreglos automáticos sin modelo, snapshots git por build.
+
+v7.1 (bugs vistos en uso real)
+  - Tool loop: con "2+2" obtenía 4 y repetía execute_command. La respuesta en
+    texto después de una herramienta ahora ES la respuesta final; una llamada
+    idéntica sin cambios en el proyecto reutiliza el resultado y un bucle se corta.
+  - Repeticiones según el estado del workspace: después de editar, volver a
+    correr run_tests o releer un archivo está permitido.
+  - Cumplimiento falso: un informe que dice "validé / los tests pasan" sin una
+    ejecución real (o con la última fallida o bloqueada) se rechaza o se marca.
+  - "Responde únicamente cuánto es 5+5. No crees archivos ni ejecutes comandos."
+    → responde en texto; las prohibiciones explícitas del usuario se respetan.
+  - Programas interactivos: EOFError → pista "no lo modifiques, probalo con
+    <stdin>"; execute_command y run_python aceptan entrada estándar.
+  - /construir: re-pide el plan si el arquitecto devuelve una sola tarea gigante;
+    una tarea que no terminó tiene que mostrar progreso; no se revisa (ni se
+    aprueba) una tarea cuya verificación real falla.
+  - Parser: `python3 -c "print(2+2)"` ya no pierde la comilla final; se aceptan
+    llamadas con etiquetas de cierre olvidadas; se ocultan los ```xml``` vacíos.
 
 Instalar:
     pip install httpx pyflakes      (opcionales: sin httpx usa urllib)
@@ -37,7 +55,7 @@ Ejecutar:
 
 from __future__ import annotations
 
-__version__ = "7.0.0"
+__version__ = "7.1.0"
 __codename__ = "Dragón"
 
 import argparse
