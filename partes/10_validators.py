@@ -59,6 +59,9 @@ class Resultado:
 def entorno_seguro() -> dict:
     """Entorno para subprocesos sin claves API (el modelo nunca debe verlas)."""
     env = {k: v for k, v in os.environ.items() if not _ENV_SECRETO.search(k)}
+    if any(k.startswith("GIT_CONFIG_") and k not in env for k in os.environ):
+        # GIT_CONFIG_COUNT/KEY_n/VALUE_n van juntas: si se quitó una, se quitan todas (si no, git no arranca).
+        env = {k: v for k, v in env.items() if not (k.startswith("GIT_CONFIG_") or k == "GIT_CONFIG_PARAMETERS")}
     env["PYTHONIOENCODING"] = "utf-8"
     env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
     env.setdefault("NO_COLOR", "1")

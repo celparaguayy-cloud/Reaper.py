@@ -34,17 +34,22 @@ def _tokens_receta(r: Receta) -> tuple[set, set, set]:
     return etiquetas, titulo, descripcion
 
 
-def puntuar_receta(r: Receta, tokens: dict) -> float:
+def puntuar_receta(r: Receta, tokens: dict, con_distintos: bool = False):
     etiquetas, titulo, descripcion = _tokens_receta(r)
     puntaje = 0.0
+    distintos = 0
     for t, peso in tokens.items():
+        acierto = False
         if t in etiquetas:
             puntaje += 3 * peso
+            acierto = True
         if t in titulo:
             puntaje += 2 * peso
+            acierto = True
         if t in descripcion:
             puntaje += 0.5 * peso
-    return puntaje
+        distintos += acierto
+    return (puntaje, distintos) if con_distintos else puntaje
 
 
 def buscar_recetas(consulta: str, k: int = 4, lenguaje: str = "") -> list[Receta]:
@@ -67,8 +72,9 @@ def recetas_para_prompt(tarea: str, k: int = 2, umbral: float = 5.0, maximo: int
     tokens = tokens_pedido(tarea)
     if not tokens:
         return ""
-    puntuadas = sorted(((puntuar_receta(r, tokens), r) for r in RECETAS), key=lambda t: -t[0])
-    elegidas = [r for p, r in puntuadas[:k] if p >= umbral]
+    puntuadas = sorted(((*puntuar_receta(r, tokens, con_distintos=True), r) for r in RECETAS), key=lambda t: -t[0])
+    # Hace falta una coincidencia fuerte: puntaje alto Y al menos dos palabras distintas del pedido.
+    elegidas = [r for p, distintos, r in puntuadas[:k] if p >= umbral and distintos >= 2]
     if not elegidas:
         return ""
     partes, usado = [], 0

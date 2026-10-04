@@ -19,7 +19,8 @@ def es_repo_git(ws: Workspace) -> bool:
 
 def git(ws: Workspace, *args: str, env: Optional[dict] = None, timeout: int = 60,
         entrada: Optional[str] = None) -> Resultado:
-    entorno = entorno_seguro()
+    # Estos comandos los corre REAPER (no el modelo): se usa el entorno completo para respetar la config de git.
+    entorno = dict(os.environ)
     entorno.setdefault("GIT_TERMINAL_PROMPT", "0")
     if env:
         entorno.update(env)

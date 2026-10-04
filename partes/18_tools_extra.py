@@ -522,19 +522,10 @@ def run_python(ctx: Contexto, p: dict) -> str:
         ctx.ui.codigo(recortar(codigo, 1200), "python")
         if not ctx.ui.confirmar("  ¿Ejecutar?"):
             raise ErrorHerramienta("El usuario no aprobó ejecutar ese código.")
-    with tempfile.NamedTemporaryFile("w", suffix=".py", prefix="reaper_snippet_", delete=False,
-                                     encoding="utf-8") as f:
-        f.write(codigo)
-        temporal = f.name
-    try:
-        r = ejecutar([sys.executable, temporal], cwd=ctx.ws.raiz, timeout=60)
-    finally:
-        try:
-            os.unlink(temporal)
-        except OSError:
-            pass
+    # Por stdin ("python -"): así el directorio del proyecto queda en sys.path y los imports locales andan.
+    r = ejecutar([sys.executable, "-"], cwd=ctx.ws.raiz, timeout=60, entrada=codigo)
     r.comando = "run_python"
-    texto = r.resumen(limite=MAX_SALIDA // 2).replace(temporal, "<fragmento>")
+    texto = r.resumen(limite=MAX_SALIDA // 2).replace('File "<stdin>"', 'File "<fragmento>"')
     if not r.ok and ctx.settings.pistas_errores:
         texto = anexar_pistas(texto, 2)
     return texto

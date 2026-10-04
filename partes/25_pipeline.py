@@ -180,6 +180,17 @@ def _es_test(rel: str) -> bool:
     return any(fnmatch.fnmatch(rel, p) for p in PATRONES_TESTS)
 
 
+def _es_de_especificacion(nombre_test: str, protegidos: dict) -> bool:
+    """¿El test que falla pertenece a un archivo de la especificación? (pytest usa ruta::test, unittest modulo.Clase.test)"""
+    for rel in protegidos:
+        ruta = Path(rel)
+        modulo = ".".join(ruta.with_suffix("").parts)
+        if rel in nombre_test or nombre_test.startswith(modulo + ".") or f".{ruta.stem}." in f".{nombre_test}." \
+                or nombre_test.startswith(ruta.stem + "."):
+            return True
+    return False
+
+
 class Orquestador:
     def __init__(self, llm, ws: Workspace, settings: Settings, ui: UI):
         self.llm = llm
@@ -490,7 +501,9 @@ class Orquestador:
         conteo = conteo_de_resultado(tests)
         problemas = [r.resumen(2500) for r in fallos(validaciones)]
         if tests is not None and not tests.ok and conteo.reconocido:
-            nuevos_fallos = [n for n in conteo.nombres_fallados if n not in nombres_antes]
+            # Los tests de la especificación de tareas siguientes fallan a propósito: no son regresión.
+            nuevos_fallos = [n for n in conteo.nombres_fallados
+                             if n not in nombres_antes and not _es_de_especificacion(n, self._protegidos)]
             retroceso = conteo.pasados < antes.pasados
             mas_errores = conteo.errores > antes.errores
             if retroceso or mas_errores or nuevos_fallos:

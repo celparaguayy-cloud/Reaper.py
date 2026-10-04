@@ -50,7 +50,8 @@ tarea_eval("fizzbuzz", "FizzBuzz con reglas", """
             r = fizzbuzz(27)
             self.assertEqual(r[6], "Siete")
             self.assertEqual(r[26], "Siete")
-            self.assertEqual(r[20], "Siete")
+            self.assertEqual(r[16], "Siete")
+            self.assertEqual(r[20], "Fizz")
         def test_vacio(self):
             self.assertEqual(fizzbuzz(0), [])
 """})

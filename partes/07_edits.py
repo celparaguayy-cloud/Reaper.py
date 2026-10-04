@@ -388,8 +388,12 @@ def solapamiento_final(existente: str, nuevo: str, minimo: int = 2) -> int:
         if [l.rstrip() for l in viejas[-k:]] == [l.rstrip() for l in nuevas[:k]]:
             mejor = k
     if mejor < minimo and mejor:
-        # Una sola línea repetida solo cuenta si es no trivial.
-        if not viejas[-1].strip() or len(viejas[-1].strip()) < 12:
+        # Una sola línea repetida cuenta si es una cabecera estructural (def/class/function, termina en ':' o '{')
+        # o es lo bastante larga como para no ser casualidad.
+        ultima = viejas[-1].strip()
+        estructural = bool(re.match(r"^(async\s+def|def|class|function|export|func|fn|pub\s+fn|if|for|while)\b", ultima)) \
+            or ultima.endswith((":", "{"))
+        if not ultima or (not estructural and len(ultima) < 12):
             return 0
     return mejor
 

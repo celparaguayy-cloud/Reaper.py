@@ -370,8 +370,21 @@ def simbolos_shell(texto: str, archivo: str) -> list[Simbolo]:
         abre = texto.find("{", offsets[i], offsets[min(len(offsets) - 1, i + 2)] if i + 2 < len(offsets) else len(texto))
         if abre < 0:
             continue
-        cierre = _saltar_hasta_llave_cierre(texto, abre, "sh")
-        fin = _linea_de_offset(offsets, cierre) if cierre is not None else len(lineas)
+        # En bash la llave de cierre solo cuenta en posición de comando: una línea que empieza con '}'
+        # con la misma indentación (o menos) que la función. 'echo }' no cierra nada.
+        indent = len(m.group(1).expandtabs(4))
+        fin = None
+        if linea.rstrip().endswith("}") and linea.count("{") == linea.count("}"):
+            fin = i + 1  # función de una sola línea: f() { echo hola; }
+        else:
+            for j in range(i + 1, len(lineas)):
+                sig = lineas[j]
+                if re.match(r"^\s*\}(\s|;|>|$|\|)", sig) and len(sig) - len(sig.lstrip()) <= indent:
+                    fin = j + 1
+                    break
+        if fin is None:
+            cierre = _saltar_hasta_llave_cierre(texto, abre, "sh")
+            fin = _linea_de_offset(offsets, cierre) if cierre is not None else len(lineas)
         salida.append(Simbolo(nombre, "funcion", archivo, i + 1, fin, "()", "", m.group(1)))
     return salida
 

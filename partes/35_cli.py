@@ -201,12 +201,13 @@ class App:
         self._pedido_actual = texto
         cid = self.ws.checkpoints.iniciar(f"pedido: {texto[:80]}")
         inicio = time.monotonic()
+        res = None
         try:
             res = self.principal.ejecutar(self.expandir_menciones(texto), cid_inicio=cid)
         finally:
+            self.historial.append((datetime.now().strftime("%H:%M"), texto[:200], bool(res and res.ok)))
             self._guardar_sesion()
             self.ws.checkpoints.descartar_si_vacio(cid)
-        self.historial.append((datetime.now().strftime("%H:%M"), texto[:200], res.ok))
         self.ui.linea("")
         self.ui.linea(f"{Tema.agente}{C.BOLD}reaper »{C.RESET}")
         mostrar_markdown(self.ui, res.resumen)
