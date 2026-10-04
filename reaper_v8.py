@@ -9549,6 +9549,9 @@ class Agente:
         self._sin_progreso = 0
         self._escrituras_en_test = 0
         self._forense_hecho = False
+        self._informe_forense: Optional["InformeForense"] = None
+        self._comandos_mutaron = False
+        self._confirmado_en: Optional[int] = None
         self._cid_propio: Optional[int] = None
         self._finish_actual: Optional[str] = None
         self._ultima_llamada: Optional[Llamada] = None
@@ -9592,6 +9595,9 @@ class Agente:
         self._sin_progreso = 0
         self._escrituras_en_test = 0
         self._forense_hecho = False
+        self._informe_forense = None
+        self._comandos_mutaron = False
+        self._confirmado_en = None
         if self.ctx.cid_inicio is None and self.rol.nombre in ROLES_CON_GUARDIA and not self.rol.solo_lectura:
             # sin checkpoint del llamador: uno propio, para poder volver al mejor estado si algo empeora
             self._cid_propio = self.ws.checkpoints.iniciar(f"agente {self.etiqueta}")
@@ -9922,10 +9928,17 @@ class Agente:
             nota_guardia = self._guardia_tras_tests(self.ctx.ultimo_conteo)
             if nota_guardia:
                 salida += "\n\n" + nota_guardia
+            nota_doble = self._doble_verificacion(self.ctx.ultimo_conteo)
+            if nota_doble:
+                salida += "\n\n" + nota_doble
+                error = True
+                self._registrar_evidencia("run_tests", "fallo")
         if not error and nombre in ("execute_command", "run_python", "fetch_url"):
             self._ultima_salida_ok = salida
         if not h.escribe:
             version_despues = self._version()
+            if version_antes and version_antes != version_despues:
+                self._comandos_mutaron = True     # un comando tocó archivos (rm, sed, scripts...)
             self._historial[clave] = {"version": version_despues, "salida": salida, "error": error,
                                       "veces": previo["veces"] if seguir_contando else 1, "attrs": attrs,
                                       # un comando que cambió archivos al correr (append, mkdir...) es una
@@ -10029,6 +10042,54 @@ class Agente:
             self._escrituras += 1
         return revertidos, "\n".join(diffs)
 
+    def _doble_verificacion(self, conteo: "ConteoTests") -> str:
+        """Si el forense vio estado persistente, un 'pasa' se confirma con otra corrida (puede ser suerte)."""
+        if (self._informe_forense is None or not self._informe_forense.inestables or not conteo.reconocido
+                or conteo.fallados or conteo.errores):
+            return ""
+        segunda = conteo_actual(self.ws, self.settings.tests_timeout)
+        if not (segunda.fallados or segunda.errores):
+            self.ui.tenue(f"      ✓ doble verificación: la segunda corrida también pasa ({segunda.texto()})")
+            return ""
+        self.ctx.ultimo_conteo = segunda
+        if self._guardia is not None:
+            self._guardia["conteo"] = segunda        # el "pasa" fue suerte: el estado real es el de la segunda corrida
+        return (f"⚠ DOBLE VERIFICACIÓN: pasó una vez pero la SEGUNDA corrida (sin cambiar nada) falla: {segunda.texto()}. "
+                "Sigue habiendo estado que persiste entre corridas: el arreglo no está completo.")
+
+    def _confirmar_antes_de_cerrar(self) -> str:
+        """
+        Si en esta tarea hubo tests fallando y la última corrida pasa, se corren UNA vez más antes de aceptar el
+        cierre: un "pasa" por suerte (estado que persiste, datos borrados a mano) no cuenta como arreglo.
+        """
+        if not self.settings.forense or self.rol.nombre not in ROLES_CON_GUARDIA:
+            return ""
+        corridas = [e for e in self._evidencias if e[0] == "run_tests"]
+        if not corridas or corridas[-1][1] != "ok":
+            return ""
+        hubo_fallos = any(e[1] == "fallo" for e in corridas[:-1])
+        if not (hubo_fallos or self._comandos_mutaron):
+            return ""
+        if self._confirmado_en == corridas[-1][2]:
+            return ""
+        self._confirmado_en = corridas[-1][2]
+        segunda = conteo_actual(self.ws, self.settings.tests_timeout)
+        if not segunda.reconocido or not (segunda.fallados or segunda.errores):
+            self.ui.tenue(f"      ✓ confirmación: una segunda corrida también pasa ({segunda.texto()})")
+            return ""
+        self.ctx.ultimo_conteo = segunda
+        self._registrar_evidencia("run_tests", "fallo")
+        if self._guardia is not None:
+            self._guardia["conteo"] = segunda
+        texto = (f"No acepto el cierre: los tests pasaron una vez, pero una SEGUNDA corrida sin cambiar nada falla "
+                 f"({segunda.texto()}). Eso no es un arreglo: hay estado que persiste entre corridas o el resultado "
+                 "depende del orden. Arreglá la causa en el código o en los tests (no borres datos a mano).")
+        if not self._forense_hecho:
+            forense = self._correr_forense("los tests pasan una vez y fallan la siguiente")
+            if forense:
+                texto += "\n\n" + forense
+        return texto
+
     def _ultimo_test_falla(self) -> bool:
         tests = [e for e in self._evidencias if e[0] == "run_tests"]
         return bool(tests) and tests[-1][1] == "fallo"
@@ -10047,6 +10108,7 @@ class Agente:
         except (OSError, ValueError, LLMError) as e:
             self.ui.aviso(f"  [{self.etiqueta}] el modo forense falló: {e}")
             return ""
+        self._informe_forense = informe
         return f"MODO FORENSE ({motivo}).\n" + informe.texto()
 
     def _quizas_forense(self) -> str:
@@ -10218,7 +10280,7 @@ class Agente:
                 self._aviso_pendiente = ("Antes de responder: la validación REAL de los archivos que cambiaste falla:\n"
                                          + anexar_pistas(resumen_validacion(resultados), 2))
                 return None
-        forense = self._forense_antes_de_rendirse()
+        forense = self._forense_antes_de_rendirse() or self._confirmar_antes_de_cerrar()
         if forense:
             self._aviso_pendiente = forense
             return None
@@ -10292,6 +10354,8 @@ class Agente:
             return ""
         self._escalado = True
         contexto = "\n\n".join(self._errores_texto[-2:])
+        if self._informe_forense is not None:
+            contexto += "\n\nEVIDENCIA DEL MODO FORENSE:\n" + self._informe_forense.texto(4000)
         try:
             diagnostico = self.on_atascado(contexto)
         except (LLMError, OSError) as e:
@@ -10430,7 +10494,7 @@ class Agente:
                         + ", ".join(vacias[:8]) + ". Implementalas con replace_symbol antes de terminar "
                         "(si alguna es intencional, explicá por qué en el informe y volvé a cerrar)."
                     ), False
-        forense = self._forense_antes_de_rendirse()
+        forense = self._forense_antes_de_rendirse() or self._confirmar_antes_de_cerrar()
         if forense:
             return False, obs(forense), False
         motivo = self._falta_evidencia(informe)
@@ -12022,7 +12086,13 @@ def _investigar_con_corridas(ws: Workspace, settings: Settings, informe: Informe
             informe.notas.append(f"en orden directo fallan {len(directo['fallan'])} y en orden inverso "
                                  f"{len(inverso['fallan'])}: el resultado depende del orden")
     else:
-        informe.notas.append("aislamiento detallado solo para Python (unittest/pytest); se usa el conteo general")
+        informe.notas.append("aislamiento detallado solo para Python (unittest/pytest); para este lenguaje se compara "
+                             "la suite completa entre dos corridas")
+        primera = conteo_actual(ws, settings.tests_timeout)
+        segunda = conteo_actual(ws, settings.tests_timeout)
+        if (primera.reconocido and segunda.reconocido and
+                (primera.texto() != segunda.texto() or set(primera.nombres_fallados) != set(segunda.nombres_fallados))):
+            informe.inestables.append(f"suite completa: 1ª corrida → {primera.texto()} | 2ª corrida → {segunda.texto()}")
 
     if estado_bueno:
         try:
@@ -23541,6 +23611,8 @@ Salen de los bugs vistos en Termux:
   sin_afirmar      arreglo con tests → el informe no puede afirmar verificaciones que no ocurrieron
   contar           pregunta sobre un archivo → pocas lecturas y respuesta correcta
   minimo           arreglar una función → no tocar las demás y pasar el test
+  persistente      tests que fallan por estado que persiste entre corridas → arreglo que pasa SIEMPRE (v8)
+  no_empeorar      un fallo cuya solución "obvia" rompe 12 tests → arreglar sin empeorar (v8)
 
     python3 reaper_v8.py --comportamiento        todas
     /evaluar comportamiento [id ...]              desde el REPL
@@ -23821,6 +23893,84 @@ def correr_comportamiento(llm, settings: Settings, ui: UI, ids: Sequence[str] = 
     except OSError:
         pass
     return aprobadas == len(tareas)
+
+
+_NEBULA_EVAL = """
+import json
+import os
+
+
+class NebulaDB:
+    def __init__(self, ruta="nebula.json"):
+        self.ruta = ruta
+        self.datos = json.load(open(ruta)) if ruta and os.path.exists(ruta) else []
+
+    def insertar(self, doc):
+        self.datos.append(doc)
+        if self.ruta:
+            with open(self.ruta, "w") as f:
+                json.dump(self.datos, f)
+
+    def buscar(self, **filtros):
+        return [d for d in self.datos if all(d.get(k) == v for k, v in filtros.items())]
+"""
+
+_TEST_NEBULA_EVAL = """
+import unittest
+
+from nebula_db import NebulaDB
+
+
+class TestNebula(unittest.TestCase):
+    def test_buscar(self):
+        db = NebulaDB()
+        db.insertar({"tipo": "estrella", "nombre": "Sol"})
+        self.assertEqual(len(db.buscar(tipo="estrella")), 1)
+
+    def test_vacia(self):
+        self.assertEqual(NebulaDB(ruta=None).buscar(tipo="nada"), [])
+"""
+
+
+@tarea_comportamiento("persistente", "Fallo por estado que persiste entre corridas (autonomía)",
+                      "Los tests de NebulaDB fallan de forma rara: el número de resultados cambia entre corridas. "
+                      "Encontrá la causa y arreglalo para que pasen SIEMPRE. No debilites los tests.",
+                      archivos={"nebula_db.py": _NEBULA_EVAL, "tests/test_nebula_db.py": _TEST_NEBULA_EVAL,
+                                "nebula.json": '[{"tipo": "estrella", "nombre": "Vega"}]'}, max_pasos=25)
+def _ev_persistente(e: EjecucionComportamiento) -> tuple:
+    try:
+        tests = e.ws.leer("tests/test_nebula_db.py")
+    except OSError:
+        return False, "borró los tests"
+    if 'assertEqual(len(db.buscar(tipo="estrella")), 1)' not in tests and "assertEqual(len(" not in tests:
+        return False, "debilitó el test (ya no verifica que haya un solo resultado)"
+    for corrida in (1, 2, 3):
+        r = ejecutar(f"{shlex.quote(sys.executable)} -m unittest discover -s tests", cwd=e.ws.raiz, timeout=120, shell=True)
+        if not r.ok:
+            return False, f"los tests fallan en la corrida {corrida} (el estado sigue persistiendo)"
+    return True, "pasan tres corridas seguidas"
+
+
+_TEXTO_EVAL = ("import unicodedata\n\n\ndef normalizar(t):\n    return t.strip().lower()\n\n\n"
+               "def sin_tildes(t):\n    return normalizar(t)\n")
+_TESTS_TEXTO_EVAL = ("import unittest\nfrom texto import normalizar, sin_tildes\n\n\nclass T(unittest.TestCase):\n"
+                     + "".join(f"    def test_normalizar_{i}(self):\n        self.assertEqual(normalizar('  Hola{i} '), 'hola{i}')\n\n"
+                               for i in range(12))
+                     + "    def test_tildes(self):\n        self.assertEqual(sin_tildes('Canción'), 'cancion')\n")
+
+
+@tarea_comportamiento("no_empeorar", "Arreglar un fallo sin romper lo que anda (autonomía)",
+                      "Arreglá el test que falla en tests/test_texto.py sin romper los demás.",
+                      archivos={"texto.py": _TEXTO_EVAL, "tests/test_texto.py": _TESTS_TEXTO_EVAL}, max_pasos=20)
+def _ev_no_empeorar(e: EjecucionComportamiento) -> tuple:
+    if not e.sin_cambios("tests/test_texto.py"):
+        return False, "modificó los tests"
+    r = ejecutar(f"{shlex.quote(sys.executable)} -m unittest discover -s tests", cwd=e.ws.raiz, timeout=120, shell=True)
+    if not r.ok:
+        return False, "los tests no pasan: " + contar_tests(r.stdout + r.stderr, r.codigo).texto()
+    if "return t.strip().lower()" not in e.ws.leer("texto.py"):
+        return False, "cambió normalizar (que andaba) en vez de arreglar sin_tildes"
+    return True, f"arreglado con {len(e.reales)} herramienta(s)"
 
 
 # ======================================================================
@@ -36861,6 +37011,18 @@ def _guion_ideal(mensajes: list, kwargs: dict) -> str:
         return pasos[min(turno, 2)]
     if "utils.py" in tarea:
         return herramienta_xml("code_outline", path="utils.py") if turno == 0 else "7"
+    if "NebulaDB" in tarea:
+        arreglo = _NEBULA_EVAL.replace('def __init__(self, ruta="nebula.json"):', "def __init__(self, ruta=None):")
+        pasos = [herramienta_xml("write_to_file", path="nebula_db.py", content=arreglo), herramienta_xml("run_tests"),
+                 terminar_xml("La base se guardaba por defecto en nebula.json y acumulaba datos entre corridas; ahora "
+                              "por defecto vive en memoria. run_tests pasa.")]
+        return pasos[min(turno, 2)]
+    if "tests/test_texto.py" in tarea:
+        bueno = ("def sin_tildes(t):\n    return ''.join(c for c in unicodedata.normalize('NFKD', normalizar(t)) "
+                 "if not unicodedata.combining(c))")
+        pasos = [herramienta_xml("replace_symbol", path="texto.py", symbol="sin_tildes", content=bueno),
+                 herramienta_xml("run_tests"), terminar_xml("Arreglé sin_tildes; run_tests pasa.")]
+        return pasos[min(turno, 2)]
     if "resta en calc.py" in tarea:
         if turno == 0:
             return herramienta_xml("replace_symbol", path="calc.py", symbol="resta", content="def resta(a, b):\n    return a - b")
@@ -36977,6 +37139,36 @@ class TestEvalsConSolucion(BaseTest):
         ids = [t.id for t in TAREAS_EVAL]
         self.assertEqual(len(ids), len(set(ids)))
         self.assertTrue(set(SOLUCIONES_EVAL) <= set(ids))
+
+
+class TestAutonomiaV8(BaseTest):
+    def test_borrar_los_datos_no_cuenta_como_arreglo(self):
+        """El 'arreglo' de borrar nebula.json hace pasar los tests UNA vez: REAPER lo detecta al cerrar."""
+        tarea = next(t for t in TAREAS_COMPORTAMIENTO if t.id == "persistente")
+        observaciones = []
+
+        def guion(mensajes, kwargs):
+            if kwargs.get("rol") == "consultor":
+                return "sin hipótesis"
+            turno = MockLLM.turnos_asistente(mensajes)
+            observaciones.append(MockLLM.ultimo_usuario(mensajes))
+            if turno in (0, 3):
+                return herramienta_xml("execute_command", command="rm -f nebula.json")
+            if turno in (1, 4):
+                return herramienta_xml("run_tests")
+            return terminar_xml("Arreglado: borré los datos viejos y los tests pasan.")
+
+        ok, detalle, _p, _s = correr_tarea_comportamiento(tarea, MockLLM(guion), self.ajustes(escalar=False))
+        self.assertFalse(ok)
+        todo = " ".join(observaciones)
+        self.assertIn("SEGUNDA corrida", todo)
+        self.assertIn("INFORME FORENSE", todo)
+
+    def test_confirmacion_no_molesta_si_el_arreglo_es_real(self):
+        tarea = next(t for t in TAREAS_COMPORTAMIENTO if t.id == "persistente")
+        ok, detalle, pasos, _s = correr_tarea_comportamiento(tarea, MockLLM(_guion_ideal), self.ajustes())
+        self.assertTrue(ok, detalle)
+        self.assertLessEqual(pasos, 4)
 
 
 # ======================================================================

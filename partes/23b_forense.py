@@ -560,7 +560,13 @@ def _investigar_con_corridas(ws: Workspace, settings: Settings, informe: Informe
             informe.notas.append(f"en orden directo fallan {len(directo['fallan'])} y en orden inverso "
                                  f"{len(inverso['fallan'])}: el resultado depende del orden")
     else:
-        informe.notas.append("aislamiento detallado solo para Python (unittest/pytest); se usa el conteo general")
+        informe.notas.append("aislamiento detallado solo para Python (unittest/pytest); para este lenguaje se compara "
+                             "la suite completa entre dos corridas")
+        primera = conteo_actual(ws, settings.tests_timeout)
+        segunda = conteo_actual(ws, settings.tests_timeout)
+        if (primera.reconocido and segunda.reconocido and
+                (primera.texto() != segunda.texto() or set(primera.nombres_fallados) != set(segunda.nombres_fallados))):
+            informe.inestables.append(f"suite completa: 1ª corrida → {primera.texto()} | 2ª corrida → {segunda.texto()}")
 
     if estado_bueno:
         try:

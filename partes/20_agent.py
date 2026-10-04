@@ -355,6 +355,9 @@ class Agente:
         self._sin_progreso = 0
         self._escrituras_en_test = 0
         self._forense_hecho = False
+        self._informe_forense: Optional["InformeForense"] = None
+        self._comandos_mutaron = False
+        self._confirmado_en: Optional[int] = None
         self._cid_propio: Optional[int] = None
         self._finish_actual: Optional[str] = None
         self._ultima_llamada: Optional[Llamada] = None
@@ -398,6 +401,9 @@ class Agente:
         self._sin_progreso = 0
         self._escrituras_en_test = 0
         self._forense_hecho = False
+        self._informe_forense = None
+        self._comandos_mutaron = False
+        self._confirmado_en = None
         if self.ctx.cid_inicio is None and self.rol.nombre in ROLES_CON_GUARDIA and not self.rol.solo_lectura:
             # sin checkpoint del llamador: uno propio, para poder volver al mejor estado si algo empeora
             self._cid_propio = self.ws.checkpoints.iniciar(f"agente {self.etiqueta}")
@@ -728,10 +734,17 @@ class Agente:
             nota_guardia = self._guardia_tras_tests(self.ctx.ultimo_conteo)
             if nota_guardia:
                 salida += "\n\n" + nota_guardia
+            nota_doble = self._doble_verificacion(self.ctx.ultimo_conteo)
+            if nota_doble:
+                salida += "\n\n" + nota_doble
+                error = True
+                self._registrar_evidencia("run_tests", "fallo")
         if not error and nombre in ("execute_command", "run_python", "fetch_url"):
             self._ultima_salida_ok = salida
         if not h.escribe:
             version_despues = self._version()
+            if version_antes and version_antes != version_despues:
+                self._comandos_mutaron = True     # un comando tocó archivos (rm, sed, scripts...)
             self._historial[clave] = {"version": version_despues, "salida": salida, "error": error,
                                       "veces": previo["veces"] if seguir_contando else 1, "attrs": attrs,
                                       # un comando que cambió archivos al correr (append, mkdir...) es una
@@ -835,6 +848,54 @@ class Agente:
             self._escrituras += 1
         return revertidos, "\n".join(diffs)
 
+    def _doble_verificacion(self, conteo: "ConteoTests") -> str:
+        """Si el forense vio estado persistente, un 'pasa' se confirma con otra corrida (puede ser suerte)."""
+        if (self._informe_forense is None or not self._informe_forense.inestables or not conteo.reconocido
+                or conteo.fallados or conteo.errores):
+            return ""
+        segunda = conteo_actual(self.ws, self.settings.tests_timeout)
+        if not (segunda.fallados or segunda.errores):
+            self.ui.tenue(f"      ✓ doble verificación: la segunda corrida también pasa ({segunda.texto()})")
+            return ""
+        self.ctx.ultimo_conteo = segunda
+        if self._guardia is not None:
+            self._guardia["conteo"] = segunda        # el "pasa" fue suerte: el estado real es el de la segunda corrida
+        return (f"⚠ DOBLE VERIFICACIÓN: pasó una vez pero la SEGUNDA corrida (sin cambiar nada) falla: {segunda.texto()}. "
+                "Sigue habiendo estado que persiste entre corridas: el arreglo no está completo.")
+
+    def _confirmar_antes_de_cerrar(self) -> str:
+        """
+        Si en esta tarea hubo tests fallando y la última corrida pasa, se corren UNA vez más antes de aceptar el
+        cierre: un "pasa" por suerte (estado que persiste, datos borrados a mano) no cuenta como arreglo.
+        """
+        if not self.settings.forense or self.rol.nombre not in ROLES_CON_GUARDIA:
+            return ""
+        corridas = [e for e in self._evidencias if e[0] == "run_tests"]
+        if not corridas or corridas[-1][1] != "ok":
+            return ""
+        hubo_fallos = any(e[1] == "fallo" for e in corridas[:-1])
+        if not (hubo_fallos or self._comandos_mutaron):
+            return ""
+        if self._confirmado_en == corridas[-1][2]:
+            return ""
+        self._confirmado_en = corridas[-1][2]
+        segunda = conteo_actual(self.ws, self.settings.tests_timeout)
+        if not segunda.reconocido or not (segunda.fallados or segunda.errores):
+            self.ui.tenue(f"      ✓ confirmación: una segunda corrida también pasa ({segunda.texto()})")
+            return ""
+        self.ctx.ultimo_conteo = segunda
+        self._registrar_evidencia("run_tests", "fallo")
+        if self._guardia is not None:
+            self._guardia["conteo"] = segunda
+        texto = (f"No acepto el cierre: los tests pasaron una vez, pero una SEGUNDA corrida sin cambiar nada falla "
+                 f"({segunda.texto()}). Eso no es un arreglo: hay estado que persiste entre corridas o el resultado "
+                 "depende del orden. Arreglá la causa en el código o en los tests (no borres datos a mano).")
+        if not self._forense_hecho:
+            forense = self._correr_forense("los tests pasan una vez y fallan la siguiente")
+            if forense:
+                texto += "\n\n" + forense
+        return texto
+
     def _ultimo_test_falla(self) -> bool:
         tests = [e for e in self._evidencias if e[0] == "run_tests"]
         return bool(tests) and tests[-1][1] == "fallo"
@@ -853,6 +914,7 @@ class Agente:
         except (OSError, ValueError, LLMError) as e:
             self.ui.aviso(f"  [{self.etiqueta}] el modo forense falló: {e}")
             return ""
+        self._informe_forense = informe
         return f"MODO FORENSE ({motivo}).\n" + informe.texto()
 
     def _quizas_forense(self) -> str:
@@ -1024,7 +1086,7 @@ class Agente:
                 self._aviso_pendiente = ("Antes de responder: la validación REAL de los archivos que cambiaste falla:\n"
                                          + anexar_pistas(resumen_validacion(resultados), 2))
                 return None
-        forense = self._forense_antes_de_rendirse()
+        forense = self._forense_antes_de_rendirse() or self._confirmar_antes_de_cerrar()
         if forense:
             self._aviso_pendiente = forense
             return None
@@ -1098,6 +1160,8 @@ class Agente:
             return ""
         self._escalado = True
         contexto = "\n\n".join(self._errores_texto[-2:])
+        if self._informe_forense is not None:
+            contexto += "\n\nEVIDENCIA DEL MODO FORENSE:\n" + self._informe_forense.texto(4000)
         try:
             diagnostico = self.on_atascado(contexto)
         except (LLMError, OSError) as e:
@@ -1236,7 +1300,7 @@ class Agente:
                         + ", ".join(vacias[:8]) + ". Implementalas con replace_symbol antes de terminar "
                         "(si alguna es intencional, explicá por qué en el informe y volvé a cerrar)."
                     ), False
-        forense = self._forense_antes_de_rendirse()
+        forense = self._forense_antes_de_rendirse() or self._confirmar_antes_de_cerrar()
         if forense:
             return False, obs(forense), False
         motivo = self._falta_evidencia(informe)
