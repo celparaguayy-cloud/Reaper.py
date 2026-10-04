@@ -27,7 +27,43 @@ for d in (raiz, os.path.join(raiz, "tests"), os.path.join(raiz, "test")):
         sys.path.insert(0, d)
 repr_corto = reprlib.Repr()
 repr_corto.maxstring, repr_corto.maxother, repr_corto.maxlist, repr_corto.maxdict = 160, 160, 8, 8
-IGNORAR = {"self", "__builtins__", "__class__"}
+IGNORAR = {"__builtins__", "__class__"}
+
+def atributos(v):
+    return {a: b for a, b in vars(v).items() if not a.startswith("_")}
+
+traza = []
+profundidad = [0]
+
+def rastreador(frame, evento, arg):
+    archivo = frame.f_code.co_filename
+    if not archivo.startswith(raiz) or "/unittest/" in archivo or len(traza) >= 80:
+        return None
+    if frame.f_code.co_name.startswith("<"):   # <listcomp>, <genexpr>, <lambda>...: ruido
+        return None
+    if evento == "call":
+        codigo = frame.f_code
+        argumentos = {}
+        cantidad = codigo.co_argcount + codigo.co_kwonlyargcount
+        cantidad += bool(codigo.co_flags & 0x04) + bool(codigo.co_flags & 0x08)   # *args y **kwargs
+        for nombre in codigo.co_varnames[:cantidad]:
+            if nombre != "self" and nombre in frame.f_locals:
+                try:
+                    argumentos[nombre] = repr_corto.repr(frame.f_locals[nombre])
+                except Exception:
+                    argumentos[nombre] = "?"
+        traza.append({"e": "call", "f": codigo.co_name, "a": os.path.relpath(archivo, raiz), "l": frame.f_lineno,
+                      "args": argumentos, "p": profundidad[0]})
+        profundidad[0] += 1
+        return rastreador
+    if evento == "return":
+        profundidad[0] = max(0, profundidad[0] - 1)
+        try:
+            valor = repr_corto.repr(arg)
+        except Exception:
+            valor = "?"
+        traza.append({"e": "ret", "f": frame.f_code.co_name, "v": valor, "p": profundidad[0]})
+    return rastreador
 
 def foto():
     estado = {}
@@ -57,11 +93,14 @@ class Resultado(unittest.TestResult):
                 if k in IGNORAR or k.startswith("__"):
                     continue
                 try:
+                    if k == "self" and hasattr(v, "__dict__"):
+                        # el estado del objeto (en un TestCase: los fixtures armados en setUp)
+                        locales["self"] = type(v).__name__ + repr_corto.repr(atributos(v))
+                        continue
                     texto = repr_corto.repr(v)
                     if " object at 0x" in texto and hasattr(v, "__dict__"):
                         # repr genérico: se muestran los atributos, que es lo que sirve para diagnosticar
-                        atributos = {a: b for a, b in vars(v).items() if not a.startswith("__")}
-                        texto = type(v).__name__ + repr_corto.repr(atributos)
+                        texto = type(v).__name__ + repr_corto.repr(atributos(v))
                     locales[k] = texto
                 except Exception as e:
                     locales[k] = f"<repr falló: {type(e).__name__}>"
@@ -81,12 +120,17 @@ def aplanar(suite):
         else:
             yield t
 
-def correr(tests):
+def correr(tests, rastrear=False):
     r = Resultado()
     salida = io.StringIO()
     with contextlib.redirect_stdout(salida), contextlib.redirect_stderr(salida):
         for t in tests:
-            t.run(r)
+            if rastrear:
+                sys.settrace(rastreador)
+            try:
+                t.run(r)
+            finally:
+                sys.settrace(None)
     return r, salida.getvalue()
 
 modo, argumento = sys.argv[1], json.loads(sys.argv[2])
@@ -101,12 +145,13 @@ if modo == "aislar":
             informe["tests"].append({"nombre": nombre, "estado": "no_cargo", "detalle": repr(e)[:300]})
             continue
         antes = foto()
-        r, texto = correr(tests)
+        del traza[:]
+        r, texto = correr(tests, rastrear=True)
         despues = foto()
         cambiados = sorted(k for k in set(antes) | set(despues) if antes.get(k) != despues.get(k))
         estado = "pasa" if r.wasSuccessful() else ("error" if r.errors else "falla")
         informe["tests"].append({"nombre": nombre, "estado": estado, "detalles": r.detalles,
-                                 "archivos_tocados": cambiados[:20], "salida": texto[-800:]})
+                                 "archivos_tocados": cambiados[:20], "salida": texto[-800:], "traza": list(traza)})
 elif modo == "orden":
     base = argumento.get("base") or ("tests" if os.path.isdir("tests") else ".")
     tests = list(aplanar(cargador.discover(base, top_level_dir=None)))
@@ -170,6 +215,10 @@ class InformeForense:
                     locales = ", ".join(f"{k}={v}" for k, v in list(fr.get("locales", {}).items())[:8])
                     linea += f"\n    en {fr['archivo']}:{fr['linea']} ({fr['funcion']}): {locales}"
             partes.append(linea)
+        for a in self.aislados[:2]:
+            arbol = arbol_de_llamadas(a.get("traza") or [])
+            if arbol:
+                partes.append(f"LLAMADAS durante {a.get('nombre')} (argumentos → valor devuelto):\n{arbol}")
         if self.culpables:
             partes.append("CAMBIO QUE INTRODUJO LA REGRESIÓN (encontrado por bisección):\n" + "\n".join(self.culpables[:3]))
         for i, h in enumerate(self.hipotesis, 1):
@@ -181,6 +230,24 @@ class InformeForense:
         partes.append("Siguiente paso: arreglá la causa que muestra la evidencia con el cambio MÍNIMO y corré run_tests. "
                       "Si un cambio empeora los tests, REAPER lo revierte solo.")
         return recortar("\n\n".join(partes), limite)
+
+
+def arbol_de_llamadas(traza: list, maximo: int = 30) -> str:
+    """Traza del arnés → árbol legible: '→ f(a=1)' al entrar y '← f = 3' al salir, indentado por profundidad."""
+    lineas = []
+    for ev in traza:
+        sangria = "  " * min(int(ev.get("p", 0)), 8)
+        if ev.get("e") == "call":
+            if ev.get("f", "").startswith("test"):
+                continue
+            argumentos = ", ".join(f"{k}={v}" for k, v in (ev.get("args") or {}).items())
+            lineas.append(f"  {sangria}→ {ev['f']}({argumentos})  [{ev.get('a')}:{ev.get('l')}]")
+        elif ev.get("e") == "ret" and not ev.get("f", "").startswith("test"):
+            lineas.append(f"  {sangria}← {ev['f']} = {ev.get('v')}")
+        if len(lineas) >= maximo:
+            lineas.append("  ...")
+            break
+    return "\n".join(lineas)
 
 
 def _correr_arnes(ws: Workspace, modo: str, argumento, timeout: int = 120) -> Optional[dict]:
@@ -300,11 +367,29 @@ def biseccion(ws: Workspace, estado_bueno: dict, timeout: int = 300, max_archivo
     return culpables
 
 
-_RE_HIPOTESIS = re.compile(
-    r"H\d+\s*[:.)-]\s*(?P<texto>.+?)\n\s*EXPERIMENTO\s*:?\s*\n?```(?:python)?\s*\n(?P<codigo>.*?)```\s*"
-    r"(?:SI ES VERDAD|SI ES CIERTA|ESPERADO)\s*:?\s*(?P<esperado>[^\n]*)",
-    re.S | re.I,
-)
+_RE_INICIO_HIPOTESIS = re.compile(r"^\s*(?:\*\*)?(?:H\s*\d+|hip[óo]tesis\s*\d*|\d+[.)])\s*(?:\*\*)?\s*[:.)-]?\s*(?:\*\*)?\s*",
+                                  re.I | re.M)
+_RE_CODIGO = re.compile(r"```(?:python|py)?\s*\n(.*?)```", re.S)
+_RE_ESPERADO = re.compile(r"(?:SI ES VERDAD|SI ES CIERTA|SI ES CIERTO|ESPERADO|RESULTADO ESPERADO)\s*:?\s*\**\s*([^\n]*)", re.I)
+
+
+def parsear_hipotesis(texto: str, maximo: int = 3) -> list:
+    """Tolerante con el formato de un modelo chico: 'H1:', 'Hipótesis 1:', '1.', negritas, etc."""
+    inicios = [m for m in _RE_INICIO_HIPOTESIS.finditer(texto or "")]
+    salida = []
+    for i, m in enumerate(inicios):
+        bloque = texto[m.end(): inicios[i + 1].start() if i + 1 < len(inicios) else len(texto)]
+        primera = bloque.strip().splitlines()[0] if bloque.strip() else ""
+        enunciado = re.sub(r"\*\*|\bEXPERIMENTO\s*:.*$", "", primera, flags=re.I).strip(" :-")
+        codigo = _RE_CODIGO.search(bloque)
+        esperado = _RE_ESPERADO.search(bloque[codigo.end():] if codigo else bloque)
+        if not enunciado:
+            continue
+        salida.append(Hipotesis(enunciado, codigo.group(1).strip() if codigo else "",
+                                esperado.group(1).strip() if esperado else ""))
+        if len(salida) >= maximo:
+            break
+    return salida
 _INSEGURO = re.compile(r"\b(shutil\.rmtree|os\.remove|os\.unlink|os\.rmdir|os\.system|subprocess|socket|urllib|requests|"
                        r"http\.client|ftplib|smtplib|__import__\(['\"]os['\"]\)\.system|\.unlink\(|rmtree)\b")
 
@@ -496,8 +581,11 @@ def _hipotesis_y_conclusion(ws: Workspace, informe: InformeForense, llm, context
         except LLMError as e:
             respuesta = ""
             informe.notas.append(f"no pude pedir hipótesis: {e}")
-        for m in list(_RE_HIPOTESIS.finditer(respuesta or ""))[:3]:
-            h = Hipotesis(m.group("texto").strip(), m.group("codigo").strip(), m.group("esperado").strip())
+        for h in parsear_hipotesis(respuesta or ""):
+            if not h.experimento:
+                h.estado = "sin experimento"
+                informe.hipotesis.append(h)
+                continue
             ejecutado, salida = correr_experimento(ws, h.experimento)
             h.resultado = salida
             if not ejecutado:

@@ -277,3 +277,47 @@ class TestGuardiaEnLaReparacion(BaseTest):
         self.assertNotIn("INFORME FORENSE", prompts[0])
         self.assertIn("INFORME FORENSE", prompts[1])
         self.assertIn("nebula.json", prompts[1])
+
+
+class TestForenseEvidencia(BaseTest):
+    def test_traza_de_llamadas(self):
+        ws = self.proyecto({"nebula_db.py": _NEBULA, "tests/test_nebula_db.py": _TEST_NEBULA})
+        (ws.raiz / "nebula.json").write_text('[{"tipo": "estrella"}]')
+        texto = investigar(ws, self.ajustes(), self.ui(), None, con_hipotesis=False,
+                           fallidos=["test_nebula_db.TestNebula.test_buscar"]).texto()
+        self.assertIn("→ __init__(ruta='nebula.json')", texto)
+        self.assertIn("→ buscar(filtros={'tipo': 'estrella'})", texto)
+        self.assertIn("← buscar = [{'tipo': 'estrella'}, {'nombre': 'Sol', 'tipo': 'estrella'}]", texto)
+        self.assertNotIn("<genexpr>", texto)
+        self.assertEqual((ws.raiz / "nebula.json").read_text(), '[{"tipo": "estrella"}]')
+
+    def test_fixtures_de_setup(self):
+        ws = self.proyecto({
+            "pila.py": "class Pila:\n    def __init__(self):\n        self.items = []\n"
+                       "    def sacar(self):\n        return self.items.pop(0)\n",
+            "tests/test_pila.py": "import unittest\nfrom pila import Pila\n\n\nclass T(unittest.TestCase):\n"
+                                  "    def setUp(self):\n        self.pila = Pila()\n        self.pila.items = [1, 2, 3]\n\n"
+                                  "    def test_lifo(self):\n        self.assertEqual(self.pila.sacar(), 3)\n",
+        })
+        texto = investigar(ws, self.ajustes(), self.ui(), None, con_hipotesis=False).texto()
+        self.assertIn("self=T{'pila': <pila.Pila object", texto)
+        self.assertIn("→ sacar()", texto)
+        self.assertIn("← sacar = 1", texto)
+
+    def test_parser_de_hipotesis_tolerante(self):
+        respuesta = ("**Hipótesis 1:** la ruta es fija\n```python\nprint('fija')\n```\nSi es verdad: fija\n\n"
+                     "2) el filtro ignora mayúsculas\n```py\nprint('x')\n```\nESPERADO: x\n\n"
+                     "H3: otra idea sin experimento\n")
+        hs = parsear_hipotesis(respuesta)
+        self.assertEqual([h.texto for h in hs], ["la ruta es fija", "el filtro ignora mayúsculas", "otra idea sin experimento"])
+        self.assertEqual([h.esperado for h in hs], ["fija", "x", ""])
+        self.assertEqual(hs[2].experimento, "")
+
+    def test_comando_forense(self):
+        ws = self.proyecto({"nebula_db.py": _NEBULA, "tests/test_nebula_db.py": _TEST_NEBULA})
+        (ws.raiz / "nebula.json").write_text('[{"tipo": "estrella"}]')
+        app = App(self.ajustes(escalar=False), MockLLM(lambda m, k: "sin hipótesis"), self.ui(), ws, persistir=False)
+        app.comando("/forense")
+        texto = app.ui.texto_registrado()
+        self.assertIn("INFORME FORENSE", texto)
+        self.assertIn("nebula.json", texto)
