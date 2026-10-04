@@ -214,7 +214,8 @@ class TestEvaluacion(BaseTest):
         self.assertEqual(len(ids), len(set(ids)))
         for t in TAREAS_EVAL:
             for rel, contenido in {**t.tests, **t.archivos}.items():
-                compile(contenido, rel, "exec")
+                if rel.endswith(".py"):
+                    compile(contenido, rel, "exec")
 
     def test_correr_evaluacion_guarda_informe(self):
         llm = MockLLM(lambda m, k: "No sé.")
