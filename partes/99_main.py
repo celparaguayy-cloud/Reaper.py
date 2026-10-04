@@ -82,6 +82,8 @@ def main(argv: Optional[list] = None) -> int:
         return 1
 
     limpiar_sandboxes_viejos()
+    if settings.plugins:
+        cargar_plugins(ui=ui)
     try:
         if args.nuevo:
             plantilla, carpeta = args.nuevo

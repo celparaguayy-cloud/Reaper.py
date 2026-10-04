@@ -37,7 +37,7 @@ necesario, editar, verificar con herramientas reales y reportar.
 - Antes de terminar, corré validate y, si hay tests, run_tests.""",
         LECTURA + ESCRITURA + VERIFICACION + ARCHIVOS
         + ("execute_command", "run_python", "view_diff", "update_todo", "project_map", "save_note", "learn_lesson",
-           "write_large_file", "delegate", "ask_user", "attempt_completion"),
+           "write_large_file", "fetch_url", "rename_symbol", "delegate", "ask_user", "attempt_completion"),
         0.2,
         puede_delegar=True,
     ),
@@ -51,7 +51,7 @@ Tu attempt_completion es un INFORME para otro agente que no vio nada. Incluí:
 3. Convenciones del proyecto (estilo, framework, cómo se testea, cómo se ejecuta).
 4. Riesgos o dudas.
 No escribas código nuevo largo.""",
-        LECTURA + ("project_map", "attempt_completion"),
+        LECTURA + ("project_map", "fetch_url", "attempt_completion"),
         0.2,
         solo_lectura=True,
     ),
@@ -112,7 +112,7 @@ devuelve cada edición y corregí errores → run_tests → attempt_completion.
 No toques archivos fuera de la tarea salvo que sea imprescindible (y decilo en el informe).
 Informe final: archivos tocados, qué hiciste, cómo lo verificaste (resultados reales).""",
         LECTURA + ESCRITURA + VERIFICACION + ("execute_command", "run_python", "update_todo", "revert_file",
-                                              "write_large_file", "attempt_completion"),
+                                              "write_large_file", "rename_symbol", "attempt_completion"),
         0.15,
     ),
     "revisor": Rol(
@@ -148,7 +148,7 @@ Si recibís un DIAGNÓSTICO DE UN EXPERTO, seguilo: ya analizó el error con má
 Después de corregir, ejecutá validate y run_tests para confirmar.
 Informe: causa raíz, cambio hecho y resultado real de la verificación.""",
         LECTURA + ESCRITURA + VERIFICACION + ("execute_command", "run_python", "revert_file", "learn_lesson",
-                                              "attempt_completion"),
+                                              "fetch_url", "attempt_completion"),
         0.15,
     ),
     "consultor": Rol(
@@ -240,7 +240,9 @@ def _entorno() -> str:
 
 
 def system_prompt(rol: Rol, ws: Workspace, max_llamadas: int = 4, arbol: bool = True,
-                  lecciones: str = "", extra: str = "") -> str:
+                  lecciones: str = "", extra: str = "", idioma: str = "es") -> str:
+    if idioma == "en":
+        return system_prompt_en(rol, ws, max_llamadas, arbol, lecciones, extra)
     partes = [
         BASE.replace("{max_llamadas}", str(max_llamadas)),
         f"\n# TU ROL: {rol.nombre.upper()}\n{rol.mision}",

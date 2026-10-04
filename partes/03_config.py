@@ -11,6 +11,8 @@ CONFIG_FILE = BASE_DIR / "config.json"
 ESTADO_FILE = BASE_DIR / "estado.json"
 LECCIONES_GLOBALES = BASE_DIR / "lecciones.md"
 HISTORIAL_FILE = BASE_DIR / "historial_repl.txt"
+COMANDOS_USUARIO_DIR = BASE_DIR / "comandos"
+HERRAMIENTAS_USUARIO_DIR = BASE_DIR / "herramientas"
 ESTADISTICAS_FILE = BASE_DIR / "estadisticas.json"
 
 API_URL = os.getenv("REAPER_API_URL", "https://openrouter.ai/api/v1/chat/completions")
@@ -150,6 +152,13 @@ class Settings:
     git_snapshots: bool = True
     rama_git: str = "reaper/builds"
 
+    # --- v7: extensiones ------------------------------------------------
+    web: bool = True                 # herramienta fetch_url (leer documentación)
+    dominios_web: list = field(default_factory=list)  # vacío = cualquiera (con confirmación fuera de modo auto)
+    plugins: bool = True             # herramientas propias en ~/reaper/herramientas/*.py
+    hooks: bool = True               # comandos antes/después de herramientas (.reaper/config.json → "hooks")
+    idioma_prompts: str = "es"       # "en": instrucciones en inglés (respuestas en español)
+
     # --- v7: interfaz ---------------------------------------------------
     tema: str = "dragon"
     animacion: bool = True
@@ -222,6 +231,9 @@ class Settings:
             self.proveedor = "openrouter"
         if self.tema not in TEMAS:
             self.tema = "dragon"
+        if self.idioma_prompts not in ("es", "en"):
+            self.idioma_prompts = "es"
+        self.dominios_web = [str(d).strip().lower() for d in self.dominios_web if str(d).strip()]
         self.temperaturas = [max(0.0, min(2.0, float(t))) for t in self.temperaturas
                              if isinstance(t, (int, float)) and not isinstance(t, bool)] or [0.1, 0.4, 0.7]
         return self

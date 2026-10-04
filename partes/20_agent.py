@@ -177,7 +177,7 @@ class Agente:
             except OSError:
                 lecciones = ""
         prompt = system_prompt(self.rol, self.ws, self.settings.max_llamadas_turno,
-                               lecciones=lecciones, extra=self.extra_prompt)
+                               lecciones=lecciones, extra=self.extra_prompt, idioma=self.settings.idioma_prompts)
         if self.mensajes:
             self.mensajes[0] = {"role": "system", "content": prompt}
         else:
@@ -224,7 +224,7 @@ class Agente:
                 self.ctx.tropiezo("sin_herramienta")
                 if sin_herramienta > 2:
                     return self._cerrar(texto or "El agente no produjo un resultado.", paso, "sin_herramientas")
-                aviso = RECORDATORIO
+                aviso = RECORDATORIO_EN if self.settings.idioma_prompts == "en" else RECORDATORIO
                 if respuesta.finish_reason == "length":
                     aviso = ("Tu respuesta se cortó por longitud. Escribí menos por mensaje: "
                              "archivos largos en partes (write_to_file con partial=true + append_to_file).\n\n") + aviso

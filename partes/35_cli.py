@@ -38,6 +38,11 @@ COMANDOS_AYUDA = [
         ("/checkpoints", "historial de checkpoints"),
     ]),
     ("CÓDIGO", [
+        ("/explicar <archivo|símbolo>", "explicación en español de un archivo o una función"),
+        ("/testear <archivo>", "QA escribe tests para un archivo existente y los corre"),
+        ("/documentar <archivo>", "agrega docstrings sin cambiar el comportamiento"),
+        ("/renombrar <viejo> <nuevo>", "renombra un símbolo en todo el proyecto (sin modelo, validado)"),
+        ("/web <url> [palabras]", "lee una página (documentación) como texto"),
         ("/simbolo <nombre>", "muestra una función o clase (Clase.metodo)"),
         ("/referencias <nombre>", "dónde se usa un nombre"),
         ("/mapa <tema>", "archivos más relevantes para un tema"),
@@ -47,6 +52,8 @@ COMANDOS_AYUDA = [
         ("/lecciones [general|borrar N|agregar …]", "lecciones aprendidas entre sesiones"),
         ("/notas", "notas que dejaron los agentes en .reaper/notas.md"),
         ("/git [log|estado|diff|snapshot|init]", "builds verificadas guardadas en la rama reaper/builds"),
+        ("/commit [mensaje]", "commit de tus cambios con mensaje escrito por el modelo"),
+        ("/sesiones · /estadisticas", "sesiones guardadas · uso y tasas de éxito por día"),
         ("/historial · /exportar [ruta]", "pedidos de la sesión · exportar la conversación a Markdown"),
     ]),
     ("AJUSTES", [
@@ -58,6 +65,12 @@ COMANDOS_AYUDA = [
         ("/uso · /contexto · /compactar · /estado", "consumo, contexto del agente, estado general"),
         ("/doctor · /instalar · /dragon · /evaluar", "diagnóstico, comando `reaper`, el dragón, benchmark"),
         ("/todo · /reset · /salir", "lista de tareas, reiniciar conversación, salir"),
+    ]),
+    ("EXTENSIONES", [
+        ("/comandos [ejemplos]", "tus comandos propios (~/reaper/comandos/*.md con $ARGUMENTOS)"),
+        ("/plugins [ejemplo]", "herramientas propias en ~/reaper/herramientas/*.py"),
+        ("/hooks", "comandos que corren antes/después de herramientas (.reaper/config.json)"),
+        ("/deps", "instala las dependencias del proyecto (pip, npm, go...)"),
     ]),
 ]
 
@@ -108,6 +121,7 @@ class App:
         self.escalador = Escalador(llm, settings, ui)
         self.memoria = self._nueva_memoria()
         self.principal = self._nuevo_principal()
+        self.estadisticas = Estadisticas()
         if persistir:
             self._cargar_sesion()
 
@@ -216,7 +230,11 @@ class App:
                 f"\n  {len(res.cambios)} archivo(s) cambiados: {', '.join(res.cambios[:8])}"
                 f"{' ...' if len(res.cambios) > 8 else ''} · /diff · /deshacer"
             )
-        detalle = [formatear_duracion(time.monotonic() - inicio), f"{res.pasos} pasos"]
+        duracion = time.monotonic() - inicio
+        self.estadisticas.registrar(pedidos=1, pedidos_ok=int(res.ok), segundos=round(duracion, 1),
+                                    escaladas=int(res.escalado))
+        self.estadisticas.registrar_uso(self.llm.uso, self.settings.modelo)
+        detalle = [formatear_duracion(duracion), f"{res.pasos} pasos"]
         if res.escalado:
             detalle.append("con escalada")
         self.ui.tenue("  " + " · ".join(detalle))
@@ -229,6 +247,14 @@ class App:
         self._pedido_actual = pedido
         informe = Orquestador(self.llm, self.ws, self.settings, self.ui).construir(pedido, confirmar)
         self.historial.append((datetime.now().strftime("%H:%M"), f"/construir {pedido[:180]}", informe.ok))
+        if informe.estado != "cancelada":
+            self.estadisticas.registrar(
+                builds=1, builds_ok=int(informe.ok), escaladas=informe.escaladas, lecciones=len(informe.lecciones),
+                torneos=sum(1 for _, modo, _g in informe.torneos if modo == "torneo"), segundos=round(informe.segundos, 1))
+            self.estadisticas.registrar_uso(self.llm.uso, self.settings.modelo)
+            if self.settings.hooks:
+                for r in ejecutar_hooks(self.ws, "despues_de_build", {"estado": informe.estado, "pedido": pedido[:200]}):
+                    (self.ui.tenue if r.ok else self.ui.aviso)(f"  hook: {r.comando} → {'ok' if r.ok else 'falló'}")
         return informe.ok
 
     # ------------------------------------------------------------ comandos
@@ -250,6 +276,9 @@ class App:
         nombre = alias.get(cmd, cmd[1:]).replace("-", "_")
         metodo = getattr(self, "cmd_" + nombre, None)
         if metodo is None:
+            propio = comandos_usuario(self.ws).get(cmd[1:])
+            if propio is not None:
+                return self.ejecutar_comando_usuario(propio, arg)
             parecidos = difflib.get_close_matches(cmd[1:], [n[4:] for n in dir(self) if n.startswith("cmd_")], n=2)
             sugerencia = f" ¿Quisiste decir /{parecidos[0].replace('_', '-')}?" if parecidos else ""
             self.ui.error(f"Comando desconocido: {cmd}.{sugerencia} (probá /ayuda)")
@@ -257,7 +286,19 @@ class App:
         return metodo(arg)
 
     def nombres_comandos(self) -> list[str]:
-        return sorted("/" + n[4:].replace("_", "-") for n in dir(self) if n.startswith("cmd_"))
+        propios = ["/" + n for n in comandos_usuario(self.ws)]
+        return sorted({"/" + n[4:].replace("_", "-") for n in dir(self) if n.startswith("cmd_")} | set(propios))
+
+    def ejecutar_comando_usuario(self, comando: "ComandoUsuario", argumentos: str) -> None:
+        pedido = comando.expandir(argumentos)
+        self.ui.tenue(f"  /{comando.nombre}: {recortar(pedido, 160)}")
+        modo = (comando.modo or "agente").strip().lower()
+        if modo == "construir":
+            self.construir(pedido)
+        elif modo.startswith("rol:"):
+            self.cmd_agente(f"{modo[4:].strip()} {pedido}")
+        else:
+            self.turno(pedido)
 
     def cmd_ayuda(self, arg: str) -> None:
         self.ui.linea(texto_ayuda())
@@ -1006,6 +1047,9 @@ class App:
     def repl(self, animar: bool = True) -> int:
         self._configurar_readline()
         self.mostrar_inicio(animar)
+        if self.settings.hooks:
+            for r in ejecutar_hooks(self.ws, "al_iniciar", {"proyecto": str(self.ws.raiz)}):
+                (self.ui.tenue if r.ok else self.ui.aviso)(f"  hook al_iniciar: {r.comando} → {'ok' if r.ok else r.salida[-200:]}")
         while True:
             try:
                 entrada = self._leer_entrada()

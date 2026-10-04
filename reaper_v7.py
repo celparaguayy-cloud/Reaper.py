@@ -1417,6 +1417,8 @@ CONFIG_FILE = BASE_DIR / "config.json"
 ESTADO_FILE = BASE_DIR / "estado.json"
 LECCIONES_GLOBALES = BASE_DIR / "lecciones.md"
 HISTORIAL_FILE = BASE_DIR / "historial_repl.txt"
+COMANDOS_USUARIO_DIR = BASE_DIR / "comandos"
+HERRAMIENTAS_USUARIO_DIR = BASE_DIR / "herramientas"
 ESTADISTICAS_FILE = BASE_DIR / "estadisticas.json"
 
 API_URL = os.getenv("REAPER_API_URL", "https://openrouter.ai/api/v1/chat/completions")
@@ -1556,6 +1558,13 @@ class Settings:
     git_snapshots: bool = True
     rama_git: str = "reaper/builds"
 
+    # --- v7: extensiones ------------------------------------------------
+    web: bool = True                 # herramienta fetch_url (leer documentación)
+    dominios_web: list = field(default_factory=list)  # vacío = cualquiera (con confirmación fuera de modo auto)
+    plugins: bool = True             # herramientas propias en ~/reaper/herramientas/*.py
+    hooks: bool = True               # comandos antes/después de herramientas (.reaper/config.json → "hooks")
+    idioma_prompts: str = "es"       # "en": instrucciones en inglés (respuestas en español)
+
     # --- v7: interfaz ---------------------------------------------------
     tema: str = "dragon"
     animacion: bool = True
@@ -1628,6 +1637,9 @@ class Settings:
             self.proveedor = "openrouter"
         if self.tema not in TEMAS:
             self.tema = "dragon"
+        if self.idioma_prompts not in ("es", "en"):
+            self.idioma_prompts = "es"
+        self.dominios_web = [str(d).strip().lower() for d in self.dominios_web if str(d).strip()]
         self.temperaturas = [max(0.0, min(2.0, float(t))) for t in self.temperaturas
                              if isinstance(t, (int, float)) and not isinstance(t, bool)] or [0.1, 0.4, 0.7]
         return self
@@ -7342,6 +7354,9 @@ def _post_escritura(ctx: Contexto, rel: str, antes: Optional[str], despues: str,
         avisos = advertencias_python(despues)
         if avisos:
             texto += "\nAdvertencias:\n" + "\n".join(f"- {a}" for a in avisos[:6])
+    extra_hooks = _hook_post_escritura(ctx, rel)
+    if extra_hooks:
+        texto += "\n" + extra_hooks
     return texto
 
 
@@ -7710,6 +7725,9 @@ def execute_command(ctx: Contexto, p: dict) -> str:
     patron = comando_bloqueado(comando)
     if patron:
         raise ErrorHerramienta(f"Comando bloqueado por seguridad (coincide con {patron}).")
+    motivo_hook = _hook_antes_de_comando(ctx, comando)
+    if motivo_hook:
+        raise ErrorHerramienta(f"Comando bloqueado: {motivo_hook}.")
     if ctx.settings.modo != "auto" and not comando_seguro(comando):
         ctx.ui.aviso(f"  {ctx.etiqueta} quiere ejecutar: {comando}")
         if not ctx.ui.confirmar("  ¿Ejecutar?"):
@@ -8462,7 +8480,7 @@ necesario, editar, verificar con herramientas reales y reportar.
 - Antes de terminar, corré validate y, si hay tests, run_tests.""",
         LECTURA + ESCRITURA + VERIFICACION + ARCHIVOS
         + ("execute_command", "run_python", "view_diff", "update_todo", "project_map", "save_note", "learn_lesson",
-           "write_large_file", "delegate", "ask_user", "attempt_completion"),
+           "write_large_file", "fetch_url", "rename_symbol", "delegate", "ask_user", "attempt_completion"),
         0.2,
         puede_delegar=True,
     ),
@@ -8476,7 +8494,7 @@ Tu attempt_completion es un INFORME para otro agente que no vio nada. Incluí:
 3. Convenciones del proyecto (estilo, framework, cómo se testea, cómo se ejecuta).
 4. Riesgos o dudas.
 No escribas código nuevo largo.""",
-        LECTURA + ("project_map", "attempt_completion"),
+        LECTURA + ("project_map", "fetch_url", "attempt_completion"),
         0.2,
         solo_lectura=True,
     ),
@@ -8537,7 +8555,7 @@ devuelve cada edición y corregí errores → run_tests → attempt_completion.
 No toques archivos fuera de la tarea salvo que sea imprescindible (y decilo en el informe).
 Informe final: archivos tocados, qué hiciste, cómo lo verificaste (resultados reales).""",
         LECTURA + ESCRITURA + VERIFICACION + ("execute_command", "run_python", "update_todo", "revert_file",
-                                              "write_large_file", "attempt_completion"),
+                                              "write_large_file", "rename_symbol", "attempt_completion"),
         0.15,
     ),
     "revisor": Rol(
@@ -8573,7 +8591,7 @@ Si recibís un DIAGNÓSTICO DE UN EXPERTO, seguilo: ya analizó el error con má
 Después de corregir, ejecutá validate y run_tests para confirmar.
 Informe: causa raíz, cambio hecho y resultado real de la verificación.""",
         LECTURA + ESCRITURA + VERIFICACION + ("execute_command", "run_python", "revert_file", "learn_lesson",
-                                              "attempt_completion"),
+                                              "fetch_url", "attempt_completion"),
         0.15,
     ),
     "consultor": Rol(
@@ -8665,7 +8683,9 @@ def _entorno() -> str:
 
 
 def system_prompt(rol: Rol, ws: Workspace, max_llamadas: int = 4, arbol: bool = True,
-                  lecciones: str = "", extra: str = "") -> str:
+                  lecciones: str = "", extra: str = "", idioma: str = "es") -> str:
+    if idioma == "en":
+        return system_prompt_en(rol, ws, max_llamadas, arbol, lecciones, extra)
     partes = [
         BASE.replace("{max_llamadas}", str(max_llamadas)),
         f"\n# TU ROL: {rol.nombre.upper()}\n{rol.mision}",
@@ -8871,7 +8891,7 @@ class Agente:
             except OSError:
                 lecciones = ""
         prompt = system_prompt(self.rol, self.ws, self.settings.max_llamadas_turno,
-                               lecciones=lecciones, extra=self.extra_prompt)
+                               lecciones=lecciones, extra=self.extra_prompt, idioma=self.settings.idioma_prompts)
         if self.mensajes:
             self.mensajes[0] = {"role": "system", "content": prompt}
         else:
@@ -8918,7 +8938,7 @@ class Agente:
                 self.ctx.tropiezo("sin_herramienta")
                 if sin_herramienta > 2:
                     return self._cerrar(texto or "El agente no produjo un resultado.", paso, "sin_herramientas")
-                aviso = RECORDATORIO
+                aviso = RECORDATORIO_EN if self.settings.idioma_prompts == "en" else RECORDATORIO
                 if respuesta.finish_reason == "length":
                     aviso = ("Tu respuesta se cortó por longitud. Escribí menos por mensaje: "
                              "archivos largos en partes (write_to_file con partial=true + append_to_file).\n\n") + aviso
@@ -15340,6 +15360,11 @@ COMANDOS_AYUDA = [
         ("/checkpoints", "historial de checkpoints"),
     ]),
     ("CÓDIGO", [
+        ("/explicar <archivo|símbolo>", "explicación en español de un archivo o una función"),
+        ("/testear <archivo>", "QA escribe tests para un archivo existente y los corre"),
+        ("/documentar <archivo>", "agrega docstrings sin cambiar el comportamiento"),
+        ("/renombrar <viejo> <nuevo>", "renombra un símbolo en todo el proyecto (sin modelo, validado)"),
+        ("/web <url> [palabras]", "lee una página (documentación) como texto"),
         ("/simbolo <nombre>", "muestra una función o clase (Clase.metodo)"),
         ("/referencias <nombre>", "dónde se usa un nombre"),
         ("/mapa <tema>", "archivos más relevantes para un tema"),
@@ -15349,6 +15374,8 @@ COMANDOS_AYUDA = [
         ("/lecciones [general|borrar N|agregar …]", "lecciones aprendidas entre sesiones"),
         ("/notas", "notas que dejaron los agentes en .reaper/notas.md"),
         ("/git [log|estado|diff|snapshot|init]", "builds verificadas guardadas en la rama reaper/builds"),
+        ("/commit [mensaje]", "commit de tus cambios con mensaje escrito por el modelo"),
+        ("/sesiones · /estadisticas", "sesiones guardadas · uso y tasas de éxito por día"),
         ("/historial · /exportar [ruta]", "pedidos de la sesión · exportar la conversación a Markdown"),
     ]),
     ("AJUSTES", [
@@ -15360,6 +15387,12 @@ COMANDOS_AYUDA = [
         ("/uso · /contexto · /compactar · /estado", "consumo, contexto del agente, estado general"),
         ("/doctor · /instalar · /dragon · /evaluar", "diagnóstico, comando `reaper`, el dragón, benchmark"),
         ("/todo · /reset · /salir", "lista de tareas, reiniciar conversación, salir"),
+    ]),
+    ("EXTENSIONES", [
+        ("/comandos [ejemplos]", "tus comandos propios (~/reaper/comandos/*.md con $ARGUMENTOS)"),
+        ("/plugins [ejemplo]", "herramientas propias en ~/reaper/herramientas/*.py"),
+        ("/hooks", "comandos que corren antes/después de herramientas (.reaper/config.json)"),
+        ("/deps", "instala las dependencias del proyecto (pip, npm, go...)"),
     ]),
 ]
 
@@ -15410,6 +15443,7 @@ class App:
         self.escalador = Escalador(llm, settings, ui)
         self.memoria = self._nueva_memoria()
         self.principal = self._nuevo_principal()
+        self.estadisticas = Estadisticas()
         if persistir:
             self._cargar_sesion()
 
@@ -15518,7 +15552,11 @@ class App:
                 f"\n  {len(res.cambios)} archivo(s) cambiados: {', '.join(res.cambios[:8])}"
                 f"{' ...' if len(res.cambios) > 8 else ''} · /diff · /deshacer"
             )
-        detalle = [formatear_duracion(time.monotonic() - inicio), f"{res.pasos} pasos"]
+        duracion = time.monotonic() - inicio
+        self.estadisticas.registrar(pedidos=1, pedidos_ok=int(res.ok), segundos=round(duracion, 1),
+                                    escaladas=int(res.escalado))
+        self.estadisticas.registrar_uso(self.llm.uso, self.settings.modelo)
+        detalle = [formatear_duracion(duracion), f"{res.pasos} pasos"]
         if res.escalado:
             detalle.append("con escalada")
         self.ui.tenue("  " + " · ".join(detalle))
@@ -15531,6 +15569,14 @@ class App:
         self._pedido_actual = pedido
         informe = Orquestador(self.llm, self.ws, self.settings, self.ui).construir(pedido, confirmar)
         self.historial.append((datetime.now().strftime("%H:%M"), f"/construir {pedido[:180]}", informe.ok))
+        if informe.estado != "cancelada":
+            self.estadisticas.registrar(
+                builds=1, builds_ok=int(informe.ok), escaladas=informe.escaladas, lecciones=len(informe.lecciones),
+                torneos=sum(1 for _, modo, _g in informe.torneos if modo == "torneo"), segundos=round(informe.segundos, 1))
+            self.estadisticas.registrar_uso(self.llm.uso, self.settings.modelo)
+            if self.settings.hooks:
+                for r in ejecutar_hooks(self.ws, "despues_de_build", {"estado": informe.estado, "pedido": pedido[:200]}):
+                    (self.ui.tenue if r.ok else self.ui.aviso)(f"  hook: {r.comando} → {'ok' if r.ok else 'falló'}")
         return informe.ok
 
     # ------------------------------------------------------------ comandos
@@ -15552,6 +15598,9 @@ class App:
         nombre = alias.get(cmd, cmd[1:]).replace("-", "_")
         metodo = getattr(self, "cmd_" + nombre, None)
         if metodo is None:
+            propio = comandos_usuario(self.ws).get(cmd[1:])
+            if propio is not None:
+                return self.ejecutar_comando_usuario(propio, arg)
             parecidos = difflib.get_close_matches(cmd[1:], [n[4:] for n in dir(self) if n.startswith("cmd_")], n=2)
             sugerencia = f" ¿Quisiste decir /{parecidos[0].replace('_', '-')}?" if parecidos else ""
             self.ui.error(f"Comando desconocido: {cmd}.{sugerencia} (probá /ayuda)")
@@ -15559,7 +15608,19 @@ class App:
         return metodo(arg)
 
     def nombres_comandos(self) -> list[str]:
-        return sorted("/" + n[4:].replace("_", "-") for n in dir(self) if n.startswith("cmd_"))
+        propios = ["/" + n for n in comandos_usuario(self.ws)]
+        return sorted({"/" + n[4:].replace("_", "-") for n in dir(self) if n.startswith("cmd_")} | set(propios))
+
+    def ejecutar_comando_usuario(self, comando: "ComandoUsuario", argumentos: str) -> None:
+        pedido = comando.expandir(argumentos)
+        self.ui.tenue(f"  /{comando.nombre}: {recortar(pedido, 160)}")
+        modo = (comando.modo or "agente").strip().lower()
+        if modo == "construir":
+            self.construir(pedido)
+        elif modo.startswith("rol:"):
+            self.cmd_agente(f"{modo[4:].strip()} {pedido}")
+        else:
+            self.turno(pedido)
 
     def cmd_ayuda(self, arg: str) -> None:
         self.ui.linea(texto_ayuda())
@@ -16308,6 +16369,9 @@ class App:
     def repl(self, animar: bool = True) -> int:
         self._configurar_readline()
         self.mostrar_inicio(animar)
+        if self.settings.hooks:
+            for r in ejecutar_hooks(self.ws, "al_iniciar", {"proyecto": str(self.ws.raiz)}):
+                (self.ui.tenue if r.ok else self.ui.aviso)(f"  hook al_iniciar: {r.comando} → {'ok' if r.ok else r.salida[-200:]}")
         while True:
             try:
                 entrada = self._leer_entrada()
@@ -16483,7 +16547,7 @@ Filtrar: REAPER_AUTOTEST=parser python3 reaper_v7.py --autotest
 
 _RUTAS_GLOBALES = ("BASE_DIR", "PROJECTS_DIR", "CHECKPOINTS_DIR", "SESIONES_DIR", "LOGS_DIR", "CACHE_DIR",
                    "PLANTILLAS_USUARIO_DIR", "CONFIG_FILE", "ESTADO_FILE", "LECCIONES_GLOBALES", "HISTORIAL_FILE",
-                   "ESTADISTICAS_FILE")
+                   "ESTADISTICAS_FILE", "COMANDOS_USUARIO_DIR", "HERRAMIENTAS_USUARIO_DIR")
 
 
 class entorno_aislado:
@@ -16509,6 +16573,8 @@ class entorno_aislado:
             "LECCIONES_GLOBALES": self.base / "lecciones.md",
             "HISTORIAL_FILE": self.base / "historial_repl.txt",
             "ESTADISTICAS_FILE": self.base / "estadisticas.json",
+            "COMANDOS_USUARIO_DIR": self.base / "comandos",
+            "HERRAMIENTAS_USUARIO_DIR": self.base / "herramientas",
         }
         for nombre in _RUTAS_GLOBALES:
             self._previas[nombre] = g[nombre]
@@ -18639,6 +18705,314 @@ class TestPlantillas(BaseTest):
 
 
 # ======================================================================
+# MÓDULO: autotest_extensiones
+# ======================================================================
+"""Autotest: fetch_url, comandos propios, plugins, hooks, renombrado, prompts en inglés, estadísticas y comandos extra."""
+
+import http.server as _http_server
+
+
+class _ServidorDePrueba:
+    """Servidor HTTP local con páginas fijas, para probar fetch sin internet."""
+
+    PAGINAS = {
+        "/doc": ("text/html; charset=utf-8",
+                 "<html><head><title>Docs de prueba</title><style>x{}</style></head><body><nav>menú</nav>"
+                 "<h1>Guía</h1><p>Primer párrafo sin nada.</p><p>Usá <code>row_factory</code> para filas como dict.</p>"
+                 "<pre>con = sqlite3.connect('x.db')\ncon.row_factory = sqlite3.Row</pre>"
+                 "<ul><li>uno</li><li>dos</li></ul><a href='/otra'>otra página</a><script>no()</script></body></html>"),
+        "/api": ("application/json", '{"nombre": "reaper", "version": 7}'),
+        "/texto": ("text/plain", "línea uno\nlínea dos"),
+    }
+
+    def __enter__(self):
+        paginas = self.PAGINAS
+
+        class Manejador(_http_server.BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):
+                tipo, cuerpo = paginas.get(self.path, ("text/plain", "no existe"))
+                datos = cuerpo.encode("utf-8")
+                self.send_response(200 if self.path in paginas else 404)
+                self.send_header("Content-Type", tipo)
+                self.send_header("Content-Length", str(len(datos)))
+                self.end_headers()
+                self.wfile.write(datos)
+
+        self.servidor = _http_server.ThreadingHTTPServer(("127.0.0.1", 0), Manejador)
+        self.base = f"http://127.0.0.1:{self.servidor.server_address[1]}"
+        threading.Thread(target=self.servidor.serve_forever, daemon=True).start()
+        return self
+
+    def __exit__(self, *exc):
+        self.servidor.shutdown()
+        self.servidor.server_close()
+
+
+class TestWeb(BaseTest):
+    def test_html_a_texto(self):
+        titulo, texto = html_a_texto(_ServidorDePrueba.PAGINAS["/doc"][1], "https://x.org/")
+        self.assertEqual(titulo, "Docs de prueba")
+        self.assertIn("# Guía", texto)
+        self.assertIn("`row_factory`", texto)
+        self.assertIn("con.row_factory = sqlite3.Row", texto)
+        self.assertIn("- uno", texto)
+        self.assertNotIn("menú", texto)
+        self.assertNotIn("no()", texto)
+        self.assertIn("https://x.org/otra", texto)
+
+    def test_filtrar(self):
+        texto = "intro\n\nnada que ver\n\nusa row_factory acá\n\notro\n\nfinal"
+        filtrado = filtrar_relevante(texto, "row_factory", contexto=0)
+        self.assertIn("row_factory", filtrado)
+        self.assertNotIn("intro", filtrado)
+        self.assertIn("no encontré", filtrar_relevante(texto, "inexistente"))
+
+    def test_validar_url(self):
+        self.assertTrue(validar_url("https://docs.python.org/3/")[1])
+        self.assertFalse(validar_url("https://ejemplo.com/x")[1])
+        self.assertTrue(validar_url("https://ejemplo.com/x", ["ejemplo.com"])[1])
+        for mala in ("ftp://x", "http://localhost:8000", "http://192.168.0.1/", "https://x.com/?q=" + "a" * 400,
+                     "https://x.com/?k=sk-abcdefghijklmnopqrst", "no es url"):
+            with self.assertRaises(ValueError):
+                validar_url(mala)
+
+    def test_descargar_local(self):
+        with _ServidorDePrueba() as srv:
+            html = descargar_texto(srv.base + "/doc", usar_cache=False)
+            self.assertEqual((html["tipo"], html["titulo"]), ("html", "Docs de prueba"))
+            api = descargar_texto(srv.base + "/api", usar_cache=False)
+            self.assertEqual(api["tipo"], "json")
+            self.assertIn('"version": 7', api["texto"])
+            plano = descargar_texto(srv.base + "/texto")
+            self.assertEqual(plano["texto"], "línea uno\nlínea dos")
+            self.assertTrue(list((CACHE_DIR / "web").glob("*.json")))
+
+    def test_herramienta_rechaza_y_desactivada(self):
+        ctx = self.contexto(self.proyecto())
+        with self.assertRaises(ErrorHerramienta):
+            self.herramienta(ctx, "fetch_url", url="http://127.0.0.1:1/x")
+        ctx.settings.web = False
+        with self.assertRaises(ErrorHerramienta):
+            self.herramienta(ctx, "fetch_url", url="https://docs.python.org/3/")
+
+
+class TestComandosPropios(BaseTest):
+    def test_leer_y_expandir(self):
+        carpeta = COMANDOS_USUARIO_DIR
+        carpeta.mkdir(parents=True, exist_ok=True)
+        (carpeta / "revisar-seg.md").write_text("---\ndescripcion: seguridad\nmodo: rol:revisor\n---\nRevisá $ARGUMENTOS con cuidado ($1)\n",
+                                                encoding="utf-8")
+        (carpeta / "Nombre Invalido!.md").write_text("x", encoding="utf-8")
+        comandos = comandos_usuario()
+        self.assertEqual(list(comandos), ["revisar-seg"])
+        c = comandos["revisar-seg"]
+        self.assertEqual((c.descripcion, c.modo), ("seguridad", "rol:revisor"))
+        self.assertEqual(c.expandir("app.py utils.py"), "Revisá app.py utils.py con cuidado (app.py)")
+        sin_variable = ComandoUsuario("x", "Hacé tests.")
+        self.assertEqual(sin_variable.expandir("de calc.py"), "Hacé tests.\n\nde calc.py")
+
+    def test_proyecto_gana_y_ejemplos(self):
+        ws = self.proyecto({".reaper/comandos/hola.md": "Saludá a $ARGUMENTOS"})
+        crear_comandos_de_ejemplo()
+        comandos = comandos_usuario(ws)
+        self.assertIn("hola", comandos)
+        self.assertIn("seguridad", comandos)
+
+    def test_desde_la_app(self):
+        ws = self.proyecto({".reaper/comandos/saluda.md": "Decí hola a $ARGUMENTOS"})
+        app = App(self.ajustes(), MockLLM(["¡Hola Ana!"]), self.ui(), ws, persistir=False)
+        app.comando("/saluda Ana")
+        self.assertEqual(app.llm.llamadas[0]["mensajes"][1]["content"].split("\n")[0], "Decí hola a Ana")
+        self.assertIn("/saluda", app.nombres_comandos())
+
+
+class TestPlugins(BaseTest):
+    def test_cargar_registra_y_asigna_roles(self):
+        roles_previos = dict(ROLES)
+        registro_previo = dict(REGISTRO)
+        try:
+            HERRAMIENTAS_USUARIO_DIR.mkdir(parents=True, exist_ok=True)
+            (HERRAMIENTAS_USUARIO_DIR / "contar.py").write_text(EJEMPLO_PLUGIN, encoding="utf-8")
+            (HERRAMIENTAS_USUARIO_DIR / "roto.py").write_text("esto no es python (", encoding="utf-8")
+            cargados = cargar_plugins()
+            buenos = [p for p in cargados if not p.error]
+            self.assertEqual(buenos[0].herramientas, ["count_lines"])
+            self.assertTrue(any(p.error for p in cargados))
+            self.assertIn("count_lines", ROLES["principal"].herramientas)
+            self.assertIn("count_lines", ROLES["explorador"].herramientas)
+            ctx = self.contexto(self.proyecto({"a.py": "1\n2\n"}))
+            self.assertIn(".py: 2", self.herramienta(ctx, "count_lines"))
+        finally:
+            ROLES.clear()
+            ROLES.update(roles_previos)
+            REGISTRO.clear()
+            REGISTRO.update(registro_previo)
+            PLUGINS_CARGADOS.clear()
+
+
+class TestHooks(BaseTest):
+    def test_post_escritura_y_bloqueo(self):
+        ws = self.proyecto({".reaper/config.json": json.dumps({"hooks": {
+            "despues_de_escribir": ["echo '# formateado' >> {archivo}"],
+            "antes_de_comando": ["echo {comando} | grep -qv prohibido"],
+        }})})
+        ctx = self.contexto(ws)
+        salida = self.herramienta(ctx, "write_to_file", path="a.py", content="x = 1")
+        self.assertIn("un hook del proyecto modificó a.py", salida)
+        self.assertIn("# formateado", ws.leer("a.py"))
+        self.assertIn("permitido", self.herramienta(ctx, "execute_command", command="echo permitido"))
+        with self.assertRaises(ErrorHerramienta) as cm:
+            self.herramienta(ctx, "execute_command", command="echo prohibido")
+        self.assertIn("hook", str(cm.exception))
+
+    def test_eventos_y_desactivados(self):
+        ws = self.proyecto({".reaper/config.json": '{"hooks": {"despues_de_build": "echo {estado}"}}'})
+        resultados = ejecutar_hooks(ws, "despues_de_build", {"estado": "verificada"})
+        self.assertEqual(resultados[0].salida, "verificada")
+        with self.assertRaises(ValueError):
+            ejecutar_hooks(ws, "evento_raro")
+        ctx = self.contexto(ws, hooks=False)
+        self.assertEqual(_hook_post_escritura(ctx, "x"), "")
+
+
+class TestRenombrar(BaseTest):
+    def test_python_no_toca_strings_ni_comentarios(self):
+        texto = 'def total(x):\n    return x  # total sin cambiar\n\nprint(total(2), "total")\nobj.total = 1\n'
+        nuevo, n = renombrar_en_texto("a.py", texto, "total", "suma")
+        self.assertEqual(n, 3)
+        self.assertIn("def suma(x):", nuevo)
+        self.assertIn("# total sin cambiar", nuevo)
+        self.assertIn('"total"', nuevo)
+        self.assertIn("obj.suma = 1", nuevo)
+        self.assertNotIn("subtotal", renombrar_en_texto("b.py", "subtotal = total\n", "total", "suma")[0].replace("subtotal", "ok"))
+
+    def test_js(self):
+        texto = "const total = 1; // total\nconsole.log(`total ${total}`, 'total', subtotal, total);\n"
+        nuevo, n = renombrar_en_texto("a.js", texto, "total", "suma")
+        self.assertEqual(n, 2)
+        self.assertIn("const suma = 1; // total", nuevo)
+        self.assertIn("subtotal, suma)", nuevo)
+
+    def test_plan_y_aplicacion_en_proyecto(self):
+        ws = self.proyecto({"calc.py": "def calcular(x):\n    return x\n",
+                            "main.py": "from calc import calcular\nprint(calcular(1))\n",
+                            "notas.txt": "calcular a mano"})
+        plan = planificar_renombrado(ws, "calcular", "computar")
+        self.assertEqual(sorted(plan.cambios), ["calc.py", "main.py"])
+        self.assertEqual(plan.total, 3)
+        ws.checkpoints.iniciar("renombrar")
+        aplicar_renombrado(ws, plan)
+        self.assertIn("from calc import computar", ws.leer("main.py"))
+        self.assertEqual(ws.leer("notas.txt"), "calcular a mano")
+        for malo in (("1x", "y"), ("a", "a"), ("a", "class")):
+            with self.assertRaises(ValueError):
+                planificar_renombrado(ws, *malo)
+
+    def test_herramienta(self):
+        ws = self.proyecto({"m.py": "def vieja():\n    return 1\n\nvieja()\n"})
+        ctx = self.contexto(ws)
+        salida = self.herramienta(ctx, "rename_symbol", old="vieja", new="nueva")
+        self.assertIn("2 cambio(s)", salida)
+        self.assertIn("def nueva", ws.leer("m.py"))
+        self.assertIn("No encontré", self.herramienta(ctx, "rename_symbol", old="inexistente", new="x"))
+
+
+class TestIngles(BaseTest):
+    def test_prompt_en(self):
+        ws = self.proyecto()
+        prompt = system_prompt(ROLES["implementador"], ws, 4, idioma="en")
+        self.assertIn("You are REAPER", prompt)
+        self.assertIn("YOUR ROLE: IMPLEMENTADOR", prompt)
+        self.assertIn("Replaces a WHOLE function", prompt)
+        self.assertIn("# TU ROL: IMPLEMENTADOR", prompt)  # los guiones siguen encontrando el rol
+
+    def test_todo_traducido(self):
+        faltan_roles = [r for r in ROLES if r not in MISIONES_EN]
+        self.assertEqual(faltan_roles, [])
+        faltan_docs = [h for h in REGISTRO if h not in DOCS_EN and not h.startswith("count_")]
+        self.assertEqual(faltan_docs, [])
+
+    def test_agente_en_ingles(self):
+        llm = MockLLM(["Respuesta en español."])
+        Agente("principal", llm, self.proyecto(), self.ajustes(idioma_prompts="en"), self.ui(), memoria=None).ejecutar("hola")
+        self.assertIn("You are REAPER", llm.llamadas[0]["mensajes"][0]["content"])
+
+
+class TestEstadisticas(BaseTest):
+    def test_registrar_y_totales(self):
+        est = Estadisticas(self.dir / "est.json")
+        est.registrar(pedidos=1, pedidos_ok=1, segundos=2.5)
+        est.registrar(builds=1, builds_ok=0, torneos=2, modelo="venice")
+        uso = Uso(llamadas=3, tokens_entrada=100, tokens_salida=50, costo=0.01)
+        est.registrar_uso(uso, "venice")
+        est.registrar_uso(uso, "venice")  # sin cambios: no suma dos veces
+        t = est.totales()
+        self.assertEqual((t["pedidos"], t["builds"], t["torneos"], t["llamadas"], t["tokens_entrada"]), (1, 1, 2, 3, 100))
+        self.assertAlmostEqual(t["costo"], 0.01)
+        self.assertEqual(len(est.dias()), 1)
+        ui = self.ui()
+        mostrar_estadisticas(ui, est)
+        self.assertIn("TOTALES", ui.texto_registrado())
+        self.assertEqual(tasa(1, 4), "25%")
+
+
+class TestComandosExtra(BaseTest):
+    def app(self, guion=None, archivos=None, respuestas=None) -> App:
+        ws = self.proyecto(archivos or {"calc.py": "def suma(a, b):\n    return a + b\n"})
+        return App(self.ajustes(), MockLLM(guion or []), self.ui(respuestas=respuestas), ws, persistir=False)
+
+    def test_explicar(self):
+        app = self.app(["**suma** devuelve a + b."])
+        app.comando("/explicar suma")
+        self.assertIn("devuelve a + b", app.ui.texto_registrado())
+        self.assertIn("def suma", app.llm.llamadas[0]["mensajes"][-1]["content"])
+        app.comando("/explicar no_existe_nada")
+        self.assertIn("No encontré", app.ui.texto_registrado())
+
+    def test_renombrar_desde_la_cli(self):
+        app = self.app(respuestas=["s"], archivos={"a.py": "def f():\n    return 1\n\nf()\n"})
+        app.comando("/renombrar f g")
+        self.assertIn("def g", app.ws.leer("a.py"))
+
+    def test_comandos_varios(self):
+        app = self.app()
+        for comando, esperado in (("/estadisticas", "estadísticas"), ("/sesiones", "No hay sesiones"),
+                                  ("/comandos", "No tenés comandos"), ("/plugins", "No hay plugins"),
+                                  ("/hooks", "Sin hooks"), ("/deps", "No encontré archivos de dependencias"),
+                                  ("/web ftp://x", "http"), ("/commit", "no es un repositorio")):
+            app.comando(comando)
+            self.assertIn(esperado, app.ui.texto_registrado(), comando)
+            app.ui.registro.clear()
+        app.comando("/comandos ejemplos")
+        app.comando("/comandos")
+        self.assertIn("/seguridad", app.ui.texto_registrado())
+        app.comando("/comandos nuevo mio")
+        self.assertTrue((app.ws.raiz / ".reaper" / "comandos" / "mio.md").exists())
+
+    def test_deps_detecta(self):
+        ws = self.proyecto({"requirements.txt": "requests\n", "package.json": "{}"})
+        origenes = [o for o, _ in comandos_de_dependencias(ws)]
+        self.assertEqual(origenes, ["requirements.txt", "package.json"])
+
+    def test_commit_con_mensaje_generado(self):
+        if not shutil.which("git"):
+            self.skipTest("git no está instalado")
+        app = self.app(["Agrega suma\n\n- suma dos números"], respuestas=["s"])
+        env = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+        os.environ.update(env)
+        try:
+            git(app.ws, "init", "-q")
+            app.comando("/commit")
+            self.assertIn("Agrega suma", git(app.ws, "log", "-1", "--pretty=%B").stdout)
+        finally:
+            for k in env:
+                os.environ.pop(k, None)
+
+
+# ======================================================================
 # MÓDULO: autotest_runner
 # ======================================================================
 """Ejecutor del autotest interno."""
@@ -18674,6 +19048,1421 @@ def correr_autotest(filtro: Optional[str] = None, verbosidad: Optional[int] = No
     print(f"{Tema.error}✗ {len(resultado.failures)} fallos y {len(resultado.errors)} errores de "
           f"{resultado.testsRun} tests ({duracion}){C.RESET}")
     return 1
+
+
+# ======================================================================
+# MÓDULO: web
+# ======================================================================
+"""
+fetch_url: leer documentación o una página web desde el agente.
+
+Un modelo de 24B no sabe todas las APIs. Con fetch_url puede leer la
+documentación oficial, un README o la respuesta a un error, convertida a
+texto limpio (sin HTML, scripts ni menús) y recortada a lo relevante.
+
+Seguridad:
+  - solo GET, máximo 2 MB, timeout 20 s, sin cookies
+  - fuera del modo auto pide confirmación (salvo dominios permitidos)
+  - rechaza URLs con datos sospechosos (claves, query strings enormes): un
+    texto malicioso no puede usar fetch_url para sacar información del proyecto
+  - caché de 1 hora para no repetir descargas
+"""
+
+_RE_URL_SOSPECHOSA = re.compile(r"(sk-[A-Za-z0-9_-]{10,}|gh[pousr]_[A-Za-z0-9]{10,}|AKIA[0-9A-Z]{12,}|[A-Za-z0-9+/=]{120,})")
+DOMINIOS_SEGUROS = ("docs.python.org", "developer.mozilla.org", "nodejs.org", "wiki.termux.com", "github.com",
+                    "raw.githubusercontent.com", "pypi.org", "stackoverflow.com", "go.dev", "doc.rust-lang.org",
+                    "en.wikipedia.org", "es.wikipedia.org", "readthedocs.io", "npmjs.com")
+
+
+from html.parser import HTMLParser as _HTMLParserBase
+
+
+class HTMLaTexto(_HTMLParserBase):
+    """Convierte HTML en texto tipo Markdown: títulos, listas, código y links."""
+
+    IGNORAR = {"script", "style", "noscript", "svg", "nav", "footer", "header", "form", "button", "iframe", "template"}
+    BLOQUES = {"p", "div", "section", "article", "main", "br", "tr", "table", "blockquote", "dd", "dt"}
+
+    def __init__(self, base: str = ""):
+        super().__init__(convert_charrefs=True)
+        self.base = base
+        self.partes: list[str] = []
+        self._ignorar = 0
+        self._pre = 0
+        self._link: Optional[str] = None
+        self._texto_link: list[str] = []
+        self.titulo = ""
+        self._en_titulo = False
+
+    def handle_starttag(self, tag, attrs):
+        if tag in self.IGNORAR:
+            self._ignorar += 1
+            return
+        if self._ignorar:
+            return
+        atributos = dict(attrs)
+        if tag == "title":
+            self._en_titulo = True
+        elif tag in ("h1", "h2", "h3", "h4"):
+            self.partes.append("\n\n" + "#" * int(tag[1]) + " ")
+        elif tag == "li":
+            self.partes.append("\n- ")
+        elif tag == "pre":
+            self._pre += 1
+            self.partes.append("\n```\n")
+        elif tag == "code" and not self._pre:
+            self.partes.append("`")
+        elif tag == "a" and atributos.get("href"):
+            self._link = urllib.parse.urljoin(self.base, atributos["href"])
+            self._texto_link = []
+        elif tag in self.BLOQUES:
+            self.partes.append("\n")
+
+    def handle_endtag(self, tag):
+        if tag in self.IGNORAR:
+            self._ignorar = max(0, self._ignorar - 1)
+            return
+        if self._ignorar:
+            return
+        if tag == "title":
+            self._en_titulo = False
+        elif tag == "pre":
+            self._pre = max(0, self._pre - 1)
+            self.partes.append("\n```\n")
+        elif tag == "code" and not self._pre:
+            self.partes.append("`")
+        elif tag == "a" and self._link is not None:
+            texto = "".join(self._texto_link).strip()
+            if texto and not self._link.startswith("javascript:") and len(texto) < 80:
+                self.partes.append(f" ({self._link})" if texto != self._link else "")
+            self._link = None
+        elif tag in ("h1", "h2", "h3", "h4") or tag in self.BLOQUES:
+            self.partes.append("\n")
+
+    def handle_data(self, data):
+        if self._ignorar:
+            return
+        if self._en_titulo:
+            self.titulo += data
+            return
+        if self._link is not None:
+            self._texto_link.append(data)
+        self.partes.append(data if self._pre else re.sub(r"\s+", " ", data))
+
+    def texto(self) -> str:
+        crudo = "".join(self.partes)
+        crudo = re.sub(r"[ \t]+\n", "\n", crudo)
+        crudo = re.sub(r"\n{3,}", "\n\n", crudo)
+        return crudo.strip()
+
+
+def html_a_texto(html: str, base: str = "") -> tuple[str, str]:
+    conversor = HTMLaTexto(base)
+    try:
+        conversor.feed(html)
+        conversor.close()
+    except (ValueError, AssertionError):
+        pass
+    return " ".join(conversor.titulo.split()), conversor.texto()
+
+
+def filtrar_relevante(texto: str, buscar: str, contexto: int = 1, maximo: int = 8000) -> str:
+    """Párrafos que contienen alguna palabra buscada (con sus vecinos)."""
+    palabras = [p for p in re.findall(r"[\w.-]{3,}", sin_tildes(buscar.lower()))]
+    if not palabras:
+        return recortar(texto, maximo)
+    parrafos = [p for p in re.split(r"\n\s*\n", texto) if p.strip()]
+    marcados = set()
+    for i, p in enumerate(parrafos):
+        bajo = sin_tildes(p.lower())
+        if any(palabra in bajo for palabra in palabras):
+            for j in range(max(0, i - contexto), min(len(parrafos), i + contexto + 1)):
+                marcados.add(j)
+    if not marcados:
+        return "(no encontré esas palabras; primeras partes de la página)\n" + recortar(texto, maximo)
+    seleccion, previo = [], -2
+    for i in sorted(marcados):
+        if i != previo + 1:
+            seleccion.append("[...]")
+        seleccion.append(parrafos[i])
+        previo = i
+    return recortar("\n\n".join(seleccion), maximo)
+
+
+def _ruta_cache(url: str) -> Path:
+    return CACHE_DIR / "web" / (hashlib.sha1(url.encode("utf-8")).hexdigest()[:20] + ".json")
+
+
+def descargar_texto(url: str, timeout: int = 20, maximo: int = 2_000_000, usar_cache: bool = True) -> dict:
+    """Descarga y convierte. Devuelve {url, titulo, tipo, texto}. Lanza ValueError/OSError."""
+    cache = _ruta_cache(url)
+    if usar_cache:
+        try:
+            datos = json.loads(cache.read_text(encoding="utf-8"))
+            if time.time() - datos.get("guardado", 0) < 3600:
+                return datos
+        except (OSError, ValueError):
+            pass
+    pedido = urllib.request.Request(url, headers={
+        "User-Agent": "Mozilla/5.0 (Linux; Android) REAPER/" + __version__,
+        "Accept": "text/html,application/json,text/plain;q=0.9,*/*;q=0.5",
+    })
+    with urllib.request.urlopen(pedido, timeout=timeout) as r:
+        crudo = r.read(maximo + 1)
+        if len(crudo) > maximo:
+            raise ValueError(f"la página supera {maximo // 1_000_000} MB")
+        tipo = (r.headers.get("Content-Type") or "").lower()
+        codificacion = r.headers.get_content_charset() or "utf-8"
+        final = r.geturl()
+    texto = crudo.decode(codificacion, errors="replace")
+    titulo = ""
+    if "json" in tipo or texto.lstrip()[:1] in "[{" and "html" not in tipo:
+        try:
+            texto = json.dumps(json.loads(texto), ensure_ascii=False, indent=2)
+            tipo = "json"
+        except ValueError:
+            pass
+    elif "html" in tipo or "<html" in texto[:2000].lower():
+        titulo, texto = html_a_texto(texto, final)
+        tipo = "html"
+    else:
+        tipo = "texto"
+    datos = {"url": final, "titulo": titulo, "tipo": tipo, "texto": texto, "guardado": time.time()}
+    try:
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        cache.write_text(json.dumps(datos, ensure_ascii=False), encoding="utf-8")
+    except OSError:
+        pass
+    return datos
+
+
+def validar_url(url: str, permitidos: Sequence[str] = ()) -> tuple[str, bool]:
+    """(url normalizada, es_de_confianza). Lanza ValueError si la URL no se debe pedir."""
+    url = (url or "").strip().strip("<>\"'")
+    partes = urllib.parse.urlparse(url)
+    if partes.scheme not in ("http", "https") or not partes.netloc:
+        raise ValueError("solo URLs http(s) completas, p. ej. https://docs.python.org/3/library/json.html")
+    host = (partes.hostname or "").lower()
+    if host in ("localhost", "127.0.0.1", "0.0.0.0") or host.endswith(".local") or re.match(r"^(10|192\.168|172\.(1[6-9]|2\d|3[01]))\.", host):
+        raise ValueError("no se piden direcciones locales o de la red interna con fetch_url (usá execute_command)")
+    if len(partes.query) > 300 or _RE_URL_SOSPECHOSA.search(url):
+        raise ValueError("la URL lleva datos sospechosos (claves o parámetros enormes): no la pido")
+    confiable = any(host == d or host.endswith("." + d) for d in (*DOMINIOS_SEGUROS, *permitidos))
+    return url, confiable
+
+
+@herramienta(
+    "fetch_url",
+    "Lee una página web (documentación oficial, README, una respuesta a un error) y devuelve su texto limpio. "
+    "Con 'buscar' devuelve solo los párrafos que contienen esas palabras. Solo GET; no envía datos del proyecto.",
+    [Param("url", "URL completa http(s)"),
+     Param("buscar", "palabras clave para quedarse con lo relevante (opcional)", requerido=False)],
+    "<fetch_url>\n<url>https://docs.python.org/3/library/sqlite3.html</url>\n<buscar>row_factory</buscar>\n</fetch_url>",
+)
+def fetch_url(ctx: Contexto, p: dict) -> str:
+    if not ctx.settings.web:
+        raise ErrorHerramienta("La lectura web está desactivada (/config web true).")
+    try:
+        url, confiable = validar_url(p["url"], ctx.settings.dominios_web)
+    except ValueError as e:
+        raise ErrorHerramienta(str(e))
+    if ctx.settings.modo != "auto" and not confiable:
+        ctx.ui.aviso(f"  {ctx.etiqueta} quiere leer: {url}")
+        if not ctx.ui.confirmar("  ¿Permitir?"):
+            raise ErrorHerramienta("El usuario no permitió leer esa URL. Seguí con lo que sabés.")
+    try:
+        datos = descargar_texto(url)
+    except urllib.error.HTTPError as e:
+        raise ErrorHerramienta(f"HTTP {e.code} al leer {url}")
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        raise ErrorHerramienta(f"No pude leer {url}: {e}")
+    texto = datos["texto"]
+    if p.get("buscar"):
+        texto = filtrar_relevante(texto, p["buscar"])
+    else:
+        texto = recortar(texto, 8000)
+    cabecera = f"{datos['url']}" + (f" — {datos['titulo']}" if datos.get("titulo") else "") + f" ({datos['tipo']})"
+    return redactar_secretos(f"{cabecera}\n\n{texto}")
+
+
+ALIAS_HERRAMIENTAS.update({"web": "fetch_url", "leer_web": "fetch_url", "browse": "fetch_url",
+                           "open_url": "fetch_url", "web_fetch": "fetch_url", "curl": "fetch_url"})
+
+
+# ======================================================================
+# MÓDULO: extensiones
+# ======================================================================
+"""
+Extensiones del usuario: comandos propios, plugins de herramientas y hooks.
+
+COMANDOS PROPIOS (como los custom commands de Claude Code)
+  Un archivo Markdown en ~/reaper/comandos/<nombre>.md (para todos los
+  proyectos) o en <proyecto>/.reaper/comandos/<nombre>.md (solo ese proyecto).
+  Se usa como /<nombre> argumentos. El texto es el pedido; $ARGUMENTOS (o
+  $ARGUMENTS) se reemplaza por lo que escribas después del comando, y $1, $2...
+  por cada palabra. Encabezado opcional:
+      ---
+      descripcion: revisa la seguridad de un archivo
+      modo: agente | construir | rol:revisor
+      ---
+      Revisá $ARGUMENTOS buscando inyecciones SQL y rutas sin validar...
+
+PLUGINS DE HERRAMIENTAS
+  ~/reaper/herramientas/<nombre>.py con funciones decoradas con @herramienta
+  (las mismas que usa REAPER) y una variable ROLES = ("principal", ...) con los
+  roles que pueden usarlas. Son tu código: corren con tus permisos.
+
+HOOKS (en <proyecto>/.reaper/config.json)
+      "hooks": {
+        "despues_de_escribir": ["black -q {archivo}"],
+        "antes_de_comando": ["echo {comando} | grep -qv 'npm publish'"],
+        "despues_de_build": ["termux-notification --title REAPER --content '{estado}'"]
+      }
+  Si un hook "antes_de_comando" termina con error, el comando se bloquea.
+"""
+
+
+@dataclass
+class ComandoUsuario:
+    nombre: str
+    texto: str
+    descripcion: str = ""
+    modo: str = "agente"
+    origen: str = ""
+
+    def expandir(self, argumentos: str) -> str:
+        palabras = shlex.split(argumentos) if argumentos.strip() else []
+        texto = self.texto.replace("$ARGUMENTOS", argumentos).replace("$ARGUMENTS", argumentos)
+        for i in range(9, 0, -1):
+            texto = texto.replace(f"${i}", palabras[i - 1] if i <= len(palabras) else "")
+        if argumentos and "$ARGUMENTOS" not in self.texto and "$ARGUMENTS" not in self.texto and "$1" not in self.texto:
+            texto += f"\n\n{argumentos}"
+        return texto.strip()
+
+
+_RE_FRONT = re.compile(r"\A---\s*\n(.*?)\n---\s*\n?", re.S)
+
+
+def leer_comando(ruta: Path) -> Optional[ComandoUsuario]:
+    try:
+        texto = ruta.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+    meta: dict[str, str] = {}
+    m = _RE_FRONT.match(texto)
+    if m:
+        for linea in m.group(1).splitlines():
+            if ":" in linea:
+                clave, valor = linea.split(":", 1)
+                meta[clave.strip().lower()] = valor.strip()
+        texto = texto[m.end():]
+    nombre = ruta.stem.lower().replace(" ", "-")
+    if not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", nombre):
+        return None
+    return ComandoUsuario(nombre, texto.strip(), meta.get("descripcion", meta.get("description", "")),
+                          meta.get("modo", meta.get("mode", "agente")), str(ruta))
+
+
+def comandos_usuario(ws: Optional[Workspace] = None) -> dict[str, ComandoUsuario]:
+    """Comandos globales y del proyecto (los del proyecto ganan si se llaman igual)."""
+    carpetas = [COMANDOS_USUARIO_DIR]
+    if ws is not None:
+        carpetas.append(ws.raiz / ".reaper" / "comandos")
+    salida: dict[str, ComandoUsuario] = {}
+    for carpeta in carpetas:
+        if not carpeta.is_dir():
+            continue
+        for ruta in sorted(carpeta.glob("*.md")):
+            comando = leer_comando(ruta)
+            if comando:
+                salida[comando.nombre] = comando
+    return salida
+
+
+EJEMPLO_COMANDO = """---
+descripcion: {descripcion}
+modo: agente
+---
+{texto}
+"""
+
+COMANDOS_DE_EJEMPLO = {
+    "seguridad": ("revisa un archivo buscando problemas de seguridad",
+                  "Revisá $ARGUMENTOS buscando problemas de seguridad reales: inyección SQL o de comandos, rutas sin "
+                  "validar, secretos en el código, deserialización insegura y manejo de errores que filtra datos. "
+                  "Para cada hallazgo: archivo:línea, riesgo concreto y arreglo. Si no hay nada grave, decilo."),
+    "docstrings": ("agrega docstrings sin cambiar el comportamiento",
+                   "Agregá docstrings claros en español a todas las funciones y clases públicas de $ARGUMENTOS que no "
+                   "tengan, sin cambiar el comportamiento. Después corré run_tests para confirmar que nada se rompió."),
+    "optimizar": ("busca cuellos de botella y los mejora",
+                  "Analizá $ARGUMENTOS buscando cuellos de botella de rendimiento (bucles cuadráticos, lecturas repetidas "
+                  "de disco, consultas dentro de bucles). Proponé y aplicá solo mejoras que no cambien el resultado, "
+                  "verificando con los tests."),
+}
+
+
+def crear_comandos_de_ejemplo(carpeta: Optional[Path] = None) -> list[Path]:
+    carpeta = carpeta or COMANDOS_USUARIO_DIR
+    carpeta.mkdir(parents=True, exist_ok=True)
+    creados = []
+    for nombre, (descripcion, texto) in COMANDOS_DE_EJEMPLO.items():
+        ruta = carpeta / f"{nombre}.md"
+        if not ruta.exists():
+            ruta.write_text(EJEMPLO_COMANDO.format(descripcion=descripcion, texto=texto), encoding="utf-8")
+            creados.append(ruta)
+    return creados
+
+
+# ======================================================================
+# PLUGINS
+# ======================================================================
+@dataclass
+class Plugin:
+    ruta: Path
+    herramientas: list
+    roles: tuple
+    error: str = ""
+
+
+PLUGINS_CARGADOS: list[Plugin] = []
+
+
+def agregar_herramienta_a_roles(nombre: str, roles: Iterable[str]) -> None:
+    for rol in roles:
+        actual = ROLES.get(rol)
+        if actual is None or nombre in actual.herramientas:
+            continue
+        ROLES[rol] = replace(actual, herramientas=actual.herramientas + (nombre,))
+
+
+def cargar_plugins(carpeta: Optional[Path] = None, ui: Optional[UI] = None) -> list[Plugin]:
+    """Ejecuta ~/reaper/herramientas/*.py y registra sus herramientas en los roles indicados."""
+    carpeta = carpeta or HERRAMIENTAS_USUARIO_DIR
+    cargados = []
+    if not carpeta.is_dir():
+        return cargados
+    for ruta in sorted(carpeta.glob("*.py")):
+        antes = set(REGISTRO)
+        espacio = {
+            "__name__": f"reaper_plugin_{ruta.stem}", "__file__": str(ruta),
+            "herramienta": herramienta, "Param": Param, "ErrorHerramienta": ErrorHerramienta,
+            "Contexto": Contexto, "ejecutar": ejecutar, "recortar": recortar, "Path": Path,
+            "json": json, "re": re, "os": os, "subprocess": subprocess,
+        }
+        try:
+            codigo = compile(ruta.read_text(encoding="utf-8"), str(ruta), "exec")
+            exec(codigo, espacio)
+        except Exception as e:  # un plugin roto no debe impedir que REAPER arranque
+            plugin = Plugin(ruta, [], (), f"{type(e).__name__}: {e}")
+            cargados.append(plugin)
+            if ui:
+                ui.aviso(f"  plugin {ruta.name} no cargó: {plugin.error}")
+            continue
+        nuevas = sorted(set(REGISTRO) - antes)
+        roles = tuple(espacio.get("ROLES") or ("principal",))
+        for nombre in nuevas:
+            agregar_herramienta_a_roles(nombre, roles)
+        cargados.append(Plugin(ruta, nuevas, roles))
+    PLUGINS_CARGADOS.extend(cargados)
+    return cargados
+
+
+EJEMPLO_PLUGIN = '''"""Plugin de ejemplo para REAPER: cuenta líneas de código por extensión."""
+
+ROLES = ("principal", "explorador")
+
+
+@herramienta(
+    "count_lines",
+    "Cuenta líneas de código por extensión en el proyecto.",
+    [Param("path", "carpeta (opcional)", requerido=False)],
+    "<count_lines>\\n<path>.</path>\\n</count_lines>",
+)
+def count_lines(ctx, p):
+    conteo = {}
+    for ruta in ctx.ws.iterar(p.get("path") or "."):
+        if ctx.ws.es_texto(ruta):
+            try:
+                n = len(ruta.read_text(encoding="utf-8", errors="replace").splitlines())
+            except OSError:
+                continue
+            conteo[ruta.suffix or ruta.name] = conteo.get(ruta.suffix or ruta.name, 0) + n
+    return "\\n".join(f"{ext}: {n}" for ext, n in sorted(conteo.items(), key=lambda kv: -kv[1])) or "sin archivos"
+'''
+
+
+# ======================================================================
+# HOOKS
+# ======================================================================
+EVENTOS_HOOK = ("despues_de_escribir", "antes_de_comando", "despues_de_comando", "despues_de_build", "al_iniciar")
+
+
+@dataclass
+class ResultadoHook:
+    evento: str
+    comando: str
+    ok: bool
+    salida: str
+
+
+def hooks_de(ws: Workspace, evento: str) -> list[str]:
+    hooks = ws.config_local().get("hooks")
+    if not isinstance(hooks, dict):
+        return []
+    comandos = hooks.get(evento) or []
+    if isinstance(comandos, str):
+        comandos = [comandos]
+    return [c for c in comandos if isinstance(c, str) and c.strip()]
+
+
+def ejecutar_hooks(ws: Workspace, evento: str, variables: Optional[dict] = None, timeout: int = 60) -> list[ResultadoHook]:
+    if evento not in EVENTOS_HOOK:
+        raise ValueError(f"evento de hook desconocido: {evento}")
+    resultados = []
+    for plantilla in hooks_de(ws, evento):
+        comando = plantilla
+        for clave, valor in (variables or {}).items():
+            comando = comando.replace("{" + clave + "}", shlex.quote(str(valor)))
+        r = ejecutar(comando, cwd=ws.raiz, timeout=timeout, shell=True)
+        resultados.append(ResultadoHook(evento, comando, r.ok, (r.stdout + r.stderr).strip()[-1500:]))
+    return resultados
+
+
+def _hook_post_escritura(ctx: Contexto, rel: str) -> str:
+    """Corre los hooks despues_de_escribir; devuelve texto para el agente si alguno falló o cambió algo."""
+    if not ctx.settings.hooks:
+        return ""
+    antes = ctx.ws.hash(rel)
+    resultados = ejecutar_hooks(ctx.ws, "despues_de_escribir", {"archivo": rel})
+    if not resultados:
+        return ""
+    partes = []
+    if ctx.ws.hash(rel) != antes:
+        partes.append(f"(un hook del proyecto modificó {rel}: releelo antes de volver a editarlo)")
+    for r in resultados:
+        if not r.ok:
+            partes.append(f"HOOK FALLÓ ({r.comando}):\n{r.salida}")
+    return "\n".join(partes)
+
+
+def _hook_antes_de_comando(ctx: Contexto, comando: str) -> Optional[str]:
+    """Devuelve el motivo si un hook bloquea el comando."""
+    if not ctx.settings.hooks:
+        return None
+    for r in ejecutar_hooks(ctx.ws, "antes_de_comando", {"comando": comando}):
+        if not r.ok:
+            return f"el hook '{r.comando}' bloqueó el comando" + (f": {r.salida[-300:]}" if r.salida else "")
+    return None
+
+
+# ======================================================================
+# MÓDULO: refactor
+# ======================================================================
+"""
+Refactor sin modelo: renombrar un símbolo en todo el proyecto.
+
+Renombrar una función usada en 12 archivos es justo el tipo de cambio en el
+que un modelo de 24B se olvida de alguno. REAPER lo hace de forma
+determinista:
+  - Python: con el tokenizador real (tokenize), solo cambia tokens NAME, nunca
+    texto dentro de strings ni comentarios.
+  - JS/TS y otros lenguajes con llaves: escáner que salta strings, template
+    literals y comentarios, y cambia identificadores completos.
+Después valida todos los archivos tocados; si alguno queda roto, no se aplica nada.
+"""
+
+import tokenize as _tokenize
+
+_RE_IDENT_VALIDO = re.compile(r"^[A-Za-z_$][\w$]*$")
+
+
+def _renombrar_python(texto: str, viejo: str, nuevo: str) -> tuple[str, int]:
+    lineas = texto.splitlines(keepends=True)
+    try:
+        tokens = list(_tokenize.generate_tokens(io.StringIO(texto).readline))
+    except (_tokenize.TokenError, IndentationError, SyntaxError):
+        return texto, -1
+    cambios = [(t.start, t.end) for t in tokens if t.type == _tokenize.NAME and t.string == viejo]
+    if not cambios:
+        return texto, 0
+    # Se aplica de atrás hacia adelante para no correr las posiciones.
+    for (fila, col), (_fila_fin, col_fin) in reversed(cambios):
+        linea = lineas[fila - 1]
+        lineas[fila - 1] = linea[:col] + nuevo + linea[col_fin:]
+    return "".join(lineas), len(cambios)
+
+
+def _renombrar_generico(texto: str, viejo: str, nuevo: str, comentario: str = "//") -> tuple[str, int]:
+    salida = []
+    i, n, cambios = 0, len(texto), 0
+    largo = len(viejo)
+    while i < n:
+        ch = texto[i]
+        if texto.startswith(comentario, i):
+            fin = texto.find("\n", i)
+            fin = n if fin < 0 else fin
+            salida.append(texto[i:fin])
+            i = fin
+            continue
+        if comentario == "//" and texto.startswith("/*", i):
+            fin = texto.find("*/", i + 2)
+            fin = n if fin < 0 else fin + 2
+            salida.append(texto[i:fin])
+            i = fin
+            continue
+        if ch in "\"'`":
+            j = i + 1
+            while j < n and texto[j] != ch:
+                if texto[j] == "\\":
+                    j += 1
+                elif texto[j] == "\n" and ch != "`":
+                    break
+                j += 1
+            salida.append(texto[i:j + 1])
+            i = j + 1
+            continue
+        if texto.startswith(viejo, i):
+            antes = texto[i - 1] if i > 0 else ""
+            despues = texto[i + largo] if i + largo < n else ""
+            if not (antes.isalnum() or antes in "_$") and not (despues.isalnum() or despues in "_$"):
+                salida.append(nuevo)
+                i += largo
+                cambios += 1
+                continue
+        salida.append(ch)
+        i += 1
+    return "".join(salida), cambios
+
+
+def renombrar_en_texto(rel: str, texto: str, viejo: str, nuevo: str) -> tuple[str, int]:
+    sufijo = Path(rel).suffix.lower()
+    if sufijo == ".py":
+        nuevo_texto, cambios = _renombrar_python(texto, viejo, nuevo)
+        if cambios >= 0:
+            return nuevo_texto, cambios
+        return _renombrar_generico(texto, viejo, nuevo, "#")
+    if sufijo in (".sh", ".bash", ".rb"):
+        return _renombrar_generico(texto, viejo, nuevo, "#")
+    if sufijo in LENGUAJES_LLAVES or sufijo in (".html", ".htm", ".vue", ".svelte"):
+        return _renombrar_generico(texto, viejo, nuevo, "//")
+    return texto, 0
+
+
+@dataclass
+class PlanRenombrado:
+    viejo: str
+    nuevo: str
+    cambios: dict = field(default_factory=dict)  # rel → (antes, despues, cantidad)
+    conflictos: list = field(default_factory=list)
+
+    @property
+    def total(self) -> int:
+        return sum(c for _, _, c in self.cambios.values())
+
+    def diff(self) -> str:
+        return "\n".join(diff_unificado(a, d, rel) for rel, (a, d, _c) in self.cambios.items())
+
+    def resumen(self) -> str:
+        filas = [f"  {rel}: {c} cambio(s)" for rel, (_a, _d, c) in sorted(self.cambios.items())]
+        return f"{self.viejo} → {self.nuevo}: {self.total} cambio(s) en {len(self.cambios)} archivo(s)\n" + "\n".join(filas)
+
+
+def planificar_renombrado(ws: Workspace, viejo: str, nuevo: str, archivos: Optional[Iterable[str]] = None) -> PlanRenombrado:
+    viejo, nuevo = viejo.strip(), nuevo.strip()
+    if not _RE_IDENT_VALIDO.match(viejo) or not _RE_IDENT_VALIDO.match(nuevo):
+        raise ValueError("los nombres deben ser identificadores válidos (letras, números y _)")
+    if viejo == nuevo:
+        raise ValueError("el nombre nuevo es igual al viejo")
+    if keyword.iskeyword(nuevo):
+        raise ValueError(f"'{nuevo}' es una palabra reservada de Python")
+    plan = PlanRenombrado(viejo, nuevo)
+    candidatos = list(archivos) if archivos else ws.archivos_codigo(limite=3000)
+    for rel in candidatos:
+        try:
+            texto = ws.leer(rel)
+        except (OSError, ValueError, ErrorRuta):
+            continue
+        if viejo not in texto:
+            continue
+        nuevo_texto, cantidad = renombrar_en_texto(rel, texto, viejo, nuevo)
+        if cantidad > 0:
+            if re.search(r"(?<![\w$])" + re.escape(nuevo) + r"(?![\w$])", texto):
+                plan.conflictos.append(f"{rel}: ya existe el nombre '{nuevo}'")
+            plan.cambios[rel] = (texto, nuevo_texto, cantidad)
+    return plan
+
+
+def aplicar_renombrado(ws: Workspace, plan: PlanRenombrado) -> list[Resultado]:
+    """Escribe todos los cambios; si la validación empeora, revierte todo y lanza ValueError."""
+    previos = {rel: fallos(validar_archivo(ws, rel)) for rel in plan.cambios}
+    for rel, (_antes, despues, _c) in plan.cambios.items():
+        ws.escribir(rel, despues)
+    resultados = validar_archivos(ws, list(plan.cambios))
+    nuevos_fallos = [r for r in fallos(resultados) if not any(p.comando == r.comando for p in previos.get(r.archivo, []))]
+    if nuevos_fallos:
+        for rel, (antes, _d, _c) in plan.cambios.items():
+            ws.escribir(rel, antes)
+        raise ValueError("el renombrado rompía la validación; no apliqué nada:\n" + resumen_validacion(nuevos_fallos, 1500))
+    indice_de(ws).invalidar()
+    return resultados
+
+
+@herramienta(
+    "rename_symbol",
+    "Renombra una función, clase, variable o método en TODO el proyecto (o en los archivos indicados) de forma "
+    "segura: no toca strings ni comentarios y valida todo al final. Mucho más confiable que editar archivo por archivo.",
+    [Param("old", "nombre actual"), Param("new", "nombre nuevo"),
+     Param("paths", "archivos separados por coma (opcional: por defecto todo el proyecto)", requerido=False)],
+    "<rename_symbol>\n<old>calcular_total</old>\n<new>total_con_iva</new>\n</rename_symbol>",
+    escribe=True,
+)
+def rename_symbol(ctx: Contexto, p: dict) -> str:
+    archivos = [a.strip() for a in re.split(r"[,\n]", p.get("paths") or "") if a.strip()] or None
+    try:
+        plan = planificar_renombrado(ctx.ws, p["old"], p["new"], archivos)
+    except ValueError as e:
+        raise ErrorHerramienta(str(e))
+    if not plan.cambios:
+        return f"No encontré usos de '{p['old']}' como identificador."
+    protegidos = [rel for rel in plan.cambios if rel in ctx.protegidos]
+    if protegidos:
+        raise ErrorHerramienta(f"El renombrado tocaría tests de la especificación ({', '.join(protegidos)}): no permitido.")
+    if ctx.settings.modo == "confirmar":
+        ctx.ui.aviso(f"  {ctx.etiqueta} quiere renombrar {plan.resumen()}")
+        ctx.ui.diff(plan.diff(), max_lineas=40)
+        if not ctx.ui.confirmar("  ¿Aplicar?"):
+            raise ErrorHerramienta("El usuario rechazó el renombrado.")
+    try:
+        resultados = aplicar_renombrado(ctx.ws, plan)
+    except ValueError as e:
+        raise ErrorHerramienta(str(e))
+    ctx.cambios.update(plan.cambios)
+    texto = plan.resumen()
+    if plan.conflictos:
+        texto += "\nOjo, el nombre nuevo ya existía en: " + "; ".join(plan.conflictos)
+    return texto + "\nValidación: " + resumen_validacion(resultados)
+
+
+ALIAS_HERRAMIENTAS.update({"rename": "rename_symbol", "renombrar": "rename_symbol", "refactor_rename": "rename_symbol"})
+ALIAS_PARAMS.update({"old": ("viejo", "old_name", "from_name", "actual"), "new": ("nuevo", "new_name", "to_name")})
+
+
+# ======================================================================
+# MÓDULO: ingles
+# ======================================================================
+"""
+Prompts en inglés (opcional): /config idioma_prompts en
+
+Muchos modelos chicos (incluido el linaje Mistral de Venice 24B) fueron
+entrenados mayormente en inglés y siguen mejor las instrucciones de formato en
+ese idioma. Con idioma_prompts = "en", el system prompt, las misiones de cada
+rol y la documentación de herramientas van en inglés; al usuario se le sigue
+respondiendo en español. Las salidas de las herramientas no cambian.
+"""
+
+BASE_EN = """You are REAPER, an autonomous coding agent. You work INSIDE a real workspace using tools:
+you really read, edit and run things. Always answer the user in SPANISH (Rioplatense is fine).
+
+PRINCIPLES
+1. Verify, don't assume: read before editing. Never invent files, APIs, packages, commands or results.
+2. Never claim something works or that a test passed unless you saw it in a real <resultado>.
+3. Minimal, precise changes; don't rewrite what already works.
+4. Handle errors explicitly (no `except: pass`).
+5. Termux/Android environment: no sudo, no systemd, no /usr/bin; prefer the standard library.
+6. Offensive security only on your own systems, labs, CTFs or with explicit authorization.
+
+HOW TO USE TOOLS
+- Write tool calls as XML tags exactly like the examples. You may write 1-3 sentences of reasoning first.
+- At most {max_llamadas} tools per message. Then STOP: REAPER runs them and replies with <resultado ...>.
+  NEVER write <resultado> yourself or invent its content.
+- Existing file: read it first (read_symbol for one function, read_file otherwise), then edit.
+  replace_in_file needs the SEARCH text copied EXACTLY (without the "  12| " line numbers).
+- New file: write_to_file with the COMPLETE content. "...", "rest unchanged" and similar are forbidden.
+- LONG FILES: never more than ~150 lines per message. First part with write_to_file + partial=true,
+  the rest with append_to_file (the last one with last=true). If your message gets cut, REAPER saves what
+  you wrote and asks you to continue.
+- Every edit returns the real validation (and trivial automatic fixes). If it says VALIDACIÓN FALLÓ,
+  fix that first.
+- When done, call attempt_completion with a concrete report (in Spanish).
+
+EXAMPLE
+Request: add a function resta to calc.py
+You:
+I'll read calc.py first.
+<read_file>
+<path>calc.py</path>
+</read_file>
+(REAPER replies with <resultado> and the file; only then you continue)
+You:
+<insert_after_symbol>
+<path>calc.py</path>
+<symbol>suma</symbol>
+<content>
+def resta(a, b):
+    return a - b
+</content>
+</insert_after_symbol>"""
+
+MISIONES_EN = {
+    "principal": """You are the MAIN AGENT. Solve the user's request end to end: understand, explore what is needed,
+edit, verify with real tools and report.
+- If the request is just a question that needs no file changes, answer directly in text, without tools.
+- For multi-step work, keep a list with update_todo.
+- REAPER already gives you the most likely relevant files: start there with read_symbol / read_file.
+- To understand a big project, delegate to 'explorador' subagents IN PARALLEL (several <delegate> in the same
+  message, each with a different question) so you don't fill your context reading whole files.
+- You can delegate a bounded part to an 'implementador' or ask a 'revisor' for a review.
+- Before finishing, run validate and, if there are tests, run_tests.""",
+    "explorador": """You are an EXPLORER (read-only). Investigate the code to answer the task, nothing else.
+Be efficient: project_map, search_files, code_outline and read_symbol before reading whole files.
+Your attempt_completion is a REPORT for another agent who saw nothing. Include:
+1. Relevant files with exact paths and what each one contains.
+2. Key functions/classes with line numbers and how they connect.
+3. Project conventions (style, framework, how to test, how to run).
+4. Risks or doubts.
+Don't write long new code.""",
+    "arquitecto": """You are the ARCHITECT (read-only). Turn the request into a plan of small, concrete, verifiable
+tasks ordered by dependency. Each task touches few files and can be done by an implementer who only reads that task.
+Check with tools what exists before planning changes on it.
+Define the public INTERFACE (files, functions/classes and exact signatures): tests are written from it BEFORE
+implementing, so it must be precise and importable.
+If a new file will be long (more than ~250 lines), split it into several modules or tasks.
+Your attempt_completion MUST contain the plan EXACTLY in this format:
+<plan>
+<objetivo>one sentence</objetivo>
+<interfaz>
+- path/module.py: def function(param: type) -> type  — what it returns
+- path/module.py: class Klass(args) with methods method(x) -> type
+</interfaz>
+<tarea id="1" archivos="path/a.py, path/b.py">What to do: functions, signatures, behavior, edge cases.</tarea>
+<tarea id="2" archivos="path/c.py">...</tarea>
+<criterios>
+- acceptance criterion checkable with a test (function, input → expected output)
+</criterios>
+</plan>""",
+    "especificador": """You are the SPECIFIER (QA before implementation). Write REAL automated tests that encode the
+plan's interface and acceptance criteria. The code does NOT exist yet (or lacks this feature): your tests MUST
+fail now and pass once someone implements the plan correctly.
+- Import exactly what the plan's INTERFACE says (same files, names and signatures).
+- Python: standard-library unittest in tests/test_<module>.py (or pytest if the project already uses it).
+- JavaScript: node:test in tests/<module>.test.mjs (or the existing runner).
+- One test per criterion, with concrete values (input → expected output) and edge cases. Deterministic,
+  no network, no input(), fast; temporary files with tempfile.
+- Do NOT implement the application code (you may only write test files).
+- Run run_tests: they must fail because of ImportError/AttributeError/assert (missing implementation), NEVER
+  because of a syntax error or a bug in the test itself. If a test is broken, fix it.
+Final report: test files, what each test checks and the real run_tests output.""",
+    "implementador": """You are the IMPLEMENTER. Implement ONLY the assigned task with real, complete, working code.
+Flow: read the involved files (read_symbol for specific functions) → edit → check the validation each edit
+returns and fix errors → run_tests → attempt_completion.
+- Existing file: replace_symbol to rewrite a whole function; replace_in_file for small changes;
+  insert_after_symbol to add new functions or methods.
+- New file: write_to_file. If it will have more than ~150 lines, write it IN PARTS: write_to_file with
+  partial=true and the first part, then append_to_file with the rest (the last one with last=true).
+  For a VERY large Python/JS file (more than ~300 lines) use write_large_file with a detailed spec.
+- If there are specification tests, they are the goal: make them pass WITHOUT modifying them.
+Don't touch files outside the task unless essential (and say so in the report).
+Final report: files touched, what you did, how you verified it (real results).""",
+    "revisor": """You are the senior REVIEWER (read-only). Review the changes against the task: logic bugs, imports,
+paths, error handling, edge cases, state, file safety, Termux compatibility and consistency between files.
+Confirm by reading the real code; don't invent problems or ask for style changes.
+Your attempt_completion MUST start with ONE of these lines:
+VEREDICTO: APROBADO
+VEREDICTO: CAMBIOS
+If it's CAMBIOS, continue with a numbered list: file, concrete problem, exact fix.""",
+    "qa": """You are QA. Write REAL automated tests that verify the acceptance criteria and run them.
+- Python: standard-library unittest in tests/test_<module>.py (unless the project already uses pytest).
+- JavaScript: the existing runner or node:test in tests/<module>.test.mjs.
+- Deterministic, no network, no input(), fast tests; use temporary files (tempfile) if needed.
+Run them with run_tests. If it fails because the TEST is wrong, fix the test. If it fails because the CODE has a
+bug, DON'T touch the code or weaken the test: describe it in the report with the real error.""",
+    "reparador": """You are the FIXER. You receive REAL diagnostics from validators and tests. Read the code, find the
+root cause and fix it with the minimal change. Never delete, skip or weaken tests to make them pass.
+If you receive an EXPERT DIAGNOSIS (DIAGNÓSTICO DE UN EXPERTO), follow it: a stronger model already analyzed the error.
+After fixing, run validate and run_tests to confirm.
+Report: root cause, change made and real verification result.""",
+    "consultor": """You are the EXPERT CONSULTANT (read-only). A smaller model tried several times to solve a task and
+the real verification keeps failing. Your job is NOT to edit: diagnose precisely so the other model can apply the
+fix without thinking.
+Read the real error and the involved code (read_symbol/read_file) and answer with attempt_completion:
+DIAGNÓSTICO: what fails and why (the root cause, not the symptom)
+ARREGLO: the exact changes, file by file. For each one, the COMPLETE corrected function/class in a code block,
+or SEARCH/REPLACE blocks copying the current text exactly.
+VERIFICACIÓN: which test or command should pass afterwards.
+Be concrete and brief. Don't propose rewriting what works.""",
+    "escritor": """You are the WRITER of large files. The file already exists with a SKELETON (signatures and
+docstrings with empty bodies). Implement ONLY the sections assigned to you, one by one, with replace_symbol
+(complete definition: signature + real body). Don't change signatures or touch other sections.
+Check the validation each replace_symbol returns and fix what fails. When your sections are done,
+attempt_completion with the list of implemented functions.""",
+}
+
+DOCS_EN = {
+    "read_file": ("Reads a text file. Returns numbered lines ('  12| code'); the numbers are NOT part of the file.",
+                  {"path": "path relative to the workspace", "desde": "first line to show", "hasta": "last line to show"}),
+    "list_files": ("Lists workspace files (ignores .git, node_modules, venv, etc.).",
+                   {"path": "relative folder (root by default)", "recursive": "true/false (true by default)"}),
+    "search_files": ("Searches a (Python) regular expression in text files. Returns file:line: text.",
+                     {"regex": "expression to search, e.g. def process|class Client", "path": "folder or file (optional)",
+                      "file_pattern": "name filter like *.py (optional)"}),
+    "code_outline": ("Quick map of a file or folder: classes, functions and signatures with line numbers.",
+                     {"path": "file or folder (root by default)"}),
+    "read_symbol": ("Reads ONLY one function, class or method by name (with line numbers). Much cheaper than read_file "
+                    "for big files. Name format: 'function', 'Class' or 'Class.method'. path is optional.",
+                    {"symbol": "name: function | Class | Class.method", "path": "file to search in (optional)"}),
+    "find_references": ("Finds where a name (function, class, variable) is used in the whole project, excluding its definition.",
+                        {"symbol": "name to search"}),
+    "project_map": ("The project files and functions most related to a topic (ranked by names, symbols and imports).",
+                    {"topic": "what you are looking for (keywords)"}),
+    "write_to_file": ("Creates a file or replaces it ENTIRELY. For existing files prefer replace_in_file/replace_symbol. "
+                      "Content must be COMPLETE: '...' or 'rest unchanged' are forbidden.",
+                      {"path": "relative path", "content": "complete file content",
+                       "partial": "true if this is the FIRST PART of a long file (the rest goes with append_to_file)"}),
+    "replace_in_file": ("Edits parts of an existing file with one or more SEARCH/REPLACE blocks. SEARCH must copy the "
+                        "current text EXACTLY (no line numbers) and be unique; include 2-3 context lines. All blocks or none.",
+                        {"path": "relative path", "diff": "SEARCH/REPLACE blocks"}),
+    "replace_symbol": ("Replaces a WHOLE function, method or class by name. Write the complete new definition (with its "
+                       "def/function/class line); REAPER re-indents it. More robust than SEARCH/REPLACE.",
+                       {"path": "file", "symbol": "function | Class | Class.method", "content": "complete new definition"}),
+    "insert_after_symbol": ("Inserts new code (a function, method or class) right AFTER an existing symbol. If the symbol "
+                            "is a class, the code is added at the END of the class as a method.",
+                            {"path": "file", "symbol": "reference symbol", "content": "complete new code"}),
+    "append_to_file": ("Appends content to the END of a file. This is how long files are written in parts: write_to_file "
+                       "(partial=true) first, then several append_to_file of ~150 lines. Repeated last lines are detected "
+                       "and not duplicated. Put last=true on the final part.",
+                       {"path": "file", "content": "content to append", "last": "true if it is the last part"}),
+    "insert_lines": ("Inserts new lines AFTER line N (0 = at the beginning). Requires having read the current file with read_file.",
+                     {"path": "file", "line": "insert after this line (0 = start)", "content": "lines to insert"}),
+    "replace_lines": ("Replaces the line range desde..hasta (inclusive). Requires having read the current file. Useful when "
+                      "SEARCH/REPLACE doesn't match.",
+                      {"path": "file", "desde": "first line to replace", "hasta": "last line to replace",
+                       "content": "new content for that range"}),
+    "delete_file": ("Deletes a project file (kept in the checkpoint: recoverable with /deshacer).", {"path": "file to delete"}),
+    "move_file": ("Moves or renames a file (with checkpoint). Does not update imports: check them with find_references.",
+                  {"path": "current file", "new_path": "new path"}),
+    "revert_file": ("Restores a file to how it was when this task started (if you broke it and want to start over).",
+                    {"path": "file"}),
+    "execute_command": ("Runs a shell (bash) command at the workspace root, non-interactive. Prefer run_tests for tests. "
+                        "Servers or interactive programs are cut by timeout.",
+                        {"command": "command to run", "timeout": "seconds (optional, max 600)"}),
+    "run_python": ("Runs a short Python snippet at the project root (to try a function or inspect data). Use print(). "
+                   "No input(). 60 s timeout.", {"content": "Python code"}),
+    "run_tests": ("Detects and runs the project's test suite (pytest, unittest, npm test, node --test...).", {}),
+    "validate": ("Runs the real validators (syntax, imports, undefined names, node --check, JSON) on files. Without "
+                 "paths it validates what you changed in this task.", {"paths": "comma-separated paths (optional)"}),
+    "view_diff": ("Shows the real diff of the changes made since the current task started.", {}),
+    "update_todo": ("Keeps your task list. Send the WHOLE list each time: '[x]' done, '[ ]' pending, '[>]' in progress.",
+                    {"items": "one task per line"}),
+    "delegate": ("Launches a SUBAGENT with a clean context for a bounded task. Roles: explorador (investigates, read-only), "
+                 "implementador (writes code), revisor (reviews, read-only), qa (tests), reparador (fixes failures), "
+                 "arquitecto, especificador. Several read-only <delegate> in the SAME message run IN PARALLEL.",
+                 {"role": "explorador | implementador | revisor | qa | reparador", "task": "complete, self-contained instructions",
+                  "files": "relevant files, comma-separated (optional)"}),
+    "ask_user": ("Asks the user a question when essential information is missing. Don't use it to ask for permission.",
+                 {"question": "concrete question (in Spanish)"}),
+    "attempt_completion": ("Finishes the task. Only after verifying the result. REAPER validates the changed files before accepting.",
+                           {"result": "final report in Spanish: what you did, files, how it was verified, pending items"}),
+    "save_note": ("Saves a short, durable note about the project in .reaper/notas.md (future agents see it).",
+                  {"note": "one or two line note"}),
+    "learn_lesson": ("Records a lesson learned from a real error (one concrete line). scope: proyecto or general.",
+                     {"lesson": "one-line lesson with concrete names", "scope": "proyecto | general"}),
+    "write_large_file": ("Writes a LONG file (Python or JS/TS, hundreds or thousands of lines) without getting cut: REAPER "
+                         "first generates a skeleton with all signatures and then implements each function separately, "
+                         "validating each one. Use it for new files over ~250 lines.",
+                         {"path": "file to create", "spec": "complete spec: responsibilities, classes, functions, data, edge cases"}),
+    "fetch_url": ("Reads a web page (official docs, README, an answer to an error) and returns its clean text. With "
+                  "'buscar' only paragraphs with those words are returned. GET only; never sends project data.",
+                  {"url": "full http(s) URL", "buscar": "keywords to keep only the relevant part (optional)"}),
+    "rename_symbol": ("Renames a function, class, variable or method across the WHOLE project safely: never touches "
+                      "strings or comments and validates everything at the end.",
+                      {"old": "current name", "new": "new name", "paths": "comma-separated files (optional)"}),
+}
+
+RECORDATORIO_EN = """You didn't use any tool (or the format wasn't understood). Write the tool with XML tags, for example:
+<read_file>
+<path>file.py</path>
+</read_file>
+To create or change files use write_to_file, replace_in_file or replace_symbol (don't paste loose code in the chat).
+If you are done:
+<attempt_completion>
+<result>your report in Spanish</result>
+</attempt_completion>"""
+
+
+def documentacion_en(nombres: list) -> str:
+    partes = []
+    for nombre in nombres:
+        h = REGISTRO.get(nombre)
+        if not h:
+            continue
+        descripcion, params_en = DOCS_EN.get(nombre, (h.descripcion, {}))
+        params = ", ".join(
+            f"{p.nombre}{'' if p.requerido else ' (optional)'}: {params_en.get(p.nombre, p.descripcion)}" for p in h.params
+        ) or "no parameters"
+        partes.append(f"## {h.nombre}\n{descripcion}\nParameters: {params}\n{h.ejemplo}")
+    return "\n\n".join(partes)
+
+
+def system_prompt_en(rol: "Rol", ws: Workspace, max_llamadas: int = 4, arbol: bool = True,
+                     lecciones: str = "", extra: str = "") -> str:
+    partes = [
+        BASE_EN.replace("{max_llamadas}", str(max_llamadas)),
+        f"\n# YOUR ROLE: {rol.nombre.upper()}\n{MISIONES_EN.get(rol.nombre, rol.mision)}",
+        "\n# AVAILABLE TOOLS\n" + documentacion_en(list(rol.herramientas)),
+        f"\n# ENVIRONMENT\n- Workspace: {ws.raiz}\n{_entorno()}",
+    ]
+    if rol.rutas_permitidas:
+        partes.append("- You may only write test files (" + ", ".join(rol.rutas_permitidas[:6]) + " ...).")
+    memoria = ws.memoria()
+    if memoria:
+        partes.append(f"\n# PROJECT MEMORY\n{memoria}")
+    notas = ws.notas()
+    if notas.strip():
+        partes.append(f"\n# NOTES FROM PREVIOUS AGENTS (.reaper/notas.md)\n{notas.strip()}")
+    if lecciones.strip():
+        partes.append(f"\n# LESSONS LEARNED (apply them)\n{lecciones.strip()}")
+    if extra.strip():
+        partes.append("\n" + extra.strip())
+    if arbol:
+        partes.append(f"\n# WORKSPACE FILES (partial)\n{ws.arbol(limite=80)}")
+    # El rol en español sigue presente para los guiones/tests que lo buscan.
+    partes.append(f"\n(# TU ROL: {rol.nombre.upper()})")
+    return "\n".join(partes)
+
+
+# ======================================================================
+# MÓDULO: estadisticas
+# ======================================================================
+"""
+Estadísticas persistentes de uso: pedidos, builds, torneos, escaladas, tokens y costo por día.
+
+Sirven para ver con datos si un perfil o un modelo rinde mejor (tasa de builds
+verificadas, pasos promedio, costo por build) y cuánto se gasta.
+"""
+
+CAMPOS_DIA = ("pedidos", "pedidos_ok", "builds", "builds_ok", "torneos", "escaladas", "lecciones",
+              "tokens_entrada", "tokens_salida", "llamadas", "segundos")
+
+
+class Estadisticas:
+    def __init__(self, ruta: Optional[Path] = None):
+        self.ruta = ruta or ESTADISTICAS_FILE
+        self._lock = threading.Lock()
+        self._ultimo_uso = (0, 0, 0, 0.0)
+
+    def _cargar(self) -> dict:
+        try:
+            datos = json.loads(Path(self.ruta).read_text(encoding="utf-8"))
+            return datos if isinstance(datos, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def _guardar(self, datos: dict) -> None:
+        try:
+            escritura_atomica(Path(self.ruta), json.dumps(datos, ensure_ascii=False, indent=1))
+        except OSError:
+            pass
+
+    def _dia(self, datos: dict, fecha: Optional[str] = None) -> dict:
+        dias = datos.setdefault("dias", {})
+        clave = fecha or datetime.now().strftime("%Y-%m-%d")
+        dia = dias.setdefault(clave, {})
+        for campo in CAMPOS_DIA:
+            dia.setdefault(campo, 0)
+        dia.setdefault("costo", 0.0)
+        dia.setdefault("modelos", {})
+        return dia
+
+    def registrar(self, **incrementos) -> None:
+        with self._lock:
+            datos = self._cargar()
+            dia = self._dia(datos, incrementos.pop("fecha", None))
+            modelo = incrementos.pop("modelo", None)
+            for clave, valor in incrementos.items():
+                if clave in dia and isinstance(valor, (int, float)):
+                    dia[clave] = round(dia[clave] + valor, 6) if isinstance(dia[clave], float) else dia[clave] + valor
+            if modelo:
+                dia["modelos"][modelo] = dia["modelos"].get(modelo, 0) + 1
+            datos["actualizado"] = datetime.now().isoformat(timespec="seconds")
+            self._guardar(datos)
+
+    def registrar_uso(self, uso: Uso, modelo: str = "") -> None:
+        """Suma lo que el cliente LLM gastó desde la última vez."""
+        actual = (uso.llamadas, uso.tokens_entrada, uso.tokens_salida, uso.costo)
+        previo = self._ultimo_uso
+        delta = [a - b for a, b in zip(actual, previo)]
+        self._ultimo_uso = actual
+        if not any(delta):
+            return
+        with self._lock:
+            datos = self._cargar()
+            dia = self._dia(datos)
+            dia["llamadas"] += int(delta[0])
+            dia["tokens_entrada"] += int(delta[1])
+            dia["tokens_salida"] += int(delta[2])
+            dia["costo"] = round(dia["costo"] + float(delta[3]), 6)
+            if modelo:
+                dia["modelos"][modelo] = dia["modelos"].get(modelo, 0) + int(delta[0])
+            self._guardar(datos)
+
+    def dias(self, cantidad: int = 14) -> list[tuple[str, dict]]:
+        datos = self._cargar().get("dias", {})
+        return sorted(datos.items())[-cantidad:]
+
+    def totales(self) -> dict:
+        total = {campo: 0 for campo in CAMPOS_DIA}
+        total["costo"] = 0.0
+        for _fecha, dia in self._cargar().get("dias", {}).items():
+            for campo in total:
+                total[campo] += dia.get(campo, 0)
+        return total
+
+
+def tasa(ok: int, total: int) -> str:
+    return f"{100 * ok // total}%" if total else "-"
+
+
+def mostrar_estadisticas(ui: UI, est: Estadisticas, cantidad: int = 14) -> None:
+    dias = est.dias(cantidad)
+    if not dias:
+        ui.tenue("Todavía no hay estadísticas (se juntan solas mientras usás REAPER).")
+        return
+    filas = []
+    for fecha, d in dias:
+        filas.append([fecha, f"{d.get('pedidos_ok', 0)}/{d.get('pedidos', 0)}", f"{d.get('builds_ok', 0)}/{d.get('builds', 0)}",
+                      str(d.get("torneos", 0)), str(d.get("escaladas", 0)), formatear_numero(d.get("tokens_entrada", 0)),
+                      formatear_numero(d.get("tokens_salida", 0)), f"${d.get('costo', 0):.3f}" if d.get("costo") else "-"])
+    ui.tabla(filas, ["día", "pedidos", "builds", "torneos", "escal.", "entrada", "salida", "costo"], "lrrrrrrr")
+    t = est.totales()
+    ui.caja([f"pedidos resueltos: {t['pedidos_ok']}/{t['pedidos']} ({tasa(t['pedidos_ok'], t['pedidos'])})",
+             f"builds verificadas: {t['builds_ok']}/{t['builds']} ({tasa(t['builds_ok'], t['builds'])})",
+             f"torneos: {t['torneos']} · escaladas: {t['escaladas']} · lecciones: {t['lecciones']}",
+             f"tokens: {formatear_numero(t['tokens_entrada'])} entrada / {formatear_numero(t['tokens_salida'])} salida"
+             + (f" · costo total ${t['costo']:.3f}" if t["costo"] else "")], titulo="TOTALES")
+
+
+# ======================================================================
+# MÓDULO: comandos_extra
+# ======================================================================
+"""
+Comandos extra del REPL (se agregan a App sin tocar la CLI base):
+/explicar /testear /documentar /renombrar /web /commit /deps /estadisticas
+/sesiones /comandos /plugins /hooks
+"""
+
+PROMPT_EXPLICAR = """Explicá este código en español, para alguien que programa pero no lo escribió.
+Estructura: 1) qué hace en una frase, 2) cómo funciona paso a paso, 3) entradas/salidas y casos borde,
+4) posibles problemas o mejoras (solo si son reales). Sé concreto y breve.
+
+{titulo}
+```{lenguaje}
+{codigo}
+```"""
+
+
+def _codigo_para_explicar(app: "App", objetivo: str) -> tuple[str, str, str]:
+    """(título, lenguaje, código) de un archivo o un símbolo."""
+    try:
+        ruta = app.ws.ruta(objetivo)
+        if ruta.is_file():
+            rel = app.ws.rel(ruta)
+            lineas = app.ws.leer(rel).splitlines()
+            extra = f"\n# ... ({len(lineas) - 400} líneas más)" if len(lineas) > 400 else ""
+            return f"Archivo {rel} ({len(lineas)} líneas)", lenguaje_de(rel), "\n".join(lineas[:400]) + extra
+    except (ErrorRuta, OSError, ValueError):
+        pass
+    encontrados, sugerencias = indice_de(app.ws).buscar(objetivo)
+    if not encontrados:
+        raise ValueError(f"No encontré '{objetivo}' como archivo ni como símbolo."
+                         + (f" ¿{', '.join(sugerencias)}?" if sugerencias else ""))
+    s = encontrados[0]
+    texto = app.ws.leer(s.archivo)
+    return s.describir(), lenguaje_de(s.archivo), texto_de_simbolo(texto, s, numerar=False)
+
+
+def _cmd_explicar(self: "App", arg: str) -> None:
+    if not arg:
+        self.ui.tenue("Uso: /explicar <archivo | función | Clase.metodo>")
+        return
+    try:
+        titulo, lenguaje, codigo = _codigo_para_explicar(self, arg.strip())
+    except ValueError as e:
+        self.ui.error(str(e))
+        return
+    self.ui.esperando("explicar", "leyendo el código")
+    try:
+        texto = self.llm.chat_simple(PROMPT_EXPLICAR.format(titulo=titulo, lenguaje=lenguaje, codigo=codigo),
+                                     sistema="Sos un programador senior que explica código con claridad.",
+                                     temperatura=0.2, max_tokens=1800, rol="explicar")
+    finally:
+        self.ui.fin_progreso()
+    self.ui.titulo(titulo)
+    mostrar_markdown(self.ui, texto)
+
+
+def _cmd_testear(self: "App", arg: str) -> None:
+    if not arg:
+        self.ui.tenue("Uso: /testear <archivo>   (QA escribe tests para ese archivo y los corre)")
+        return
+    try:
+        rel = self.ws.rel(self.ws.ruta(arg.strip()))
+    except ErrorRuta as e:
+        self.ui.error(str(e))
+        return
+    if not self.ws.existe(rel):
+        self.ui.error(f"No existe {rel}.")
+        return
+    cid = self.ws.checkpoints.iniciar(f"tests para {rel}")
+    tarea = (f"Escribí tests automáticos para {rel}: cubrí las funciones públicas con casos normales, casos borde y "
+             "errores esperados. Leé el archivo primero (read_file/read_symbol). Corré run_tests y reportá el resultado "
+             "real. Si un test falla por un bug del código, NO cambies el código: describí el bug en el informe.")
+    res = ejecutar_subagentes([("qa", tarea, rel, f"tests para {rel}", {"memoria": self.memoria})],
+                              self.llm, self.ws, self.settings, self.ui, profundidad=1, cid_inicio=cid)[0]
+    self.ws.checkpoints.descartar_si_vacio(cid)
+    mostrar_markdown(self.ui, res.resumen)
+
+
+def _cmd_documentar(self: "App", arg: str) -> None:
+    if not arg:
+        self.ui.tenue("Uso: /documentar <archivo>")
+        return
+    tarea = (f"Agregá docstrings claros en español a las funciones, clases y módulo de {arg.strip()} que no tengan "
+             "(o que estén vacíos), SIN cambiar el comportamiento ni las firmas. Usá replace_symbol por función. "
+             "Al final corré validate y run_tests.")
+    cid = self.ws.checkpoints.iniciar(f"documentar {arg[:60]}")
+    res = ejecutar_subagentes([("implementador", tarea, arg.strip(), "documenta", {"memoria": self.memoria})],
+                              self.llm, self.ws, self.settings, self.ui, profundidad=1, cid_inicio=cid)[0]
+    self.ws.checkpoints.descartar_si_vacio(cid)
+    mostrar_markdown(self.ui, res.resumen)
+
+
+def _cmd_renombrar(self: "App", arg: str) -> None:
+    partes = arg.split()
+    if len(partes) < 2:
+        self.ui.tenue("Uso: /renombrar <viejo> <nuevo> [archivos...]")
+        return
+    try:
+        plan = planificar_renombrado(self.ws, partes[0], partes[1], partes[2:] or None)
+    except ValueError as e:
+        self.ui.error(str(e))
+        return
+    if not plan.cambios:
+        self.ui.tenue(f"No encontré usos de '{partes[0]}'.")
+        return
+    self.ui.linea(plan.resumen())
+    for conflicto in plan.conflictos:
+        self.ui.aviso(f"  ⚠ {conflicto}")
+    self.ui.diff(plan.diff(), max_lineas=60)
+    if not self.ui.confirmar("¿Aplicar el renombrado?", defecto=True):
+        return
+    self.ws.checkpoints.iniciar(f"renombrar {partes[0]} → {partes[1]}")
+    try:
+        aplicar_renombrado(self.ws, plan)
+    except ValueError as e:
+        self.ui.error(str(e))
+        return
+    self.ui.ok(f"Renombrado: {plan.total} cambio(s) en {len(plan.cambios)} archivo(s) · /deshacer para revertir")
+
+
+def _cmd_web(self: "App", arg: str) -> None:
+    partes = arg.split(maxsplit=1)
+    if not partes:
+        self.ui.tenue("Uso: /web <url> [palabras a buscar]")
+        return
+    try:
+        url, _ = validar_url(partes[0], self.settings.dominios_web)
+        datos = descargar_texto(url)
+    except (ValueError, OSError) as e:
+        self.ui.error(str(e))
+        return
+    texto = filtrar_relevante(datos["texto"], partes[1]) if len(partes) > 1 else recortar(datos["texto"], 6000)
+    self.ui.titulo(datos.get("titulo") or datos["url"])
+    mostrar_markdown(self.ui, texto)
+
+
+PROMPT_COMMIT = """Escribí el mensaje de commit para estos cambios, en español:
+- primera línea: resumen en imperativo, máximo 72 caracteres, sin punto final
+- una línea en blanco
+- 2 a 6 viñetas con lo importante (qué y por qué), sin repetir el diff
+Respondé SOLO con el mensaje.
+
+ARCHIVOS:
+{estado}
+
+DIFF:
+{diff}"""
+
+
+def _cmd_commit(self: "App", arg: str) -> None:
+    if not es_repo_git(self.ws):
+        self.ui.tenue("El proyecto no es un repositorio git (/git init).")
+        return
+    estado = git(self.ws, "status", "--short").stdout.strip()
+    if not estado:
+        self.ui.tenue("No hay cambios para commitear.")
+        return
+    self.ui.linea(estado)
+    mensaje = arg.strip()
+    if not mensaje:
+        diff = git(self.ws, "diff", "HEAD").stdout or git(self.ws, "diff").stdout
+        nuevos = [l[3:] for l in estado.splitlines() if l.startswith("??")]
+        if nuevos:
+            diff += "\n(archivos nuevos: " + ", ".join(nuevos[:20]) + ")"
+        self.ui.esperando("commit", "escribiendo el mensaje")
+        try:
+            mensaje = self.llm.chat_simple(PROMPT_COMMIT.format(estado=estado, diff=recortar(redactar_secretos(diff), 9000)),
+                                           temperatura=0.2, max_tokens=400, rol="commit").strip().strip("`")
+        except LLMError as e:
+            self.ui.error(f"No pude generar el mensaje: {e}")
+            return
+        finally:
+            self.ui.fin_progreso()
+    self.ui.caja(mensaje.splitlines() or ["(vacío)"], titulo="mensaje de commit")
+    if not self.ui.confirmar("¿Hago `git add -A` y commit con este mensaje?", defecto=True):
+        return
+    r = git(self.ws, "add", "-A")
+    if r.ok:
+        r = git(self.ws, "commit", "-q", "-F", "-", entrada=mensaje + "\n")
+    (self.ui.ok if r.ok else self.ui.error)("Commit hecho." if r.ok else (r.stderr.strip() or r.stdout.strip()))
+
+
+def comandos_de_dependencias(ws: Workspace) -> list[tuple[str, str]]:
+    raiz = ws.raiz
+    comandos = []
+    if (raiz / "requirements.txt").is_file():
+        comandos.append(("requirements.txt", f"{shlex.quote(sys.executable)} -m pip install -r requirements.txt"))
+    if (raiz / "pyproject.toml").is_file() and not (raiz / "requirements.txt").is_file():
+        comandos.append(("pyproject.toml", f"{shlex.quote(sys.executable)} -m pip install -e ."))
+    if (raiz / "package.json").is_file():
+        comandos.append(("package.json", "npm install"))
+    if (raiz / "go.mod").is_file():
+        comandos.append(("go.mod", "go mod download"))
+    if (raiz / "Cargo.toml").is_file():
+        comandos.append(("Cargo.toml", "cargo fetch"))
+    return comandos
+
+
+def _cmd_deps(self: "App", arg: str) -> None:
+    comandos = comandos_de_dependencias(self.ws)
+    if not comandos:
+        self.ui.tenue("No encontré archivos de dependencias (requirements.txt, package.json, go.mod, Cargo.toml).")
+        return
+    for origen, comando in comandos:
+        self.ui.info(f"{origen}: {comando}")
+        if not self.ui.confirmar("  ¿Ejecutar?", defecto=True):
+            continue
+        r = ejecutar(comando, cwd=self.ws.raiz, timeout=900, shell=True)
+        self.ui.linea(recortar((r.stdout + "\n" + r.stderr).strip(), 3000))
+        (self.ui.ok if r.ok else self.ui.error)(f"{comando}: {'listo' if r.ok else 'falló'}")
+        if not r.ok:
+            for pista in pistas_para(r.stdout + r.stderr, 2):
+                self.ui.tenue(f"  💡 {pista}")
+
+
+def _cmd_estadisticas(self: "App", arg: str) -> None:
+    self.estadisticas.registrar_uso(self.llm.uso, self.settings.modelo)
+    mostrar_estadisticas(self.ui, self.estadisticas, int(arg) if arg.isdigit() else 14)
+
+
+def listar_sesiones() -> list[tuple[Path, dict]]:
+    salida = []
+    if not SESIONES_DIR.is_dir():
+        return salida
+    for ruta in sorted(SESIONES_DIR.glob("*.json"), key=lambda r: r.stat().st_mtime, reverse=True):
+        try:
+            datos = json.loads(ruta.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        salida.append((ruta, datos))
+    return salida
+
+
+def _cmd_sesiones(self: "App", arg: str) -> None:
+    sesiones = listar_sesiones()
+    partes = arg.split()
+    if partes[:1] == ["borrar"] and len(partes) == 2 and partes[1].isdigit():
+        indice = int(partes[1]) - 1
+        if 0 <= indice < len(sesiones):
+            sesiones[indice][0].unlink()
+            self.ui.ok(f"Sesión borrada: {sesiones[indice][0].stem}")
+        else:
+            self.ui.error("Número inválido.")
+        return
+    if not sesiones:
+        self.ui.tenue("No hay sesiones guardadas.")
+        return
+    filas = []
+    for i, (ruta, datos) in enumerate(sesiones[:20], start=1):
+        mensajes = len(datos.get("mensajes", []))
+        ultimo = next((h[1] for h in reversed(datos.get("historial", [])) if isinstance(h, list) and len(h) == 3), "")
+        filas.append([str(i), ruta.stem.rsplit("_", 1)[0], datos.get("guardado", "?").replace("T", " "), str(mensajes),
+                      recortar(ultimo, 40).replace("\n", " ")])
+    self.ui.tabla(filas, ["#", "proyecto", "guardada", "msjs", "último pedido"], "rllrl")
+    self.ui.tenue("  /proyecto <ruta> retoma la sesión de ese proyecto · /sesiones borrar N")
+
+
+def _cmd_comandos(self: "App", arg: str) -> None:
+    if arg.strip() == "ejemplos":
+        creados = crear_comandos_de_ejemplo()
+        self.ui.ok(f"Comandos de ejemplo en {COMANDOS_USUARIO_DIR}: " + (", ".join(p.stem for p in creados) or "ya existían"))
+        return
+    if arg.startswith("nuevo "):
+        nombre = arg.split(maxsplit=1)[1].strip().lower()
+        if not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", nombre):
+            self.ui.error("Nombre inválido (letras, números, - y _).")
+            return
+        ruta = self.ws.raiz / ".reaper" / "comandos" / f"{nombre}.md"
+        if ruta.exists():
+            self.ui.error(f"Ya existe {ruta}.")
+            return
+        escritura_atomica(ruta, EJEMPLO_COMANDO.format(descripcion="describí qué hace",
+                                                       texto="Escribí acá el pedido. $ARGUMENTOS se reemplaza por lo que "
+                                                             "escribas después del comando."))
+        self.ui.ok(f"Creado {ruta}: editalo y usalo como /{nombre} <argumentos>")
+        return
+    propios = comandos_usuario(self.ws)
+    if not propios:
+        self.ui.tenue("No tenés comandos propios. /comandos ejemplos crea algunos · /comandos nuevo <nombre> crea uno.")
+        return
+    filas = [[f"/{c.nombre}", c.modo, c.descripcion or recortar(c.texto, 60).replace("\n", " ")] for c in propios.values()]
+    self.ui.tabla(filas, ["comando", "modo", "descripción"])
+
+
+def _cmd_plugins(self: "App", arg: str) -> None:
+    if arg.strip() == "ejemplo":
+        HERRAMIENTAS_USUARIO_DIR.mkdir(parents=True, exist_ok=True)
+        ruta = HERRAMIENTAS_USUARIO_DIR / "contar_lineas.py"
+        if not ruta.exists():
+            ruta.write_text(EJEMPLO_PLUGIN, encoding="utf-8")
+        self.ui.ok(f"Plugin de ejemplo: {ruta} (se carga al reiniciar REAPER)")
+        return
+    if not PLUGINS_CARGADOS:
+        self.ui.tenue(f"No hay plugins cargados. Poné archivos .py en {HERRAMIENTAS_USUARIO_DIR} (/plugins ejemplo).")
+        return
+    for plugin in PLUGINS_CARGADOS:
+        if plugin.error:
+            self.ui.error(f"{plugin.ruta.name}: {plugin.error}")
+        else:
+            self.ui.ok(f"{plugin.ruta.name}: {', '.join(plugin.herramientas) or '(sin herramientas)'} → {', '.join(plugin.roles)}")
+
+
+def _cmd_hooks(self: "App", arg: str) -> None:
+    configurados = {e: hooks_de(self.ws, e) for e in EVENTOS_HOOK}
+    if not any(configurados.values()):
+        self.ui.tenue('Sin hooks. Ejemplo en .reaper/config.json:\n  {"hooks": {"despues_de_escribir": ["black -q {archivo}"], '
+                      '"despues_de_build": ["termux-notification --title REAPER --content {estado}"]}}')
+        return
+    for evento, comandos in configurados.items():
+        for c in comandos:
+            self.ui.linea(f"  {Tema.info}{evento:<22}{C.RESET} {c}")
+    self.ui.tenue(f"  hooks {'activados' if self.settings.hooks else 'desactivados'} (/config hooks true|false)")
+
+
+for _nombre, _funcion in (("explicar", _cmd_explicar), ("testear", _cmd_testear), ("documentar", _cmd_documentar),
+                          ("renombrar", _cmd_renombrar), ("web", _cmd_web), ("commit", _cmd_commit), ("deps", _cmd_deps),
+                          ("estadisticas", _cmd_estadisticas), ("sesiones", _cmd_sesiones), ("comandos", _cmd_comandos),
+                          ("plugins", _cmd_plugins), ("hooks", _cmd_hooks)):
+    setattr(App, "cmd_" + _nombre, _funcion)
 
 
 # ======================================================================
@@ -18763,6 +20552,8 @@ def main(argv: Optional[list] = None) -> int:
         return 1
 
     limpiar_sandboxes_viejos()
+    if settings.plugins:
+        cargar_plugins(ui=ui)
     try:
         if args.nuevo:
             plantilla, carpeta = args.nuevo

@@ -188,6 +188,9 @@ def _post_escritura(ctx: Contexto, rel: str, antes: Optional[str], despues: str,
         avisos = advertencias_python(despues)
         if avisos:
             texto += "\nAdvertencias:\n" + "\n".join(f"- {a}" for a in avisos[:6])
+    extra_hooks = _hook_post_escritura(ctx, rel)
+    if extra_hooks:
+        texto += "\n" + extra_hooks
     return texto
 
 
@@ -556,6 +559,9 @@ def execute_command(ctx: Contexto, p: dict) -> str:
     patron = comando_bloqueado(comando)
     if patron:
         raise ErrorHerramienta(f"Comando bloqueado por seguridad (coincide con {patron}).")
+    motivo_hook = _hook_antes_de_comando(ctx, comando)
+    if motivo_hook:
+        raise ErrorHerramienta(f"Comando bloqueado: {motivo_hook}.")
     if ctx.settings.modo != "auto" and not comando_seguro(comando):
         ctx.ui.aviso(f"  {ctx.etiqueta} quiere ejecutar: {comando}")
         if not ctx.ui.confirmar("  ¿Ejecutar?"):
