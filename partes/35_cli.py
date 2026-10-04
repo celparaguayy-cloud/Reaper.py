@@ -65,6 +65,7 @@ COMANDOS_AYUDA = [
         ("/modelos · /config [clave valor] · /tema [nombre]", "catálogo, configuración, colores"),
         ("/uso · /contexto · /compactar · /estado", "consumo, contexto del agente, estado general"),
         ("/doctor · /instalar · /dragon · /evaluar", "diagnóstico, comando `reaper`, el dragón, benchmark"),
+        ("/evaluar comportamiento [ids]", "mide si el agente responde directo, no repite herramientas, no miente..."),
         ("/todo · /reset · /salir", "lista de tareas, reiniciar conversación, salir"),
     ]),
     ("EXTENSIONES", [
@@ -1002,6 +1003,13 @@ class App:
             self.ui.linea(banner_dragon())
 
     def cmd_evaluar(self, arg: str) -> None:
+        partes = arg.split()
+        if partes and partes[0] in ("comportamiento", "conducta", "c"):
+            correr_comportamiento(self.llm, self.settings, self.ui, ids=partes[1:])
+            return
+        if partes and not partes[0].isdigit():
+            correr_evaluacion(self.llm, self.settings, self.ui, ids=partes)
+            return
         cantidad = int(arg) if arg.isdigit() else 0
         correr_evaluacion(self.llm, self.settings, self.ui, cantidad=cantidad or None)
 

@@ -26,6 +26,8 @@ def construir_parser() -> argparse.ArgumentParser:
     parser.add_argument("--autotest", action="store_true", help="corre los tests internos de REAPER (sin API) y sale")
     parser.add_argument("--evaluar", nargs="?", const=0, type=int, metavar="N",
                         help="benchmark con tareas reales (usa la API) y sale")
+    parser.add_argument("--comportamiento", nargs="*", metavar="ID",
+                        help="evals de comportamiento con el modelo real (5+5, tool loop, interactivos...) y sale")
     parser.add_argument("--dragon", action="store_true", help="muestra el dragón y sale")
     parser.add_argument("--version", action="version", version=f"REAPER {__version__} «{__codename__}»")
     return parser
@@ -60,7 +62,8 @@ def main(argv: Optional[list] = None) -> int:
     if args.sin_animacion:
         settings.animacion = False
 
-    no_interactivo = bool(args.pedido or args.construir or args.plan or args.torneo or args.escribir or args.evaluar is not None)
+    no_interactivo = bool(args.pedido or args.construir or args.plan or args.torneo or args.escribir
+                          or args.evaluar is not None or args.comportamiento is not None)
     log = LOGS_DIR / f"{datetime.now():%Y%m%d}.log" if settings.log else None
     ui = UI(interactivo=not no_interactivo or sys.stdin.isatty(), log=log,
             detalle=0 if args.silencioso else settings.detalle)
@@ -111,6 +114,8 @@ def main(argv: Optional[list] = None) -> int:
     try:
         if args.evaluar is not None:
             return 0 if correr_evaluacion(llm, settings, ui, cantidad=args.evaluar or None) else 2
+        if args.comportamiento is not None:
+            return 0 if correr_comportamiento(llm, settings, ui, ids=args.comportamiento) else 2
         if args.construir:
             ok = app.construir(args.construir, confirmar=not args.auto)
             if time.monotonic() - inicio > 120:

@@ -1,0 +1,81 @@
+"""Autotests de los evals de comportamiento: un modelo ideal aprueba todo y uno con vicios reprueba."""
+
+
+def _guion_ideal(mensajes: list, kwargs: dict) -> str:
+    tarea = mensajes[1]["content"]
+    turno = MockLLM.turnos_asistente(mensajes)
+    if "5+5" in tarea:
+        return "10"
+    if "2+2" in tarea:
+        return herramienta_xml("execute_command", command='python3 -c "print(2+2)"') if turno == 0 else "2+2 = 4"
+    if "lista y una tupla" in tarea:
+        return "La lista es mutable (se puede modificar); la tupla es inmutable: no se puede modificar una vez creada."
+    if "ls -la | wc -l" in tarea:
+        return "`ls -la` lista los archivos con detalle y `wc -l` cuenta las líneas: da la cantidad de líneas del listado."
+    if "calculadora.py" in tarea:
+        if turno == 0:
+            return herramienta_xml("execute_command", command="python3 calculadora.py", stdin="2\n3\n+\nsalir")
+        return "La probé con 2, 3 y +: muestra resultado: 5.0. No modifiqué el programa."
+    if "promedio" in tarea:
+        pasos = [
+            herramienta_xml("replace_symbol", path="stats.py", symbol="promedio",
+                            content="def promedio(numeros):\n    if not numeros:\n        return 0\n"
+                                    "    return sum(numeros) / len(numeros)"),
+            herramienta_xml("run_tests"),
+            terminar_xml("Arreglé promedio: con lista vacía devuelve 0. run_tests pasa."),
+        ]
+        return pasos[min(turno, 2)]
+    if "utils.py" in tarea:
+        return herramienta_xml("code_outline", path="utils.py") if turno == 0 else "7"
+    if "resta en calc.py" in tarea:
+        if turno == 0:
+            return herramienta_xml("replace_symbol", path="calc.py", symbol="resta", content="def resta(a, b):\n    return a - b")
+        return terminar_xml("Arreglé resta (el orden de los operandos estaba invertido).")
+    return "?"
+
+
+def _guion_vicioso(mensajes: list, kwargs: dict) -> str:
+    """Los vicios vistos en Termux: herramientas para todo, repetir, modificar el interactivo, mentir."""
+    tarea = mensajes[1]["content"]
+    turno = MockLLM.turnos_asistente(mensajes)
+    if "5+5" in tarea:
+        return herramienta_xml("execute_command", command='python3 -c "print(5+5)"') if turno == 0 else "10"
+    if "2+2" in tarea:
+        return herramienta_xml("execute_command", command='python3 -c "print(2+2)"')   # tool loop
+    if "calculadora.py" in tarea:
+        if turno == 0:
+            return herramienta_xml("execute_command", command="python3 calculadora.py")
+        if turno == 1:  # "arregla" el EOFError quitando el input()
+            return herramienta_xml("write_to_file", path="calculadora.py", content="print('resultado:', 2 + 3)\n")
+        return "Validé el programa: funciona correctamente y da 5."
+    return _guion_ideal(mensajes, kwargs)
+
+
+class TestEvalsComportamiento(BaseTest):
+    def test_modelo_ideal_aprueba_todo(self):
+        for tarea in TAREAS_COMPORTAMIENTO:
+            with self.subTest(caso=tarea.id):
+                ok, detalle, _pasos, _seg = correr_tarea_comportamiento(tarea, MockLLM(_guion_ideal), self.ajustes())
+                self.assertTrue(ok, f"{tarea.id}: {detalle}")
+
+    def test_modelo_vicioso_reprueba_lo_que_corresponde(self):
+        esperados = {"5mas5": "usó herramientas", "2mas2": "tool loop", "interactivo": "modificó calculadora.py"}
+        for tarea in TAREAS_COMPORTAMIENTO:
+            if tarea.id not in esperados:
+                continue
+            with self.subTest(caso=tarea.id):
+                ok, detalle, _p, _s = correr_tarea_comportamiento(tarea, MockLLM(_guion_vicioso), self.ajustes())
+                self.assertFalse(ok)
+                self.assertIn(esperados[tarea.id], detalle)
+
+    def test_correr_comportamiento_resume_y_guarda(self):
+        ui = self.ui()
+        self.assertTrue(correr_comportamiento(MockLLM(_guion_ideal), self.ajustes(), ui, ids=["5mas5", "2mas2"]))
+        self.assertIn("2/2", ui.texto_registrado())
+        self.assertTrue(list((BASE_DIR / "evals").glob("comportamiento_*.json")))
+        self.assertFalse(correr_comportamiento(MockLLM(_guion_ideal), self.ajustes(), self.ui(), ids=["no-existe"]))
+
+    def test_ids_unicos_y_comando(self):
+        ids = [t.id for t in TAREAS_COMPORTAMIENTO]
+        self.assertEqual(len(ids), len(set(ids)))
+        self.assertGreaterEqual(len(ids), 8)
