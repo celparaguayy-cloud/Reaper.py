@@ -9647,7 +9647,8 @@ class Agente:
             guia = guias_para(archivos or self.ws.archivos_codigo(limite=60), tarea)
             if guia:
                 extras.append("GUÍA RÁPIDA DEL LENGUAJE:\n" + guia)
-            recetas = recetas_para_prompt(tarea)
+            lenguajes = lenguajes_mencionados(tarea, archivos or self.ws.archivos_codigo(limite=60))
+            recetas = recetas_para_prompt(tarea, lenguajes=lenguajes or None)
             if recetas:
                 extras.append(recetas)
         if not extras:
@@ -18020,12 +18021,39 @@ def buscar_recetas(consulta: str, k: int = 4, lenguaje: str = "") -> list[Receta
     return [r for _, _, r in puntuadas[:k]]
 
 
-def recetas_para_prompt(tarea: str, k: int = 2, umbral: float = 5.0, maximo: int = 2600) -> str:
-    """Recetas que coinciden FUERTE con la tarea (si no, nada: mejor sin ruido)."""
+_PALABRAS_LENGUAJE = {
+    "go": (" go ", "golang", "go.mod"), "rust": ("rust", "cargo"), "c": (" en c ", " c99", "makefile", " c "),
+    "java": ("java ", "java.", " java"), "php": (" php", "php "), "ruby": ("ruby",), "perl": ("perl",),
+    "javascript": ("javascript", "node", " js ", "web", "html", "navegador", "react"),
+    "bash": ("bash", "shell", " sh ", "script de terminal"), "python": ("python", " py "),
+}
+_EXT_LENGUAJE = {".py": "python", ".go": "go", ".rs": "rust", ".c": "c", ".h": "c", ".java": "java", ".php": "php",
+                 ".rb": "ruby", ".pl": "perl", ".pm": "perl", ".sh": "bash", ".js": "javascript", ".mjs": "javascript",
+                 ".ts": "javascript", ".html": "javascript"}
+
+
+def lenguajes_mencionados(texto: str, archivos: Iterable[str] = ()) -> set:
+    """Lenguajes que el pedido nombra (o que usan los archivos indicados)."""
+    t = f" {(texto or '').lower()} "
+    salida = {lang for lang, palabras in _PALABRAS_LENGUAJE.items() if any(p in t for p in palabras)}
+    salida |= {_EXT_LENGUAJE[Path(a).suffix.lower()] for a in archivos if Path(a).suffix.lower() in _EXT_LENGUAJE}
+    return salida
+
+
+def recetas_para_prompt(tarea: str, k: int = 2, umbral: float = 5.0, maximo: int = 2600,
+                        lenguajes: Optional[Iterable[str]] = None) -> str:
+    """Recetas que coinciden FUERTE con la tarea (si no, nada: mejor sin ruido) y en un lenguaje que sirva."""
     tokens = tokens_pedido(tarea)
     if not tokens:
         return ""
-    puntuadas = sorted(((*puntuar_receta(r, tokens, con_distintos=True), r) for r in RECETAS), key=lambda t: -t[0])
+    permitidos = set(lenguajes) if lenguajes is not None else lenguajes_mencionados(tarea)
+    if not permitidos:
+        permitidos = {"python", "bash", "javascript"}   # lo habitual en Termux si no se dice otra cosa
+    permitidos.add("bash")
+    if "javascript" in permitidos:
+        permitidos |= {"html", "css"}
+    candidatas = [r for r in RECETAS if r.lenguaje in permitidos]
+    puntuadas = sorted(((*puntuar_receta(r, tokens, con_distintos=True), r) for r in candidatas), key=lambda t: -t[0])
     # Hace falta una coincidencia fuerte: puntaje alto Y al menos dos palabras distintas del pedido.
     elegidas = [r for p, distintos, r in puntuadas[:k] if p >= umbral and distintos >= 2]
     if not elegidas:
@@ -18769,6 +18797,2103 @@ TMP=$(mktemp)
 trap 'rm -f "$TMP"' EXIT
 [[ $VERBOSO -eq 1 ]] && echo "procesando $1 → $SALIDA"
 sort -u "$1" > "$TMP" && mv "$TMP" "$SALIDA"
+''')
+
+
+# ======================================================================
+# MÓDULO: recetas_python
+# ======================================================================
+"""
+Más recetas de Python. Cada una es un programa COMPLETO: al ejecutarlo corre una demo con asserts,
+así que el autotest no solo las compila: las ejecuta (las marcadas como ejecutables) y verifica que
+el ejemplo que ve el modelo funciona de verdad.
+"""
+
+RECETAS_EJECUTABLES: set = set()
+
+
+def receta_ejecutable(titulo: str, lenguaje: str, etiquetas: str, descripcion: str, codigo: str) -> Receta:
+    r = receta(titulo, lenguaje, etiquetas, descripcion, codigo)
+    RECETAS_EJECUTABLES.add(titulo)
+    return r
+
+
+receta_ejecutable("Caché en disco con vencimiento (TTL)", "python", "cache, cachear, ttl, vencimiento, memoizar, guardar",
+                  "Guarda resultados caros (llamadas a APIs) en JSON con fecha de vencimiento.", r'''
+import json
+import time
+from pathlib import Path
+
+
+class CacheDisco:
+    def __init__(self, ruta: Path, ttl_segundos: float):
+        self.ruta = Path(ruta)
+        self.ttl = ttl_segundos
+        try:
+            self.datos = json.loads(self.ruta.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            self.datos = {}
+
+    def obtener(self, clave: str, ahora: float | None = None):
+        ahora = time.time() if ahora is None else ahora
+        entrada = self.datos.get(clave)
+        if entrada is None or ahora - entrada["t"] > self.ttl:
+            return None
+        return entrada["v"]
+
+    def guardar(self, clave: str, valor, ahora: float | None = None) -> None:
+        self.datos[clave] = {"t": time.time() if ahora is None else ahora, "v": valor}
+        tmp = self.ruta.with_suffix(".tmp")
+        tmp.write_text(json.dumps(self.datos, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(self.ruta)
+
+    def o_calcular(self, clave: str, funcion):
+        valor = self.obtener(clave)
+        if valor is None:
+            valor = funcion()
+            self.guardar(clave, valor)
+        return valor
+
+
+if __name__ == "__main__":
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        c = CacheDisco(Path(d) / "cache.json", ttl_segundos=60)
+        llamadas = []
+        assert c.o_calcular("clima", lambda: llamadas.append(1) or {"temp": 21}) == {"temp": 21}
+        assert c.o_calcular("clima", lambda: llamadas.append(1) or {"temp": 99}) == {"temp": 21}
+        assert len(llamadas) == 1
+        c.guardar("viejo", 1, ahora=0)
+        assert c.obtener("viejo", ahora=61) is None          # venció
+        assert CacheDisco(Path(d) / "cache.json", 60).obtener("clima") == {"temp": 21}  # persiste
+        print("ok")
+''')
+
+receta_ejecutable("Limitador de tasa (token bucket)", "python", "limite, tasa, rate limit, rpm, throttle, api, peticiones",
+                  "Permite ráfagas cortas pero respeta N operaciones por segundo; seguro entre hilos.", r'''
+import threading
+import time
+
+
+EPS = 1e-9  # tolerancia: 0.6 - 0.5 da 0.0999...; sin esto el bucle de esperar() puede no terminar nunca
+
+
+class LimitadorTasa:
+    def __init__(self, por_segundo: float, rafaga: int = 1, reloj=time.monotonic, dormir=time.sleep):
+        self.tasa = por_segundo
+        self.capacidad = rafaga
+        self.fichas = float(rafaga)
+        self.reloj = reloj
+        self.dormir = dormir
+        self.ultimo = reloj()
+        self.lock = threading.Lock()
+
+    def _recargar(self) -> None:
+        ahora = self.reloj()
+        self.fichas = min(self.capacidad, self.fichas + (ahora - self.ultimo) * self.tasa)
+        self.ultimo = ahora
+
+    def intentar(self) -> bool:
+        with self.lock:
+            self._recargar()
+            if self.fichas >= 1 - EPS:
+                self.fichas = max(0.0, self.fichas - 1)
+                return True
+            return False
+
+    def esperar(self) -> None:
+        while True:
+            with self.lock:
+                self._recargar()
+                if self.fichas >= 1 - EPS:
+                    self.fichas = max(0.0, self.fichas - 1)
+                    return
+                falta = max((1 - self.fichas) / self.tasa, 0.001)
+            self.dormir(falta)
+
+
+if __name__ == "__main__":
+    t = [0.0]
+    lim = LimitadorTasa(2, rafaga=3, reloj=lambda: t[0])
+    assert [lim.intentar() for _ in range(4)] == [True, True, True, False]   # ráfaga de 3
+    t[0] += 0.5                                                              # medio segundo = 1 ficha
+    assert lim.intentar() and not lim.intentar()
+    dormido = []
+    lim2 = LimitadorTasa(10, reloj=lambda: t[0], dormir=lambda s: (dormido.append(s), t.__setitem__(0, t[0] + s)))
+    lim2.esperar(); lim2.esperar()
+    assert abs(sum(dormido) - 0.1) < 1e-9
+    print("ok")
+''')
+
+receta_ejecutable("Vigilar cambios en archivos (polling)", "python", "vigilar, cambios, watch, archivos, recargar, monitorear",
+                  "Detecta archivos nuevos, modificados y borrados comparando fechas; sin dependencias.", r'''
+import os
+from pathlib import Path
+
+
+def instantanea(carpeta: Path, patron: str = "*") -> dict[str, tuple[int, int]]:
+    salida = {}
+    for ruta in Path(carpeta).rglob(patron):
+        if ruta.is_file() and "__pycache__" not in ruta.parts:
+            st = ruta.stat()
+            salida[str(ruta.relative_to(carpeta))] = (st.st_mtime_ns, st.st_size)
+    return salida
+
+
+def diferencias(antes: dict, despues: dict) -> dict[str, list[str]]:
+    return {
+        "nuevos": sorted(set(despues) - set(antes)),
+        "borrados": sorted(set(antes) - set(despues)),
+        "modificados": sorted(k for k in set(antes) & set(despues) if antes[k] != despues[k]),
+    }
+
+
+def vigilar(carpeta: Path, al_cambiar, intervalo: float = 1.0, patron: str = "*", vueltas: int | None = None):
+    import time
+    previa = instantanea(carpeta, patron)
+    n = 0
+    while vueltas is None or n < vueltas:
+        time.sleep(intervalo)
+        actual = instantanea(carpeta, patron)
+        cambios = diferencias(previa, actual)
+        if any(cambios.values()):
+            al_cambiar(cambios)
+        previa = actual
+        n += 1
+
+
+if __name__ == "__main__":
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d)
+        (base / "a.txt").write_text("1")
+        (base / "b.txt").write_text("1")
+        antes = instantanea(base)
+        (base / "a.txt").write_text("12")
+        os.utime(base / "a.txt", ns=(1, 1))
+        (base / "b.txt").unlink()
+        (base / "c.txt").write_text("nuevo")
+        cambios = diferencias(antes, instantanea(base))
+        assert cambios == {"nuevos": ["c.txt"], "borrados": ["b.txt"], "modificados": ["a.txt"]}, cambios
+        print("ok")
+''')
+
+receta_ejecutable("Contraseñas: hash seguro y verificación", "python", "contraseña, password, hash, login, usuario, seguridad, pbkdf2",
+                  "PBKDF2 con sal aleatoria (librería estándar) y comparación en tiempo constante.", r'''
+import base64
+import hashlib
+import hmac
+import secrets
+
+ITERACIONES = 200_000
+
+
+def hashear(password: str, iteraciones: int = ITERACIONES) -> str:
+    sal = secrets.token_bytes(16)
+    clave = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), sal, iteraciones)
+    return "pbkdf2_sha256${}${}${}".format(
+        iteraciones, base64.b64encode(sal).decode(), base64.b64encode(clave).decode())
+
+
+def verificar(password: str, guardado: str) -> bool:
+    try:
+        algoritmo, iteraciones, sal_b64, clave_b64 = guardado.split("$")
+    except ValueError:
+        return False
+    if algoritmo != "pbkdf2_sha256":
+        return False
+    sal = base64.b64decode(sal_b64)
+    esperado = base64.b64decode(clave_b64)
+    calculado = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), sal, int(iteraciones))
+    return hmac.compare_digest(calculado, esperado)
+
+
+def token_sesion() -> str:
+    return secrets.token_urlsafe(32)
+
+
+if __name__ == "__main__":
+    h = hashear("mate123", iteraciones=1000)
+    assert verificar("mate123", h)
+    assert not verificar("mate124", h)
+    assert hashear("mate123", 1000) != h          # sal distinta cada vez
+    assert not verificar("x", "basura")
+    assert len(token_sesion()) >= 40
+    print("ok")
+''')
+
+receta_ejecutable("Leer un archivo .env sin dependencias", "python", "env, dotenv, configuracion, variables, entorno, secretos",
+                  "KEY=valor, comillas, comentarios y export; no pisa variables ya definidas.", r'''
+import os
+import re
+from pathlib import Path
+
+_LINEA = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$")
+
+
+def leer_env(texto: str) -> dict[str, str]:
+    valores = {}
+    for linea in texto.splitlines():
+        if not linea.strip() or linea.lstrip().startswith("#"):
+            continue
+        m = _LINEA.match(linea)
+        if not m:
+            continue
+        clave, valor = m.group(1), m.group(2).strip()
+        if len(valor) >= 2 and valor[0] == valor[-1] and valor[0] in "'\"":
+            valor = valor[1:-1]
+            if m.group(2).strip()[0] == '"':
+                valor = valor.replace("\\n", "\n")
+        else:
+            valor = re.sub(r"\s+#.*$", "", valor)
+        valores[clave] = valor
+    return valores
+
+
+def cargar_env(ruta: Path = Path(".env"), pisar: bool = False) -> dict[str, str]:
+    try:
+        valores = leer_env(Path(ruta).read_text(encoding="utf-8"))
+    except OSError:
+        return {}
+    for clave, valor in valores.items():
+        if pisar or clave not in os.environ:
+            os.environ[clave] = valor
+    return valores
+
+
+if __name__ == "__main__":
+    v = leer_env('# comentario\nexport TOKEN="abc def"\nPUERTO=8080  # puerto\nVACIO=\nMULTI="a\\nb"\nmal linea\n')
+    assert v == {"TOKEN": "abc def", "PUERTO": "8080", "VACIO": "", "MULTI": "a\nb"}, v
+    print("ok")
+''')
+
+receta_ejecutable("Máquina de estados simple", "python", "estados, maquina, transiciones, flujo, pedido, workflow",
+                  "Transiciones permitidas explícitas, historial y error claro si la transición no vale.", r'''
+from dataclasses import dataclass, field
+
+
+class TransicionInvalida(Exception):
+    pass
+
+
+@dataclass
+class Pedido:
+    TRANSICIONES = {
+        "nuevo": {"pagado", "cancelado"},
+        "pagado": {"enviado", "cancelado"},
+        "enviado": {"entregado"},
+        "entregado": set(),
+        "cancelado": set(),
+    }
+    estado: str = "nuevo"
+    historial: list = field(default_factory=list)
+
+    def pasar_a(self, nuevo: str) -> None:
+        permitidos = self.TRANSICIONES.get(self.estado, set())
+        if nuevo not in permitidos:
+            opciones = ", ".join(sorted(permitidos)) or "ninguno (estado final)"
+            raise TransicionInvalida(f"no se puede pasar de {self.estado} a {nuevo}; opciones: {opciones}")
+        self.historial.append((self.estado, nuevo))
+        self.estado = nuevo
+
+    @property
+    def terminado(self) -> bool:
+        return not self.TRANSICIONES[self.estado]
+
+
+if __name__ == "__main__":
+    p = Pedido()
+    p.pasar_a("pagado"); p.pasar_a("enviado"); p.pasar_a("entregado")
+    assert p.terminado and len(p.historial) == 3
+    try:
+        Pedido().pasar_a("enviado")
+        raise AssertionError("debía fallar")
+    except TransicionInvalida as e:
+        assert "opciones: cancelado, pagado" in str(e)
+    print("ok")
+''')
+
+receta_ejecutable("Cola de prioridad con heapq", "python", "cola, prioridad, heap, heapq, tareas, ordenar, scheduler",
+                  "Desempata por orden de llegada (estable) y permite cancelar tareas.", r'''
+import heapq
+import itertools
+
+
+class ColaPrioridad:
+    def __init__(self):
+        self._heap = []
+        self._contador = itertools.count()
+        self._entradas = {}
+
+    def agregar(self, tarea, prioridad: int = 0) -> None:
+        if tarea in self._entradas:
+            self.cancelar(tarea)
+        entrada = [-prioridad, next(self._contador), tarea, True]
+        self._entradas[tarea] = entrada
+        heapq.heappush(self._heap, entrada)
+
+    def cancelar(self, tarea) -> None:
+        entrada = self._entradas.pop(tarea)
+        entrada[3] = False
+
+    def sacar(self):
+        while self._heap:
+            _p, _n, tarea, viva = heapq.heappop(self._heap)
+            if viva:
+                del self._entradas[tarea]
+                return tarea
+        raise IndexError("cola vacía")
+
+    def __len__(self) -> int:
+        return len(self._entradas)
+
+
+if __name__ == "__main__":
+    c = ColaPrioridad()
+    c.agregar("lavar", 1); c.agregar("pagar luz", 5); c.agregar("leer", 1); c.agregar("urgente", 9)
+    c.cancelar("urgente")
+    c.agregar("leer", 3)                      # re-prioriza
+    assert [c.sacar() for _ in range(len(c))] == ["pagar luz", "leer", "lavar"]
+    print("ok")
+''')
+
+receta_ejecutable("Eventos: publicar y suscribirse", "python", "eventos, observer, suscribir, publicar, callback, bus",
+                  "Bus de eventos mínimo; un suscriptor que falla no rompe a los demás.", r'''
+from collections import defaultdict
+
+
+class BusEventos:
+    def __init__(self):
+        self._suscriptores = defaultdict(list)
+        self.errores = []
+
+    def suscribir(self, evento: str, funcion):
+        self._suscriptores[evento].append(funcion)
+        return lambda: self._suscriptores[evento].remove(funcion)   # para desuscribirse
+
+    def publicar(self, evento: str, **datos) -> int:
+        llamados = 0
+        for funcion in list(self._suscriptores[evento]):
+            try:
+                funcion(**datos)
+                llamados += 1
+            except Exception as e:  # se registra y se sigue con el resto
+                self.errores.append((evento, funcion.__name__, repr(e)))
+        return llamados
+
+
+if __name__ == "__main__":
+    bus = BusEventos()
+    recibidos = []
+    def anotar(**d): recibidos.append(d)
+    def roto(**d): raise ValueError("ups")
+    desuscribir = bus.suscribir("venta", anotar)
+    bus.suscribir("venta", roto)
+    assert bus.publicar("venta", total=100) == 1
+    assert recibidos == [{"total": 100}] and bus.errores[0][1] == "roto"
+    desuscribir()
+    assert bus.publicar("venta", total=5) == 0
+    print("ok")
+''')
+
+receta_ejecutable("Dataclass a JSON y de vuelta (con validación)", "python", "dataclass, json, serializar, modelo, validar, dict",
+                  "asdict para guardar; constructor desde dict que ignora claves extra y valida tipos básicos.", r'''
+import json
+from dataclasses import asdict, dataclass, field, fields
+from datetime import date
+
+
+@dataclass
+class Contacto:
+    nombre: str
+    email: str = ""
+    nacimiento: date | None = None
+    etiquetas: list[str] = field(default_factory=list)
+
+    def __post_init__(self):
+        if not self.nombre.strip():
+            raise ValueError("nombre vacío")
+        if self.email and "@" not in self.email:
+            raise ValueError(f"email inválido: {self.email}")
+
+    def a_dict(self) -> dict:
+        d = asdict(self)
+        d["nacimiento"] = self.nacimiento.isoformat() if self.nacimiento else None
+        return d
+
+    @classmethod
+    def desde_dict(cls, d: dict) -> "Contacto":
+        conocidos = {f.name for f in fields(cls)}
+        datos = {k: v for k, v in d.items() if k in conocidos}
+        if datos.get("nacimiento"):
+            datos["nacimiento"] = date.fromisoformat(datos["nacimiento"])
+        return cls(**datos)
+
+
+if __name__ == "__main__":
+    c = Contacto("Ana", "ana@mail.com", date(1990, 5, 1), ["familia"])
+    texto = json.dumps(c.a_dict())
+    assert Contacto.desde_dict(json.loads(texto) | {"campo_viejo": 1}) == c
+    for malo in ({"nombre": " "}, {"nombre": "x", "email": "sin-arroba"}):
+        try:
+            Contacto.desde_dict(malo)
+            raise AssertionError("debía fallar")
+        except ValueError:
+            pass
+    print("ok")
+''')
+
+receta_ejecutable("Tamaño de carpetas y archivos más grandes", "python", "disco, espacio, tamaño, carpetas, archivos grandes, limpiar",
+                  "Recorre con os.scandir (rápido) y muestra tamaños legibles; útil para liberar espacio en el celular.", r'''
+import heapq
+import os
+from pathlib import Path
+
+
+def legible(n: float) -> str:
+    for unidad in ("B", "KB", "MB", "GB"):
+        if n < 1024:
+            return f"{n:.0f} {unidad}" if unidad == "B" else f"{n:.1f} {unidad}"
+        n /= 1024
+    return f"{n:.1f} TB"
+
+
+def recorrer(carpeta: Path):
+    pila = [Path(carpeta)]
+    while pila:
+        actual = pila.pop()
+        try:
+            with os.scandir(actual) as it:
+                for e in it:
+                    if e.is_dir(follow_symlinks=False):
+                        pila.append(Path(e.path))
+                    elif e.is_file(follow_symlinks=False):
+                        yield Path(e.path), e.stat(follow_symlinks=False).st_size
+        except PermissionError:
+            continue
+
+
+def resumen(carpeta: Path, top: int = 5) -> tuple[int, list[tuple[int, str]]]:
+    total = 0
+    grandes = []
+    for ruta, tam in recorrer(carpeta):
+        total += tam
+        heapq.heappush(grandes, (tam, str(ruta)))
+        if len(grandes) > top:
+            heapq.heappop(grandes)
+    return total, sorted(grandes, reverse=True)
+
+
+if __name__ == "__main__":
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d)
+        (base / "sub").mkdir()
+        (base / "a.bin").write_bytes(b"x" * 3000)
+        (base / "sub" / "b.bin").write_bytes(b"x" * 100)
+        total, grandes = resumen(base, top=1)
+        assert total == 3100 and grandes[0][1].endswith("a.bin")
+        assert legible(3100) == "3.0 KB" and legible(5) == "5 B"
+        print("ok")
+''')
+
+receta_ejecutable("Comprimir y extraer zip de forma segura", "python", "zip, comprimir, descomprimir, backup, respaldo, archivo",
+                  "Crea zips de una carpeta y extrae evitando rutas peligrosas (../) del 'zip slip'.", r'''
+import zipfile
+from pathlib import Path
+
+
+def comprimir(carpeta: Path, destino: Path, ignorar=("__pycache__", ".git")) -> int:
+    carpeta, n = Path(carpeta), 0
+    with zipfile.ZipFile(destino, "w", compression=zipfile.ZIP_DEFLATED) as z:
+        for ruta in sorted(carpeta.rglob("*")):
+            if ruta.is_file() and not any(p in ruta.parts for p in ignorar):
+                z.write(ruta, ruta.relative_to(carpeta).as_posix())
+                n += 1
+    return n
+
+
+def extraer_seguro(zip_ruta: Path, destino: Path) -> list[str]:
+    destino = Path(destino).resolve()
+    extraidos = []
+    with zipfile.ZipFile(zip_ruta) as z:
+        for info in z.infolist():
+            objetivo = (destino / info.filename).resolve()
+            if destino not in objetivo.parents and objetivo != destino:
+                raise ValueError(f"ruta peligrosa en el zip: {info.filename}")
+            z.extract(info, destino)
+            extraidos.append(info.filename)
+    return extraidos
+
+
+if __name__ == "__main__":
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d)
+        (base / "proy" / "src").mkdir(parents=True)
+        (base / "proy" / "src" / "a.py").write_text("print(1)")
+        (base / "proy" / "__pycache__").mkdir()
+        (base / "proy" / "__pycache__" / "x.pyc").write_bytes(b"0")
+        assert comprimir(base / "proy", base / "p.zip") == 1
+        assert extraer_seguro(base / "p.zip", base / "salida") == ["src/a.py"]
+        with zipfile.ZipFile(base / "malo.zip", "w") as z:
+            z.writestr("../../fuera.txt", "x")
+        try:
+            extraer_seguro(base / "malo.zip", base / "salida2")
+            raise AssertionError("debía rechazarlo")
+        except ValueError:
+            pass
+        print("ok")
+''')
+
+receta_ejecutable("Gráfico de barras en SVG sin librerías", "python", "grafico, svg, barras, chart, estadisticas, visualizar",
+                  "Genera un SVG que se abre en el navegador del celular; escala automática y etiquetas escapadas.", r'''
+from html import escape
+
+
+def barras_svg(datos: dict[str, float], ancho: int = 480, alto_barra: int = 26, color: str = "#7c3aed") -> str:
+    if not datos:
+        return '<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"/>'
+    maximo = max(datos.values()) or 1
+    margen = 110
+    alto = len(datos) * (alto_barra + 8) + 10
+    filas = []
+    for i, (etiqueta, valor) in enumerate(datos.items()):
+        y = 10 + i * (alto_barra + 8)
+        largo = max(1, int((ancho - margen - 60) * valor / maximo))
+        filas.append(
+            f'<text x="{margen - 8}" y="{y + alto_barra * 0.7:.0f}" text-anchor="end" font-size="14">{escape(etiqueta)}</text>'
+            f'<rect x="{margen}" y="{y}" width="{largo}" height="{alto_barra}" rx="4" fill="{color}"/>'
+            f'<text x="{margen + largo + 6}" y="{y + alto_barra * 0.7:.0f}" font-size="13">{valor:g}</text>'
+        )
+    return (f'<svg xmlns="http://www.w3.org/2000/svg" width="{ancho}" height="{alto}" font-family="sans-serif">'
+            + "".join(filas) + "</svg>")
+
+
+if __name__ == "__main__":
+    svg = barras_svg({"Comida": 120, "Transporte": 45.5, "<Otros>": 0})
+    assert svg.count("<rect") == 3 and "&lt;Otros&gt;" in svg and "45.5" in svg
+    print("ok")
+''')
+
+receta_ejecutable("Gráficos en la terminal (sparkline y barras)", "python", "grafico, terminal, ascii, sparkline, barras, consola",
+                  "Visualización rápida de series en la consola de Termux.", r'''
+BLOQUES = "▁▂▃▄▅▆▇█"
+
+
+def sparkline(valores: list[float]) -> str:
+    if not valores:
+        return ""
+    minimo, maximo = min(valores), max(valores)
+    rango = (maximo - minimo) or 1
+    return "".join(BLOQUES[int((v - minimo) / rango * (len(BLOQUES) - 1))] for v in valores)
+
+
+def barras(datos: dict[str, float], ancho: int = 30) -> str:
+    if not datos:
+        return "(sin datos)"
+    maximo = max(datos.values()) or 1
+    etiqueta = max(len(k) for k in datos)
+    return "\n".join(f"{k:<{etiqueta}} {'█' * round(v / maximo * ancho):<{ancho}} {v:g}" for k, v in datos.items())
+
+
+if __name__ == "__main__":
+    assert sparkline([1, 2, 3, 4, 5, 6, 7, 8]) == BLOQUES
+    assert sparkline([5, 5]) == "▁▁"
+    salida = barras({"lunes": 10, "martes": 5}, ancho=10)
+    assert salida.splitlines()[0] == "lunes  ██████████ 10"
+    print(salida)
+''')
+
+receta_ejecutable("Servidor y cliente TCP con timeout", "python", "socket, tcp, red, cliente, servidor, puerto, chat",
+                  "Servidor eco con hilos; el cliente usa timeout para no colgarse nunca.", r'''
+import socket
+import socketserver
+import threading
+
+
+class Eco(socketserver.StreamRequestHandler):
+    def handle(self):
+        for linea in self.rfile:
+            texto = linea.decode("utf-8", "replace").rstrip("\r\n")
+            if texto == "chau":
+                self.wfile.write(b"adios\n")
+                return
+            self.wfile.write(f"eco: {texto}\n".encode("utf-8"))
+
+
+class Servidor(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+
+def pedir(host: str, puerto: int, lineas: list[str], timeout: float = 3.0) -> list[str]:
+    with socket.create_connection((host, puerto), timeout=timeout) as s:
+        archivo = s.makefile("rw", encoding="utf-8", newline="\n")
+        respuestas = []
+        for linea in lineas:
+            archivo.write(linea + "\n")
+            archivo.flush()
+            respuestas.append(archivo.readline().rstrip("\n"))
+        return respuestas
+
+
+if __name__ == "__main__":
+    servidor = Servidor(("127.0.0.1", 0), Eco)
+    hilo = threading.Thread(target=servidor.serve_forever, daemon=True)
+    hilo.start()
+    try:
+        puerto = servidor.server_address[1]
+        assert pedir("127.0.0.1", puerto, ["hola", "chau"]) == ["eco: hola", "adios"]
+    finally:
+        servidor.shutdown()
+        servidor.server_close()
+    print("ok")
+''')
+
+receta_ejecutable("Extraer links y textos de HTML (html.parser)", "python", "html, scraping, links, parsear, extraer, web",
+                  "Sin BeautifulSoup: links absolutos, título y texto visible.", r'''
+from html.parser import HTMLParser
+from urllib.parse import urljoin
+
+
+class Extractor(HTMLParser):
+    def __init__(self, base: str = ""):
+        super().__init__(convert_charrefs=True)
+        self.base = base
+        self.links: list[tuple[str, str]] = []
+        self.titulo = ""
+        self._en_titulo = False
+        self._link_actual = None
+        self._texto_link = []
+        self._ignorar = 0
+        self.texto: list[str] = []
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        if tag in ("script", "style"):
+            self._ignorar += 1
+        elif tag == "title":
+            self._en_titulo = True
+        elif tag == "a" and attrs.get("href"):
+            self._link_actual = urljoin(self.base, attrs["href"])
+            self._texto_link = []
+
+    def handle_endtag(self, tag):
+        if tag in ("script", "style") and self._ignorar:
+            self._ignorar -= 1
+        elif tag == "title":
+            self._en_titulo = False
+        elif tag == "a" and self._link_actual:
+            self.links.append((self._link_actual, " ".join("".join(self._texto_link).split())))
+            self._link_actual = None
+
+    def handle_data(self, data):
+        if self._ignorar:
+            return
+        if self._en_titulo:
+            self.titulo += data.strip()
+        if self._link_actual is not None:
+            self._texto_link.append(data)
+        if data.strip():
+            self.texto.append(data.strip())
+
+
+def analizar_html(html: str, base: str = "") -> Extractor:
+    e = Extractor(base)
+    e.feed(html)
+    e.close()
+    return e
+
+
+if __name__ == "__main__":
+    e = analizar_html('<html><head><title>Hola</title><script>x=1</script></head><body>'
+                      '<a href="/a">Ir &amp; volver</a> <a href="https://y.com">Y</a><p>texto</p></body></html>',
+                      base="https://x.com/dir/")
+    assert e.titulo == "Hola"
+    assert e.links == [("https://x.com/a", "Ir & volver"), ("https://y.com", "Y")]
+    assert "x=1" not in " ".join(e.texto) and "texto" in e.texto
+    print("ok")
+''')
+
+receta_ejecutable("SQLite: migraciones con user_version", "python", "sqlite, migracion, esquema, version, base de datos, tabla",
+                  "Cada migración corre una sola vez y en orden; PRAGMA user_version guarda en qué versión está la base.", r'''
+import sqlite3
+
+MIGRACIONES = [
+    "CREATE TABLE notas (id INTEGER PRIMARY KEY, texto TEXT NOT NULL)",
+    "ALTER TABLE notas ADD COLUMN creada TEXT DEFAULT CURRENT_TIMESTAMP",
+    "CREATE INDEX idx_notas_creada ON notas(creada)",
+]
+
+
+def migrar(con: sqlite3.Connection) -> int:
+    version = con.execute("PRAGMA user_version").fetchone()[0]
+    for numero, sql in enumerate(MIGRACIONES[version:], start=version + 1):
+        with con:  # cada migración en su transacción
+            con.execute(sql)
+            con.execute(f"PRAGMA user_version = {numero}")
+    return con.execute("PRAGMA user_version").fetchone()[0]
+
+
+if __name__ == "__main__":
+    con = sqlite3.connect(":memory:")
+    assert migrar(con) == 3
+    assert migrar(con) == 3                     # idempotente
+    con.execute("INSERT INTO notas (texto) VALUES (?)", ("hola",))
+    assert con.execute("SELECT texto, creada IS NOT NULL FROM notas").fetchone() == ("hola", 1)
+    print("ok")
+''')
+
+receta_ejecutable("Búsqueda de texto completo con SQLite FTS5", "python", "buscar, busqueda, texto, fts, sqlite, indice, search",
+                  "Índice de búsqueda rápido con ranking; cae a LIKE si FTS5 no está compilado.", r'''
+import sqlite3
+
+
+def crear(con: sqlite3.Connection) -> bool:
+    try:
+        con.execute("CREATE VIRTUAL TABLE docs USING fts5(titulo, cuerpo)")
+        return True
+    except sqlite3.OperationalError:
+        con.execute("CREATE TABLE docs (titulo TEXT, cuerpo TEXT)")
+        return False
+
+
+def buscar(con: sqlite3.Connection, consulta: str, fts: bool, limite: int = 10) -> list[str]:
+    if fts:
+        terminos = " ".join(f'"{t}"' for t in consulta.split() if t)
+        filas = con.execute("SELECT titulo FROM docs WHERE docs MATCH ? ORDER BY rank LIMIT ?", (terminos, limite))
+    else:
+        patron = f"%{consulta}%"
+        filas = con.execute("SELECT titulo FROM docs WHERE titulo LIKE ? OR cuerpo LIKE ? LIMIT ?",
+                            (patron, patron, limite))
+    return [f[0] for f in filas]
+
+
+if __name__ == "__main__":
+    con = sqlite3.connect(":memory:")
+    fts = crear(con)
+    con.executemany("INSERT INTO docs VALUES (?, ?)", [
+        ("Receta de mate", "cómo cebar un buen mate"), ("Viaje", "fuimos a la playa"), ("Mate dulce", "con azúcar")])
+    assert set(buscar(con, "mate", fts)) == {"Receta de mate", "Mate dulce"}
+    assert buscar(con, "playa", fts) == ["Viaje"]
+    print("ok", "(fts5)" if fts else "(like)")
+''')
+
+receta_ejecutable("Salida limpia con Ctrl+C y señales", "python", "señal, signal, sigterm, ctrl+c, salir, apagar, limpieza",
+                  "Captura SIGINT/SIGTERM, termina el trabajo en curso y guarda antes de salir.", r'''
+import signal
+import threading
+
+
+class Apagado:
+    def __init__(self):
+        self.evento = threading.Event()
+        self.motivo = ""
+
+    def instalar(self) -> "Apagado":
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            signal.signal(sig, self._manejar)
+        return self
+
+    def _manejar(self, numero, _frame):
+        self.motivo = signal.Signals(numero).name
+        self.evento.set()
+
+    @property
+    def pedido(self) -> bool:
+        return self.evento.is_set()
+
+
+def trabajar(apagado: Apagado, tareas: list[int]) -> list[int]:
+    hechas = []
+    for t in tareas:
+        if apagado.pedido:
+            break               # se termina prolijo: lo hecho queda guardado
+        hechas.append(t * 2)
+    return hechas
+
+
+if __name__ == "__main__":
+    import os
+    apagado = Apagado().instalar()
+    assert trabajar(apagado, [1, 2]) == [2, 4]
+    os.kill(os.getpid(), signal.SIGTERM)
+    assert apagado.evento.wait(2) and apagado.motivo == "SIGTERM"
+    assert trabajar(apagado, [1, 2]) == []
+    print("ok")
+''')
+
+receta_ejecutable("Una sola instancia con archivo de lock", "python", "lock, instancia, daemon, bloqueo, fcntl, proceso",
+                  "Evita que el mismo script corra dos veces a la vez (útil con cron en Termux).", r'''
+import fcntl
+import os
+from pathlib import Path
+
+
+class Instancia:
+    def __init__(self, ruta: Path):
+        self.ruta = Path(ruta)
+        self.archivo = None
+
+    def __enter__(self) -> "Instancia":
+        self.archivo = open(self.ruta, "a+")
+        try:
+            fcntl.flock(self.archivo, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            self.archivo.close()
+            raise RuntimeError(f"ya hay otra instancia corriendo ({self.ruta})")
+        self.archivo.seek(0)
+        self.archivo.truncate()
+        self.archivo.write(str(os.getpid()))
+        self.archivo.flush()
+        return self
+
+    def __exit__(self, *exc) -> None:
+        fcntl.flock(self.archivo, fcntl.LOCK_UN)
+        self.archivo.close()
+
+
+if __name__ == "__main__":
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        lock = Path(d) / "app.lock"
+        with Instancia(lock):
+            try:
+                with Instancia(lock):
+                    raise AssertionError("no debía poder entrar")
+            except RuntimeError as e:
+                assert "otra instancia" in str(e)
+        with Instancia(lock):            # liberado: se puede volver a tomar
+            pass
+    print("ok")
+''')
+
+receta_ejecutable("¿Quisiste decir...? (sugerencias con difflib)", "python", "sugerencia, parecido, typo, corregir, fuzzy, buscar",
+                  "Sugerir comandos o nombres parecidos cuando el usuario se equivoca.", r'''
+import difflib
+import unicodedata
+
+
+def normalizar(texto: str) -> str:
+    sin_tildes = unicodedata.normalize("NFKD", texto).encode("ascii", "ignore").decode()
+    return " ".join(sin_tildes.lower().split())
+
+
+def sugerir(palabra: str, opciones: list[str], n: int = 3, corte: float = 0.6) -> list[str]:
+    mapa = {normalizar(o): o for o in opciones}
+    return [mapa[c] for c in difflib.get_close_matches(normalizar(palabra), list(mapa), n=n, cutoff=corte)]
+
+
+def buscar_difuso(consulta: str, opciones: list[str]) -> list[str]:
+    q = normalizar(consulta)
+    puntuadas = []
+    for o in opciones:
+        n = normalizar(o)
+        puntaje = 1.0 if q in n else difflib.SequenceMatcher(None, q, n).ratio()
+        puntuadas.append((puntaje, o))
+    return [o for p, o in sorted(puntuadas, key=lambda x: (-x[0], x[1])) if p >= 0.5]
+
+
+if __name__ == "__main__":
+    comandos = ["agregar", "listar", "borrar", "exportar", "configuración"]
+    assert sugerir("lsitar", comandos) == ["listar"]
+    assert sugerir("configuracion", comandos) == ["configuración"]
+    assert sugerir("zzz", comandos) == []
+    assert buscar_difuso("expor", comandos)[0] == "exportar"
+    print("ok")
+''')
+
+receta_ejecutable("Detectar archivos duplicados por hash", "python", "duplicados, hash, sha256, archivos, fotos, limpiar, espacio",
+                  "Agrupa por tamaño primero (rápido) y recién después calcula el hash por bloques.", r'''
+import hashlib
+from collections import defaultdict
+from pathlib import Path
+
+
+def hash_archivo(ruta: Path, bloque: int = 1 << 20) -> str:
+    h = hashlib.sha256()
+    with open(ruta, "rb") as f:
+        for trozo in iter(lambda: f.read(bloque), b""):
+            h.update(trozo)
+    return h.hexdigest()
+
+
+def duplicados(carpeta: Path) -> list[list[Path]]:
+    por_tamano = defaultdict(list)
+    for ruta in Path(carpeta).rglob("*"):
+        if ruta.is_file() and not ruta.is_symlink():
+            por_tamano[ruta.stat().st_size].append(ruta)
+    grupos = []
+    for tam, rutas in por_tamano.items():
+        if len(rutas) < 2 or tam == 0:
+            continue
+        por_hash = defaultdict(list)
+        for ruta in rutas:
+            por_hash[hash_archivo(ruta)].append(ruta)
+        grupos.extend(sorted(g) for g in por_hash.values() if len(g) > 1)
+    return sorted(grupos)
+
+
+if __name__ == "__main__":
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d)
+        (base / "a.jpg").write_bytes(b"foto1")
+        (base / "copia.jpg").write_bytes(b"foto1")
+        (base / "otra.jpg").write_bytes(b"foto2")
+        grupos = duplicados(base)
+        assert [[p.name for p in g] for g in grupos] == [["a.jpg", "copia.jpg"]]
+        print("ok")
+''')
+
+receta_ejecutable("Plantillas de texto con string.Template", "python", "plantilla, template, texto, email, mensaje, reemplazar",
+                  "Variables $nombre seguras (safe_substitute no explota si falta una).", r'''
+from string import Template
+
+FACTURA = Template("""Hola $cliente,
+Tu pedido #$numero por $$${total} está $estado.
+""")
+
+
+def renderizar(plantilla: Template, **valores) -> str:
+    return plantilla.safe_substitute(**valores)
+
+
+def faltantes(plantilla: Template, valores: dict) -> list[str]:
+    nombres = {m.group("named") or m.group("braced") for m in plantilla.pattern.finditer(plantilla.template)}
+    return sorted(n for n in nombres if n and n not in valores)
+
+
+if __name__ == "__main__":
+    texto = renderizar(FACTURA, cliente="Ana", numero=12, total="1500.00", estado="en camino")
+    assert texto == "Hola Ana,\nTu pedido #12 por $1500.00 está en camino.\n", texto
+    assert faltantes(FACTURA, {"cliente": "x"}) == ["estado", "numero", "total"]
+    print("ok")
+''')
+
+receta_ejecutable("Medir tiempos y encontrar lo lento (cProfile)", "python", "rendimiento, lento, profiling, tiempo, optimizar, cprofile",
+                  "Cronómetro con contexto y perfilado de una función para ver dónde se va el tiempo.", r'''
+import cProfile
+import io
+import pstats
+import time
+from contextlib import contextmanager
+
+
+@contextmanager
+def cronometro(nombre: str, resultados: dict | None = None):
+    inicio = time.perf_counter()
+    try:
+        yield
+    finally:
+        segundos = time.perf_counter() - inicio
+        if resultados is not None:
+            resultados[nombre] = segundos
+        else:
+            print(f"{nombre}: {segundos * 1000:.1f} ms")
+
+
+def perfilar(funcion, *args, top: int = 5, **kwargs) -> tuple[object, str]:
+    perfil = cProfile.Profile()
+    resultado = perfil.runcall(funcion, *args, **kwargs)
+    salida = io.StringIO()
+    pstats.Stats(perfil, stream=salida).sort_stats("cumulative").print_stats(top)
+    return resultado, salida.getvalue()
+
+
+if __name__ == "__main__":
+    tiempos = {}
+    with cronometro("suma", tiempos):
+        sum(range(10000))
+    assert tiempos["suma"] >= 0
+    def lento(n): return sorted(str(i) for i in range(n))
+    resultado, informe = perfilar(lento, 1000)
+    assert len(resultado) == 1000 and "function calls" in informe
+    print("ok")
+''')
+
+receta_ejecutable("Tests parametrizados con subTest", "python", "test, tests, parametrizar, casos, subtest, unittest, tabla",
+                  "Una tabla de casos en un solo test; cada caso que falla se informa por separado.", r'''
+import unittest
+
+
+def clasificar_imc(imc: float) -> str:
+    if imc <= 0:
+        raise ValueError("IMC inválido")
+    if imc < 18.5:
+        return "bajo peso"
+    if imc < 25:
+        return "normal"
+    if imc < 30:
+        return "sobrepeso"
+    return "obesidad"
+
+
+class TestIMC(unittest.TestCase):
+    CASOS = [(17.9, "bajo peso"), (18.5, "normal"), (24.99, "normal"), (25, "sobrepeso"), (31, "obesidad")]
+
+    def test_tabla(self):
+        for imc, esperado in self.CASOS:
+            with self.subTest(imc=imc):
+                self.assertEqual(clasificar_imc(imc), esperado)
+
+    def test_invalidos(self):
+        for imc in (0, -3):
+            with self.subTest(imc=imc), self.assertRaises(ValueError):
+                clasificar_imc(imc)
+
+
+if __name__ == "__main__":
+    resultado = unittest.main(argv=["x"], exit=False, verbosity=0).result
+    assert resultado.wasSuccessful()
+''')
+
+receta_ejecutable("Paginar resultados", "python", "paginar, paginacion, pagina, listado, resultados, limite",
+                  "Página con total, cantidad de páginas y navegación; valida números fuera de rango.", r'''
+import math
+from dataclasses import dataclass
+
+
+@dataclass
+class Pagina:
+    items: list
+    numero: int
+    por_pagina: int
+    total: int
+
+    @property
+    def paginas(self) -> int:
+        return max(1, math.ceil(self.total / self.por_pagina))
+
+    @property
+    def tiene_siguiente(self) -> bool:
+        return self.numero < self.paginas
+
+    @property
+    def tiene_anterior(self) -> bool:
+        return self.numero > 1
+
+
+def paginar(items: list, numero: int = 1, por_pagina: int = 10) -> Pagina:
+    if por_pagina < 1:
+        raise ValueError("por_pagina debe ser >= 1")
+    total = len(items)
+    paginas = max(1, math.ceil(total / por_pagina))
+    numero = min(max(1, numero), paginas)
+    inicio = (numero - 1) * por_pagina
+    return Pagina(items[inicio:inicio + por_pagina], numero, por_pagina, total)
+
+
+if __name__ == "__main__":
+    p = paginar(list(range(25)), 3, 10)
+    assert p.items == list(range(20, 25)) and p.paginas == 3 and not p.tiene_siguiente and p.tiene_anterior
+    assert paginar([], 5).numero == 1 and paginar(list(range(5)), 99, 2).numero == 3
+    print("ok")
+''')
+
+receta_ejecutable("Probar un programa interactivo con subprocess", "python", "interactivo, input, probar, test, stdin, subprocess, menu, calculadora",
+                  "La forma correcta de testear un programa que usa input(): pasarle la entrada, NO quitarle el input().", r'''
+import subprocess
+import sys
+import tempfile
+import textwrap
+from pathlib import Path
+
+PROGRAMA = textwrap.dedent("""
+    def main():
+        while True:
+            try:
+                texto = input("número (o salir): ")
+            except EOFError:
+                print("\\nfin de la entrada")
+                break
+            if texto == "salir":
+                print("chau")
+                break
+            print("doble:", int(texto) * 2)
+
+    if __name__ == "__main__":
+        main()
+""")
+
+
+def correr_con_entrada(ruta: Path, entrada: str, timeout: float = 10) -> subprocess.CompletedProcess:
+    return subprocess.run([sys.executable, str(ruta)], input=entrada, capture_output=True, text=True, timeout=timeout)
+
+
+if __name__ == "__main__":
+    with tempfile.TemporaryDirectory() as d:
+        ruta = Path(d) / "app.py"
+        ruta.write_text(PROGRAMA)
+        r = correr_con_entrada(ruta, "2\n5\nsalir\n")
+        assert r.returncode == 0 and "doble: 4" in r.stdout and "doble: 10" in r.stdout and "chau" in r.stdout
+        r = correr_con_entrada(ruta, "3\n")                # sin "salir": termina por fin de entrada
+        assert "fin de la entrada" in r.stdout and r.returncode == 0
+        print("ok")
+''')
+
+
+# ======================================================================
+# MÓDULO: recetas_lenguajes
+# ======================================================================
+"""
+Recetas de otros lenguajes, también como programas completos con verificación incorporada
+(si algo no da lo esperado, terminan con código de salida != 0).
+comando_receta() arma el comando para compilar y ejecutar cada una.
+"""
+
+_EXTENSION_RECETA = {"python": "py", "go": "go", "rust": "rs", "c": "c", "java": "java", "php": "php", "ruby": "rb",
+                     "bash": "sh", "javascript": "mjs", "perl": "pl", "html": "html", "css": "css"}
+_REQUIERE_RECETA = {"go": "go", "rust": "rustc", "c": "cc", "java": "java", "php": "php", "ruby": "ruby", "bash": "bash",
+                    "javascript": "node", "perl": "perl", "python": "python3"}
+
+
+def comando_receta(r: Receta, ruta: str) -> str:
+    q = shlex.quote(ruta)
+    binario = shlex.quote(str(Path(ruta).with_suffix("")))
+    return {
+        "python": f"{shlex.quote(sys.executable)} {q}",
+        "go": f"go run {q}",
+        "rust": f"rustc --edition 2021 -O -o {binario} {q} && {binario}",
+        "c": f"cc -std=c99 -Wall -Wextra -o {binario} {q} -lm && {binario}",
+        "java": f"java {q}",
+        "php": f"php {q}",
+        "ruby": f"ruby {q}",
+        "bash": f"bash {q}",
+        "javascript": f"node {q}",
+        "perl": f"perl {q}",
+    }[r.lenguaje]
+
+
+def receta_disponible(r: Receta) -> bool:
+    return shutil.which(_REQUIERE_RECETA.get(r.lenguaje, r.lenguaje)) is not None
+
+
+# ======================================================================== GO
+receta_ejecutable("Go: worker pool con goroutines", "go", "go, golang, goroutine, concurrencia, paralelo, worker, canal",
+                  "N trabajadores procesan tareas de un canal; resultados y errores en orden de llegada, con WaitGroup.", r'''
+package main
+
+import (
+	"errors"
+	"fmt"
+	"os"
+	"sort"
+	"sync"
+)
+
+type resultado struct {
+	entrada int
+	salida  int
+	err     error
+}
+
+func procesar(n int) (int, error) {
+	if n < 0 {
+		return 0, errors.New("número negativo")
+	}
+	return n * n, nil
+}
+
+func pool(entradas []int, trabajadores int) []resultado {
+	tareas := make(chan int)
+	resultados := make(chan resultado)
+	var wg sync.WaitGroup
+	for i := 0; i < trabajadores; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for n := range tareas {
+				s, err := procesar(n)
+				resultados <- resultado{n, s, err}
+			}
+		}()
+	}
+	go func() {
+		for _, n := range entradas {
+			tareas <- n
+		}
+		close(tareas)
+	}()
+	go func() {
+		wg.Wait()
+		close(resultados)
+	}()
+	var todos []resultado
+	for r := range resultados {
+		todos = append(todos, r)
+	}
+	sort.Slice(todos, func(a, b int) bool { return todos[a].entrada < todos[b].entrada })
+	return todos
+}
+
+func main() {
+	rs := pool([]int{3, -1, 2, 5}, 3)
+	errores, suma := 0, 0
+	for _, r := range rs {
+		if r.err != nil {
+			errores++
+			continue
+		}
+		suma += r.salida
+	}
+	fmt.Println("suma:", suma, "errores:", errores)
+	if suma != 38 || errores != 1 || len(rs) != 4 {
+		os.Exit(1)
+	}
+}
+''')
+
+receta_ejecutable("Go: guardar y cargar JSON con structs", "go", "go, golang, json, archivo, guardar, cargar, struct",
+                  "Tags json, escritura atómica y error claro si el archivo está dañado.", r'''
+package main
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+)
+
+type Config struct {
+	Nombre  string   `json:"nombre"`
+	Puerto  int      `json:"puerto"`
+	Debug   bool     `json:"debug,omitempty"`
+	Usuarios []string `json:"usuarios"`
+}
+
+func cargar(ruta string) (Config, error) {
+	c := Config{Puerto: 8080} // valores por defecto
+	datos, err := os.ReadFile(ruta)
+	if errors.Is(err, os.ErrNotExist) {
+		return c, nil
+	}
+	if err != nil {
+		return c, err
+	}
+	if err := json.Unmarshal(datos, &c); err != nil {
+		return c, fmt.Errorf("config dañada en %s: %w", ruta, err)
+	}
+	return c, nil
+}
+
+func guardar(ruta string, c Config) error {
+	datos, err := json.MarshalIndent(c, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp := ruta + ".tmp"
+	if err := os.WriteFile(tmp, append(datos, '\n'), 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, ruta)
+}
+
+func main() {
+	dir, _ := os.MkdirTemp("", "cfg")
+	defer os.RemoveAll(dir)
+	ruta := filepath.Join(dir, "config.json")
+	c, err := cargar(ruta)
+	if err != nil || c.Puerto != 8080 {
+		os.Exit(1)
+	}
+	c.Nombre, c.Usuarios = "app", []string{"ana"}
+	if err := guardar(ruta, c); err != nil {
+		os.Exit(1)
+	}
+	otra, err := cargar(ruta)
+	if err != nil || otra.Nombre != "app" || len(otra.Usuarios) != 1 {
+		os.Exit(1)
+	}
+	_ = os.WriteFile(ruta, []byte("{roto"), 0o644)
+	if _, err := cargar(ruta); err == nil {
+		os.Exit(1)
+	}
+	fmt.Println("ok")
+}
+''')
+
+receta_ejecutable("Go: cliente HTTP con timeout y contexto", "go", "go, golang, http, cliente, timeout, api, request",
+                  "http.Client con Timeout, context para cancelar y chequeo del código de estado.", r'''
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"time"
+)
+
+func obtenerJSON(ctx context.Context, cliente *http.Client, url string, destino interface{}) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Accept", "application/json")
+	resp, err := cliente.Do(req)
+	if err != nil {
+		return fmt.Errorf("pedido a %s: %w", url, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		cuerpo, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, cuerpo)
+	}
+	return json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(destino)
+}
+
+func main() {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/lento" {
+			time.Sleep(300 * time.Millisecond)
+		}
+		if r.URL.Path == "/error" {
+			http.Error(w, "no", http.StatusTeapot)
+			return
+		}
+		fmt.Fprint(w, `{"temp": 21}`)
+	}))
+	defer srv.Close()
+	cliente := &http.Client{Timeout: 100 * time.Millisecond}
+	var datos struct{ Temp int `json:"temp"` }
+	if err := obtenerJSON(context.Background(), cliente, srv.URL+"/clima", &datos); err != nil || datos.Temp != 21 {
+		fmt.Println("fallo:", err)
+		os.Exit(1)
+	}
+	if err := obtenerJSON(context.Background(), cliente, srv.URL+"/lento", &datos); err == nil {
+		os.Exit(1)
+	}
+	if err := obtenerJSON(context.Background(), cliente, srv.URL+"/error", &datos); err == nil {
+		os.Exit(1)
+	}
+	fmt.Println("ok")
+}
+''')
+
+# ======================================================================== RUST
+receta_ejecutable("Rust: contar palabras con HashMap", "rust", "rust, hashmap, contar, palabras, frecuencia, texto",
+                  "entry().or_insert, normalización y orden por frecuencia y luego alfabético.", r'''
+use std::collections::HashMap;
+
+fn frecuencias(texto: &str) -> Vec<(String, usize)> {
+    let mut conteo: HashMap<String, usize> = HashMap::new();
+    for palabra in texto
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|p| !p.is_empty())
+        .map(|p| p.to_lowercase())
+    {
+        *conteo.entry(palabra).or_insert(0) += 1;
+    }
+    let mut v: Vec<(String, usize)> = conteo.into_iter().collect();
+    v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    v
+}
+
+fn main() {
+    let v = frecuencias("El mate, el MATE y el termo. ¡Mate!");
+    println!("{:?}", &v[..2]);
+    assert_eq!(v[0], ("el".to_string(), 3));
+    assert_eq!(v[1], ("mate".to_string(), 3));
+    assert_eq!(v.len(), 4);
+}
+''')
+
+receta_ejecutable("Rust: tipo propio con FromStr y Display", "rust", "rust, fromstr, display, parsear, tipo, struct, hora",
+                  "Parsear '12:30' a un struct con errores descriptivos y mostrarlo con formato.", r'''
+use std::fmt;
+use std::str::FromStr;
+
+#[derive(Debug, PartialEq, Clone, Copy)]
+struct Hora {
+    h: u8,
+    m: u8,
+}
+
+#[derive(Debug, PartialEq)]
+enum ErrorHora {
+    Formato,
+    Rango(String),
+}
+
+impl fmt::Display for ErrorHora {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ErrorHora::Formato => write!(f, "formato inválido, se esperaba HH:MM"),
+            ErrorHora::Rango(s) => write!(f, "hora fuera de rango: {}", s),
+        }
+    }
+}
+
+impl FromStr for Hora {
+    type Err = ErrorHora;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let (h, m) = s.trim().split_once(':').ok_or(ErrorHora::Formato)?;
+        let h: u8 = h.parse().map_err(|_| ErrorHora::Formato)?;
+        let m: u8 = m.parse().map_err(|_| ErrorHora::Formato)?;
+        if h > 23 || m > 59 {
+            return Err(ErrorHora::Rango(s.to_string()));
+        }
+        Ok(Hora { h, m })
+    }
+}
+
+impl fmt::Display for Hora {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:02}:{:02}", self.h, self.m)
+    }
+}
+
+impl Hora {
+    fn sumar_minutos(self, minutos: u32) -> Hora {
+        let total = (self.h as u32 * 60 + self.m as u32 + minutos) % (24 * 60);
+        Hora { h: (total / 60) as u8, m: (total % 60) as u8 }
+    }
+}
+
+fn main() {
+    let h: Hora = "9:05".parse().unwrap();
+    assert_eq!(h.to_string(), "09:05");
+    assert_eq!(h.sumar_minutos(1000).to_string(), "01:45");
+    assert_eq!("25:00".parse::<Hora>(), Err(ErrorHora::Rango("25:00".into())));
+    assert_eq!("hola".parse::<Hora>(), Err(ErrorHora::Formato));
+    println!("ok {}", ErrorHora::Formato);
+}
+''')
+
+receta_ejecutable("Rust: errores con enum, From y el operador ?", "rust", "rust, error, result, from, operador, propagar, io",
+                  "Un enum de error que envuelve io::Error y ParseIntError; ? convierte solo gracias a From.", r'''
+use std::fmt;
+use std::fs;
+use std::io;
+use std::num::ParseIntError;
+
+#[derive(Debug)]
+enum Error {
+    Io(io::Error),
+    Numero { linea: usize, fuente: ParseIntError },
+    Vacio,
+}
+
+impl From<io::Error> for Error {
+    fn from(e: io::Error) -> Self {
+        Error::Io(e)
+    }
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Error::Io(e) => write!(f, "no pude leer el archivo: {}", e),
+            Error::Numero { linea, fuente } => write!(f, "línea {}: {}", linea, fuente),
+            Error::Vacio => write!(f, "el archivo no tiene números"),
+        }
+    }
+}
+
+fn promedio_de_archivo(ruta: &str) -> Result<f64, Error> {
+    let texto = fs::read_to_string(ruta)?; // io::Error → Error por From
+    let mut numeros = Vec::new();
+    for (i, linea) in texto.lines().enumerate().filter(|(_, l)| !l.trim().is_empty()) {
+        let n: i64 = linea.trim().parse().map_err(|e| Error::Numero { linea: i + 1, fuente: e })?;
+        numeros.push(n);
+    }
+    if numeros.is_empty() {
+        return Err(Error::Vacio);
+    }
+    Ok(numeros.iter().sum::<i64>() as f64 / numeros.len() as f64)
+}
+
+fn main() {
+    let dir = std::env::temp_dir().join(format!("receta_{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let ok = dir.join("ok.txt");
+    fs::write(&ok, "10\n20\n\n30\n").unwrap();
+    assert_eq!(promedio_de_archivo(ok.to_str().unwrap()).unwrap(), 20.0);
+    let malo = dir.join("malo.txt");
+    fs::write(&malo, "1\nx\n").unwrap();
+    let e = promedio_de_archivo(malo.to_str().unwrap()).unwrap_err();
+    assert!(e.to_string().starts_with("línea 2:"), "{}", e);
+    assert!(matches!(promedio_de_archivo("/no/existe"), Err(Error::Io(_))));
+    fs::remove_dir_all(&dir).unwrap();
+    println!("ok");
+}
+''')
+
+# ======================================================================== C
+receta_ejecutable("C: lista enlazada sin fugas de memoria", "c", "c, lista, enlazada, malloc, free, memoria, puntero",
+                  "Insertar al final, borrar por valor y liberar todo; cada malloc chequeado.", r'''
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+typedef struct nodo {
+    char nombre[32];
+    struct nodo *sig;
+} nodo;
+
+static int agregar(nodo **cabeza, const char *nombre) {
+    nodo *n = malloc(sizeof *n);
+    if (!n) {
+        return -1;
+    }
+    snprintf(n->nombre, sizeof n->nombre, "%s", nombre);
+    n->sig = NULL;
+    nodo **p = cabeza;
+    while (*p) {
+        p = &(*p)->sig;
+    }
+    *p = n;
+    return 0;
+}
+
+static int borrar(nodo **cabeza, const char *nombre) {
+    for (nodo **p = cabeza; *p; p = &(*p)->sig) {
+        if (strcmp((*p)->nombre, nombre) == 0) {
+            nodo *viejo = *p;
+            *p = viejo->sig;
+            free(viejo);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static size_t largo(const nodo *n) {
+    size_t c = 0;
+    for (; n; n = n->sig) {
+        c++;
+    }
+    return c;
+}
+
+static void liberar(nodo **cabeza) {
+    nodo *n = *cabeza;
+    while (n) {
+        nodo *sig = n->sig;
+        free(n);
+        n = sig;
+    }
+    *cabeza = NULL;
+}
+
+int main(void) {
+    nodo *lista = NULL;
+    agregar(&lista, "ana");
+    agregar(&lista, "luis");
+    agregar(&lista, "eva");
+    if (largo(lista) != 3 || !borrar(&lista, "luis") || borrar(&lista, "zoe") || largo(lista) != 2) {
+        return 1;
+    }
+    if (strcmp(lista->nombre, "ana") != 0 || strcmp(lista->sig->nombre, "eva") != 0) {
+        return 1;
+    }
+    liberar(&lista);
+    printf("ok\n");
+    return lista == NULL ? 0 : 1;
+}
+''')
+
+receta_ejecutable("C: leer un archivo entero en memoria", "c", "c, archivo, leer, fread, realloc, memoria, buffer",
+                  "Lee por bloques agrandando el buffer (sirve también para stdin) y siempre termina en '\\0'.", r'''
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* Devuelve un buffer terminado en '\0' que el llamador libera con free(), o NULL si falla. */
+static char *leer_todo(FILE *f, size_t *largo) {
+    size_t cap = 4096, n = 0;
+    char *buf = malloc(cap);
+    if (!buf) {
+        return NULL;
+    }
+    size_t leidos;
+    while ((leidos = fread(buf + n, 1, cap - n - 1, f)) > 0) {
+        n += leidos;
+        if (cap - n - 1 == 0) {
+            char *nuevo = realloc(buf, cap * 2);
+            if (!nuevo) {
+                free(buf);
+                return NULL;
+            }
+            buf = nuevo;
+            cap *= 2;
+        }
+    }
+    if (ferror(f)) {
+        free(buf);
+        return NULL;
+    }
+    buf[n] = '\0';
+    if (largo) {
+        *largo = n;
+    }
+    return buf;
+}
+
+int main(void) {
+    FILE *tmp = tmpfile();
+    if (!tmp) {
+        return 1;
+    }
+    for (int i = 0; i < 2000; i++) {
+        fputs("linea de prueba\n", tmp);
+    }
+    rewind(tmp);
+    size_t n = 0;
+    char *texto = leer_todo(tmp, &n);
+    fclose(tmp);
+    if (!texto || n != 2000 * strlen("linea de prueba\n") || texto[n] != '\0') {
+        free(texto);
+        return 1;
+    }
+    printf("ok (%zu bytes)\n", n);
+    free(texto);
+    return 0;
+}
+''')
+
+# ======================================================================== JAVA
+receta_ejecutable("Java: archivos con Files y try-with-resources", "java", "java, archivo, leer, escribir, files, recursos, lineas",
+                  "Leer/escribir texto UTF-8 y procesar líneas sin dejar archivos abiertos.", r'''
+import java.io.BufferedReader;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.List;
+
+public class Archivos {
+    static long contarLineasCon(Path ruta, String palabra) throws IOException {
+        long n = 0;
+        try (BufferedReader lector = Files.newBufferedReader(ruta, StandardCharsets.UTF_8)) {
+            String linea;
+            while ((linea = lector.readLine()) != null) {
+                if (linea.toLowerCase().contains(palabra.toLowerCase())) {
+                    n++;
+                }
+            }
+        }
+        return n;
+    }
+
+    public static void main(String[] args) throws IOException {
+        Path dir = Files.createTempDirectory("receta");
+        Path ruta = dir.resolve("notas.txt");
+        Files.write(ruta, List.of("Comprar mate", "llamar a Ana", "MATE cocido"), StandardCharsets.UTF_8);
+        long n = contarLineasCon(ruta, "mate");
+        Files.writeString(dir.resolve("resumen.txt"), "líneas con mate: " + n);
+        String resumen = Files.readString(dir.resolve("resumen.txt"));
+        Files.delete(dir.resolve("resumen.txt"));
+        Files.delete(ruta);
+        Files.delete(dir);
+        if (n != 2 || !resumen.equals("líneas con mate: 2")) {
+            System.exit(1);
+        }
+        System.out.println("ok");
+    }
+}
+''')
+
+receta_ejecutable("Java: agrupar y contar con streams", "java", "java, stream, agrupar, contar, map, collectors, lista",
+                  "groupingBy + counting, ordenar un Map por valor y sumar con mapToLong.", r'''
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.stream.Collectors;
+
+public class Streams {
+    static class Gasto {
+        final String categoria;
+        final long centavos;
+        Gasto(String categoria, long centavos) { this.categoria = categoria; this.centavos = centavos; }
+    }
+
+    public static void main(String[] args) {
+        List<Gasto> gastos = List.of(new Gasto("comida", 1500), new Gasto("viaje", 4000),
+                                     new Gasto("comida", 2500), new Gasto("ocio", 800));
+        Map<String, Long> porCategoria = gastos.stream()
+            .collect(Collectors.groupingBy(g -> g.categoria, Collectors.summingLong(g -> g.centavos)));
+        Map<String, Long> ordenado = porCategoria.entrySet().stream()
+            .sorted(Map.Entry.<String, Long>comparingByValue().reversed())
+            .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue, (a, b) -> a, LinkedHashMap::new));
+        long total = gastos.stream().mapToLong(g -> g.centavos).sum();
+        Map<String, Long> cantidad = gastos.stream()
+            .collect(Collectors.groupingBy(g -> g.categoria, Collectors.counting()));
+        System.out.println(ordenado);
+        if (!ordenado.keySet().iterator().next().equals("viaje") || total != 8800 || cantidad.get("comida") != 2) {
+            System.exit(1);
+        }
+    }
+}
+''')
+
+# ======================================================================== PHP
+receta_ejecutable("PHP: SQLite con PDO y consultas preparadas", "php", "php, pdo, sqlite, sql, base de datos, preparada, seguridad",
+                  "Nunca concatenar SQL: prepare/execute, transacciones y fetch asociativo.", r'''
+<?php
+declare(strict_types=1);
+
+function conectar(string $dsn = 'sqlite::memory:'): PDO
+{
+    $pdo = new PDO($dsn, null, null, [
+        PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+        PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+    ]);
+    $pdo->exec('CREATE TABLE IF NOT EXISTS usuarios (id INTEGER PRIMARY KEY, nombre TEXT NOT NULL, email TEXT UNIQUE)');
+    return $pdo;
+}
+
+function crearUsuario(PDO $pdo, string $nombre, string $email): int
+{
+    $st = $pdo->prepare('INSERT INTO usuarios (nombre, email) VALUES (:nombre, :email)');
+    $st->execute([':nombre' => $nombre, ':email' => $email]);
+    return (int) $pdo->lastInsertId();
+}
+
+function buscar(PDO $pdo, string $texto): array
+{
+    $st = $pdo->prepare('SELECT id, nombre FROM usuarios WHERE nombre LIKE ? ORDER BY nombre');
+    $st->execute(['%' . $texto . '%']);
+    return $st->fetchAll();
+}
+
+$pdo = conectar();
+$pdo->beginTransaction();
+crearUsuario($pdo, 'Ana', 'ana@x.com');
+crearUsuario($pdo, "Robert'); DROP TABLE usuarios;--", 'bobby@x.com');
+$pdo->commit();
+try {
+    crearUsuario($pdo, 'Otra Ana', 'ana@x.com');
+    exit(1);
+} catch (PDOException $e) {
+    // email duplicado: la restricción UNIQUE lo impide
+}
+$r = buscar($pdo, 'Ana');
+$total = (int) $pdo->query('SELECT COUNT(*) FROM usuarios')->fetchColumn();
+if (count($r) !== 1 || $r[0]['nombre'] !== 'Ana' || $total !== 2) {
+    exit(1);
+}
+echo "ok\n";
+''')
+
+receta_ejecutable("PHP: validar y limpiar datos de un formulario", "php", "php, formulario, validar, sanitizar, post, email, html",
+                  "filter_var para email/números, trim, límites y mensajes por campo; escape al mostrar.", r'''
+<?php
+declare(strict_types=1);
+
+function validarRegistro(array $datos): array
+{
+    $errores = [];
+    $limpio = [];
+    $nombre = trim((string) ($datos['nombre'] ?? ''));
+    if ($nombre === '' || mb_strlen($nombre) > 60) {
+        $errores['nombre'] = 'El nombre es obligatorio (máx. 60 caracteres).';
+    }
+    $limpio['nombre'] = $nombre;
+    $email = filter_var(trim((string) ($datos['email'] ?? '')), FILTER_VALIDATE_EMAIL);
+    if ($email === false) {
+        $errores['email'] = 'Email inválido.';
+    }
+    $limpio['email'] = $email ?: '';
+    $edad = filter_var($datos['edad'] ?? null, FILTER_VALIDATE_INT, ['options' => ['min_range' => 13, 'max_range' => 120]]);
+    if ($edad === false) {
+        $errores['edad'] = 'La edad debe ser un número entre 13 y 120.';
+    }
+    $limpio['edad'] = $edad === false ? null : $edad;
+    return [$limpio, $errores];
+}
+
+function e(string $texto): string
+{
+    return htmlspecialchars($texto, ENT_QUOTES, 'UTF-8');
+}
+
+[$ok, $errores] = validarRegistro(['nombre' => '  Ana ', 'email' => 'ana@mail.com', 'edad' => '30']);
+[$malo, $errores2] = validarRegistro(['nombre' => '', 'email' => 'no-es-email', 'edad' => '7']);
+if ($errores !== [] || $ok['nombre'] !== 'Ana' || $ok['edad'] !== 30) {
+    exit(1);
+}
+if (array_keys($errores2) !== ['nombre', 'email', 'edad']) {
+    exit(1);
+}
+if (e('<script>"x"</script>') !== '&lt;script&gt;&quot;x&quot;&lt;/script&gt;') {
+    exit(1);
+}
+echo "ok\n";
+''')
+
+# ======================================================================== RUBY
+receta_ejecutable("Ruby: JSON, group_by y sumas", "ruby", "ruby, json, agrupar, group_by, sumar, hash, datos",
+                  "Leer y escribir JSON, agrupar registros y totalizar con sum y transform_values.", r'''
+require "json"
+require "tmpdir"
+
+def resumen(gastos)
+  gastos.group_by { |g| g["categoria"] }
+        .transform_values { |lista| lista.sum { |g| g["monto"] } }
+        .sort_by { |cat, total| [-total, cat] }
+        .to_h
+end
+
+Dir.mktmpdir do |dir|
+  ruta = File.join(dir, "gastos.json")
+  datos = [
+    { "categoria" => "comida", "monto" => 1500 },
+    { "categoria" => "viaje", "monto" => 4000 },
+    { "categoria" => "comida", "monto" => 2500 },
+  ]
+  File.write(ruta, JSON.pretty_generate(datos))
+  leidos = JSON.parse(File.read(ruta))
+  r = resumen(leidos)
+  abort("mal: #{r}") unless r == { "comida" => 4000, "viaje" => 4000 }
+  abort("orden") unless r.keys == %w[comida viaje]
+  begin
+    JSON.parse("{roto")
+    abort("debía fallar")
+  rescue JSON::ParserError
+    puts "ok"
+  end
+end
+''')
+
+# ======================================================================== BASH
+receta_ejecutable("Bash: opciones con getopts y ayuda", "bash", "bash, getopts, opciones, argumentos, flags, script, ayuda",
+                  "Parsear -v -n NUM -o ARCHIVO con validación y un uso claro.", r'''
+#!/usr/bin/env bash
+set -euo pipefail
+
+uso() {
+  echo "uso: $(basename "$0") [-v] [-n NUM] [-o ARCHIVO] ARGS..." >&2
+}
+
+parsear() {
+  VERBOSE=0 NUM=1 SALIDA="-"
+  local OPTIND opt
+  while getopts ":vn:o:h" opt; do
+    case "$opt" in
+      v) VERBOSE=1 ;;
+      n) [[ "$OPTARG" =~ ^[0-9]+$ ]] || { echo "-n necesita un número" >&2; return 2; }
+         NUM="$OPTARG" ;;
+      o) SALIDA="$OPTARG" ;;
+      h) uso; return 3 ;;
+      :) echo "falta el valor de -$OPTARG" >&2; return 2 ;;
+      \?) echo "opción desconocida: -$OPTARG" >&2; uso; return 2 ;;
+    esac
+  done
+  shift $((OPTIND - 1))
+  RESTO=("$@")
+}
+
+parsear -v -n 3 -o out.txt a b
+[[ $VERBOSE == 1 && $NUM == 3 && $SALIDA == out.txt && "${RESTO[*]}" == "a b" ]] || exit 1
+parsear -n x 2>/dev/null && exit 1
+parsear -z 2>/dev/null && exit 1
+parsear
+[[ $VERBOSE == 0 && $NUM == 1 && ${#RESTO[@]} == 0 ]] || exit 1
+echo ok
+''')
+
+receta_ejecutable("Bash: limpieza con trap y temporales", "bash", "bash, trap, temporal, mktemp, limpieza, salir, error",
+                  "mktemp + trap EXIT: los temporales se borran aunque el script falle o se interrumpa. "
+                  "Ojo: trap RETURN con variables local NO sirve (la variable ya no existe cuando corre).", r'''
+#!/usr/bin/env bash
+set -euo pipefail
+
+# El cuerpo entre ( ) corre en un subshell: su trap EXIT se dispara al terminar la función,
+# aunque falle un comando por set -e. En un script entero alcanza con: trap 'rm -rf "$tmp"' EXIT
+procesar() (
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' EXIT
+  printf 'b\na\nc\n' > "$tmp/datos.txt"
+  sort "$tmp/datos.txt" > "$tmp/orden.txt"
+  echo "$tmp"                        # solo para comprobar que después ya no existe
+  paste -sd, "$tmp/orden.txt"
+)
+
+salida="$(procesar)"
+dir="$(head -n1 <<<"$salida")"
+[[ "$(tail -n1 <<<"$salida")" == "a,b,c" ]] || exit 1
+[[ ! -e "$dir" ]] || { echo "no se limpió $dir"; exit 1; }
+echo ok
+''')
+
+receta_ejecutable("Bash: reintentar un comando con espera creciente", "bash", "bash, reintentar, retry, backoff, red, comando, fallos",
+                  "reintentar N comando...: espera 1, 2, 4... segundos entre intentos y devuelve el último código.", r'''
+#!/usr/bin/env bash
+set -uo pipefail
+
+reintentar() {
+  local intentos="$1"; shift
+  local espera="${ESPERA_INICIAL:-1}" n=1 codigo=0
+  while true; do
+    "$@" && return 0
+    codigo=$?
+    (( n >= intentos )) && return "$codigo"
+    echo "intento $n falló (código $codigo); reintento en ${espera}s" >&2
+    sleep "$espera"
+    espera=$(( espera * 2 ))
+    n=$(( n + 1 ))
+  done
+}
+
+CONTADOR="$(mktemp)"
+trap 'rm -f "$CONTADOR"' EXIT
+echo 0 > "$CONTADOR"
+falla_dos_veces() {
+  local n; n=$(( $(cat "$CONTADOR") + 1 )); echo "$n" > "$CONTADOR"
+  (( n >= 3 ))
+}
+ESPERA_INICIAL=0 reintentar 5 falla_dos_veces 2>/dev/null || exit 1
+[[ "$(cat "$CONTADOR")" == 3 ]] || exit 1
+ESPERA_INICIAL=0 reintentar 2 false 2>/dev/null && exit 1
+echo ok
+''')
+
+# ======================================================================== JAVASCRIPT
+receta_ejecutable("JS: fetch con timeout (AbortController)", "javascript", "javascript, node, fetch, timeout, api, abort, http",
+                  "Node 18+ trae fetch: AbortSignal.timeout corta pedidos colgados; chequear res.ok.", r'''
+import http from 'node:http';
+import assert from 'node:assert/strict';
+
+export async function obtenerJSON(url, { timeoutMs = 3000 } = {}) {
+  const res = await fetch(url, { signal: AbortSignal.timeout(timeoutMs), headers: { accept: 'application/json' } });
+  if (!res.ok) {
+    throw new Error(`HTTP ${res.status} en ${url}`);
+  }
+  return res.json();
+}
+
+const servidor = http.createServer((req, res) => {
+  if (req.url === '/lento') { setTimeout(() => res.end('{}'), 500); return; }
+  if (req.url === '/error') { res.writeHead(500); res.end('x'); return; }
+  res.setHeader('content-type', 'application/json');
+  res.end(JSON.stringify({ temp: 21 }));
+});
+await new Promise((ok) => servidor.listen(0, '127.0.0.1', ok));
+const base = `http://127.0.0.1:${servidor.address().port}`;
+try {
+  assert.deepEqual(await obtenerJSON(`${base}/clima`), { temp: 21 });
+  await assert.rejects(obtenerJSON(`${base}/lento`, { timeoutMs: 100 }), { name: 'TimeoutError' });
+  await assert.rejects(obtenerJSON(`${base}/error`), /HTTP 500/);
+  console.log('ok');
+} finally {
+  servidor.closeAllConnections?.();
+  servidor.close();
+}
+''')
+
+receta_ejecutable("JS: debounce y throttle", "javascript", "javascript, debounce, throttle, eventos, input, scroll, navegador",
+                  "Para buscar mientras se escribe (debounce) o limitar eventos de scroll (throttle).", r'''
+import assert from 'node:assert/strict';
+
+export function debounce(fn, ms) {
+  let id;
+  return (...args) => {
+    clearTimeout(id);
+    id = setTimeout(() => fn(...args), ms);
+  };
+}
+
+export function throttle(fn, ms) {
+  let ultimo = -Infinity;
+  return (...args) => {
+    const ahora = Date.now();
+    if (ahora - ultimo >= ms) {
+      ultimo = ahora;
+      fn(...args);
+    }
+  };
+}
+
+const esperar = (ms) => new Promise((r) => setTimeout(r, ms));
+const llamadas = [];
+const buscar = debounce((q) => llamadas.push(q), 30);
+buscar('m'); buscar('ma'); buscar('mat'); buscar('mate');
+await esperar(60);
+assert.deepEqual(llamadas, ['mate']);
+
+let veces = 0;
+const scroll = throttle(() => veces++, 1000);
+for (let i = 0; i < 50; i++) scroll();
+assert.equal(veces, 1);
+console.log('ok');
+''')
+
+receta_ejecutable("JS: router por hash para una página de una sola vista", "javascript", "javascript, router, spa, hash, navegacion, rutas, web",
+                  "Rutas con parámetros (#/nota/12) sin frameworks; la lógica de match se testea en Node.", r'''
+import assert from 'node:assert/strict';
+
+export function crearRouter(rutas) {
+  const compiladas = Object.entries(rutas).filter(([patron]) => patron !== '*').map(([patron, vista]) => {
+    const nombres = [];
+    const regex = new RegExp('^' + patron.replace(/:(\w+)/g, (_, n) => { nombres.push(n); return '([^/]+)'; }) + '$');
+    return { regex, nombres, vista };
+  });
+  return function resolver(hash) {
+    const ruta = (hash || '#/').replace(/^#/, '') || '/';
+    for (const { regex, nombres, vista } of compiladas) {
+      const m = ruta.match(regex);
+      if (m) {
+        const params = Object.fromEntries(nombres.map((n, i) => [n, decodeURIComponent(m[i + 1])]));
+        return vista(params);
+      }
+    }
+    return rutas['*'] ? rutas['*']({ ruta }) : null;
+  };
+}
+
+// En el navegador:
+//   const resolver = crearRouter({...});
+//   const pintar = () => { document.querySelector('#app').innerHTML = resolver(location.hash); };
+//   addEventListener('hashchange', pintar); pintar();
+const resolver = crearRouter({
+  '/': () => 'inicio',
+  '/nota/:id': ({ id }) => `nota ${id}`,
+  '/buscar/:q': ({ q }) => `buscar ${q}`,
+  '*': ({ ruta }) => `404 ${ruta}`,
+});
+assert.equal(resolver(''), 'inicio');
+assert.equal(resolver('#/nota/12'), 'nota 12');
+assert.equal(resolver('#/buscar/mate%20cocido'), 'buscar mate cocido');
+assert.equal(resolver('#/nada'), '404 /nada');
+console.log('ok');
+''')
+
+# ======================================================================== PERL
+receta_ejecutable("Perl: leer un archivo y contar con un hash", "perl", "perl, hash, contar, archivo, lineas, palabras, log",
+                  "open con manejo de error, chomp, conteo con hash y orden por valor.", r'''
+use strict;
+use warnings;
+use File::Temp qw(tempfile);
+
+sub contar_niveles {
+    my ($ruta) = @_;
+    open(my $fh, '<:encoding(UTF-8)', $ruta) or die "no pude abrir $ruta: $!\n";
+    my %conteo;
+    while (my $linea = <$fh>) {
+        chomp $linea;
+        next unless $linea =~ /\b(INFO|WARN|ERROR)\b/;
+        $conteo{$1}++;
+    }
+    close $fh;
+    return \%conteo;
+}
+
+my ($fh, $ruta) = tempfile(UNLINK => 1);
+print $fh "10:00 INFO inicio\n10:01 ERROR falló\n10:02 INFO sigue\n10:03 WARN lento\nbasura\n";
+close $fh;
+my $c = contar_niveles($ruta);
+my @orden = sort { $c->{$b} <=> $c->{$a} || $a cmp $b } keys %$c;
+die "mal\n" unless "@orden" eq "INFO ERROR WARN" && $c->{INFO} == 2;
+eval { contar_niveles('/no/existe') };
+die "debía fallar\n" unless $@ =~ /no pude abrir/;
+print "ok\n";
 ''')
 
 
@@ -28592,6 +30717,45 @@ class TestGuiasLenguaje(BaseTest):
 
     def test_maximo_tres_guias(self):
         self.assertLessEqual(guias_para(["a.py", "b.js", "c.go", "d.rs", "e.c"]).count("\n\n") + 1, 3)
+
+
+class TestRecetasLenguajes(BaseTest):
+    def _correr(self, r: "Receta") -> "Resultado":
+        carpeta = self.dir / f"receta_{abs(hash(r.titulo))}"
+        carpeta.mkdir(parents=True, exist_ok=True)
+        ruta = carpeta / f"receta.{_EXTENSION_RECETA[r.lenguaje]}"
+        ruta.write_text(r.codigo, encoding="utf-8")
+        return ejecutar(comando_receta(r, str(ruta)), cwd=carpeta, timeout=180, shell=True)
+
+    def test_recetas_ejecutables_funcionan(self):
+        compilados = {"go", "rust", "c", "java"}
+        for r in RECETAS:
+            if r.titulo not in RECETAS_EJECUTABLES:
+                continue
+            with self.subTest(receta=r.titulo):
+                if not receta_disponible(r):
+                    continue
+                if r.lenguaje in compilados and not os.getenv("REAPER_AUTOTEST_COMPLETO"):
+                    continue  # compilar tarda: solo con REAPER_AUTOTEST_COMPLETO=1
+                resultado = self._correr(r)
+                self.assertTrue(resultado.ok, f"{r.titulo}: {recortar(resultado.stdout + resultado.stderr, 1500)}")
+
+    def test_recetas_por_lenguaje_del_pedido(self):
+        self.assertIn("(go)", recetas_para_prompt("hacé un worker pool con goroutines en go para procesar en paralelo"))
+        python = recetas_para_prompt("procesar tareas en paralelo con hilos y concurrencia")
+        self.assertNotIn("(go)", python)
+        self.assertIn("(rust)", recetas_para_prompt("en rust contar palabras con un hashmap y su frecuencia"))
+
+    def test_lenguajes_mencionados(self):
+        self.assertEqual(lenguajes_mencionados("hacelo en golang"), {"go"})
+        self.assertEqual(lenguajes_mencionados("arreglá esto", ["src/main.rs"]), {"rust"})
+        self.assertEqual(lenguajes_mencionados("una calculadora"), set())
+
+    def test_cada_receta_tiene_lenguaje_conocido(self):
+        for r in RECETAS:
+            with self.subTest(receta=r.titulo):
+                self.assertIn(r.lenguaje, _EXTENSION_RECETA)
+                self.assertTrue(r.etiquetas and r.descripcion and r.codigo.strip())
 
 
 # ======================================================================

@@ -527,7 +527,8 @@ class Agente:
             guia = guias_para(archivos or self.ws.archivos_codigo(limite=60), tarea)
             if guia:
                 extras.append("GUÍA RÁPIDA DEL LENGUAJE:\n" + guia)
-            recetas = recetas_para_prompt(tarea)
+            lenguajes = lenguajes_mencionados(tarea, archivos or self.ws.archivos_codigo(limite=60))
+            recetas = recetas_para_prompt(tarea, lenguajes=lenguajes or None)
             if recetas:
                 extras.append(recetas)
         if not extras:

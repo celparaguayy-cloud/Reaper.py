@@ -141,3 +141,42 @@ class TestGuiasLenguaje(BaseTest):
 
     def test_maximo_tres_guias(self):
         self.assertLessEqual(guias_para(["a.py", "b.js", "c.go", "d.rs", "e.c"]).count("\n\n") + 1, 3)
+
+
+class TestRecetasLenguajes(BaseTest):
+    def _correr(self, r: "Receta") -> "Resultado":
+        carpeta = self.dir / f"receta_{abs(hash(r.titulo))}"
+        carpeta.mkdir(parents=True, exist_ok=True)
+        ruta = carpeta / f"receta.{_EXTENSION_RECETA[r.lenguaje]}"
+        ruta.write_text(r.codigo, encoding="utf-8")
+        return ejecutar(comando_receta(r, str(ruta)), cwd=carpeta, timeout=180, shell=True)
+
+    def test_recetas_ejecutables_funcionan(self):
+        compilados = {"go", "rust", "c", "java"}
+        for r in RECETAS:
+            if r.titulo not in RECETAS_EJECUTABLES:
+                continue
+            with self.subTest(receta=r.titulo):
+                if not receta_disponible(r):
+                    continue
+                if r.lenguaje in compilados and not os.getenv("REAPER_AUTOTEST_COMPLETO"):
+                    continue  # compilar tarda: solo con REAPER_AUTOTEST_COMPLETO=1
+                resultado = self._correr(r)
+                self.assertTrue(resultado.ok, f"{r.titulo}: {recortar(resultado.stdout + resultado.stderr, 1500)}")
+
+    def test_recetas_por_lenguaje_del_pedido(self):
+        self.assertIn("(go)", recetas_para_prompt("hacé un worker pool con goroutines en go para procesar en paralelo"))
+        python = recetas_para_prompt("procesar tareas en paralelo con hilos y concurrencia")
+        self.assertNotIn("(go)", python)
+        self.assertIn("(rust)", recetas_para_prompt("en rust contar palabras con un hashmap y su frecuencia"))
+
+    def test_lenguajes_mencionados(self):
+        self.assertEqual(lenguajes_mencionados("hacelo en golang"), {"go"})
+        self.assertEqual(lenguajes_mencionados("arreglá esto", ["src/main.rs"]), {"rust"})
+        self.assertEqual(lenguajes_mencionados("una calculadora"), set())
+
+    def test_cada_receta_tiene_lenguaje_conocido(self):
+        for r in RECETAS:
+            with self.subTest(receta=r.titulo):
+                self.assertIn(r.lenguaje, _EXTENSION_RECETA)
+                self.assertTrue(r.etiquetas and r.descripcion and r.codigo.strip())

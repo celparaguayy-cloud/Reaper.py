@@ -67,12 +67,39 @@ def buscar_recetas(consulta: str, k: int = 4, lenguaje: str = "") -> list[Receta
     return [r for _, _, r in puntuadas[:k]]
 
 
-def recetas_para_prompt(tarea: str, k: int = 2, umbral: float = 5.0, maximo: int = 2600) -> str:
-    """Recetas que coinciden FUERTE con la tarea (si no, nada: mejor sin ruido)."""
+_PALABRAS_LENGUAJE = {
+    "go": (" go ", "golang", "go.mod"), "rust": ("rust", "cargo"), "c": (" en c ", " c99", "makefile", " c "),
+    "java": ("java ", "java.", " java"), "php": (" php", "php "), "ruby": ("ruby",), "perl": ("perl",),
+    "javascript": ("javascript", "node", " js ", "web", "html", "navegador", "react"),
+    "bash": ("bash", "shell", " sh ", "script de terminal"), "python": ("python", " py "),
+}
+_EXT_LENGUAJE = {".py": "python", ".go": "go", ".rs": "rust", ".c": "c", ".h": "c", ".java": "java", ".php": "php",
+                 ".rb": "ruby", ".pl": "perl", ".pm": "perl", ".sh": "bash", ".js": "javascript", ".mjs": "javascript",
+                 ".ts": "javascript", ".html": "javascript"}
+
+
+def lenguajes_mencionados(texto: str, archivos: Iterable[str] = ()) -> set:
+    """Lenguajes que el pedido nombra (o que usan los archivos indicados)."""
+    t = f" {(texto or '').lower()} "
+    salida = {lang for lang, palabras in _PALABRAS_LENGUAJE.items() if any(p in t for p in palabras)}
+    salida |= {_EXT_LENGUAJE[Path(a).suffix.lower()] for a in archivos if Path(a).suffix.lower() in _EXT_LENGUAJE}
+    return salida
+
+
+def recetas_para_prompt(tarea: str, k: int = 2, umbral: float = 5.0, maximo: int = 2600,
+                        lenguajes: Optional[Iterable[str]] = None) -> str:
+    """Recetas que coinciden FUERTE con la tarea (si no, nada: mejor sin ruido) y en un lenguaje que sirva."""
     tokens = tokens_pedido(tarea)
     if not tokens:
         return ""
-    puntuadas = sorted(((*puntuar_receta(r, tokens, con_distintos=True), r) for r in RECETAS), key=lambda t: -t[0])
+    permitidos = set(lenguajes) if lenguajes is not None else lenguajes_mencionados(tarea)
+    if not permitidos:
+        permitidos = {"python", "bash", "javascript"}   # lo habitual en Termux si no se dice otra cosa
+    permitidos.add("bash")
+    if "javascript" in permitidos:
+        permitidos |= {"html", "css"}
+    candidatas = [r for r in RECETAS if r.lenguaje in permitidos]
+    puntuadas = sorted(((*puntuar_receta(r, tokens, con_distintos=True), r) for r in candidatas), key=lambda t: -t[0])
     # Hace falta una coincidencia fuerte: puntaje alto Y al menos dos palabras distintas del pedido.
     elegidas = [r for p, distintos, r in puntuadas[:k] if p >= umbral and distintos >= 2]
     if not elegidas:
