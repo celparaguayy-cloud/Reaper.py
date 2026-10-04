@@ -360,16 +360,18 @@ _EXTENSIONES_GUIA = {
 }
 
 
+PALABRAS_GUIA = [("python", "python"), ("html", "web"), (" web", "web"), ("javascript", "js"), ("node", "js"),
+                 ("bash", "sh"), ("script", "sh"), ("golang", "go"), (" go ", "go"), ("rust", "rust")]
+
+
 def guias_para(archivos: Iterable[str], pedido: str = "") -> str:
     claves: list[str] = []
     for a in archivos:
         clave = _EXTENSIONES_GUIA.get(Path(a).suffix.lower())
         if clave and clave not in claves:
             claves.append(clave)
-    texto = (pedido or "").lower()
-    for palabra, clave in (("python", "python"), ("html", "web"), ("web", "web"), ("javascript", "js"),
-                           ("node", "js"), ("bash", "sh"), ("script", "sh"), ("golang", "go"), (" go ", "go"),
-                           ("rust", "rust")):
+    texto = f" {(pedido or '').lower()} "
+    for palabra, clave in PALABRAS_GUIA:
         if palabra in texto and clave not in claves:
             claves.append(clave)
     if not claves:

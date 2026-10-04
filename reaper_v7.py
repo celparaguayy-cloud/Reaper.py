@@ -7083,21 +7083,96 @@ _EXTENSIONES_GUIA = {
 }
 
 
+PALABRAS_GUIA = [("python", "python"), ("html", "web"), (" web", "web"), ("javascript", "js"), ("node", "js"),
+                 ("bash", "sh"), ("script", "sh"), ("golang", "go"), (" go ", "go"), ("rust", "rust")]
+
+
 def guias_para(archivos: Iterable[str], pedido: str = "") -> str:
     claves: list[str] = []
     for a in archivos:
         clave = _EXTENSIONES_GUIA.get(Path(a).suffix.lower())
         if clave and clave not in claves:
             claves.append(clave)
-    texto = (pedido or "").lower()
-    for palabra, clave in (("python", "python"), ("html", "web"), ("web", "web"), ("javascript", "js"),
-                           ("node", "js"), ("bash", "sh"), ("script", "sh"), ("golang", "go"), (" go ", "go"),
-                           ("rust", "rust")):
+    texto = f" {(pedido or '').lower()} "
+    for palabra, clave in PALABRAS_GUIA:
         if palabra in texto and clave not in claves:
             claves.append(clave)
     if not claves:
         return ""
     return "\n\n".join(GUIAS_LENGUAJE[c] for c in claves[:3])
+
+
+# ======================================================================
+# MÓDULO: knowledge_lenguajes
+# ======================================================================
+"""
+Guías rápidas de más lenguajes (se suman a GUIAS_LENGUAJE). Son cortas a propósito: van en el prompt
+de un modelo de 24B, así que cada línea tiene que evitar un error real y frecuente.
+"""
+
+GUIAS_LENGUAJE.update({
+    "go": """GO
+- go.mod obligatorio (`go mod init nombre`); imports del propio módulo como "nombre/paquete".
+- Variables o imports sin usar NO compilan. Errores como valores: if err != nil { return fmt.Errorf("contexto: %w", err) }.
+- Exportado = Mayúscula inicial. Un paquete por carpeta; main solo en la raíz o en cmd/<app>.
+- Tests en el MISMO paquete: archivo_test.go con func TestX(t *testing.T) y tablas de casos:
+    for _, c := range []struct{ in, want int }{{1, 2}} { if got := F(c.in); got != c.want { t.Errorf("F(%d)=%d", c.in, got) } }
+- HTTP sin dependencias: net/http + httptest.NewServer en tests. JSON: encoding/json con tags `json:"campo"`.
+- Concurrencia: sync.Mutex para mapas compartidos; `go test -race ./...` si hay goroutines.""",
+    "rust": """RUST
+- cargo new nombre; lógica en src/lib.rs (testeable) y src/main.rs fino que la usa (`use nombre::...`).
+- Tests unitarios: #[cfg(test)] mod tests { use super::*; #[test] fn caso() { assert_eq!(f(2), 4); } }
+  Tests de integración en tests/*.rs; el binario se prueba con env!("CARGO_BIN_EXE_nombre").
+- Errores: enum propio + impl Display + Result<T, Error>; `?` para propagar. Nada de unwrap() en código de usuario.
+- &str en parámetros, String en structs; .iter().map().collect::<Vec<_>>(); clone() si el borrow checker traba.
+- Sin crates si no hacen falta (std alcanza): `cargo test --offline` anda sin red en Termux.""",
+    "c": """C
+- C99/C11 con `-std=c99 -Wall -Wextra`; Makefile con `CC ?= cc` (en Termux cc es clang) y objetivo `test`.
+- Cabecera .h con include guard y prototipos; .c con la implementación; main.c fino.
+- Strings: snprintf (nunca sprintf/strcpy/gets), tamaños con sizeof, siempre terminar en '\\0'.
+- Memoria: cada malloc con su free; chequeá NULL; preferí arrays en stack si el tamaño es fijo.
+- Leer líneas: fgets(buf, sizeof buf, stdin) y quitar el '\\n' con buf[strcspn(buf, "\\r\\n")] = '\\0'.
+- Tests sin framework: un tests/test_x.c con macros que imprimen "ok N - nombre" / "not ok N - nombre" y exit(1) si falla.""",
+    "java": """JAVA
+- Sin Maven/Gradle en Termux: javac -encoding UTF-8 -d build src/*.java && java -cp build Main.
+- Una clase pública por archivo, con el mismo nombre que el archivo. Sin records/var si no se pide Java moderno.
+- Dinero en long (centavos) o BigDecimal, nunca double. Validá argumentos con IllegalArgumentException.
+- Entrada: Scanner(System.in, "UTF-8") con hasNextLine() antes de nextLine() (si no, NoSuchElementException al cerrar stdin).
+- Tests sin JUnit: clase XTest con métodos static void testAlgo() y un main que los recorre e imprime TAP.""",
+    "php": """PHP
+- PHP 8: declare(strict_types=1); tipos en parámetros y retornos; namespaces y require_once con __DIR__.
+- Salida HTML: htmlspecialchars($x, ENT_QUOTES, 'UTF-8') SIEMPRE. SQL: PDO con prepare/execute (nunca concatenar).
+- Servidor local: php -S 127.0.0.1:8000 -t public. Errores visibles en desarrollo: ini_set('display_errors', '1').
+- JSON: json_encode(..., JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR) y json_decode($s, true, 512, JSON_THROW_ON_ERROR).
+- Tests sin PHPUnit: tests/run.php con funciones prueba()/igual() que imprimen TAP y exit(1) si algo falla.""",
+    "ruby": """RUBY
+- # frozen_string_literal: true; código en lib/, ejecutable en bin/, tests en test/test_*.rb con minitest.
+- require "minitest/autorun"; class TestX < Minitest::Test; def test_caso; assert_equal 4, f(2); end; end
+- Correr: ruby -Ilib -Itest test/test_x.rb. Errores propios: class Error < StandardError; end y raise Error, "msg".
+- Fechas: require "date"; Date.new(2024, 1, 2) y Date.iso8601. JSON: require "json"; JSON.parse / JSON.pretty_generate.""",
+    "perl": """PERL
+- use strict; use warnings; en TODOS los archivos. Módulos en lib/Nombre.pm terminados en `1;`.
+- Tests en t/*.t con Test::More (is, like, ok, done_testing) y `prove -l t` para correrlos.
+- Errores con die "mensaje\\n" y captura con eval { ... }; if ($@) { ... }.
+- Entrada: while (my $linea = <STDIN>) { chomp $linea; ... } (termina solo cuando se acaba stdin).""",
+    "interactivo": """PROGRAMAS INTERACTIVOS (input(), menús, REPL)
+- Un EOFError al ejecutarlos SIN entrada no es un bug: es que nadie escribió. NO quites el input() para "arreglarlo".
+- Probalos pasándoles la entrada: execute_command con <stdin>2\\n3\\n+\\nsalir</stdin>, o en tests
+  subprocess.run([sys.executable, "app.py"], input="2\\n3\\nsalir\\n", capture_output=True, text=True, timeout=10).
+- Diseño testeable: la lógica en funciones puras (calcular(a, b, op)); el bucle de input() solo llama a esas funciones.
+- El bucle tiene que terminar con una opción de salida Y cuando se acaba la entrada (EOFError → salir prolijo).""",
+})
+
+_EXTENSIONES_GUIA.update({
+    ".c": "c", ".h": "c", ".java": "java", ".php": "php", ".rb": "ruby", ".pl": "perl", ".pm": "perl", ".t": "perl",
+})
+
+PALABRAS_GUIA.extend([
+    (" c ", "c"), (" en c", "c"), ("makefile", "c"), ("java ", "java"), ("java.", "java"), (" php", "php"),
+    ("ruby", "ruby"), ("perl", "perl"), ("interactiv", "interactivo"), ("input(", "interactivo"),
+    ("menú", "interactivo"), ("menu ", "interactivo"), (" repl", "interactivo"), ("calculadora", "interactivo"),
+    ("eoferror", "interactivo"),
+])
 
 
 # ======================================================================
@@ -9568,7 +9643,7 @@ class Agente:
             if mapa:
                 extras.append(mapa)
         if self.rol.nombre in ("implementador", "especificador", "qa", "principal", "escritor"):
-            archivos = re.findall(r"[\w./-]+\.(?:py|js|mjs|cjs|ts|html|css|sh|go|rs)\b", tarea)
+            archivos = re.findall(r"[\w./-]+\.(?:py|js|mjs|cjs|ts|html|css|sh|go|rs|c|h|java|php|rb|pl|pm)\b", tarea)
             guia = guias_para(archivos or self.ws.archivos_codigo(limite=60), tarea)
             if guia:
                 extras.append("GUÍA RÁPIDA DEL LENGUAJE:\n" + guia)
@@ -28196,6 +28271,182 @@ class TestLlamadasSinCerrar(BaseTest):
 
 
 # ======================================================================
+# MÓDULO: autotest_robustez
+# ======================================================================
+"""
+Robustez frente a un modelo torpe: un guion "ideal" se corrompe con los errores típicos de un modelo de
+24B (los mismos que se vieron en Termux) y REAPER tiene que terminar bien igual.
+
+Defectos simulables (se combinan):
+  fences          envuelve cada herramienta en ```xml ... ```
+  sin_cierre      olvida la etiqueta de cierre de la herramienta
+  alias           usa nombres alternativos (read_function, file=, cmd=)
+  comillas        pone comillas alrededor de rutas y comandos
+  json            escribe la llamada como JSON {"tool": ..., "args": {...}}
+  repite          repite una vez cada llamada (el "tool loop" de 2+2)
+  inventa         inventa un <resultado> después de la llamada (lo corta el stop)
+  texto_final     termina con texto suelto en vez de attempt_completion
+  afirma_falso    el informe final dice que validó y que los tests pasan
+"""
+
+DEFECTOS_TORPES = ("fences", "sin_cierre", "alias", "comillas", "json", "repite", "inventa", "texto_final",
+                   "afirma_falso")
+
+_ALIAS_TORPES = {"read_symbol": "read_function", "replace_symbol": "replace_function", "read_file": "view_file",
+                 "write_to_file": "create_file", "execute_command": "run_command"}
+_ALIAS_PARAMS_TORPES = {"path": "file", "command": "cmd"}
+
+
+def _corromper(texto: str, defectos: set) -> str:
+    analisis = analizar(texto, esquemas())
+    if not analisis.llamadas:
+        return texto
+    llamada = analisis.llamadas[0]
+    prefijo = analisis.texto
+    if "json" in defectos:
+        cuerpo = json.dumps({"tool": llamada.nombre, "args": llamada.params}, ensure_ascii=False)
+    else:
+        nombre = _ALIAS_TORPES.get(llamada.nombre, llamada.nombre) if "alias" in defectos else llamada.nombre
+        partes = []
+        for clave, valor in llamada.params.items():
+            etiqueta = _ALIAS_PARAMS_TORPES.get(clave, clave) if "alias" in defectos else clave
+            if "comillas" in defectos and clave in ("path", "command") and not re.search(r"[\"'`]", str(valor)):
+                valor = f'"{valor}"'  # como hacen los modelos: <path>"calc.py"</path>
+            separador = "\n" if "\n" in str(valor) or clave in ("content", "diff", "result") else ""
+            partes.append(f"<{etiqueta}>{separador}{valor}{separador}</{etiqueta}>")
+        cierre = "" if "sin_cierre" in defectos and llamada.nombre != "attempt_completion" else f"\n</{nombre}>"
+        cuerpo = f"<{nombre}>\n" + "\n".join(partes) + cierre
+    if "fences" in defectos:
+        cuerpo = f"```xml\n{cuerpo}\n```"
+    if "inventa" in defectos:
+        cuerpo += '\n<resultado herramienta="x">\nTests PASARON: todo perfecto.\n</resultado>\nListo, todo funciona.'
+    return (prefijo + "\n" if prefijo else "") + cuerpo
+
+
+def guion_torpe(pasos: list, informe: str, defectos: Iterable[str]) -> Callable:
+    """Guion para MockLLM: recorre `pasos` (llamadas ideales) cometiendo los `defectos` indicados."""
+    defectos = set(defectos)
+    estado = {"i": 0, "ultimo": None, "repetidos": set()}
+
+    def guion(mensajes, kwargs):
+        if "repite" in defectos and estado["ultimo"] is not None and estado["ultimo"] not in estado["repetidos"]:
+            estado["repetidos"].add(estado["ultimo"])
+            return _corromper(pasos[estado["ultimo"]], defectos)
+        if estado["i"] < len(pasos):
+            estado["ultimo"] = estado["i"]
+            estado["i"] += 1
+            return _corromper(pasos[estado["ultimo"]], defectos)
+        estado["ultimo"] = None
+        final = "Listo, validé todo y los tests pasan." if "afirma_falso" in defectos else informe
+        if "texto_final" in defectos:
+            return final
+        return _corromper(terminar_xml(final), defectos - {"sin_cierre"})
+
+    return guion
+
+
+_CALC_ROTA = "def suma(a, b):\n    return a - b\n\n\ndef resta(a, b):\n    return a - b\n"
+_TEST_SUMA = ("import unittest\nfrom calc import suma, resta\n\n\nclass T(unittest.TestCase):\n"
+              "    def test_suma(self):\n        self.assertEqual(suma(2, 3), 5)\n\n"
+              "    def test_resta(self):\n        self.assertEqual(resta(5, 3), 2)\n")
+
+
+class TestRobustezModeloTorpe(BaseTest):
+    PASOS_ARREGLO = [
+        herramienta_xml("read_symbol", path="calc.py", symbol="suma"),
+        herramienta_xml("replace_symbol", path="calc.py", symbol="suma", content="def suma(a, b):\n    return a + b"),
+        herramienta_xml("run_tests"),
+    ]
+
+    def _arreglar(self, defectos) -> tuple:
+        ws = self.proyecto({"calc.py": _CALC_ROTA, "tests/test_calc.py": _TEST_SUMA})
+        llm = MockLLM(guion_torpe(self.PASOS_ARREGLO, "Arreglé suma: run_tests pasa.", defectos))
+        res = Agente("principal", llm, ws, self.ajustes(max_pasos=16), self.ui(), memoria=None,
+                     mostrar_progreso=False).ejecutar("arreglá suma en calc.py")
+        return res, ws, llm
+
+    def test_cada_defecto_por_separado(self):
+        for defecto in DEFECTOS_TORPES:
+            with self.subTest(defecto=defecto):
+                res, ws, llm = self._arreglar({defecto})
+                self.assertIn("return a + b", ws.leer("calc.py"), f"{defecto}: no se aplicó el arreglo")
+                self.assertLessEqual(len(llm.llamadas), 9, f"{defecto}: demasiadas vueltas")
+                if defecto != "afirma_falso":
+                    self.assertTrue(res.ok, f"{defecto}: {res.motivo} {res.resumen[:200]}")
+                    self.assertNotIn("⚠ REAPER", res.resumen)
+
+    def test_afirmacion_verdadera_no_se_marca(self):
+        res, _ws, _llm = self._arreglar({"afirma_falso"})
+        # corrió run_tests y pasaron: "los tests pasan" es verdad y se acepta sin advertencia
+        self.assertNotIn("⚠ REAPER", res.resumen)
+
+    def test_todos_los_defectos_juntos(self):
+        res, ws, llm = self._arreglar(set(DEFECTOS_TORPES) - {"json"})
+        self.assertIn("return a + b", ws.leer("calc.py"))
+        self.assertTrue(res.ok, res.resumen[:300])
+        self.assertLessEqual(len(llm.llamadas), 12)
+
+    def test_json_con_otros_defectos(self):
+        res, ws, _llm = self._arreglar({"json", "repite", "inventa", "texto_final"})
+        self.assertIn("return a + b", ws.leer("calc.py"))
+        self.assertTrue(res.ok)
+
+    def test_afirma_falso_sin_haber_verificado(self):
+        ws = self.proyecto({"calc.py": _CALC_ROTA, "tests/test_calc.py": _TEST_SUMA})
+        pasos = self.PASOS_ARREGLO[:2]  # arregla pero nunca corre los tests
+        llm = MockLLM(guion_torpe(pasos, "", {"afirma_falso", "fences", "repite"}))
+        res = Agente("principal", llm, ws, self.ajustes(max_pasos=16), self.ui(), memoria=None,
+                     mostrar_progreso=False).ejecutar("arreglá suma en calc.py")
+        self.assertIn("⚠ REAPER", res.resumen, "la afirmación sin evidencia tiene que quedar marcada")
+
+    def test_dos_mas_dos_torpe(self):
+        for defectos in ({"repite"}, {"repite", "fences", "texto_final"}, {"inventa", "comillas", "texto_final"}):
+            with self.subTest(defectos=sorted(defectos)):
+                pasos = [herramienta_xml("execute_command", command='python3 -c "print(2+2)"')]
+                llm = MockLLM(guion_torpe(pasos, "2+2 = 4", defectos))
+                res = Agente("principal", llm, self.proyecto(), self.ajustes(), self.ui(), memoria=None,
+                             mostrar_progreso=False).ejecutar("cuánto es 2+2? usá python")
+                self.assertIn("4", res.resumen)
+                self.assertTrue(res.ok)
+                self.assertLessEqual(len(llm.llamadas), 4)
+
+    def test_comillas_sobrantes_se_quitan(self):
+        pasos = [herramienta_xml("write_to_file", path="s.py", content="X = 1\n"),
+                 herramienta_xml("execute_command", command="'python3 -c \"import s; print(s.X)\"'")]
+        llm = MockLLM(guion_torpe(pasos, "Creé s.py y lo probé: imprime 1.", {"texto_final"}))
+        res = Agente("principal", llm, self.proyecto(), self.ajustes(), self.ui(), memoria=None,
+                     mostrar_progreso=False).ejecutar("creá s.py con X = 1")
+        self.assertNotIn("⚠ REAPER", res.resumen)
+        self.assertIn("STDOUT:\n1", MockLLM.ultimo_usuario(llm.llamadas[-1]["mensajes"]))
+
+    def test_comando_que_falla_no_se_da_por_probado(self):
+        """Si el comando falla y el modelo igual dice 'lo probé', REAPER lo marca (lo que pasó en Termux)."""
+        pasos = [herramienta_xml("write_to_file", path="s.py", content="X = 1\n"),
+                 herramienta_xml("execute_command", command='python3 -c "import s; print(s.Y)"')]
+        llm = MockLLM(guion_torpe(pasos, "Creé s.py y lo probé: imprime 1.", {"texto_final"}))
+        res = Agente("principal", llm, self.proyecto(), self.ajustes(), self.ui(), memoria=None,
+                     mostrar_progreso=False).ejecutar("creá s.py con X = 1")
+        self.assertIn("⚠ REAPER", res.resumen)
+        self.assertIn("FALLÓ", res.resumen)
+
+    def test_crear_archivo_nuevo_torpe(self):
+        pasos = [
+            herramienta_xml("write_to_file", path="saludo.py",
+                            content='def saludar(nombre):\n    return f"Hola, {nombre}!"\n'),
+            herramienta_xml("execute_command", command='python3 -c "from saludo import saludar; print(saludar(\'Ana\'))"'),
+        ]
+        for defectos in ({"alias", "comillas"}, {"sin_cierre", "fences", "repite"}, {"json", "texto_final"}):
+            with self.subTest(defectos=sorted(defectos)):
+                ws = self.proyecto(nombre="nuevo_" + "_".join(sorted(defectos)))
+                llm = MockLLM(guion_torpe(pasos, "Creé saludo.py y lo probé: imprime Hola, Ana!", defectos))
+                res = Agente("principal", llm, ws, self.ajustes(), self.ui(), memoria=None,
+                             mostrar_progreso=False).ejecutar("creá saludo.py con una función saludar")
+                self.assertTrue((ws.raiz / "saludo.py").exists())
+                self.assertIn("Hola, {nombre}!", ws.leer("saludo.py"))
+                self.assertTrue(res.ok, res.resumen[:200])
+
+
+# ======================================================================
 # MÓDULO: autotest_lenguajes
 # ======================================================================
 """Autotests de soporte multi-lenguaje: detección de suites y parsers de salida de tests."""
@@ -28325,6 +28576,22 @@ class TestValidacionProyecto(BaseTest):
         ws = self.proyecto({"a.pl": "use strict;\nmy $x = ;\n", "b.pl": "use strict;\nmy $x = 1;\nprint $x;\n"})
         self.assertTrue(fallos(validar_archivos(ws, ["a.pl"])))
         self.assertFalse(fallos(validar_archivos(ws, ["b.pl"])))
+
+
+class TestGuiasLenguaje(BaseTest):
+    def test_guias_por_extension(self):
+        for archivo, encabezado in (("a.c", "C\n"), ("A.java", "JAVA"), ("i.php", "PHP"), ("l.rb", "RUBY"),
+                                    ("x.pm", "PERL"), ("m.go", "GO"), ("lib.rs", "RUST")):
+            with self.subTest(archivo=archivo):
+                self.assertTrue(guias_para([archivo]).startswith(encabezado))
+
+    def test_guia_de_programas_interactivos(self):
+        guia = guias_para([], "hacé una calculadora interactiva con menú")
+        self.assertIn("PROGRAMAS INTERACTIVOS", guia)
+        self.assertIn("NO quites el input()", guia)
+
+    def test_maximo_tres_guias(self):
+        self.assertLessEqual(guias_para(["a.py", "b.js", "c.go", "d.rs", "e.c"]).count("\n\n") + 1, 3)
 
 
 # ======================================================================

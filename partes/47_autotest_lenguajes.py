@@ -125,3 +125,19 @@ class TestValidacionProyecto(BaseTest):
         ws = self.proyecto({"a.pl": "use strict;\nmy $x = ;\n", "b.pl": "use strict;\nmy $x = 1;\nprint $x;\n"})
         self.assertTrue(fallos(validar_archivos(ws, ["a.pl"])))
         self.assertFalse(fallos(validar_archivos(ws, ["b.pl"])))
+
+
+class TestGuiasLenguaje(BaseTest):
+    def test_guias_por_extension(self):
+        for archivo, encabezado in (("a.c", "C\n"), ("A.java", "JAVA"), ("i.php", "PHP"), ("l.rb", "RUBY"),
+                                    ("x.pm", "PERL"), ("m.go", "GO"), ("lib.rs", "RUST")):
+            with self.subTest(archivo=archivo):
+                self.assertTrue(guias_para([archivo]).startswith(encabezado))
+
+    def test_guia_de_programas_interactivos(self):
+        guia = guias_para([], "hacé una calculadora interactiva con menú")
+        self.assertIn("PROGRAMAS INTERACTIVOS", guia)
+        self.assertIn("NO quites el input()", guia)
+
+    def test_maximo_tres_guias(self):
+        self.assertLessEqual(guias_para(["a.py", "b.js", "c.go", "d.rs", "e.c"]).count("\n\n") + 1, 3)

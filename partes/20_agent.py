@@ -523,7 +523,7 @@ class Agente:
             if mapa:
                 extras.append(mapa)
         if self.rol.nombre in ("implementador", "especificador", "qa", "principal", "escritor"):
-            archivos = re.findall(r"[\w./-]+\.(?:py|js|mjs|cjs|ts|html|css|sh|go|rs)\b", tarea)
+            archivos = re.findall(r"[\w./-]+\.(?:py|js|mjs|cjs|ts|html|css|sh|go|rs|c|h|java|php|rb|pl|pm)\b", tarea)
             guia = guias_para(archivos or self.ws.archivos_codigo(limite=60), tarea)
             if guia:
                 extras.append("GUÍA RÁPIDA DEL LENGUAJE:\n" + guia)
