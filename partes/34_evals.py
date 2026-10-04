@@ -20,17 +20,24 @@ class TareaEval:
     tests: dict
     archivos: dict = field(default_factory=dict)
     dificultad: int = 1
+    comando_tests: str = ""          # vacío = unittest de Python
+    requiere: tuple = ()             # ejecutables necesarios (node, go...)
+    lenguaje: str = "python"
+
+    def disponible(self) -> bool:
+        return all(shutil.which(r) for r in self.requiere)
 
 
 TAREAS_EVAL: list[TareaEval] = []
 
 
 def tarea_eval(id_: str, titulo: str, pedido: str, tests: dict, archivos: Optional[dict] = None,
-               dificultad: int = 1) -> None:
+               dificultad: int = 1, comando_tests: str = "", requiere: Sequence[str] = (),
+               lenguaje: str = "python") -> None:
     TAREAS_EVAL.append(TareaEval(id_, titulo, textwrap.dedent(pedido).strip(),
                                  {k: textwrap.dedent(v).lstrip("\n") for k, v in tests.items()},
                                  {k: textwrap.dedent(v).lstrip("\n") for k, v in (archivos or {}).items()},
-                                 dificultad))
+                                 dificultad, comando_tests, tuple(requiere), lenguaje))
 
 
 tarea_eval("fizzbuzz", "FizzBuzz con reglas", """
@@ -379,15 +386,16 @@ def correr_tarea_eval(tarea: TareaEval, llm, settings: Settings, ui: UI, modo: s
             error = f"{type(e).__name__}: {e}"
         for rel, contenido in tarea.tests.items():
             escritura_atomica(raiz / rel, contenido)
-        r = ejecutar(f"{shlex.quote(sys.executable)} -m unittest discover -s tests", cwd=raiz,
-                     timeout=settings.tests_timeout, shell=True)
+        comando = comando_portable(tarea.comando_tests) if tarea.comando_tests else \
+            f"{shlex.quote(sys.executable)} -m unittest discover -s tests"
+        r = ejecutar(comando, cwd=raiz, timeout=settings.tests_timeout, shell=True)
         conteo = contar_tests(r.stdout + r.stderr, r.codigo)
         return ResultadoEval(tarea, r.ok and not error, conteo, pasos, time.monotonic() - inicio, error)
 
 
 def correr_evaluacion(llm, settings: Settings, ui: UI, cantidad: Optional[int] = None, modo: str = "agente",
                       ids: Sequence[str] = ()) -> bool:
-    tareas = [t for t in TAREAS_EVAL if not ids or t.id in ids]
+    tareas = [t for t in TAREAS_EVAL if (not ids or t.id in ids or t.lenguaje in ids) and t.disponible()]
     if cantidad:
         tareas = tareas[:cantidad]
     if not tareas:

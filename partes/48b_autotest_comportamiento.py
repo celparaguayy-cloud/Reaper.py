@@ -107,3 +107,39 @@ class TestManual(BaseTest):
             mencionados |= set(re.findall(r"`(/[a-z][a-z-]*)", texto))
         faltan = sorted(c for c in mencionados if c not in existentes)
         self.assertEqual(faltan, [], f"el manual menciona comandos inexistentes: {faltan}")
+
+
+class TestEvalsConSolucion(BaseTest):
+    def test_tests_ocultos_pasan_con_la_solucion_de_referencia(self):
+        for tarea in TAREAS_EVAL:
+            if tarea.id not in SOLUCIONES_EVAL:
+                continue
+            with self.subTest(tarea=tarea.id):
+                if not tarea.disponible():
+                    continue
+                if tarea.lenguaje == "go" and not os.getenv("REAPER_AUTOTEST_COMPLETO"):
+                    continue
+                raiz = self.dir / f"eval_{tarea.id}"
+                for rel, contenido in {**tarea.archivos, **SOLUCIONES_EVAL[tarea.id], **tarea.tests}.items():
+                    escritura_atomica(raiz / rel, contenido)
+                comando = comando_portable(tarea.comando_tests) if tarea.comando_tests else \
+                    f"{shlex.quote(sys.executable)} -m unittest discover -s tests"
+                r = ejecutar(comando, cwd=raiz, timeout=180, shell=True)
+                self.assertTrue(r.ok, f"{tarea.id}: {recortar(r.stdout + r.stderr, 1500)}")
+
+    def test_solucion_vacia_no_pasa(self):
+        """Los tests ocultos tienen que fallar si el modelo no hizo nada (si no, no miden nada)."""
+        for tarea in TAREAS_EVAL:
+            if tarea.id not in SOLUCIONES_EVAL or tarea.lenguaje != "python":
+                continue
+            with self.subTest(tarea=tarea.id):
+                raiz = self.dir / f"vacia_{tarea.id}"
+                for rel, contenido in {**tarea.archivos, **tarea.tests}.items():
+                    escritura_atomica(raiz / rel, contenido)
+                r = ejecutar(f"{shlex.quote(sys.executable)} -m unittest discover -s tests", cwd=raiz, timeout=60, shell=True)
+                self.assertFalse(r.ok)
+
+    def test_ids_unicos(self):
+        ids = [t.id for t in TAREAS_EVAL]
+        self.assertEqual(len(ids), len(set(ids)))
+        self.assertTrue(set(SOLUCIONES_EVAL) <= set(ids))
