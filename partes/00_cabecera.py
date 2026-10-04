@@ -59,6 +59,7 @@ __version__ = "7.1.0"
 __codename__ = "Dragón"
 
 import argparse
+import atexit
 import ast
 import base64
 import collections

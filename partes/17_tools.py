@@ -188,6 +188,8 @@ def _post_escritura(ctx: Contexto, rel: str, antes: Optional[str], despues: str,
         texto += "\nValidación: " + resumen_validacion(resultados)
     if rel.endswith(".py") and not malos:
         avisos = advertencias_python(despues)
+        if es_archivo_de_test(rel):
+            avisos = avisos + advertencias_tests_python(despues)
         if avisos:
             texto += "\nAdvertencias:\n" + "\n".join(f"- {a}" for a in avisos[:6])
     extra_hooks = _hook_post_escritura(ctx, rel)

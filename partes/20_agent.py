@@ -186,6 +186,7 @@ HERRAMIENTAS_COMANDO = ("execute_command", "run_python", "run_tests")
 HERRAMIENTAS_REUTILIZABLES = ("execute_command", "run_python", "run_tests", "validate", "fetch_url", "view_diff",
                               "project_map", "list_files", "search_files", "code_outline", "find_references")
 HERRAMIENTAS_LECTURA_BARATA = ("read_file", "read_symbol")
+HERRAMIENTAS_VOLATILES = ("process_output", "ask_user", "update_todo")  # su resultado cambia solo con el tiempo
 _RE_COMANDO_VOLATIL = re.compile(r"\b(?:sleep|date|time|curl|wget|ping|ps|top|uptime|watch|free|df|tail\s+-f|"
                                  r"git\s+(?:fetch|pull)|pip\s+(?:install|download)|npm\s+(?:install|i)|random)\b")
 
@@ -626,7 +627,7 @@ class Agente:
         # Detector de repeticiones según el ESTADO del workspace: después de una escritura, releer o
         # volver a correr los tests es legítimo; repetir lo mismo sin que nada cambie, no.
         clave = nombre + json.dumps(llamada.params, sort_keys=True, ensure_ascii=False)
-        previo = self._historial.get(clave) if not h.escribe else None
+        previo = self._historial.get(clave) if not h.escribe and nombre not in HERRAMIENTAS_VOLATILES else None
         aviso_relectura = ""
         misma_version = previo is not None and previo["version"] == self._version()
         seguir_contando = misma_version

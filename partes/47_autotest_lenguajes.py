@@ -180,3 +180,38 @@ class TestRecetasLenguajes(BaseTest):
             with self.subTest(receta=r.titulo):
                 self.assertIn(r.lenguaje, _EXTENSION_RECETA)
                 self.assertTrue(r.etiquetas and r.descripcion and r.codigo.strip())
+
+
+class TestAdvertenciasDeTests(BaseTest):
+    MALO = (
+        "import unittest\nfrom m import f\n\n\nclass T(unittest.TestCase):\n"
+        "    def test_tipos(self):\n"
+        "        r = f(1)\n"
+        "        if isinstance(r, int):\n            pass\n"
+        "        elif isinstance(r, str):\n            pass\n"
+        "        elif isinstance(r, list):\n            pass\n"
+        "        if r:\n            pass\n"
+        "    def test_esconde(self):\n"
+        "        try:\n            self.assertEqual(f(1), 2)\n        except Exception:\n            pass\n"
+        "    def test_input(self):\n        self.assertEqual(input(), 'x')\n"
+    )
+
+    def test_detecta_tests_mal_escritos(self):
+        avisos = " | ".join(advertencias_tests_python(self.MALO))
+        self.assertIn("3 isinstance", avisos)
+        self.assertIn("if dentro del test", avisos)
+        self.assertIn("no tiene ningún assert", avisos)
+        self.assertIn("esconde los fallos", avisos)
+        self.assertIn("usa input()", avisos)
+
+    def test_test_simple_sin_avisos(self):
+        bueno = ("import unittest\nfrom m import f\n\n\nclass T(unittest.TestCase):\n"
+                 "    def test_caso(self):\n        self.assertEqual(f(2), 4)\n"
+                 "    def test_error(self):\n        with self.assertRaises(ValueError):\n            f(-1)\n")
+        self.assertEqual(advertencias_tests_python(bueno), [])
+
+    def test_aparece_al_escribir_un_test(self):
+        ws = self.proyecto({"m.py": "def f(x):\n    return x * 2\n"})
+        salida = self.herramienta(self.contexto(ws), "write_to_file", path="tests/test_m.py", content=self.MALO)
+        self.assertIn("isinstance", salida)
+        self.assertTrue(es_archivo_de_test("tests/test_m.py") and not es_archivo_de_test("m.py"))

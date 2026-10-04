@@ -609,6 +609,54 @@ def advertencias_python(texto: str) -> list[str]:
     return avisos
 
 
+def es_archivo_de_test(rel: str) -> bool:
+    nombre = rel.rsplit("/", 1)[-1]
+    return (nombre.startswith("test_") or nombre.endswith("_test.py") or "/tests/" in f"/{rel}"
+            or "/test/" in f"/{rel}") and rel.endswith(".py")
+
+
+def advertencias_tests_python(texto: str) -> list[str]:
+    """
+    Tests que un modelo chico suele escribir mal (se vio en Termux: cadenas de isinstance cada vez más largas):
+    demasiada lógica, sin asserts, except que esconde fallos, input() o red real.
+    """
+    try:
+        arbol = ast.parse(texto)
+    except SyntaxError:
+        return []
+    avisos = []
+    for nodo in ast.walk(arbol):
+        if not isinstance(nodo, (ast.FunctionDef, ast.AsyncFunctionDef)) or not nodo.name.startswith("test"):
+            continue
+        llamadas = [n for n in ast.walk(nodo) if isinstance(n, ast.Call)]
+        nombres = [ast.unparse(c.func) for c in llamadas]
+        isinstances = sum(1 for n in nombres if n == "isinstance")
+        asserts = sum(1 for n in nombres if ".assert" in n or n.startswith("assert")) + sum(
+            1 for n in ast.walk(nodo) if isinstance(n, ast.Assert))
+        ramas = sum(1 for n in ast.walk(nodo) if isinstance(n, ast.If))
+        lineas = (getattr(nodo, "end_lineno", nodo.lineno) or nodo.lineno) - nodo.lineno
+        donde = f"{nodo.name} (línea {nodo.lineno})"
+        if isinstances >= 3:
+            avisos.append(f"{donde}: {isinstances} isinstance: un test compara valores concretos "
+                          "(assertEqual(f(x), esperado)), no tipos encadenados")
+        if ramas >= 3:
+            avisos.append(f"{donde}: {ramas} if dentro del test: sacá la lógica (un test por caso o subTest)")
+        if lineas > 40:
+            avisos.append(f"{donde}: {lineas} líneas: partilo en tests más chicos")
+        if asserts == 0 and not any("assertRaises" in n or "raises" in n for n in nombres):
+            avisos.append(f"{donde}: no tiene ningún assert (no verifica nada)")
+        for sub in ast.walk(nodo):
+            if isinstance(sub, ast.ExceptHandler) and (sub.type is None or ast.unparse(sub.type) in ("Exception", "BaseException")):
+                avisos.append(f"{donde}: except {ast.unparse(sub.type) if sub.type else ''} dentro del test esconde "
+                              "los fallos; usá assertRaises")
+                break
+        if "input" in nombres:
+            avisos.append(f"{donde}: usa input(); simulalo con unittest.mock.patch('builtins.input')")
+        if any(n.endswith(("urlopen", "requests.get", "requests.post", "http.client.HTTPConnection")) for n in nombres):
+            avisos.append(f"{donde}: hace pedidos de red reales; reemplazá la función con un mock")
+    return avisos[:8]
+
+
 def _validar_python(ws: Workspace, ruta: Path, rel: str) -> list[Resultado]:
     texto = ruta.read_text(encoding="utf-8", errors="replace")
     try:
