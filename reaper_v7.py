@@ -4716,6 +4716,9 @@ _COMPILADORES = {
     ".php": [("php", ["-l"])],
     ".rb": [("ruby", ["-c"])],
     ".lua": [("luac", ["-p"]), ("luac5.4", ["-p"])],
+    ".pl": [("perl", ["-Ilib", "-c"])],
+    ".pm": [("perl", ["-Ilib", "-c"])],
+    ".t": [("perl", ["-Ilib", "-c"])],
 }
 
 
@@ -4727,6 +4730,8 @@ def _validar_compilado(ws: Workspace, ruta: Path, rel: str) -> list[Resultado]:
             if ejecutable == "gofmt":
                 r.ok = r.codigo == 0 and "expected" not in r.stderr
                 r.stdout = ""
+            if ejecutable == "perl" and r.ok:
+                r.stderr = ""  # "archivo syntax OK" no aporta
             r.comando = f"{ejecutable} {rel}"
             r.archivo = rel
             return [r]
@@ -4812,7 +4817,64 @@ def validar_archivos(ws: Workspace, rels: list[str]) -> list[Resultado]:
     for rel in rels:
         if (ws.raiz / rel).is_file():
             resultados.extend(validar_archivo(ws, rel))
+    if not fallos(resultados):
+        # Solo si cada archivo está bien por separado: compilar el proyecto da los errores de tipos,
+        # imports y referencias entre archivos que un chequeo de sintaxis no ve.
+        resultados.extend(validar_proyecto(ws, rels))
     return resultados
+
+
+def _modulo_raiz(ws: Workspace, rels: list[str], marcador: str) -> Optional[Path]:
+    """Carpeta más cercana (hacia arriba, dentro del workspace) que contiene el marcador (go.mod, Cargo.toml)."""
+    for rel in rels:
+        carpeta = (ws.raiz / rel).parent
+        while True:
+            if (carpeta / marcador).is_file():
+                return carpeta
+            if carpeta == ws.raiz or ws.raiz not in carpeta.parents:
+                break
+            carpeta = carpeta.parent
+    return None
+
+
+def validar_proyecto(ws: Workspace, rels: list[str]) -> list[Resultado]:
+    """
+    Compilación del proyecto para Go (go build), Rust (cargo check) y Java sin build tool (javac).
+    No compila los tests: con "tests primero" los de tareas futuras todavía no compilan, y eso se ve en
+    run_tests, no tiene que impedir que un implementador cierre su tarea.
+    """
+    if os.getenv("REAPER_SIN_VALIDAR_PROYECTO"):
+        return []
+    salida: list[Resultado] = []
+    sufijos = {Path(r).suffix.lower() for r in rels}
+    if ".go" in sufijos and shutil.which("go"):
+        modulo = _modulo_raiz(ws, [r for r in rels if r.endswith(".go")], "go.mod")
+        if modulo is not None:
+            with tempfile.TemporaryDirectory(prefix="reaper_go_") as tmp:
+                r = ejecutar(["go", "build", "-o", tmp + os.sep, "./..."], cwd=modulo, timeout=180)
+            if not r.ok and "no main packages" in r.stderr:
+                # Solo librerías: sin -o, go build compila y descarta (no deja nada en el proyecto).
+                r = ejecutar(["go", "build", "./..."], cwd=modulo, timeout=180)
+            r.comando = "go build ./..."
+            salida.append(r)
+    if ".rs" in sufijos and shutil.which("cargo"):
+        crate = _modulo_raiz(ws, [r for r in rels if r.endswith(".rs")], "Cargo.toml")
+        if crate is not None:
+            r = ejecutar(["cargo", "check", "--offline", "-q", "--message-format", "short"], cwd=crate, timeout=300)
+            r.comando = "cargo check"
+            if r.ok:
+                r.stderr = ""
+            salida.append(r)
+    if ".java" in sufijos and shutil.which("javac"):
+        sin_build = not any((ws.raiz / m).is_file() for m in ("pom.xml", "build.gradle", "build.gradle.kts"))
+        fuentes = [ws.rel(p) for p in ws.iterar(limite=3000) if p.suffix == ".java"
+                   and not re.search(r"(^|/)(tests?|src/test)/|Test\.java$", ws.rel(p))]
+        if sin_build and fuentes and len(fuentes) <= 400:
+            with tempfile.TemporaryDirectory(prefix="reaper_javac_") as tmp:
+                r = ejecutar(["javac", "-encoding", "UTF-8", "-Xlint:none", "-d", tmp, *fuentes], cwd=ws.raiz, timeout=180)
+            r.comando = "javac (proyecto)"
+            salida.append(r)
+    return salida
 
 
 def fallos(resultados: list[Resultado]) -> list[Resultado]:
@@ -7462,9 +7524,11 @@ def _entero(valor, defecto: Optional[int]) -> Optional[int]:
 def _permiso_edicion(ctx: Contexto, rel: str, diff: str, nuevo: bool) -> None:
     if ctx.settings.modo != "confirmar":
         return
+    if EDICIONES in _sesion(ctx.ws):
+        return
     ctx.ui.aviso(f"  {ctx.etiqueta} quiere {'crear' if nuevo else 'modificar'} {rel}:")
     ctx.ui.diff(diff, max_lineas=40)
-    if not ctx.ui.confirmar("  ¿Aplicar este cambio?"):
+    if not pedir_permiso_edicion(ctx, rel):
         raise ErrorHerramienta(
             f"El usuario rechazó el cambio en {rel}. No insistas con lo mismo: "
             "preguntá qué prefiere (ask_user) o seguí con otra parte."
@@ -7947,8 +8011,7 @@ def execute_command(ctx: Contexto, p: dict) -> str:
     if motivo_hook:
         raise ErrorHerramienta(f"Comando bloqueado: {motivo_hook}.")
     if ctx.settings.modo != "auto" and not comando_seguro(comando):
-        ctx.ui.aviso(f"  {ctx.etiqueta} quiere ejecutar: {comando}")
-        if not ctx.ui.confirmar("  ¿Ejecutar?"):
+        if not pedir_permiso_comando(ctx, comando):
             raise ErrorHerramienta(
                 "El usuario no aprobó el comando (o no hay usuario para aprobarlo). "
                 "Seguí sin él o usá run_tests / validate."
@@ -8855,6 +8918,24 @@ Sé concreto y breve. No propongas reescribir lo que funciona.""",
         0.1,
         solo_lectura=True,
         max_pasos=10,
+    ),
+    "planificador": Rol(
+        "planificador",
+        """Sos el PLANIFICADOR (modo plan, SOLO LECTURA). El usuario quiere ver y aprobar un plan ANTES de que se
+toque cualquier archivo. No edites ni ejecutes nada que cambie el proyecto.
+1. Investigá lo necesario con herramientas de lectura (project_map, search_files, code_outline, read_symbol).
+2. Si falta información esencial, preguntá con ask_user (UNA pregunta concreta).
+3. Terminá con attempt_completion y el PLAN en Markdown, con estas secciones:
+   ## Objetivo            (una o dos frases)
+   ## Archivos            (cada archivo con lo que cambia; los nuevos marcados con +)
+   ## Pasos               (numerados, concretos y en orden de dependencia)
+   ## Cómo se verifica    (tests o comandos exactos)
+   ## Riesgos o dudas
+No escribas el código completo: como mucho firmas o fragmentos cortos que aclaren algo.
+Si el pedido es solo una pregunta, respondela directamente en el informe.""",
+        LECTURA + ("project_map", "fetch_url", "ask_user", "attempt_completion"),
+        0.2,
+        solo_lectura=True,
     ),
     "escritor": Rol(
         "escritor",
@@ -19377,6 +19458,7 @@ COMANDOS_AYUDA = [
     ("EQUIPO", [
         ("/construir <pedido>", "exploradores → arquitecto → tests primero → torneo por tarea → verificación → reparador"),
         ("/plan <pedido>", "solo exploración + plan (se guarda en .reaper/planes)"),
+        ("/modo plan", "modo plan: propone un plan en solo lectura y lo ejecuta cuando lo aprobás"),
         ("/torneo <tarea>", "N implementadores compiten en copias aisladas; gana el que pasa más tests"),
         ("/escribir <ruta> <qué>", "archivo largo por esqueleto + relleno (miles de líneas sin cortarse)"),
         ("/agente <rol> <tarea>", "subagente suelto (explorador, implementador, revisor, qa, reparador...)"),
@@ -19474,6 +19556,7 @@ class App:
         self.historial: list[tuple[str, str, bool]] = []
         self._rehacer: Optional[dict] = None
         self._pedido_actual = ""
+        self.modo_plan = False
         self.escalador = Escalador(llm, settings, ui)
         self.memoria = self._nueva_memoria()
         self.principal = self._nuevo_principal()
@@ -19567,7 +19650,43 @@ class App:
         self.ui.tenue(f"  adjunté {len(adjuntos)} mención(es) @")
         return texto + "\n\nARCHIVOS MENCIONADOS POR EL USUARIO:\n" + "\n\n".join(adjuntos)
 
+    def turno_plan(self, texto: str) -> bool:
+        """
+        Modo plan (como Claude Code): un agente de solo lectura investiga y propone; nada se toca hasta que
+        el usuario aprueba. Al aprobar, el plan entra como contexto del agente principal y se sale del modo.
+        """
+        self._pedido_actual = texto
+        agente = Agente("planificador", self.llm, self.ws, self.settings, self.ui, memoria=self.memoria)
+        res = agente.ejecutar(self.expandir_menciones(texto))
+        self.historial.append((datetime.now().strftime("%H:%M"), f"[plan] {texto[:190]}", res.ok))
+        self.ui.linea("")
+        self.ui.linea(f"{Tema.agente}{C.BOLD}reaper » plan{C.RESET}")
+        mostrar_markdown(self.ui, res.resumen)
+        self.ui.linea("")
+        ruta = guardar_plan_markdown(self.ws, texto, res.resumen)
+        if ruta:
+            self.ui.tenue(f"  plan guardado en {self.ws.rel(ruta)}")
+        if not res.ok and res.motivo in ("max_pasos", "bucle"):
+            self.ui.aviso(f"  (el planificador terminó con estado {res.motivo}: revisá el plan antes de aprobarlo)")
+        eleccion = self.ui.elegir("¿Qué hacemos con este plan?", [
+            "Ejecutarlo (auto-edición)",
+            "Ejecutarlo confirmando cada cambio",
+            "Seguir en modo plan (no tocar nada)",
+        ], defecto=2 if not self.ui.interactivo else 0)
+        if eleccion == 2:
+            self.ui.tenue("  Sigo en modo plan: escribí ajustes al plan o /modo auto-edicion para salir.")
+            return res.ok
+        self.modo_plan = False
+        self.settings.modo = "auto-edicion" if eleccion == 0 else "confirmar"
+        self.ui.ok(f"Plan aprobado: ejecuto en modo {self.settings.modo}")
+        return self.turno(
+            f"{texto}\n\nPLAN APROBADO POR EL USUARIO (seguilo paso a paso; si algo no coincide con el código real, "
+            f"adaptalo y decilo en el informe):\n{res.resumen}"
+        )
+
     def turno(self, texto: str) -> bool:
+        if self.modo_plan:
+            return self.turno_plan(texto)
         self._pedido_actual = texto
         cid = self.ws.checkpoints.iniciar(f"pedido: {texto[:80]}")
         inicio = time.monotonic()
@@ -20129,9 +20248,16 @@ class App:
             self.ui.linea(f"  {'✓' if estado == 'x' else '▸' if estado == '>' else '○'} {texto}")
 
     def cmd_modo(self, arg: str) -> None:
-        if arg not in MODOS:
-            self.ui.info(f"Modo actual: {self.settings.modo}  (opciones: {', '.join(MODOS)})")
+        arg = arg.strip().lower()
+        if arg == "plan":
+            self.modo_plan = True
+            self.ui.ok("Modo plan: investigo y propongo un plan sin tocar nada; lo ejecuto cuando lo apruebes.")
             return
+        if arg not in MODOS:
+            actual = "plan" if self.modo_plan else self.settings.modo
+            self.ui.info(f"Modo actual: {actual}  (opciones: plan, {', '.join(MODOS)})")
+            return
+        self.modo_plan = False
         self.settings.modo = arg
         guardar_settings(self.settings)
         self.ui.ok(f"Modo: {arg}")
@@ -20364,7 +20490,8 @@ class App:
             pass
 
     def _leer_entrada(self) -> str:
-        entrada = input(f"{Tema.prompt}{C.BOLD}vos ›{C.RESET} ")
+        marca = f"{Tema.aviso}[plan] {C.RESET}" if self.modo_plan else ""
+        entrada = input(f"{marca}{Tema.prompt}{C.BOLD}vos ›{C.RESET} ")
         if entrada.strip() != '"""':
             return entrada.strip()
         lineas = []
@@ -28160,6 +28287,164 @@ class TestDeteccionLenguajes(BaseTest):
         self.assertEqual(conteo_de_resultado(r).pasados, 6)
 
 
+class TestValidacionProyecto(BaseTest):
+    def test_go_build_detecta_error_entre_archivos(self):
+        if not shutil.which("go"):
+            self.skipTest("sin go")
+        ws = self.proyecto({"go.mod": "module demo\n\ngo 1.18\n",
+                            "main.go": "package main\n\nfunc main() { saludar() }\n",
+                            "util.go": "package main\n\nfunc saludar2() {}\n"})
+        resultados = validar_archivos(ws, ["main.go"])
+        self.assertTrue(fallos(resultados))
+        self.assertIn("saludar", resumen_validacion(resultados))
+        ws.escribir("util.go", "package main\n\nimport \"fmt\"\n\nfunc saludar() { fmt.Println(\"hola\") }\n")
+        self.assertFalse(fallos(validar_archivos(ws, ["main.go", "util.go"])))
+        self.assertFalse((ws.raiz / "demo").exists(), "go build no debe dejar binarios en el proyecto")
+
+    def test_go_no_compila_tests_de_tareas_futuras(self):
+        if not shutil.which("go"):
+            self.skipTest("sin go")
+        ws = self.proyecto({"go.mod": "module demo\n\ngo 1.18\n",
+                            "calc.go": "package demo\n\nfunc Suma(a, b int) int { return a + b }\n",
+                            "calc_test.go": "package demo\n\nimport \"testing\"\n\n"
+                                            "func TestResta(t *testing.T) { _ = Resta(1, 2) }\n"})
+        self.assertFalse(fallos(validar_archivos(ws, ["calc.go"])))
+
+    def test_java_sin_build_tool(self):
+        if not shutil.which("javac"):
+            self.skipTest("sin javac")
+        ws = self.proyecto({"src/A.java": "public class A { int f() { return new B().g(); } }\n",
+                            "src/B.java": "public class B { int h() { return 1; } }\n"})
+        resultados = validar_archivos(ws, ["src/A.java"])
+        self.assertTrue(fallos(resultados))
+        self.assertIn("javac (proyecto)", resumen_validacion(resultados))
+
+    def test_perl_sintaxis(self):
+        if not shutil.which("perl"):
+            self.skipTest("sin perl")
+        ws = self.proyecto({"a.pl": "use strict;\nmy $x = ;\n", "b.pl": "use strict;\nmy $x = 1;\nprint $x;\n"})
+        self.assertTrue(fallos(validar_archivos(ws, ["a.pl"])))
+        self.assertFalse(fallos(validar_archivos(ws, ["b.pl"])))
+
+
+# ======================================================================
+# MÓDULO: autotest_permisos
+# ======================================================================
+"""Autotests de permisos con memoria ("permitir siempre") y del modo plan."""
+
+
+class TestPermisos(BaseTest):
+    def tearDown(self) -> None:
+        olvidar_permisos()
+        super().tearDown()
+
+    def test_clave_comando(self):
+        self.assertEqual(clave_comando("git commit -m 'x'"), "git commit")
+        self.assertEqual(clave_comando("npm run build -- --prod"), "npm run build")
+        self.assertEqual(clave_comando("npm test"), "npm test")
+        self.assertEqual(clave_comando("python3 calc.py 2 3"), "python3 calc.py")
+        self.assertEqual(clave_comando("python3 -m pytest -q"), "python3 -m pytest")
+        self.assertEqual(clave_comando("python3 -c 'print(1)'"), "python3 -c")
+        self.assertEqual(clave_comando("FOO=1 BAR=2 make test"), "make test")
+        self.assertEqual(clave_comando("/usr/bin/ls -la"), "ls")
+        self.assertEqual(clave_comando(""), "")
+
+    def test_destructivos_nunca_para_siempre(self):
+        for comando in ("rm -r build", "git push origin main", "git reset --hard", "chmod 777 x", "curl http://x",
+                        "python3 -c 'import os'", "mv a b", "find . -delete", "sed -i s/a/b/ x"):
+            with self.subTest(comando=comando):
+                self.assertFalse(puede_permitirse_siempre(comando))
+        for comando in ("npm test", "python3 calc.py", "go test ./...", "cargo build", "make"):
+            with self.subTest(comando=comando):
+                self.assertTrue(puede_permitirse_siempre(comando))
+        self.assertFalse(puede_permitirse_siempre("npm test && rm -rf x"), "los compuestos se confirman siempre")
+
+    def _ctx(self, ws, respuestas):
+        return Contexto(ws, self.ajustes(modo="auto-edicion"), self.ui(respuestas=respuestas), "test")
+
+    def test_permitir_en_la_sesion(self):
+        ws = self.proyecto({"a.py": "print('hola')\n"})
+        ctx = self._ctx(ws, [1])  # "sí, y no preguntar más en esta sesión"
+        self.assertIn("hola", self.herramienta(ctx, "execute_command", command="python3 a.py"))
+        ctx2 = self._ctx(ws, [])  # sin respuestas: si preguntara, el defecto es "no"
+        self.assertIn("hola", self.herramienta(ctx2, "execute_command", command="python3 a.py 1"))
+        with self.assertRaises(ErrorHerramienta):
+            self.herramienta(ctx2, "execute_command", command="python3 otro.py")
+
+    def test_permitir_en_el_proyecto_se_guarda(self):
+        ws = self.proyecto({"a.py": "print('hola')\n"})
+        self.herramienta(self._ctx(ws, [2]), "execute_command", command="python3 a.py")
+        self.assertIn("python3 a.py", permisos_proyecto(ws))
+        olvidar_permisos()
+        self.assertTrue(comando_ya_permitido(ws, "python3 a.py --verbose"))
+        self.assertFalse(comando_ya_permitido(ws, "python3 a.py; rm x"))
+
+    def test_no_y_destructivo_pregunta_cada_vez(self):
+        ws = self.proyecto({"x.txt": "x"})
+        with self.assertRaises(ErrorHerramienta):
+            self.herramienta(self._ctx(ws, ["n"]), "execute_command", command="python3 -c 'print(1)'")
+        ctx = self._ctx(ws, ["s"])  # destructivo: solo sí/no
+        self.herramienta(ctx, "execute_command", command="mv x.txt y.txt")
+        self.assertTrue((ws.raiz / "y.txt").exists())
+        self.assertFalse(comando_ya_permitido(ws, "mv y.txt z.txt"))
+
+    def test_bloqueados_siguen_bloqueados(self):
+        ws = self.proyecto()
+        permitir_en_sesion(ws, "sudo")
+        with self.assertRaises(ErrorHerramienta) as cm:
+            self.herramienta(self._ctx(ws, [1]), "execute_command", command="sudo ls")
+        self.assertIn("bloqueado", str(cm.exception))
+
+    def test_ediciones_aceptadas_en_la_sesion(self):
+        ws = self.proyecto()
+        ctx = Contexto(ws, self.ajustes(modo="confirmar"), self.ui(respuestas=[1]), "test")
+        self.herramienta(ctx, "write_to_file", path="a.py", content="X = 1\n")
+        ctx2 = Contexto(ws, self.ajustes(modo="confirmar"), self.ui(respuestas=[]), "test")
+        self.herramienta(ctx2, "write_to_file", path="b.py", content="Y = 1\n")
+        self.assertTrue((ws.raiz / "b.py").exists())
+
+
+class TestModoPlan(BaseTest):
+    PLAN = "## Objetivo\nAgregar resta.\n## Archivos\n- calc.py\n## Pasos\n1. resta(a, b)\n## Cómo se verifica\nrun_tests"
+
+    def _app(self, guion, respuestas):
+        ws = self.proyecto({"calc.py": "def suma(a, b):\n    return a + b\n"})
+        return App(self.ajustes(), MockLLM(guion), self.ui(respuestas=respuestas), ws, persistir=False), ws
+
+    def test_plan_no_toca_nada_y_se_puede_seguir_planificando(self):
+        app, ws = self._app([herramienta_xml("read_file", path="calc.py"), terminar_xml(self.PLAN)], [2])
+        app.cmd_modo("plan")
+        app.turno("agregá resta a calc.py")
+        self.assertTrue(app.modo_plan)
+        self.assertNotIn("resta", ws.leer("calc.py"))
+        self.assertTrue(list((ws.raiz / ".reaper" / "planes").glob("plan_*.md")))
+        roles = [MockLLM.rol_de(c["mensajes"]) for c in app.llm.llamadas]
+        self.assertEqual(set(roles), {"planificador"})
+
+    def test_plan_aprobado_se_ejecuta_y_sale_del_modo(self):
+        def guion(mensajes, kwargs):
+            rol = MockLLM.rol_de(mensajes)
+            if rol == "planificador":
+                return terminar_xml(self.PLAN)
+            if MockLLM.turnos_asistente(mensajes) == 0:
+                self.assertIn("PLAN APROBADO", mensajes[1]["content"])
+                return herramienta_xml("insert_after_symbol", path="calc.py", symbol="suma",
+                                       content="def resta(a, b):\n    return a - b")
+            return terminar_xml("Agregué resta según el plan.")
+
+        app, ws = self._app(guion, [0])
+        app.cmd_modo("plan")
+        self.assertTrue(app.turno("agregá resta a calc.py"))
+        self.assertIn("def resta", ws.leer("calc.py"))
+        self.assertFalse(app.modo_plan)
+        self.assertEqual(app.settings.modo, "auto-edicion")
+
+    def test_planificador_es_de_solo_lectura(self):
+        rol = ROLES["planificador"]
+        self.assertTrue(rol.solo_lectura)
+        self.assertFalse(set(rol.herramientas) & set(ESCRITURA + ("execute_command", "run_python")))
+
+
 # ======================================================================
 # MÓDULO: autotest_runner
 # ======================================================================
@@ -28956,6 +29241,13 @@ def resta(a, b):
 </insert_after_symbol>"""
 
 MISIONES_EN = {
+    "planificador": """You are the PLANNER (plan mode, READ ONLY). The user wants to see and approve a plan BEFORE any file
+is touched. Don't edit or run anything that changes the project.
+1. Investigate with read tools (project_map, search_files, code_outline, read_symbol).
+2. If essential information is missing, ask with ask_user (ONE concrete question).
+3. Finish with attempt_completion and the PLAN in Markdown (in Spanish) with these sections:
+   ## Objetivo / ## Archivos (new ones marked with +) / ## Pasos (numbered) / ## Cómo se verifica / ## Riesgos o dudas
+Don't write the full code: at most signatures or short snippets. If the request is just a question, answer it.""",
     "principal": """You are the MAIN AGENT. Solve the user's request end to end: understand, explore what is needed,
 edit, verify with real tools and report.
 - If the request is a question or a simple calculation (e.g. "how much is 5+5"), answer directly in text in your
@@ -29619,6 +29911,176 @@ for _nombre, _funcion in (("explicar", _cmd_explicar), ("testear", _cmd_testear)
                           ("estadisticas", _cmd_estadisticas), ("sesiones", _cmd_sesiones), ("comandos", _cmd_comandos),
                           ("plugins", _cmd_plugins), ("hooks", _cmd_hooks)):
     setattr(App, "cmd_" + _nombre, _funcion)
+
+
+# ======================================================================
+# MÓDULO: permisos
+# ======================================================================
+"""
+Permisos con memoria ("permitir siempre") y utilidades del modo plan.
+
+Fuera del modo auto, cada comando que no es de solo lectura pide permiso. Preguntar lo mismo veinte
+veces cansa (y en el celular más), así que, como Claude Code, se puede responder:
+
+  1. sí, esta vez
+  2. sí, y no volver a preguntar por «npm test» en esta sesión
+  3. sí, y siempre en este proyecto     (se guarda en .reaper/config.json → "permitidos")
+  4. no
+
+La clave es el comando y su subcomando ("git commit", "npm test", "python3"). Los comandos destructivos
+(rm, mv, git push, git reset, chmod...) NUNCA se pueden permitir para siempre: se confirman cada vez.
+Los bloqueados por seguridad (rm -rf ~, sudo...) siguen bloqueados siempre.
+"""
+
+_PERMISOS_SESION: dict[str, set] = {}
+_LOCK_PERMISOS = threading.Lock()
+EDICIONES = "__ediciones__"
+
+_NUNCA_SIEMPRE = re.compile(
+    r"^(?:rm|rmdir|mv|dd|mkfs\S*|chmod|chown|shred|truncate|kill|pkill|killall|reboot|shutdown|"
+    r"git (?:push|reset|clean|rebase|checkout|restore|branch|tag|filter-branch|gc)|"
+    r"pip uninstall|npm (?:uninstall|publish|unpublish)|pkg (?:uninstall|remove)|apt(?:-get)? remove|"
+    r"curl|wget|ssh|scp|rsync|nc|ncat|termux-(?:setup-storage|reload-settings)|crontab|eval|exec|source|\.|"
+    r"\S+ -[ceprm]|\S+ --eval|xargs|find|sed -i|perl -i)$"
+)
+
+
+_CON_SUBCOMANDO = {"npm", "pnpm", "yarn", "npx", "cargo", "go", "git", "docker", "pip", "pip3", "pkg", "apt",
+                   "make", "gradle", "mvn", "bundle", "rake", "composer", "deno", "bun", "dotnet", "flutter"}
+_INTERPRETES = {"python", "python3", "node", "bash", "sh", "zsh", "ruby", "perl", "php", "lua", "deno", "bun"}
+
+
+def clave_comando(comando: str) -> str:
+    """
+    'git commit -m x' → 'git commit' · 'npm run build' → 'npm run build' · 'python3 calc.py' → 'python3 calc.py'
+    'python3 -m pytest -q' → 'python3 -m pytest' · 'python3 -c ...' → 'python3 -c' (nunca se permite siempre).
+    """
+    try:
+        partes = shlex.split(comando.strip())
+    except ValueError:
+        partes = comando.strip().split()
+    while partes and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", partes[0]):
+        partes = partes[1:]  # FOO=1 cmd ...: las variables no forman parte de la clave
+    if not partes:
+        return ""
+    cabeza = os.path.basename(partes[0])
+    palabra = re.compile(r"[a-z][a-z0-9:_.-]*$")
+    if cabeza in _INTERPRETES and len(partes) > 1:
+        if partes[1] in ("-c", "-e", "-r", "--eval", "-p"):
+            return f"{cabeza} {partes[1]}"
+        if partes[1] == "-m" and len(partes) > 2:
+            return f"{cabeza} -m {partes[2]}"
+        if not partes[1].startswith("-"):
+            return f"{cabeza} {partes[1]}"
+        return cabeza
+    if cabeza in _CON_SUBCOMANDO and len(partes) > 1 and palabra.match(partes[1]):
+        if partes[1] in ("run", "exec", "x") and len(partes) > 2 and palabra.match(partes[2]):
+            return f"{cabeza} {partes[1]} {partes[2]}"
+        return f"{cabeza} {partes[1]}"
+    return cabeza
+
+
+def _es_compuesto(comando: str) -> bool:
+    return any(s in comando for s in (";", "&&", "||", "|", "`", "$(", ">", "<", "\n"))
+
+
+_NUNCA_SIEMPRE_COMANDO = re.compile(r"^\s*(?:sed|perl|ruby)\s+(?:-\w*i|--in-place)|\s-(?:delete|exec|execdir)\b|\s--force\b")
+
+
+def puede_permitirse_siempre(comando: str) -> bool:
+    clave = clave_comando(comando)
+    return (bool(clave) and not _NUNCA_SIEMPRE.match(clave) and not _NUNCA_SIEMPRE_COMANDO.search(comando)
+            and not _es_compuesto(comando))
+
+
+def permisos_proyecto(ws: Workspace) -> set:
+    lista = ws.config_local().get("permitidos") or []
+    return {str(x).strip() for x in lista if str(x).strip()} if isinstance(lista, list) else set()
+
+
+def guardar_permiso_proyecto(ws: Workspace, clave: str) -> None:
+    ruta = ws.raiz / ".reaper" / "config.json"
+    datos = ws.config_local()
+    actuales = permisos_proyecto(ws)
+    actuales.add(clave)
+    datos["permitidos"] = sorted(actuales)
+    escritura_atomica(ruta, json.dumps(datos, ensure_ascii=False, indent=2) + "\n")
+
+
+def _sesion(ws: Workspace) -> set:
+    with _LOCK_PERMISOS:
+        return _PERMISOS_SESION.setdefault(str(ws.raiz), set())
+
+
+def permitir_en_sesion(ws: Workspace, clave: str) -> None:
+    with _LOCK_PERMISOS:
+        _PERMISOS_SESION.setdefault(str(ws.raiz), set()).add(clave)
+
+
+def olvidar_permisos(ws: Optional[Workspace] = None) -> None:
+    with _LOCK_PERMISOS:
+        if ws is None:
+            _PERMISOS_SESION.clear()
+        else:
+            _PERMISOS_SESION.pop(str(ws.raiz), None)
+
+
+def comando_ya_permitido(ws: Workspace, comando: str) -> bool:
+    if not puede_permitirse_siempre(comando):
+        return False
+    clave = clave_comando(comando)
+    return clave in _sesion(ws) or clave in permisos_proyecto(ws)
+
+
+def pedir_permiso_comando(ctx: "Contexto", comando: str) -> bool:
+    """True si el comando puede ejecutarse (ya permitido o el usuario lo aprueba ahora)."""
+    if comando_ya_permitido(ctx.ws, comando):
+        ctx.ui.tenue(f"  (permitido: {clave_comando(comando)})")
+        return True
+    ctx.ui.aviso(f"  {ctx.etiqueta} quiere ejecutar: {comando}")
+    clave = clave_comando(comando)
+    if not puede_permitirse_siempre(comando):
+        return ctx.ui.confirmar("  ¿Ejecutar?")
+    eleccion = ctx.ui.elegir("  ¿Ejecutar?", [
+        "sí, esta vez",
+        f"sí, y no preguntar más por «{clave}» en esta sesión",
+        f"sí, y siempre en este proyecto («{clave}» → .reaper/config.json)",
+        "no",
+    ], defecto=3)
+    if eleccion == 1:
+        permitir_en_sesion(ctx.ws, clave)
+    elif eleccion == 2:
+        try:
+            guardar_permiso_proyecto(ctx.ws, clave)
+        except OSError as e:
+            ctx.ui.aviso(f"  no pude guardar el permiso: {e}")
+            permitir_en_sesion(ctx.ws, clave)
+    return eleccion in (0, 1, 2)
+
+
+def pedir_permiso_edicion(ctx: "Contexto", rel: str) -> bool:
+    if EDICIONES in _sesion(ctx.ws):
+        return True
+    eleccion = ctx.ui.elegir("  ¿Aplicar este cambio?", [
+        "sí",
+        "sí, y aceptar todas las ediciones de esta sesión",
+        "no",
+    ], defecto=2)
+    if eleccion == 1:
+        permitir_en_sesion(ctx.ws, EDICIONES)
+    return eleccion in (0, 1)
+
+
+def guardar_plan_markdown(ws: Workspace, pedido: str, plan: str) -> Optional[Path]:
+    """Guarda el plan del modo plan en .reaper/planes/ (para retomarlo o compartirlo)."""
+    if not plan.strip():
+        return None
+    ruta = ws.raiz / ".reaper" / "planes" / f"plan_{datetime.now():%Y%m%d_%H%M%S}.md"
+    try:
+        escritura_atomica(ruta, f"# Plan\n\n## Pedido\n{pedido.strip()}\n\n{plan.strip()}\n")
+    except OSError:
+        return None
+    return ruta
 
 
 # ======================================================================

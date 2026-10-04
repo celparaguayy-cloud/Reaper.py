@@ -107,9 +107,11 @@ def _entero(valor, defecto: Optional[int]) -> Optional[int]:
 def _permiso_edicion(ctx: Contexto, rel: str, diff: str, nuevo: bool) -> None:
     if ctx.settings.modo != "confirmar":
         return
+    if EDICIONES in _sesion(ctx.ws):
+        return
     ctx.ui.aviso(f"  {ctx.etiqueta} quiere {'crear' if nuevo else 'modificar'} {rel}:")
     ctx.ui.diff(diff, max_lineas=40)
-    if not ctx.ui.confirmar("  ¿Aplicar este cambio?"):
+    if not pedir_permiso_edicion(ctx, rel):
         raise ErrorHerramienta(
             f"El usuario rechazó el cambio en {rel}. No insistas con lo mismo: "
             "preguntá qué prefiere (ask_user) o seguí con otra parte."
@@ -592,8 +594,7 @@ def execute_command(ctx: Contexto, p: dict) -> str:
     if motivo_hook:
         raise ErrorHerramienta(f"Comando bloqueado: {motivo_hook}.")
     if ctx.settings.modo != "auto" and not comando_seguro(comando):
-        ctx.ui.aviso(f"  {ctx.etiqueta} quiere ejecutar: {comando}")
-        if not ctx.ui.confirmar("  ¿Ejecutar?"):
+        if not pedir_permiso_comando(ctx, comando):
             raise ErrorHerramienta(
                 "El usuario no aprobó el comando (o no hay usuario para aprobarlo). "
                 "Seguí sin él o usá run_tests / validate."

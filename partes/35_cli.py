@@ -21,6 +21,7 @@ COMANDOS_AYUDA = [
     ("EQUIPO", [
         ("/construir <pedido>", "exploradores → arquitecto → tests primero → torneo por tarea → verificación → reparador"),
         ("/plan <pedido>", "solo exploración + plan (se guarda en .reaper/planes)"),
+        ("/modo plan", "modo plan: propone un plan en solo lectura y lo ejecuta cuando lo aprobás"),
         ("/torneo <tarea>", "N implementadores compiten en copias aisladas; gana el que pasa más tests"),
         ("/escribir <ruta> <qué>", "archivo largo por esqueleto + relleno (miles de líneas sin cortarse)"),
         ("/agente <rol> <tarea>", "subagente suelto (explorador, implementador, revisor, qa, reparador...)"),
@@ -118,6 +119,7 @@ class App:
         self.historial: list[tuple[str, str, bool]] = []
         self._rehacer: Optional[dict] = None
         self._pedido_actual = ""
+        self.modo_plan = False
         self.escalador = Escalador(llm, settings, ui)
         self.memoria = self._nueva_memoria()
         self.principal = self._nuevo_principal()
@@ -211,7 +213,43 @@ class App:
         self.ui.tenue(f"  adjunté {len(adjuntos)} mención(es) @")
         return texto + "\n\nARCHIVOS MENCIONADOS POR EL USUARIO:\n" + "\n\n".join(adjuntos)
 
+    def turno_plan(self, texto: str) -> bool:
+        """
+        Modo plan (como Claude Code): un agente de solo lectura investiga y propone; nada se toca hasta que
+        el usuario aprueba. Al aprobar, el plan entra como contexto del agente principal y se sale del modo.
+        """
+        self._pedido_actual = texto
+        agente = Agente("planificador", self.llm, self.ws, self.settings, self.ui, memoria=self.memoria)
+        res = agente.ejecutar(self.expandir_menciones(texto))
+        self.historial.append((datetime.now().strftime("%H:%M"), f"[plan] {texto[:190]}", res.ok))
+        self.ui.linea("")
+        self.ui.linea(f"{Tema.agente}{C.BOLD}reaper » plan{C.RESET}")
+        mostrar_markdown(self.ui, res.resumen)
+        self.ui.linea("")
+        ruta = guardar_plan_markdown(self.ws, texto, res.resumen)
+        if ruta:
+            self.ui.tenue(f"  plan guardado en {self.ws.rel(ruta)}")
+        if not res.ok and res.motivo in ("max_pasos", "bucle"):
+            self.ui.aviso(f"  (el planificador terminó con estado {res.motivo}: revisá el plan antes de aprobarlo)")
+        eleccion = self.ui.elegir("¿Qué hacemos con este plan?", [
+            "Ejecutarlo (auto-edición)",
+            "Ejecutarlo confirmando cada cambio",
+            "Seguir en modo plan (no tocar nada)",
+        ], defecto=2 if not self.ui.interactivo else 0)
+        if eleccion == 2:
+            self.ui.tenue("  Sigo en modo plan: escribí ajustes al plan o /modo auto-edicion para salir.")
+            return res.ok
+        self.modo_plan = False
+        self.settings.modo = "auto-edicion" if eleccion == 0 else "confirmar"
+        self.ui.ok(f"Plan aprobado: ejecuto en modo {self.settings.modo}")
+        return self.turno(
+            f"{texto}\n\nPLAN APROBADO POR EL USUARIO (seguilo paso a paso; si algo no coincide con el código real, "
+            f"adaptalo y decilo en el informe):\n{res.resumen}"
+        )
+
     def turno(self, texto: str) -> bool:
+        if self.modo_plan:
+            return self.turno_plan(texto)
         self._pedido_actual = texto
         cid = self.ws.checkpoints.iniciar(f"pedido: {texto[:80]}")
         inicio = time.monotonic()
@@ -773,9 +811,16 @@ class App:
             self.ui.linea(f"  {'✓' if estado == 'x' else '▸' if estado == '>' else '○'} {texto}")
 
     def cmd_modo(self, arg: str) -> None:
-        if arg not in MODOS:
-            self.ui.info(f"Modo actual: {self.settings.modo}  (opciones: {', '.join(MODOS)})")
+        arg = arg.strip().lower()
+        if arg == "plan":
+            self.modo_plan = True
+            self.ui.ok("Modo plan: investigo y propongo un plan sin tocar nada; lo ejecuto cuando lo apruebes.")
             return
+        if arg not in MODOS:
+            actual = "plan" if self.modo_plan else self.settings.modo
+            self.ui.info(f"Modo actual: {actual}  (opciones: plan, {', '.join(MODOS)})")
+            return
+        self.modo_plan = False
         self.settings.modo = arg
         guardar_settings(self.settings)
         self.ui.ok(f"Modo: {arg}")
@@ -1008,7 +1053,8 @@ class App:
             pass
 
     def _leer_entrada(self) -> str:
-        entrada = input(f"{Tema.prompt}{C.BOLD}vos ›{C.RESET} ")
+        marca = f"{Tema.aviso}[plan] {C.RESET}" if self.modo_plan else ""
+        entrada = input(f"{marca}{Tema.prompt}{C.BOLD}vos ›{C.RESET} ")
         if entrada.strip() != '"""':
             return entrada.strip()
         lineas = []

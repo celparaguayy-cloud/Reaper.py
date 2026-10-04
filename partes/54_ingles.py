@@ -56,6 +56,13 @@ def resta(a, b):
 </insert_after_symbol>"""
 
 MISIONES_EN = {
+    "planificador": """You are the PLANNER (plan mode, READ ONLY). The user wants to see and approve a plan BEFORE any file
+is touched. Don't edit or run anything that changes the project.
+1. Investigate with read tools (project_map, search_files, code_outline, read_symbol).
+2. If essential information is missing, ask with ask_user (ONE concrete question).
+3. Finish with attempt_completion and the PLAN in Markdown (in Spanish) with these sections:
+   ## Objetivo / ## Archivos (new ones marked with +) / ## Pasos (numbered) / ## Cómo se verifica / ## Riesgos o dudas
+Don't write the full code: at most signatures or short snippets. If the request is just a question, answer it.""",
     "principal": """You are the MAIN AGENT. Solve the user's request end to end: understand, explore what is needed,
 edit, verify with real tools and report.
 - If the request is a question or a simple calculation (e.g. "how much is 5+5"), answer directly in text in your

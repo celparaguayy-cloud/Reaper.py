@@ -897,6 +897,9 @@ _COMPILADORES = {
     ".php": [("php", ["-l"])],
     ".rb": [("ruby", ["-c"])],
     ".lua": [("luac", ["-p"]), ("luac5.4", ["-p"])],
+    ".pl": [("perl", ["-Ilib", "-c"])],
+    ".pm": [("perl", ["-Ilib", "-c"])],
+    ".t": [("perl", ["-Ilib", "-c"])],
 }
 
 
@@ -908,6 +911,8 @@ def _validar_compilado(ws: Workspace, ruta: Path, rel: str) -> list[Resultado]:
             if ejecutable == "gofmt":
                 r.ok = r.codigo == 0 and "expected" not in r.stderr
                 r.stdout = ""
+            if ejecutable == "perl" and r.ok:
+                r.stderr = ""  # "archivo syntax OK" no aporta
             r.comando = f"{ejecutable} {rel}"
             r.archivo = rel
             return [r]
@@ -993,7 +998,64 @@ def validar_archivos(ws: Workspace, rels: list[str]) -> list[Resultado]:
     for rel in rels:
         if (ws.raiz / rel).is_file():
             resultados.extend(validar_archivo(ws, rel))
+    if not fallos(resultados):
+        # Solo si cada archivo está bien por separado: compilar el proyecto da los errores de tipos,
+        # imports y referencias entre archivos que un chequeo de sintaxis no ve.
+        resultados.extend(validar_proyecto(ws, rels))
     return resultados
+
+
+def _modulo_raiz(ws: Workspace, rels: list[str], marcador: str) -> Optional[Path]:
+    """Carpeta más cercana (hacia arriba, dentro del workspace) que contiene el marcador (go.mod, Cargo.toml)."""
+    for rel in rels:
+        carpeta = (ws.raiz / rel).parent
+        while True:
+            if (carpeta / marcador).is_file():
+                return carpeta
+            if carpeta == ws.raiz or ws.raiz not in carpeta.parents:
+                break
+            carpeta = carpeta.parent
+    return None
+
+
+def validar_proyecto(ws: Workspace, rels: list[str]) -> list[Resultado]:
+    """
+    Compilación del proyecto para Go (go build), Rust (cargo check) y Java sin build tool (javac).
+    No compila los tests: con "tests primero" los de tareas futuras todavía no compilan, y eso se ve en
+    run_tests, no tiene que impedir que un implementador cierre su tarea.
+    """
+    if os.getenv("REAPER_SIN_VALIDAR_PROYECTO"):
+        return []
+    salida: list[Resultado] = []
+    sufijos = {Path(r).suffix.lower() for r in rels}
+    if ".go" in sufijos and shutil.which("go"):
+        modulo = _modulo_raiz(ws, [r for r in rels if r.endswith(".go")], "go.mod")
+        if modulo is not None:
+            with tempfile.TemporaryDirectory(prefix="reaper_go_") as tmp:
+                r = ejecutar(["go", "build", "-o", tmp + os.sep, "./..."], cwd=modulo, timeout=180)
+            if not r.ok and "no main packages" in r.stderr:
+                # Solo librerías: sin -o, go build compila y descarta (no deja nada en el proyecto).
+                r = ejecutar(["go", "build", "./..."], cwd=modulo, timeout=180)
+            r.comando = "go build ./..."
+            salida.append(r)
+    if ".rs" in sufijos and shutil.which("cargo"):
+        crate = _modulo_raiz(ws, [r for r in rels if r.endswith(".rs")], "Cargo.toml")
+        if crate is not None:
+            r = ejecutar(["cargo", "check", "--offline", "-q", "--message-format", "short"], cwd=crate, timeout=300)
+            r.comando = "cargo check"
+            if r.ok:
+                r.stderr = ""
+            salida.append(r)
+    if ".java" in sufijos and shutil.which("javac"):
+        sin_build = not any((ws.raiz / m).is_file() for m in ("pom.xml", "build.gradle", "build.gradle.kts"))
+        fuentes = [ws.rel(p) for p in ws.iterar(limite=3000) if p.suffix == ".java"
+                   and not re.search(r"(^|/)(tests?|src/test)/|Test\.java$", ws.rel(p))]
+        if sin_build and fuentes and len(fuentes) <= 400:
+            with tempfile.TemporaryDirectory(prefix="reaper_javac_") as tmp:
+                r = ejecutar(["javac", "-encoding", "UTF-8", "-Xlint:none", "-d", tmp, *fuentes], cwd=ws.raiz, timeout=180)
+            r.comando = "javac (proyecto)"
+            salida.append(r)
+    return salida
 
 
 def fallos(resultados: list[Resultado]) -> list[Resultado]:

@@ -85,3 +85,43 @@ class TestDeteccionLenguajes(BaseTest):
         r = ejecutar_tests(Workspace(destino), timeout=120)
         self.assertTrue(r and r.ok, r and r.resumen())
         self.assertEqual(conteo_de_resultado(r).pasados, 6)
+
+
+class TestValidacionProyecto(BaseTest):
+    def test_go_build_detecta_error_entre_archivos(self):
+        if not shutil.which("go"):
+            self.skipTest("sin go")
+        ws = self.proyecto({"go.mod": "module demo\n\ngo 1.18\n",
+                            "main.go": "package main\n\nfunc main() { saludar() }\n",
+                            "util.go": "package main\n\nfunc saludar2() {}\n"})
+        resultados = validar_archivos(ws, ["main.go"])
+        self.assertTrue(fallos(resultados))
+        self.assertIn("saludar", resumen_validacion(resultados))
+        ws.escribir("util.go", "package main\n\nimport \"fmt\"\n\nfunc saludar() { fmt.Println(\"hola\") }\n")
+        self.assertFalse(fallos(validar_archivos(ws, ["main.go", "util.go"])))
+        self.assertFalse((ws.raiz / "demo").exists(), "go build no debe dejar binarios en el proyecto")
+
+    def test_go_no_compila_tests_de_tareas_futuras(self):
+        if not shutil.which("go"):
+            self.skipTest("sin go")
+        ws = self.proyecto({"go.mod": "module demo\n\ngo 1.18\n",
+                            "calc.go": "package demo\n\nfunc Suma(a, b int) int { return a + b }\n",
+                            "calc_test.go": "package demo\n\nimport \"testing\"\n\n"
+                                            "func TestResta(t *testing.T) { _ = Resta(1, 2) }\n"})
+        self.assertFalse(fallos(validar_archivos(ws, ["calc.go"])))
+
+    def test_java_sin_build_tool(self):
+        if not shutil.which("javac"):
+            self.skipTest("sin javac")
+        ws = self.proyecto({"src/A.java": "public class A { int f() { return new B().g(); } }\n",
+                            "src/B.java": "public class B { int h() { return 1; } }\n"})
+        resultados = validar_archivos(ws, ["src/A.java"])
+        self.assertTrue(fallos(resultados))
+        self.assertIn("javac (proyecto)", resumen_validacion(resultados))
+
+    def test_perl_sintaxis(self):
+        if not shutil.which("perl"):
+            self.skipTest("sin perl")
+        ws = self.proyecto({"a.pl": "use strict;\nmy $x = ;\n", "b.pl": "use strict;\nmy $x = 1;\nprint $x;\n"})
+        self.assertTrue(fallos(validar_archivos(ws, ["a.pl"])))
+        self.assertFalse(fallos(validar_archivos(ws, ["b.pl"])))
