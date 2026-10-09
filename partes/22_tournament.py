@@ -29,6 +29,7 @@ class Candidato:
     tests: Optional[Resultado] = None
     conteo: ConteoTests = field(default_factory=ConteoTests)
     lineas: int = 0
+    discriminacion: float = 1.0        # v9 Fase 9: ¿los tests del candidato realmente discriminan?
     error: str = ""
     segundos: float = 0.0
 
@@ -46,6 +47,7 @@ class Candidato:
             self.conteo.fallados + self.conteo.errores,
             0 if self.cambios else 1,               # hizo algo
             0 if agente_ok else 1,
+            round(1.0 - self.discriminacion, 2),    # a igualdad, gana el de tests que DISCRIMINAN (Fase 9)
             self.lineas,                            # menos líneas cambiadas
             self.temperatura,
         )
@@ -56,7 +58,8 @@ class Candidato:
                                                                     ("OK" if self.tests.ok else "falló"))
         return [f"#{self.indice + 1}", f"{self.temperatura:.1f}", estado, tests,
                 "OK" if self.validaciones_ok else f"{len(fallos(self.validaciones))} fallos",
-                str(len(self.cambios)), str(self.lineas), formatear_duracion(self.segundos)]
+                f"{self.discriminacion:.2f}", str(len(self.cambios)), str(self.lineas),
+                formatear_duracion(self.segundos)]
 
 
 @dataclass
@@ -126,6 +129,10 @@ class Torneo:
         rels = [c.rel for c in cand.cambios if c.tipo != "borrado"]
         cand.validaciones = validar_archivos(copia.ws, rels)
         cand.lineas = sum(c.lineas_cambiadas() for c in cand.cambios)
+        try:
+            cand.discriminacion = discriminacion_de_tests(copia.ws)[0]
+        except (OSError, ValueError):
+            cand.discriminacion = 1.0
 
     def _correr_candidato(self, cand: Candidato, tarea: str, archivos: str, rol: str,
                           protegidos: dict[str, Optional[str]], existentes: dict[str, Optional[str]],
@@ -207,7 +214,8 @@ class Torneo:
                  protegidos: dict[str, Optional[str]]) -> ResultadoTorneo:
         ordenados = sorted(candidatos, key=lambda c: c.clave())
         self.ui.tabla([c.fila() for c in sorted(candidatos, key=lambda c: c.indice)],
-                      ["cand", "temp", "agente", "tests", "validación", "archivos", "líneas", "tiempo"], "llllllrr")
+                      ["cand", "temp", "agente", "tests", "validación", "discrim", "archivos", "líneas", "tiempo"],
+                      "lllllllrr")
         ganador = next((c for c in ordenados if not c.error and c.cambios), None)
         resultado = ResultadoTorneo(ganador, candidatos)
         if ganador is None:

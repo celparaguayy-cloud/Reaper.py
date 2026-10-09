@@ -12104,6 +12104,7 @@ class Candidato:
     tests: Optional[Resultado] = None
     conteo: ConteoTests = field(default_factory=ConteoTests)
     lineas: int = 0
+    discriminacion: float = 1.0        # v9 Fase 9: ¿los tests del candidato realmente discriminan?
     error: str = ""
     segundos: float = 0.0
 
@@ -12121,6 +12122,7 @@ class Candidato:
             self.conteo.fallados + self.conteo.errores,
             0 if self.cambios else 1,               # hizo algo
             0 if agente_ok else 1,
+            round(1.0 - self.discriminacion, 2),    # a igualdad, gana el de tests que DISCRIMINAN (Fase 9)
             self.lineas,                            # menos líneas cambiadas
             self.temperatura,
         )
@@ -12131,7 +12133,8 @@ class Candidato:
                                                                     ("OK" if self.tests.ok else "falló"))
         return [f"#{self.indice + 1}", f"{self.temperatura:.1f}", estado, tests,
                 "OK" if self.validaciones_ok else f"{len(fallos(self.validaciones))} fallos",
-                str(len(self.cambios)), str(self.lineas), formatear_duracion(self.segundos)]
+                f"{self.discriminacion:.2f}", str(len(self.cambios)), str(self.lineas),
+                formatear_duracion(self.segundos)]
 
 
 @dataclass
@@ -12201,6 +12204,10 @@ class Torneo:
         rels = [c.rel for c in cand.cambios if c.tipo != "borrado"]
         cand.validaciones = validar_archivos(copia.ws, rels)
         cand.lineas = sum(c.lineas_cambiadas() for c in cand.cambios)
+        try:
+            cand.discriminacion = discriminacion_de_tests(copia.ws)[0]
+        except (OSError, ValueError):
+            cand.discriminacion = 1.0
 
     def _correr_candidato(self, cand: Candidato, tarea: str, archivos: str, rol: str,
                           protegidos: dict[str, Optional[str]], existentes: dict[str, Optional[str]],
@@ -12282,7 +12289,8 @@ class Torneo:
                  protegidos: dict[str, Optional[str]]) -> ResultadoTorneo:
         ordenados = sorted(candidatos, key=lambda c: c.clave())
         self.ui.tabla([c.fila() for c in sorted(candidatos, key=lambda c: c.indice)],
-                      ["cand", "temp", "agente", "tests", "validación", "archivos", "líneas", "tiempo"], "llllllrr")
+                      ["cand", "temp", "agente", "tests", "validación", "discrim", "archivos", "líneas", "tiempo"],
+                      "lllllllrr")
         ganador = next((c for c in ordenados if not c.error and c.cambios), None)
         resultado = ResultadoTorneo(ganador, candidatos)
         if ganador is None:
@@ -38725,6 +38733,38 @@ class TestPlanConDeps(BaseTest):
         plan = parsear_plan(texto, "pedido")
         self.assertEqual(plan.tareas[1].deps, ["1"])
         self.assertEqual([t.id for t in GrafoTareas(plan.tareas).orden()], ["1", "2"])
+
+
+# ======================================================================
+# MÓDULO: autotest_torneo_discrim
+# ======================================================================
+"""Autotest del desempate por discriminación en el torneo (Fase 9 / v9): la evidencia real decide el ganador."""
+
+
+class TestTorneoDiscriminacion(BaseTest):
+    def _cand(self, idx, discriminacion, pasados=3):
+        c = Candidato(idx, 0.2)
+        c.conteo = ConteoTests(pasados=pasados, reconocido=True)
+        c.cambios = ["archivo.py"]          # hizo algo (clave usa bool(cambios))
+        c.discriminacion = discriminacion
+        return c
+
+    def test_gana_el_de_tests_que_discriminan(self):
+        debil = self._cand(0, 0.3)          # mismos tests pasando, pero NO discriminan
+        fuerte = self._cand(1, 1.0)         # tests que sí discriminan
+        ganador = sorted([debil, fuerte], key=lambda c: c.clave())[0]
+        self.assertEqual(ganador.indice, 1)
+
+    def test_discriminacion_no_pisa_mas_tests_pasando(self):
+        # un candidato con más tests pasando gana aunque discrimine un poco menos
+        muchos = self._cand(0, 0.8, pasados=5)
+        pocos = self._cand(1, 1.0, pasados=2)
+        ganador = sorted([muchos, pocos], key=lambda c: c.clave())[0]
+        self.assertEqual(ganador.indice, 0)
+
+    def test_discriminacion_en_la_fila(self):
+        fila = self._cand(0, 0.42).fila()
+        self.assertIn("0.42", fila)
 
 
 # ======================================================================
