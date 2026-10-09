@@ -1522,6 +1522,7 @@ class InfoModelo:
     nivel: str = "base"  # base | fuerte
     nota: str = ""
     proveedor: str = ""  # vacío = usar el proveedor activo de la sesión; si no, rutea a ese proveedor
+    free: bool = False   # candidato de nivel gratuito en su proveedor (sujeto a verificación por cuenta)
 
 
 INFO_MODELOS = {
@@ -1542,6 +1543,19 @@ INFO_MODELOS = {
     "ollama-llama": InfoModelo("llama3.1:8b", 131072, "base", "Llama 3.1 8B local (Ollama, sin clave)", "ollama"),
     "venice-directo": InfoModelo("dolphin-2.9.2-qwen2-72b", 32768, "base", "Venice API directa (VENICE_API_KEY)", "venice"),
     "gpt4o-mini": InfoModelo("gpt-4o-mini", 128000, "fuerte", "OpenAI directo (OPENAI_API_KEY)", "openai"),
+    # Modelos POTENTES con nivel gratuito frecuente (IDs pueden cambiar; coste cero sujeto a tu cuenta).
+    "groq-llama70": InfoModelo("llama-3.3-70b-versatile", 131072, "fuerte",
+                               "Llama 3.3 70B en Groq (free tier; verificar cuenta)", "groq", True),
+    "groq-deepseek70": InfoModelo("deepseek-r1-distill-llama-70b", 131072, "fuerte",
+                                  "DeepSeek R1 distill 70B en Groq (free tier)", "groq", True),
+    "gemini-flash": InfoModelo("gemini-2.0-flash", 1048576, "fuerte",
+                               "Gemini 2.0 Flash (free tier; verificar cuenta)", "gemini", True),
+    "nvidia-llama405": InfoModelo("meta/llama-3.1-405b-instruct", 131072, "fuerte",
+                                  "Llama 3.1 405B en NVIDIA NIM (free; verificar)", "nvidia", True),
+    "or-deepseek-r1-free": InfoModelo("deepseek/deepseek-r1:free", 65536, "fuerte",
+                                      "DeepSeek R1 gratis en OpenRouter (con límites de uso)", "openrouter", True),
+    "or-llama70-free": InfoModelo("meta-llama/llama-3.3-70b-instruct:free", 131072, "fuerte",
+                                  "Llama 3.3 70B gratis en OpenRouter (con límites)", "openrouter", True),
 }
 
 MODELOS = {alias: info.id for alias, info in INFO_MODELOS.items()}
@@ -1613,6 +1627,7 @@ class Settings:
     # v8: revertir solo las ediciones que dejan los tests peor que el mejor estado visto
     guardia_regresion: bool = True
     router_aprendido: bool = True   # v9 Fase 7: elegir el modelo por rol según el desempeño pasado
+    privacidad_estricta: bool = False   # AUTO-6-IA §11: no subir contenido de proyecto a proveedores externos
     # v9: modo seguridad (pentest / CTF / lab / estudio) con gate de alcance. Off por defecto.
     modo_seguridad: bool = False
     alcance_autorizado: str = ""    # objetivos autorizados (lab/CTF/pentest); sin esto el modo no se activa
@@ -26415,7 +26430,7 @@ class App:
             "/tournament": "torneo", "/recipes": "recetas", "/eval": "evaluar", "/export": "exportar",
             "/history": "historial", "/status": "estado", "/context": "contexto", "/compact": "compactar",
             "/run": "correr", "/test": "tests", "/project": "proyecto", "/model": "modelo", "/mode": "modo",
-            "/strong": "modelo_fuerte",
+            "/strong": "modelo_fuerte", "/privacy": "privacidad", "/providers": "proveedores", "/team": "equipo",
         }
         nombre = alias.get(cmd, cmd[1:]).replace("-", "_")
         metodo = getattr(self, "cmd_" + nombre, None)
@@ -27066,6 +27081,20 @@ class App:
         self.ui.aviso("  REAPER hará trabajo ofensivo SOLO dentro de ese alcance. Fuera de ahí, frena y avisa.")
         self.ui.tenue("  Seguís protegido: sudo, rm -rf, apagar el equipo y leer .env siguen bloqueados.")
 
+    def cmd_privacidad(self, arg: str) -> None:
+        """Reporte de privacidad y modo estricto. No revela datos sensibles."""
+        partes = (arg or "").split()
+        sub = partes[0].lower() if partes else "reporte"
+        if sub in ("estricto", "strict"):
+            valor = len(partes) > 1 and partes[1].lower() in ("on", "si", "sí", "1", "true")
+            self.settings.privacidad_estricta = valor
+            guardar_settings(self.settings)
+            self.ui.ok(f"Privacidad estricta: {'ON' if valor else 'OFF'}.")
+            if valor:
+                self.ui.tenue("  Evitá modelos externos para contenido sensible; preferí un proveedor local (ollama).")
+            return
+        self.ui.linea(texto_reporte_privacidad(reporte_privacidad(self.llm, self.settings)))
+
     def cmd_equipo(self, arg: str) -> None:
         """Muestra los seis roles → proveedor/modelo asignado + independencia real. Conectividad NO VERIFICADA."""
         sub = (arg or "").strip().lower()
@@ -27077,7 +27106,18 @@ class App:
             if ind["reducida"]:
                 self.ui.aviso("  Independencia REDUCIDA: todos los roles caen en un solo proveedor.")
             return
-        if sub in ("probar", "auto"):
+        if sub == "auto":
+            asignacion, motivo = autoasignar_equipo_free(self.settings)
+            if not asignacion:
+                self.ui.aviso(f"  No pude autoconfigurar modelos free: {motivo}.")
+                self.ui.tenue("  Configurá un proveedor free: export GROQ_API_KEY=... (o NVIDIA/GEMINI/OpenRouter).")
+            else:
+                self.settings.modelos_rol.update(asignacion)
+                guardar_settings(self.settings)
+                self.ui.ok("Equipo autoconfigurado con modelos free potentes (conectividad NO VERIFICADA).")
+                estado = estado_equipo(self.settings)
+                ind = independencia_equipo(estado)
+        if sub == "probar":
             self.ui.aviso("  Probar cada rol de extremo a extremo requiere peticiones reales con claves: "
                           "NO VERIFICADO hasta ejecutarse con tu consentimiento (/proveedores probar).")
         self.ui.info("Equipo de seis roles (asignación actual; conectividad NO VERIFICADA):")
@@ -40973,6 +41013,108 @@ class TestCatalogoCLI(BaseTest):
 
 
 # ======================================================================
+# MÓDULO: autotest_privacidad
+# ======================================================================
+"""Autotests de /equipo auto (modelos free) y del reporte de privacidad (REAPER AUTO-6-IA §6/§11)."""
+
+
+class _BasePriv(BaseTest):
+    _VARS = ("OPENROUTER_API_KEY", "GROQ_API_KEY", "NVIDIA_API_KEY", "GEMINI_API_KEY", "REAPER_CLAVE_PROVEEDOR")
+
+    def setUp(self):
+        super().setUp()
+        self._env_bak = {k: os.environ.pop(k, None) for k in self._VARS}
+
+    def tearDown(self):
+        for k, v in self._env_bak.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        super().tearDown()
+
+
+class TestEquipoFree(_BasePriv):
+    def test_sin_credenciales_no_asigna(self):
+        asign, motivo = autoasignar_equipo_free(self.ajustes())
+        self.assertEqual(asign, {})
+        self.assertTrue(motivo)
+
+    def test_con_groq_asigna_modelos_free(self):
+        os.environ["GROQ_API_KEY"] = "gk"
+        asign, motivo = autoasignar_equipo_free(self.ajustes())
+        self.assertEqual(set(asign), {"principal", "arquitecto", "implementador", "revisor", "qa", "reparador"})
+        # todos los modelos asignados son free y de un proveedor con credencial (groq)
+        for alias in asign.values():
+            self.assertTrue(INFO_MODELOS[alias].free)
+            self.assertEqual(INFO_MODELOS[alias].proveedor, "groq")
+
+    def test_dos_proveedores_mejora_independencia(self):
+        os.environ["GROQ_API_KEY"] = "gk"
+        os.environ["GEMINI_API_KEY"] = "gm"
+        s = self.ajustes()
+        asign, _ = autoasignar_equipo_free(s)
+        s.modelos_rol.update(asign)
+        ind = independencia_equipo(estado_equipo(s))
+        self.assertGreaterEqual(ind["proveedores_distintos"], 2)
+        self.assertFalse(ind["reducida"])
+
+    def test_modelos_potentes_free_existen(self):
+        libres = modelos_potentes_free()
+        self.assertTrue(libres)
+        self.assertTrue(all(info.free for _, info in libres))
+
+
+class TestReportePrivacidad(_BasePriv):
+    def cliente(self, eventos, **ajustes):
+        c = LLMClient("clave", self.ajustes(**ajustes), url="http://falso", transporte=transporte_falso(eventos))
+        c.dormir = lambda _s: None
+        return c
+
+    def test_reporte_registra_proveedor_contactado(self):
+        c = self.cliente(["hola"])
+        c.chat([{"role": "user", "content": "x"}])
+        rep = reporte_privacidad(c, c.settings)
+        self.assertTrue(rep["proveedores_contactados"])        # contactó al menos un proveedor
+        self.assertTrue(rep["redaccion_secretos"])
+        self.assertFalse(rep["privacidad_estricta"])
+
+    def test_reporte_sin_actividad(self):
+        c = self.cliente([])
+        rep = reporte_privacidad(c, c.settings)
+        self.assertEqual(rep["proveedores_contactados"], {})
+        self.assertIn("ninguno", texto_reporte_privacidad(rep))
+
+    def test_texto_no_revela_secretos(self):
+        rep = reporte_privacidad(self.cliente([]), self.ajustes())
+        texto = texto_reporte_privacidad(rep)
+        self.assertIn("confidencialidad absoluta", texto)
+        self.assertIn("ACTIVA", texto)
+
+
+class TestPrivacidadCLI(_BasePriv):
+    def _app(self):
+        return App(self.ajustes(forense=False, escalar=False), MockLLM([]), self.ui(), self.proyecto(), persistir=False)
+
+    def test_comando_reporte(self):
+        app = self._app()
+        app.comando("/privacidad")
+        self.assertIn("Reporte de privacidad", app.ui.texto_registrado())
+
+    def test_comando_estricto(self):
+        app = self._app()
+        app.comando("/privacidad estricto on")
+        self.assertTrue(app.settings.privacidad_estricta)
+        app.comando("/privacy estricto off")
+        self.assertFalse(app.settings.privacidad_estricta)
+
+    def test_equipo_auto_sin_claves_avisa(self):
+        app = self._app()
+        app.comando("/equipo auto")
+        self.assertIn("No pude autoconfigurar", app.ui.texto_registrado())
+
+
+# ======================================================================
 # MÓDULO: autotest_runner
 # ======================================================================
 """Ejecutor del autotest interno."""
@@ -45265,6 +45407,40 @@ def estado_equipo(settings) -> list:
     return salida
 
 
+def modelos_potentes_free() -> list:
+    """Alias curados de modelos free POTENTES (del catálogo estático), como (alias, info)."""
+    return [(alias, info) for alias, info in INFO_MODELOS.items() if info.free]
+
+
+def autoasignar_equipo_free(settings) -> tuple:
+    """
+    Asigna los seis roles a modelos free potentes SOLO de proveedores con credencial. Reparte entre
+    proveedores para maximizar independencia. Devuelve (modelos_rol, motivo_si_vacio). No inventa conexión.
+    """
+    por_proveedor = {}
+    for alias, info in modelos_potentes_free():
+        prov = info.proveedor or settings.proveedor
+        try:
+            tiene = bool(clave_de_proveedor(prov, replace(settings, proveedor=prov)))
+        except (TypeError, ValueError):
+            tiene = False
+        if tiene:
+            por_proveedor.setdefault(prov, []).append(alias)
+    if not por_proveedor:
+        return {}, "ningún proveedor con nivel gratuito tiene credencial configurada"
+    # intercalar proveedores para que roles consecutivos usen proveedores distintos cuando se pueda
+    colas = [list(v) for v in por_proveedor.values()]
+    candidatos = []
+    while any(colas):
+        for cola in colas:
+            if cola:
+                candidatos.append(cola.pop(0))
+    asignacion = {}
+    for i, (_, rol) in enumerate(ROLES_EQUIPO_SEIS):
+        asignacion[rol] = candidatos[i % len(candidatos)]
+    return asignacion, ""
+
+
 def independencia_equipo(estado: list) -> dict:
     """Independencia REAL: proveedores y modelos distintos (no premiar seis alias al mismo endpoint)."""
     provs = {e["proveedor"] for e in estado}
@@ -45486,6 +45662,64 @@ class CatalogoModelos:
 
     def gratis_verificados(self) -> list:
         return [f for f in self.fichas() if f.gratis_verificado()]
+
+
+# ======================================================================
+# MÓDULO: privacidad
+# ======================================================================
+"""
+Reporte de privacidad (REAPER AUTO-6-IA §11 / v11 §24.7).
+
+Informa, con honestidad, QUÉ proveedores fueron contactados esta sesión y QUÉ categorías de datos les envía
+REAPER — sin mostrar datos sensibles. No promete confidencialidad absoluta: una API externa recibe lo que se
+le manda. Lo que sí se garantiza: los secretos (claves, Authorization) se redactan de logs/stdout y no se
+ponen en los prompts a propósito.
+"""
+
+
+def categorias_enviadas() -> list:
+    return [
+        "instrucciones del sistema y tu pedido (prompts)",
+        "contenido de archivos del proyecto incluido como contexto (código)",
+        "resultados de herramientas (stdout/validación), con secretos redactados",
+    ]
+
+
+def reporte_privacidad(llm, settings) -> dict:
+    """Arma el reporte a partir del uso real del cliente (proveedores contactados) + los ajustes."""
+    por_proveedor = {}
+    uso = getattr(llm, "uso", None)
+    por_modelo = getattr(uso, "por_modelo", {}) or {}
+    for modelo, datos in por_modelo.items():
+        try:
+            prov = destino_modelo(modelo, settings).proveedor
+        except (ValueError, KeyError, AttributeError, TypeError):
+            prov = "?"
+        por_proveedor[prov] = por_proveedor.get(prov, 0) + int(getattr(datos, "llamadas", 0) or 0)
+    return {
+        "proveedores_contactados": por_proveedor,
+        "categorias": categorias_enviadas(),
+        "redaccion_secretos": True,
+        "no_envia": ["claves de API / Authorization (redactadas)", "archivos .env (bloqueados)"],
+        "privacidad_estricta": bool(getattr(settings, "privacidad_estricta", False)),
+    }
+
+
+def texto_reporte_privacidad(rep: dict) -> str:
+    provs = rep.get("proveedores_contactados") or {}
+    lineas = ["Reporte de privacidad (qué salió del dispositivo esta sesión):"]
+    if provs:
+        lineas.append("  Proveedores contactados: " + ", ".join(f"{p} ({n} llamada(s))" for p, n in provs.items()))
+    else:
+        lineas.append("  Proveedores contactados: ninguno todavía en esta sesión.")
+    lineas.append("  Categorías de datos enviadas a los modelos:")
+    lineas += [f"    - {c}" for c in rep.get("categorias", [])]
+    lineas.append("  Redacción de secretos (claves/Authorization): " + ("ACTIVA" if rep.get("redaccion_secretos") else "OFF"))
+    lineas.append("  NO se envía: " + "; ".join(rep.get("no_envia", [])))
+    lineas.append("  Privacidad estricta: " + ("ON" if rep.get("privacidad_estricta") else "OFF")
+                  + "  (ON = evitar subir contenido del proyecto a proveedores externos)")
+    lineas.append("  Nota honesta: las APIs externas reciben lo que se les envía; no hay confidencialidad absoluta.")
+    return "\n".join(lineas)
 
 
 # ======================================================================

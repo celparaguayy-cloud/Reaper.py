@@ -81,6 +81,7 @@ class InfoModelo:
     nivel: str = "base"  # base | fuerte
     nota: str = ""
     proveedor: str = ""  # vacío = usar el proveedor activo de la sesión; si no, rutea a ese proveedor
+    free: bool = False   # candidato de nivel gratuito en su proveedor (sujeto a verificación por cuenta)
 
 
 INFO_MODELOS = {
@@ -101,6 +102,19 @@ INFO_MODELOS = {
     "ollama-llama": InfoModelo("llama3.1:8b", 131072, "base", "Llama 3.1 8B local (Ollama, sin clave)", "ollama"),
     "venice-directo": InfoModelo("dolphin-2.9.2-qwen2-72b", 32768, "base", "Venice API directa (VENICE_API_KEY)", "venice"),
     "gpt4o-mini": InfoModelo("gpt-4o-mini", 128000, "fuerte", "OpenAI directo (OPENAI_API_KEY)", "openai"),
+    # Modelos POTENTES con nivel gratuito frecuente (IDs pueden cambiar; coste cero sujeto a tu cuenta).
+    "groq-llama70": InfoModelo("llama-3.3-70b-versatile", 131072, "fuerte",
+                               "Llama 3.3 70B en Groq (free tier; verificar cuenta)", "groq", True),
+    "groq-deepseek70": InfoModelo("deepseek-r1-distill-llama-70b", 131072, "fuerte",
+                                  "DeepSeek R1 distill 70B en Groq (free tier)", "groq", True),
+    "gemini-flash": InfoModelo("gemini-2.0-flash", 1048576, "fuerte",
+                               "Gemini 2.0 Flash (free tier; verificar cuenta)", "gemini", True),
+    "nvidia-llama405": InfoModelo("meta/llama-3.1-405b-instruct", 131072, "fuerte",
+                                  "Llama 3.1 405B en NVIDIA NIM (free; verificar)", "nvidia", True),
+    "or-deepseek-r1-free": InfoModelo("deepseek/deepseek-r1:free", 65536, "fuerte",
+                                      "DeepSeek R1 gratis en OpenRouter (con límites de uso)", "openrouter", True),
+    "or-llama70-free": InfoModelo("meta-llama/llama-3.3-70b-instruct:free", 131072, "fuerte",
+                                  "Llama 3.3 70B gratis en OpenRouter (con límites)", "openrouter", True),
 }
 
 MODELOS = {alias: info.id for alias, info in INFO_MODELOS.items()}
@@ -172,6 +186,7 @@ class Settings:
     # v8: revertir solo las ediciones que dejan los tests peor que el mejor estado visto
     guardia_regresion: bool = True
     router_aprendido: bool = True   # v9 Fase 7: elegir el modelo por rol según el desempeño pasado
+    privacidad_estricta: bool = False   # AUTO-6-IA §11: no subir contenido de proyecto a proveedores externos
     # v9: modo seguridad (pentest / CTF / lab / estudio) con gate de alcance. Off por defecto.
     modo_seguridad: bool = False
     alcance_autorizado: str = ""    # objetivos autorizados (lab/CTF/pentest); sin esto el modo no se activa

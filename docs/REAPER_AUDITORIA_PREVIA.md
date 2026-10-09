@@ -31,6 +31,13 @@ Inspección real de las 6 hipótesis del §1 del MASTER SPEC contra el código d
 
 ## Pendiente priorizado
 
-Catálogo vivo con descubrimiento por API oficial + caché TTL (§4), CapabilityProbe real (§8),
-rate-limit por proveedor/cuenta (§7.4), BudgetManager con coste-cero verificado (§7.3), y el display
-"seis agentes" con métrica de independencia real (§6/§9). Nada se declara verificado sin peticiones reales.
+CapabilityProbe real (§8), rate-limit por proveedor/cuenta (§7.4) y BudgetManager con coste-cero
+verificado (§7.3) — todos requieren peticiones reales con claves. Nada se declara verificado sin ellas.
+
+## Añadido después de la Fase A
+
+- **Catálogo vivo offline** (§4): `CatalogoModelos` (71) con parser tolerante, nulls honestos y caché TTL.
+- **Seis roles + independencia** (§6/§9): `/equipo`, y `/equipo auto` que asigna los seis roles a modelos
+  free potentes SOLO de proveedores con credencial (aliases `groq-llama70`, `gemini-flash`, etc.).
+- **`/privacidad`** (§11): reporte de proveedores contactados y categorías enviadas, sin revelar secretos;
+  flag `privacidad_estricta` y modo `/privacidad estricto on|off`.

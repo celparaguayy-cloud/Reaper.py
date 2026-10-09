@@ -315,7 +315,7 @@ class App:
             "/tournament": "torneo", "/recipes": "recetas", "/eval": "evaluar", "/export": "exportar",
             "/history": "historial", "/status": "estado", "/context": "contexto", "/compact": "compactar",
             "/run": "correr", "/test": "tests", "/project": "proyecto", "/model": "modelo", "/mode": "modo",
-            "/strong": "modelo_fuerte",
+            "/strong": "modelo_fuerte", "/privacy": "privacidad", "/providers": "proveedores", "/team": "equipo",
         }
         nombre = alias.get(cmd, cmd[1:]).replace("-", "_")
         metodo = getattr(self, "cmd_" + nombre, None)
@@ -966,6 +966,20 @@ class App:
         self.ui.aviso("  REAPER hará trabajo ofensivo SOLO dentro de ese alcance. Fuera de ahí, frena y avisa.")
         self.ui.tenue("  Seguís protegido: sudo, rm -rf, apagar el equipo y leer .env siguen bloqueados.")
 
+    def cmd_privacidad(self, arg: str) -> None:
+        """Reporte de privacidad y modo estricto. No revela datos sensibles."""
+        partes = (arg or "").split()
+        sub = partes[0].lower() if partes else "reporte"
+        if sub in ("estricto", "strict"):
+            valor = len(partes) > 1 and partes[1].lower() in ("on", "si", "sí", "1", "true")
+            self.settings.privacidad_estricta = valor
+            guardar_settings(self.settings)
+            self.ui.ok(f"Privacidad estricta: {'ON' if valor else 'OFF'}.")
+            if valor:
+                self.ui.tenue("  Evitá modelos externos para contenido sensible; preferí un proveedor local (ollama).")
+            return
+        self.ui.linea(texto_reporte_privacidad(reporte_privacidad(self.llm, self.settings)))
+
     def cmd_equipo(self, arg: str) -> None:
         """Muestra los seis roles → proveedor/modelo asignado + independencia real. Conectividad NO VERIFICADA."""
         sub = (arg or "").strip().lower()
@@ -977,7 +991,18 @@ class App:
             if ind["reducida"]:
                 self.ui.aviso("  Independencia REDUCIDA: todos los roles caen en un solo proveedor.")
             return
-        if sub in ("probar", "auto"):
+        if sub == "auto":
+            asignacion, motivo = autoasignar_equipo_free(self.settings)
+            if not asignacion:
+                self.ui.aviso(f"  No pude autoconfigurar modelos free: {motivo}.")
+                self.ui.tenue("  Configurá un proveedor free: export GROQ_API_KEY=... (o NVIDIA/GEMINI/OpenRouter).")
+            else:
+                self.settings.modelos_rol.update(asignacion)
+                guardar_settings(self.settings)
+                self.ui.ok("Equipo autoconfigurado con modelos free potentes (conectividad NO VERIFICADA).")
+                estado = estado_equipo(self.settings)
+                ind = independencia_equipo(estado)
+        if sub == "probar":
             self.ui.aviso("  Probar cada rol de extremo a extremo requiere peticiones reales con claves: "
                           "NO VERIFICADO hasta ejecutarse con tu consentimiento (/proveedores probar).")
         self.ui.info("Equipo de seis roles (asignación actual; conectividad NO VERIFICADA):")

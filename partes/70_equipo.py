@@ -33,6 +33,40 @@ def estado_equipo(settings) -> list:
     return salida
 
 
+def modelos_potentes_free() -> list:
+    """Alias curados de modelos free POTENTES (del catálogo estático), como (alias, info)."""
+    return [(alias, info) for alias, info in INFO_MODELOS.items() if info.free]
+
+
+def autoasignar_equipo_free(settings) -> tuple:
+    """
+    Asigna los seis roles a modelos free potentes SOLO de proveedores con credencial. Reparte entre
+    proveedores para maximizar independencia. Devuelve (modelos_rol, motivo_si_vacio). No inventa conexión.
+    """
+    por_proveedor = {}
+    for alias, info in modelos_potentes_free():
+        prov = info.proveedor or settings.proveedor
+        try:
+            tiene = bool(clave_de_proveedor(prov, replace(settings, proveedor=prov)))
+        except (TypeError, ValueError):
+            tiene = False
+        if tiene:
+            por_proveedor.setdefault(prov, []).append(alias)
+    if not por_proveedor:
+        return {}, "ningún proveedor con nivel gratuito tiene credencial configurada"
+    # intercalar proveedores para que roles consecutivos usen proveedores distintos cuando se pueda
+    colas = [list(v) for v in por_proveedor.values()]
+    candidatos = []
+    while any(colas):
+        for cola in colas:
+            if cola:
+                candidatos.append(cola.pop(0))
+    asignacion = {}
+    for i, (_, rol) in enumerate(ROLES_EQUIPO_SEIS):
+        asignacion[rol] = candidatos[i % len(candidatos)]
+    return asignacion, ""
+
+
 def independencia_equipo(estado: list) -> dict:
     """Independencia REAL: proveedores y modelos distintos (no premiar seis alias al mismo endpoint)."""
     provs = {e["proveedor"] for e in estado}
