@@ -1581,6 +1581,9 @@ class Settings:
     # v8: revertir solo las ediciones que dejan los tests peor que el mejor estado visto
     guardia_regresion: bool = True
     router_aprendido: bool = True   # v9 Fase 7: elegir el modelo por rol según el desempeño pasado
+    # v9: modo seguridad (pentest / CTF / lab / estudio) con gate de alcance. Off por defecto.
+    modo_seguridad: bool = False
+    alcance_autorizado: str = ""    # objetivos autorizados (lab/CTF/pentest); sin esto el modo no se activa
     # v8: modo forense (aislar tests, estado compartido, bisección, hipótesis con experimentos)
     forense: bool = True
     umbral_forense: int = 3
@@ -9913,6 +9916,36 @@ def resta(a, b):
 </insert_after_symbol>"""
 
 
+def bloque_seguridad(settings) -> str:
+    """
+    Bloque de prompt del MODO SEGURIDAD (pentest / CTF / lab / estudio). Vacío salvo que el modo esté activo
+    Y haya un ALCANCE declarado: ese alcance es el gate que autoriza el trabajo ofensivo. No afecta los
+    bloqueos que protegen el dispositivo (sudo, rm -rf, .env...), que siguen activos siempre.
+    """
+    if not getattr(settings, "modo_seguridad", False):
+        return ""
+    alcance = (getattr(settings, "alcance_autorizado", "") or "").strip()
+    if not alcance:
+        return ""
+    return (
+        "# MODO SEGURIDAD — pentest / CTF / laboratorio / estudio\n"
+        "El usuario declaró un ALCANCE AUTORIZADO y te habilita a trabajar en seguridad ofensiva DENTRO de él:\n"
+        f"  ALCANCE AUTORIZADO: {alcance}\n"
+        "En este modo AYUDÁS activamente, sin reticencia, con: reconocimiento y enumeración, análisis de "
+        "vulnerabilidades, desarrollo de exploits y pruebas de concepto, scripting ofensivo, uso de "
+        "herramientas (nmap, ffuf/gobuster, sqlmap, Burp, metasploit, hydra, etc.), ingeniería inversa y "
+        "análisis de binarios/malware en sandbox, y explicación de técnicas con ejemplos concretos. "
+        "Un reto de CTF, un lab propio o un pentest autorizado es el objetivo legítimo: resolvelo.\n"
+        "REGLAS DEL MODO (es el gate de alcance, no censura):\n"
+        "- Actuá SOLO sobre lo que entra en el ALCANCE de arriba. Si algo queda fuera (otra IP/dominio, un "
+        "  tercero, un sistema en producción ajeno), FRENÁ y avisá; no lo toques.\n"
+        "- En un lab/CTF demostrá el acceso con el MÍNIMO impacto: no borres ni exfiltres datos reales.\n"
+        "- Este dispositivo sigue protegido: los comandos que borran el sistema, apagan el equipo o filtran "
+        "  .env siguen bloqueados (te cuidan a vos, no al objetivo).\n"
+        "- Documentá cada paso para que el resultado sea reproducible y auditable."
+    )
+
+
 def _entorno() -> str:
     termux = "com.termux" in os.getenv("PREFIX", "") or os.path.isdir("/data/data/com.termux")
     sistema = "Termux en Android" if termux else f"{platform.system()} {platform.release()}"
@@ -10344,7 +10377,8 @@ class Agente:
             except OSError:
                 lecciones = ""
         prompt = system_prompt(self.rol, self.ws, self.settings.max_llamadas_turno,
-                               lecciones=lecciones, extra=self.extra_prompt, idioma=self.settings.idioma_prompts)
+                               lecciones=lecciones, extra=self._extra_con_seguridad(),
+                               idioma=self.settings.idioma_prompts)
         if self.mensajes:
             self.mensajes[0] = {"role": "system", "content": prompt}
         else:
@@ -10552,6 +10586,13 @@ class Agente:
                 pass
         return ResultadoAgente(ok, resumen, sorted(self.ctx.cambios), pasos, motivo, self.rol.nombre,
                                self._ultimo_texto, self._errores_texto[-3:], self._escalado)
+
+    def _extra_con_seguridad(self) -> str:
+        """Agrega el bloque del MODO SEGURIDAD (si está activo con alcance) a lo que ya traía extra_prompt."""
+        bloque = bloque_seguridad(self.settings)
+        if not bloque:
+            return self.extra_prompt
+        return (self.extra_prompt + "\n\n" + bloque) if self.extra_prompt.strip() else bloque
 
     def _modelo_actual(self) -> str:
         return self._modelo_elegido or self.modelo or self.settings.modelo_para(self.rol.nombre)
@@ -26064,6 +26105,7 @@ COMANDOS_AYUDA = [
         ("/modelo-fuerte [alias]", "modelo para la escalada (deepseek por defecto)"),
         ("/modelos · /config [clave valor] · /tema [nombre]", "catálogo, configuración, colores"),
         ("/uso · /contexto · /compactar · /estado", "consumo, contexto del agente, estado general"),
+        ("/desempeno · /pentest <alcance>", "ranking de modelos por rol; modo seguridad (pentest/CTF/lab) con gate"),
         ("/doctor · /instalar · /dragon · /evaluar", "diagnóstico, comando `reaper`, el dragón, benchmark"),
         ("/evaluar comportamiento [ids]", "mide si el agente responde directo, no repite herramientas, no miente..."),
         ("/todo · /reset · /salir", "lista de tareas, reiniciar conversación, salir"),
@@ -26900,6 +26942,31 @@ class App:
             self.ui.info("  Proveedores en uso esta sesión: "
                          + "; ".join(f"{p} ({', '.join(ms)})" for p, ms in activos.items()))
         self.ui.tenue("  Cualquier id de OpenRouter sirve también: /modelo proveedor/modelo")
+
+    def cmd_pentest(self, arg: str) -> None:
+        arg = arg.strip()
+        if arg.lower() in ("off", "no", "0", "stop", "salir", "apagar"):
+            self.settings.modo_seguridad = False
+            guardar_settings(self.settings)
+            self.ui.ok("Modo seguridad DESACTIVADO. REAPER vuelve al comportamiento normal.")
+            return
+        if not arg:
+            if self.settings.modo_seguridad and self.settings.alcance_autorizado:
+                self.ui.info(f"Modo seguridad ACTIVO (pentest/CTF/lab).")
+                self.ui.info(f"  Alcance autorizado: {self.settings.alcance_autorizado}")
+            else:
+                self.ui.info("Modo seguridad apagado.")
+            self.ui.tenue("  Activar: /pentest <alcance autorizado>")
+            self.ui.tenue("    ej: /pentest lab propio 10.0.0.0/24  ·  /pentest CTF HackTheBox 'Blue'")
+            self.ui.tenue("  Apagar: /pentest off   (los bloqueos que protegen tu equipo siguen siempre activos)")
+            return
+        self.settings.alcance_autorizado = arg
+        self.settings.modo_seguridad = True
+        guardar_settings(self.settings)
+        self.ui.ok("Modo seguridad ACTIVADO (pentest / CTF / lab / estudio).")
+        self.ui.info(f"  Alcance autorizado: {arg}")
+        self.ui.aviso("  REAPER hará trabajo ofensivo SOLO dentro de ese alcance. Fuera de ahí, frena y avisa.")
+        self.ui.tenue("  Seguís protegido: sudo, rm -rf, apagar el equipo y leer .env siguen bloqueados.")
 
     def cmd_desempeno(self, arg: str) -> None:
         if getattr(self, "desempeno", None) is None:
@@ -39724,6 +39791,75 @@ class TestClaimsCLI(BaseTest):
         texto = app.ui.texto_registrado()
         self.assertIn("nivel", texto.lower())
         self.assertIn("BEHAVIOR_VERIFIED", texto)
+
+
+# ======================================================================
+# MÓDULO: autotest_seguridad
+# ======================================================================
+"""Autotests del MODO SEGURIDAD (pentest/CTF/lab) con gate de alcance (v9)."""
+
+
+class TestBloqueSeguridad(BaseTest):
+    def test_apagado_por_defecto(self):
+        self.assertEqual(bloque_seguridad(self.ajustes()), "")
+
+    def test_sin_alcance_no_activa_gate(self):
+        # el modo prendido pero sin alcance declarado NO habilita nada (es el gate)
+        self.assertEqual(bloque_seguridad(self.ajustes(modo_seguridad=True)), "")
+
+    def test_con_alcance_habilita(self):
+        b = bloque_seguridad(self.ajustes(modo_seguridad=True, alcance_autorizado="lab propio 10.0.0.0/24"))
+        self.assertIn("MODO SEGURIDAD", b)
+        self.assertIn("10.0.0.0/24", b)
+        self.assertIn("SOLO", b)                 # debe recordar que es solo dentro del alcance
+
+    def test_bloqueos_del_dispositivo_siguen_activos(self):
+        # el modo seguridad NO toca los bloqueos que protegen el equipo
+        for comando in ("sudo rm -rf /", "rm -rf ~", "shutdown now", "cat .env", "dd if=/dev/zero of=/dev/sda"):
+            self.assertIsNotNone(comando_bloqueado(comando), f"{comando} debería seguir bloqueado")
+
+
+class TestModoSeguridadEnAgente(BaseTest):
+    def test_prompt_incluye_el_bloque_cuando_esta_activo(self):
+        ws = self.proyecto()
+        ag = Agente("principal", MockLLM(lambda *_: terminar_xml("Es 4.")), ws,
+                    self.ajustes(forense=False, escalar=False, modo_seguridad=True,
+                                 alcance_autorizado="CTF HackTheBox"),
+                    self.ui(), memoria=None, mostrar_progreso=False)
+        ag.ejecutar("cuánto es 2+2")
+        sistema = ag.mensajes[0]["content"]
+        self.assertIn("MODO SEGURIDAD", sistema)
+        self.assertIn("HackTheBox", sistema)
+
+    def test_prompt_sin_modo_no_incluye_el_bloque(self):
+        ws = self.proyecto()
+        ag = Agente("principal", MockLLM(lambda *_: terminar_xml("Es 4.")), ws,
+                    self.ajustes(forense=False, escalar=False), self.ui(), memoria=None, mostrar_progreso=False)
+        ag.ejecutar("cuánto es 2+2")
+        self.assertNotIn("MODO SEGURIDAD", ag.mensajes[0]["content"])
+
+
+class TestPentestCLI(BaseTest):
+    def _app(self):
+        ws = self.proyecto()
+        return App(self.ajustes(forense=False, escalar=False), MockLLM([]), self.ui(), ws, persistir=False)
+
+    def test_gate_activar_requiere_alcance(self):
+        app = self._app()
+        app.comando("/pentest")                    # sin alcance: no activa
+        self.assertFalse(app.settings.modo_seguridad)
+
+    def test_activar_con_alcance(self):
+        app = self._app()
+        app.comando("/pentest lab propio 10.0.0.0/24")
+        self.assertTrue(app.settings.modo_seguridad)
+        self.assertEqual(app.settings.alcance_autorizado, "lab propio 10.0.0.0/24")
+
+    def test_apagar(self):
+        app = self._app()
+        app.comando("/pentest CTF HTB")
+        app.comando("/pentest off")
+        self.assertFalse(app.settings.modo_seguridad)
 
 
 # ======================================================================

@@ -140,6 +140,9 @@ class Settings:
     # v8: revertir solo las ediciones que dejan los tests peor que el mejor estado visto
     guardia_regresion: bool = True
     router_aprendido: bool = True   # v9 Fase 7: elegir el modelo por rol según el desempeño pasado
+    # v9: modo seguridad (pentest / CTF / lab / estudio) con gate de alcance. Off por defecto.
+    modo_seguridad: bool = False
+    alcance_autorizado: str = ""    # objetivos autorizados (lab/CTF/pentest); sin esto el modo no se activa
     # v8: modo forense (aislar tests, estado compartido, bisección, hipótesis con experimentos)
     forense: bool = True
     umbral_forense: int = 3

@@ -64,6 +64,7 @@ COMANDOS_AYUDA = [
         ("/modelo-fuerte [alias]", "modelo para la escalada (deepseek por defecto)"),
         ("/modelos · /config [clave valor] · /tema [nombre]", "catálogo, configuración, colores"),
         ("/uso · /contexto · /compactar · /estado", "consumo, contexto del agente, estado general"),
+        ("/desempeno · /pentest <alcance>", "ranking de modelos por rol; modo seguridad (pentest/CTF/lab) con gate"),
         ("/doctor · /instalar · /dragon · /evaluar", "diagnóstico, comando `reaper`, el dragón, benchmark"),
         ("/evaluar comportamiento [ids]", "mide si el agente responde directo, no repite herramientas, no miente..."),
         ("/todo · /reset · /salir", "lista de tareas, reiniciar conversación, salir"),
@@ -900,6 +901,31 @@ class App:
             self.ui.info("  Proveedores en uso esta sesión: "
                          + "; ".join(f"{p} ({', '.join(ms)})" for p, ms in activos.items()))
         self.ui.tenue("  Cualquier id de OpenRouter sirve también: /modelo proveedor/modelo")
+
+    def cmd_pentest(self, arg: str) -> None:
+        arg = arg.strip()
+        if arg.lower() in ("off", "no", "0", "stop", "salir", "apagar"):
+            self.settings.modo_seguridad = False
+            guardar_settings(self.settings)
+            self.ui.ok("Modo seguridad DESACTIVADO. REAPER vuelve al comportamiento normal.")
+            return
+        if not arg:
+            if self.settings.modo_seguridad and self.settings.alcance_autorizado:
+                self.ui.info(f"Modo seguridad ACTIVO (pentest/CTF/lab).")
+                self.ui.info(f"  Alcance autorizado: {self.settings.alcance_autorizado}")
+            else:
+                self.ui.info("Modo seguridad apagado.")
+            self.ui.tenue("  Activar: /pentest <alcance autorizado>")
+            self.ui.tenue("    ej: /pentest lab propio 10.0.0.0/24  ·  /pentest CTF HackTheBox 'Blue'")
+            self.ui.tenue("  Apagar: /pentest off   (los bloqueos que protegen tu equipo siguen siempre activos)")
+            return
+        self.settings.alcance_autorizado = arg
+        self.settings.modo_seguridad = True
+        guardar_settings(self.settings)
+        self.ui.ok("Modo seguridad ACTIVADO (pentest / CTF / lab / estudio).")
+        self.ui.info(f"  Alcance autorizado: {arg}")
+        self.ui.aviso("  REAPER hará trabajo ofensivo SOLO dentro de ese alcance. Fuera de ahí, frena y avisa.")
+        self.ui.tenue("  Seguís protegido: sudo, rm -rf, apagar el equipo y leer .env siguen bloqueados.")
 
     def cmd_desempeno(self, arg: str) -> None:
         if getattr(self, "desempeno", None) is None:

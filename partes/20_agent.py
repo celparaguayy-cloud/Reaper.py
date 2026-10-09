@@ -387,7 +387,8 @@ class Agente:
             except OSError:
                 lecciones = ""
         prompt = system_prompt(self.rol, self.ws, self.settings.max_llamadas_turno,
-                               lecciones=lecciones, extra=self.extra_prompt, idioma=self.settings.idioma_prompts)
+                               lecciones=lecciones, extra=self._extra_con_seguridad(),
+                               idioma=self.settings.idioma_prompts)
         if self.mensajes:
             self.mensajes[0] = {"role": "system", "content": prompt}
         else:
@@ -595,6 +596,13 @@ class Agente:
                 pass
         return ResultadoAgente(ok, resumen, sorted(self.ctx.cambios), pasos, motivo, self.rol.nombre,
                                self._ultimo_texto, self._errores_texto[-3:], self._escalado)
+
+    def _extra_con_seguridad(self) -> str:
+        """Agrega el bloque del MODO SEGURIDAD (si está activo con alcance) a lo que ya traía extra_prompt."""
+        bloque = bloque_seguridad(self.settings)
+        if not bloque:
+            return self.extra_prompt
+        return (self.extra_prompt + "\n\n" + bloque) if self.extra_prompt.strip() else bloque
 
     def _modelo_actual(self) -> str:
         return self._modelo_elegido or self.modelo or self.settings.modelo_para(self.rol.nombre)

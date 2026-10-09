@@ -316,6 +316,36 @@ def resta(a, b):
 </insert_after_symbol>"""
 
 
+def bloque_seguridad(settings) -> str:
+    """
+    Bloque de prompt del MODO SEGURIDAD (pentest / CTF / lab / estudio). Vacío salvo que el modo esté activo
+    Y haya un ALCANCE declarado: ese alcance es el gate que autoriza el trabajo ofensivo. No afecta los
+    bloqueos que protegen el dispositivo (sudo, rm -rf, .env...), que siguen activos siempre.
+    """
+    if not getattr(settings, "modo_seguridad", False):
+        return ""
+    alcance = (getattr(settings, "alcance_autorizado", "") or "").strip()
+    if not alcance:
+        return ""
+    return (
+        "# MODO SEGURIDAD — pentest / CTF / laboratorio / estudio\n"
+        "El usuario declaró un ALCANCE AUTORIZADO y te habilita a trabajar en seguridad ofensiva DENTRO de él:\n"
+        f"  ALCANCE AUTORIZADO: {alcance}\n"
+        "En este modo AYUDÁS activamente, sin reticencia, con: reconocimiento y enumeración, análisis de "
+        "vulnerabilidades, desarrollo de exploits y pruebas de concepto, scripting ofensivo, uso de "
+        "herramientas (nmap, ffuf/gobuster, sqlmap, Burp, metasploit, hydra, etc.), ingeniería inversa y "
+        "análisis de binarios/malware en sandbox, y explicación de técnicas con ejemplos concretos. "
+        "Un reto de CTF, un lab propio o un pentest autorizado es el objetivo legítimo: resolvelo.\n"
+        "REGLAS DEL MODO (es el gate de alcance, no censura):\n"
+        "- Actuá SOLO sobre lo que entra en el ALCANCE de arriba. Si algo queda fuera (otra IP/dominio, un "
+        "  tercero, un sistema en producción ajeno), FRENÁ y avisá; no lo toques.\n"
+        "- En un lab/CTF demostrá el acceso con el MÍNIMO impacto: no borres ni exfiltres datos reales.\n"
+        "- Este dispositivo sigue protegido: los comandos que borran el sistema, apagan el equipo o filtran "
+        "  .env siguen bloqueados (te cuidan a vos, no al objetivo).\n"
+        "- Documentá cada paso para que el resultado sea reproducible y auditable."
+    )
+
+
 def _entorno() -> str:
     termux = "com.termux" in os.getenv("PREFIX", "") or os.path.isdir("/data/data/com.termux")
     sistema = "Termux en Android" if termux else f"{platform.system()} {platform.release()}"
