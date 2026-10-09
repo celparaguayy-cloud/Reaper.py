@@ -45,6 +45,7 @@ class Tarea:
     id: str
     descripcion: str
     archivos: list = field(default_factory=list)
+    deps: list = field(default_factory=list)   # ids de tareas que deben completarse antes (TaskGraph, Fase 8)
 
 
 @dataclass
@@ -89,9 +90,12 @@ def parsear_plan(texto: str, pedido: str, max_tareas: int = 8) -> Plan:
         attrs = {k.lower(): v for k, v in _RE_ATTR.findall(m.group(2))}
         lista = attrs.get("archivos") or attrs.get("files") or ""
         archivos = [a.strip() for a in re.split(r"[,;\s]+", lista) if a.strip()]
+        dep_txt = (attrs.get("deps") or attrs.get("depende") or attrs.get("dependencias")
+                   or attrs.get("after") or attrs.get("tras") or "")
+        deps = [d.strip() for d in re.split(r"[,;\s]+", dep_txt) if d.strip()]
         descripcion = m.group(3).strip()
         if descripcion:
-            tareas.append(Tarea(attrs.get("id") or str(len(tareas) + 1), descripcion, archivos))
+            tareas.append(Tarea(attrs.get("id") or str(len(tareas) + 1), descripcion, archivos, deps))
 
     if not tareas:
         sin_criterios = _RE_INTERFAZ.sub("", _RE_CRITERIOS.sub("", texto))
@@ -665,6 +669,13 @@ class Orquestador:
 
         self.ui.fase(numero_fase, "Implementación" + (" · torneo" if self.settings.torneo and self.settings.candidatos > 1 else ""))
         numero_fase += 1
+        grafo = GrafoTareas(plan.tareas)
+        orden = grafo.orden()
+        for aviso in grafo.problemas:
+            self.ui.aviso("  TaskGraph: " + aviso)
+        if [t.id for t in orden] != [t.id for t in plan.tareas]:
+            self.ui.tenue("  Orden por dependencias: " + " → ".join(t.id for t in orden))
+            plan.tareas = orden
         for i, tarea in enumerate(plan.tareas):
             self.ui.info(f"\n▸ Tarea {i + 1}/{len(plan.tareas)}: {recortar(tarea.descripcion.splitlines()[0], 120)}")
             antes_tests = ejecutar_tests(self.ws, timeout=self.settings.tests_timeout, completo=True)

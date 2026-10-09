@@ -74,7 +74,9 @@ Tu attempt_completion DEBE contener el plan EXACTAMENTE con este formato:
 - ruta/modulo.py: class Clase(args) con métodos metodo(x) -> tipo
 </interfaz>
 <tarea id="1" archivos="ruta/a.py, ruta/b.py">Qué hacer: funciones, firmas, comportamiento, casos borde.</tarea>
-<tarea id="2" archivos="ruta/c.py">...</tarea>
+<tarea id="2" archivos="ruta/c.py" deps="1">...</tarea>
+(deps="1,3" lista los ids de tareas que deben terminar ANTES; REAPER las ordena por dependencia y corre en
+paralelo las que no dependen entre sí ni comparten archivos. Omití deps si la tarea no depende de ninguna.)
 <criterios>
 - criterio de aceptación comprobable con un test (función, entrada → salida esperada)
 </criterios>
