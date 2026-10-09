@@ -927,6 +927,49 @@ class App:
         self.ui.aviso("  REAPER hará trabajo ofensivo SOLO dentro de ese alcance. Fuera de ahí, frena y avisa.")
         self.ui.tenue("  Seguís protegido: sudo, rm -rf, apagar el equipo y leer .env siguen bloqueados.")
 
+    def cmd_forge(self, arg: str) -> None:
+        """Tool Forge: REAPER crea/registra sus propias herramientas (gate real: tests deben pasar)."""
+        partes = (arg or "").split(maxsplit=1)
+        sub = partes[0].lower() if partes else "listar"
+        resto = partes[1].strip() if len(partes) > 1 else ""
+        forja = ForjaHerramientas(self.ws.raiz)
+        if sub in ("listar", "list", "catalogo", ""):
+            tools = forja.catalogo.listar()
+            if not tools:
+                self.ui.info("Catálogo de herramientas vacío. Probá /forge demo.")
+                return
+            for m in tools:
+                self.ui.info(f"  {m.id} v{m.version} [{m.estado}/{m.verificacion}] "
+                             f"caps={','.join(m.capabilities) or '—'} — {recortar(m.resumen, 70)}")
+            self.ui.tenue("  /forge verificar <id> · /forge ejecutar <id> [archivo]")
+            return
+        if sub in ("demo", "crear-demo"):
+            m, recibo = forja.crear(manifiesto_demo(), _FORGE_DEMO_CODIGO, _FORGE_DEMO_TEST)
+            self.ui.info(f"Forjada {m.id} v{m.version} → {m.estado} ({m.verificacion}); tests: {m.tests_resultado}")
+            self.ui.tenue(f"  code_hash: {m.code_hash[:16]}… · recibo {recibo.run_id} exit {recibo.exit_code}")
+            if m.disponible():
+                muestra = forja.catalogo.dir / "demo_input.py"
+                muestra.write_text("DEBUG = True\n", encoding="utf-8")
+                r2 = forja.ejecutar(m.id, [str(muestra)])
+                self.ui.ok(f"Reutilización real de la herramienta → {r2.stdout_preview.strip()} (exit {r2.exit_code})")
+            return
+        if sub in ("verificar", "info") and resto:
+            m = forja.catalogo.obtener(resto)
+            if m is None:
+                self.ui.error(f"No existe la herramienta {resto}.")
+                return
+            self.ui.linea(resaltar_codigo(json.dumps(m.como_dict(), ensure_ascii=False, indent=2), "json"))
+            return
+        if sub in ("ejecutar", "run") and resto:
+            p = resto.split(maxsplit=1)
+            try:
+                r = forja.ejecutar(p[0], [p[1]] if len(p) > 1 else [])
+                self.ui.info(f"{r.stdout_preview.strip()} (exit {r.exit_code})")
+            except ValueError as e:
+                self.ui.error(str(e))
+            return
+        self.ui.error("Uso: /forge listar | demo | verificar <id> | ejecutar <id> [archivo]")
+
     def cmd_muestra(self, arg: str) -> None:
         """Análisis ESTÁTICO de una muestra local (hashes, formato, entropía, strings, IOCs). No la ejecuta."""
         ruta = (arg or "").strip()
