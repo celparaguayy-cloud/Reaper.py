@@ -39,6 +39,38 @@ PROVEEDORES = {
         "clave": "OPENAI_API_KEY",
         "nota": "cualquier API compatible con OpenAI (cambiá api_url)",
     },
+    # Proveedores con nivel gratuito frecuente (endpoints OpenAI-compatibles). Los IDs de modelo NO se
+    # hardcodean: se descubren por cuenta. La clave de cada uno vive en SU variable de entorno, nunca compartida.
+    "groq": {
+        "url": "https://api.groq.com/openai/v1/chat/completions",
+        "clave": "GROQ_API_KEY",
+        "nota": "Groq: inferencia rápida, nivel gratuito; verificar modelos por cuenta",
+    },
+    "nvidia": {
+        "url": "https://integrate.api.nvidia.com/v1/chat/completions",
+        "clave": "NVIDIA_API_KEY",
+        "nota": "NVIDIA NIM: catálogo propio; compatibilidad de tool-calls a verificar",
+    },
+    "gemini": {
+        "url": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+        "clave": "GEMINI_API_KEY",
+        "nota": "Gemini vía endpoint OpenAI-compatible; adapter nativo si falta compatibilidad",
+    },
+    "mistral": {
+        "url": "https://api.mistral.ai/v1/chat/completions",
+        "clave": "MISTRAL_API_KEY",
+        "nota": "Mistral: nivel gratuito según cuenta",
+    },
+    "cohere": {
+        "url": "https://api.cohere.ai/compatibility/v1/chat/completions",
+        "clave": "COHERE_API_KEY",
+        "nota": "Cohere (endpoint de compatibilidad OpenAI)",
+    },
+    "github-models": {
+        "url": "https://models.inference.ai.azure.com/chat/completions",
+        "clave": "GITHUB_MODELS_TOKEN",
+        "nota": "GitHub Models: requiere token propio; confirmar acceso por cuenta",
+    },
 }
 
 
@@ -370,17 +402,41 @@ def guardar_estado(**valores) -> None:
         pass
 
 
-def obtener_clave_api(settings: Settings) -> Optional[str]:
-    """Clave del proveedor activo. Ollama no necesita clave."""
-    variable = settings.variable_clave()
-    if not variable:
-        return "sin-clave"
-    valor = os.getenv(variable) or (os.getenv("OPENROUTER_API_KEY") if settings.proveedor == "openrouter" else None)
-    if valor:
-        return valor.strip()
-    archivo = BASE_DIR / ".clave"
+def _duenio_clave_legacy() -> str:
+    """Proveedor al que pertenece el archivo heredado `.clave`, SOLO si está declarado sin ambigüedad."""
+    env = os.getenv("REAPER_CLAVE_PROVEEDOR")
+    if env:
+        return env.strip()
     try:
-        texto = archivo.read_text(encoding="utf-8").strip()
+        return (BASE_DIR / ".clave_proveedor").read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def _leer_clave_archivo(ruta: Path) -> Optional[str]:
+    try:
+        texto = ruta.read_text(encoding="utf-8").strip()
         return texto or None
     except OSError:
         return None
+
+
+def obtener_clave_api(settings: Settings) -> Optional[str]:
+    """
+    Clave del proveedor ACTIVO. Aislada por proveedor (spec §1.1): nunca devuelve la clave de otro.
+    Orden: variable de entorno del proveedor → archivo `.clave_<proveedor>` → `.clave` heredado SOLO si
+    declara pertenecer a este proveedor (REAPER_CLAVE_PROVEEDOR o archivo `.clave_proveedor`).
+    """
+    variable = settings.variable_clave()
+    if not variable:
+        return "sin-clave"
+    valor = os.getenv(variable)
+    if valor:
+        return valor.strip()
+    por_proveedor = _leer_clave_archivo(BASE_DIR / f".clave_{settings.proveedor}")
+    if por_proveedor:
+        return por_proveedor
+    # El `.clave` heredado solo se usa si su dueño declarado coincide con el proveedor activo (sin fallback ciego).
+    if _duenio_clave_legacy() == settings.proveedor:
+        return _leer_clave_archivo(BASE_DIR / ".clave")
+    return None

@@ -1480,6 +1480,38 @@ PROVEEDORES = {
         "clave": "OPENAI_API_KEY",
         "nota": "cualquier API compatible con OpenAI (cambiá api_url)",
     },
+    # Proveedores con nivel gratuito frecuente (endpoints OpenAI-compatibles). Los IDs de modelo NO se
+    # hardcodean: se descubren por cuenta. La clave de cada uno vive en SU variable de entorno, nunca compartida.
+    "groq": {
+        "url": "https://api.groq.com/openai/v1/chat/completions",
+        "clave": "GROQ_API_KEY",
+        "nota": "Groq: inferencia rápida, nivel gratuito; verificar modelos por cuenta",
+    },
+    "nvidia": {
+        "url": "https://integrate.api.nvidia.com/v1/chat/completions",
+        "clave": "NVIDIA_API_KEY",
+        "nota": "NVIDIA NIM: catálogo propio; compatibilidad de tool-calls a verificar",
+    },
+    "gemini": {
+        "url": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+        "clave": "GEMINI_API_KEY",
+        "nota": "Gemini vía endpoint OpenAI-compatible; adapter nativo si falta compatibilidad",
+    },
+    "mistral": {
+        "url": "https://api.mistral.ai/v1/chat/completions",
+        "clave": "MISTRAL_API_KEY",
+        "nota": "Mistral: nivel gratuito según cuenta",
+    },
+    "cohere": {
+        "url": "https://api.cohere.ai/compatibility/v1/chat/completions",
+        "clave": "COHERE_API_KEY",
+        "nota": "Cohere (endpoint de compatibilidad OpenAI)",
+    },
+    "github-models": {
+        "url": "https://models.inference.ai.azure.com/chat/completions",
+        "clave": "GITHUB_MODELS_TOKEN",
+        "nota": "GitHub Models: requiere token propio; confirmar acceso por cuenta",
+    },
 }
 
 
@@ -1811,20 +1843,44 @@ def guardar_estado(**valores) -> None:
         pass
 
 
-def obtener_clave_api(settings: Settings) -> Optional[str]:
-    """Clave del proveedor activo. Ollama no necesita clave."""
-    variable = settings.variable_clave()
-    if not variable:
-        return "sin-clave"
-    valor = os.getenv(variable) or (os.getenv("OPENROUTER_API_KEY") if settings.proveedor == "openrouter" else None)
-    if valor:
-        return valor.strip()
-    archivo = BASE_DIR / ".clave"
+def _duenio_clave_legacy() -> str:
+    """Proveedor al que pertenece el archivo heredado `.clave`, SOLO si está declarado sin ambigüedad."""
+    env = os.getenv("REAPER_CLAVE_PROVEEDOR")
+    if env:
+        return env.strip()
     try:
-        texto = archivo.read_text(encoding="utf-8").strip()
+        return (BASE_DIR / ".clave_proveedor").read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def _leer_clave_archivo(ruta: Path) -> Optional[str]:
+    try:
+        texto = ruta.read_text(encoding="utf-8").strip()
         return texto or None
     except OSError:
         return None
+
+
+def obtener_clave_api(settings: Settings) -> Optional[str]:
+    """
+    Clave del proveedor ACTIVO. Aislada por proveedor (spec §1.1): nunca devuelve la clave de otro.
+    Orden: variable de entorno del proveedor → archivo `.clave_<proveedor>` → `.clave` heredado SOLO si
+    declara pertenecer a este proveedor (REAPER_CLAVE_PROVEEDOR o archivo `.clave_proveedor`).
+    """
+    variable = settings.variable_clave()
+    if not variable:
+        return "sin-clave"
+    valor = os.getenv(variable)
+    if valor:
+        return valor.strip()
+    por_proveedor = _leer_clave_archivo(BASE_DIR / f".clave_{settings.proveedor}")
+    if por_proveedor:
+        return por_proveedor
+    # El `.clave` heredado solo se usa si su dueño declarado coincide con el proveedor activo (sin fallback ciego).
+    if _duenio_clave_legacy() == settings.proveedor:
+        return _leer_clave_archivo(BASE_DIR / ".clave")
+    return None
 
 
 # ======================================================================
@@ -1874,7 +1930,10 @@ def clave_de_proveedor(proveedor: str, settings: "Settings") -> Optional[str]:
     if proveedor == settings.proveedor:
         return obtener_clave_api(settings)
     valor = os.getenv(variable)
-    return valor.strip() if valor else None
+    if valor:
+        return valor.strip()
+    # Archivo por proveedor (dueño inequívoco); NUNCA el `.clave` heredado para otro proveedor (sin fuga).
+    return _leer_clave_archivo(BASE_DIR / f".clave_{proveedor}")
 
 
 def proveedores_de(settings: "Settings") -> dict:
@@ -26968,6 +27027,45 @@ class App:
         self.ui.aviso("  REAPER hará trabajo ofensivo SOLO dentro de ese alcance. Fuera de ahí, frena y avisa.")
         self.ui.tenue("  Seguís protegido: sudo, rm -rf, apagar el equipo y leer .env siguen bloqueados.")
 
+    def cmd_proveedores(self, arg: str) -> None:
+        """Estado de proveedores SIN exponer secretos. Las claves salen de env o .clave_<proveedor>."""
+        sub = (arg or "").strip().lower()
+        if sub in ("", "estado", "status", "diagnostico"):
+            self.ui.info("Proveedores (las claves nunca se muestran):")
+            configurados = 0
+            for prov, datos in PROVEEDORES.items():
+                var = datos["clave"]
+                if not var:
+                    estado = "SIN CLAVE (no requiere)"
+                else:
+                    tmp = replace(self.settings, proveedor=prov)
+                    tiene = bool(clave_de_proveedor(prov, tmp))
+                    configurados += int(tiene)
+                    estado = "CONFIGURADO" if tiene else "FALTA CLAVE"
+                activo = " ← activo" if prov == self.settings.proveedor else ""
+                self.ui.info(f"  {prov:<14} {estado:<22} [{var or '—'}]{activo}")
+            self.ui.tenue(f"  {configurados} proveedor(es) con credencial. Configurá con: export <VAR>=...  (una vez)")
+            if sub == "diagnostico":
+                disy = getattr(self.llm, "disyuntor", None)
+                if disy is not None:
+                    self.ui.tenue("  disyuntor: " + disy.resumen())
+            return
+        if sub == "configurar":
+            self.ui.info("Onboarding de credenciales (una sola vez, fuera del chat):")
+            self.ui.tenue("  REAPER no pide claves en el chat ni las guarda en el repo. Opciones:")
+            self.ui.tenue("    1) export GROQ_API_KEY=...  (variable de entorno por proveedor)")
+            self.ui.tenue("    2) archivo ~/reaper/.clave_<proveedor> con permisos 0600")
+            self.ui.tenue("  Una clave NUNCA se comparte entre proveedores. Luego: /proveedores")
+            return
+        if sub in ("probar", "sincronizar"):
+            candidatos = [p for p, d in PROVEEDORES.items()
+                          if d["clave"] and clave_de_proveedor(p, replace(self.settings, proveedor=p))]
+            self.ui.info(f"Proveedores con credencial para probar: {', '.join(candidatos) or 'ninguno'}")
+            self.ui.aviso("  La prueba de conectividad real / catálogo vivo hace peticiones autorizadas; "
+                          "hasta ejecutarse con tu consentimiento y claves válidas: NO VERIFICADO.")
+            return
+        self.ui.error("Uso: /proveedores [estado|configurar|probar|sincronizar|diagnostico]")
+
     def cmd_forge(self, arg: str) -> None:
         """Tool Forge: REAPER crea/registra sus propias herramientas (gate real: tests deben pasar)."""
         partes = (arg or "").split(maxsplit=1)
@@ -40562,6 +40660,97 @@ class TestForgeCLI(BaseTest):
         app = App(self.ajustes(forense=False, escalar=False), MockLLM([]), self.ui(), ws, persistir=False)
         app.comando("/forge listar")
         self.assertIn("vacío", app.ui.texto_registrado())
+
+
+# ======================================================================
+# MÓDULO: autotest_credenciales
+# ======================================================================
+"""Autotests de aislamiento de credenciales por proveedor (REAPER AUTO-6-IA §1.1) y /proveedores."""
+
+
+class _BaseCred(BaseTest):
+    _VARS = ("OPENROUTER_API_KEY", "VENICE_API_KEY", "OPENAI_API_KEY", "GROQ_API_KEY", "NVIDIA_API_KEY",
+             "GEMINI_API_KEY", "MISTRAL_API_KEY", "COHERE_API_KEY", "GITHUB_MODELS_TOKEN", "REAPER_CLAVE_PROVEEDOR")
+
+    def setUp(self):
+        super().setUp()
+        self._env_bak = {k: os.environ.pop(k, None) for k in self._VARS}
+
+    def tearDown(self):
+        for k, v in self._env_bak.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        super().tearDown()
+
+
+class TestAislamientoCredenciales(_BaseCred):
+    def test_clave_desde_env(self):
+        os.environ["GROQ_API_KEY"] = "gk-123"
+        self.assertEqual(obtener_clave_api(self.ajustes(proveedor="groq")), "gk-123")
+
+    def test_no_filtra_entre_proveedores_por_env(self):
+        # clave de NVIDIA presente; pedir la de Groq NO debe devolver la de NVIDIA
+        os.environ["NVIDIA_API_KEY"] = "nv-secreta"
+        self.assertIsNone(obtener_clave_api(self.ajustes(proveedor="groq")))
+        self.assertIsNone(clave_de_proveedor("groq", self.ajustes(proveedor="openrouter")))
+
+    def test_clave_heredada_no_se_usa_sin_dueno(self):
+        # el .clave heredado sin dueño declarado no se usa para NINGÚN proveedor (ni el default)
+        (BASE_DIR / ".clave").write_text("secreto-de-openrouter", encoding="utf-8")
+        self.assertIsNone(obtener_clave_api(self.ajustes(proveedor="openrouter")))
+        self.assertIsNone(obtener_clave_api(self.ajustes(proveedor="groq")))
+
+    def test_clave_heredada_con_dueno_declarado(self):
+        (BASE_DIR / ".clave").write_text("k-openrouter", encoding="utf-8")
+        (BASE_DIR / ".clave_proveedor").write_text("openrouter", encoding="utf-8")
+        self.assertEqual(obtener_clave_api(self.ajustes(proveedor="openrouter")), "k-openrouter")
+        self.assertIsNone(obtener_clave_api(self.ajustes(proveedor="groq")))   # dueño no coincide
+
+    def test_dueno_via_variable_entorno(self):
+        (BASE_DIR / ".clave").write_text("k-groq", encoding="utf-8")
+        os.environ["REAPER_CLAVE_PROVEEDOR"] = "groq"
+        self.assertEqual(obtener_clave_api(self.ajustes(proveedor="groq")), "k-groq")
+        self.assertIsNone(obtener_clave_api(self.ajustes(proveedor="nvidia")))
+
+    def test_archivo_por_proveedor(self):
+        (BASE_DIR / ".clave_groq").write_text("gk-archivo", encoding="utf-8")
+        self.assertEqual(obtener_clave_api(self.ajustes(proveedor="groq")), "gk-archivo")
+        self.assertIsNone(obtener_clave_api(self.ajustes(proveedor="nvidia")))
+
+    def test_env_tiene_prioridad_sobre_archivo(self):
+        (BASE_DIR / ".clave_groq").write_text("gk-archivo", encoding="utf-8")
+        os.environ["GROQ_API_KEY"] = "gk-env"
+        self.assertEqual(obtener_clave_api(self.ajustes(proveedor="groq")), "gk-env")
+
+    def test_clave_de_proveedor_no_activo_desde_archivo(self):
+        (BASE_DIR / ".clave_groq").write_text("gk", encoding="utf-8")
+        self.assertEqual(clave_de_proveedor("groq", self.ajustes(proveedor="openrouter")), "gk")
+        # pero el .clave heredado NO se usa para un proveedor no activo
+        (BASE_DIR / ".clave").write_text("otra", encoding="utf-8")
+        self.assertIsNone(clave_de_proveedor("nvidia", self.ajustes(proveedor="openrouter")))
+
+    def test_ollama_sin_clave(self):
+        self.assertEqual(obtener_clave_api(self.ajustes(proveedor="ollama")), "sin-clave")
+
+
+class TestProveedoresCLI(_BaseCred):
+    def test_estado_no_revela_secreto(self):
+        os.environ["GROQ_API_KEY"] = "supersecreta-no-mostrar"
+        ws = self.proyecto()
+        app = App(self.ajustes(forense=False, escalar=False), MockLLM([]), self.ui(), ws, persistir=False)
+        app.comando("/proveedores")
+        texto = app.ui.texto_registrado()
+        self.assertIn("groq", texto)
+        self.assertIn("CONFIGURADO", texto)
+        self.assertNotIn("supersecreta-no-mostrar", texto)      # el valor NUNCA aparece
+
+    def test_falta_clave(self):
+        ws = self.proyecto()
+        app = App(self.ajustes(forense=False, escalar=False), MockLLM([]), self.ui(), ws, persistir=False)
+        app.comando("/proveedores")
+        self.assertIn("FALTA CLAVE", app.ui.texto_registrado())
 
 
 # ======================================================================

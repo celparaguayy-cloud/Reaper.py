@@ -927,6 +927,45 @@ class App:
         self.ui.aviso("  REAPER hará trabajo ofensivo SOLO dentro de ese alcance. Fuera de ahí, frena y avisa.")
         self.ui.tenue("  Seguís protegido: sudo, rm -rf, apagar el equipo y leer .env siguen bloqueados.")
 
+    def cmd_proveedores(self, arg: str) -> None:
+        """Estado de proveedores SIN exponer secretos. Las claves salen de env o .clave_<proveedor>."""
+        sub = (arg or "").strip().lower()
+        if sub in ("", "estado", "status", "diagnostico"):
+            self.ui.info("Proveedores (las claves nunca se muestran):")
+            configurados = 0
+            for prov, datos in PROVEEDORES.items():
+                var = datos["clave"]
+                if not var:
+                    estado = "SIN CLAVE (no requiere)"
+                else:
+                    tmp = replace(self.settings, proveedor=prov)
+                    tiene = bool(clave_de_proveedor(prov, tmp))
+                    configurados += int(tiene)
+                    estado = "CONFIGURADO" if tiene else "FALTA CLAVE"
+                activo = " ← activo" if prov == self.settings.proveedor else ""
+                self.ui.info(f"  {prov:<14} {estado:<22} [{var or '—'}]{activo}")
+            self.ui.tenue(f"  {configurados} proveedor(es) con credencial. Configurá con: export <VAR>=...  (una vez)")
+            if sub == "diagnostico":
+                disy = getattr(self.llm, "disyuntor", None)
+                if disy is not None:
+                    self.ui.tenue("  disyuntor: " + disy.resumen())
+            return
+        if sub == "configurar":
+            self.ui.info("Onboarding de credenciales (una sola vez, fuera del chat):")
+            self.ui.tenue("  REAPER no pide claves en el chat ni las guarda en el repo. Opciones:")
+            self.ui.tenue("    1) export GROQ_API_KEY=...  (variable de entorno por proveedor)")
+            self.ui.tenue("    2) archivo ~/reaper/.clave_<proveedor> con permisos 0600")
+            self.ui.tenue("  Una clave NUNCA se comparte entre proveedores. Luego: /proveedores")
+            return
+        if sub in ("probar", "sincronizar"):
+            candidatos = [p for p, d in PROVEEDORES.items()
+                          if d["clave"] and clave_de_proveedor(p, replace(self.settings, proveedor=p))]
+            self.ui.info(f"Proveedores con credencial para probar: {', '.join(candidatos) or 'ninguno'}")
+            self.ui.aviso("  La prueba de conectividad real / catálogo vivo hace peticiones autorizadas; "
+                          "hasta ejecutarse con tu consentimiento y claves válidas: NO VERIFICADO.")
+            return
+        self.ui.error("Uso: /proveedores [estado|configurar|probar|sincronizar|diagnostico]")
+
     def cmd_forge(self, arg: str) -> None:
         """Tool Forge: REAPER crea/registra sus propias herramientas (gate real: tests deben pasar)."""
         partes = (arg or "").split(maxsplit=1)

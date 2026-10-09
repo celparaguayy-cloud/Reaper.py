@@ -42,7 +42,10 @@ def clave_de_proveedor(proveedor: str, settings: "Settings") -> Optional[str]:
     if proveedor == settings.proveedor:
         return obtener_clave_api(settings)
     valor = os.getenv(variable)
-    return valor.strip() if valor else None
+    if valor:
+        return valor.strip()
+    # Archivo por proveedor (dueño inequívoco); NUNCA el `.clave` heredado para otro proveedor (sin fuga).
+    return _leer_clave_archivo(BASE_DIR / f".clave_{proveedor}")
 
 
 def proveedores_de(settings: "Settings") -> dict:
