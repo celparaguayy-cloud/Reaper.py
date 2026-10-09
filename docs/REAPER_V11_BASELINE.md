@@ -29,7 +29,7 @@ construir), `NO-OBJETIVO` (el propio spec lo prohíbe).
 | §8/§23 Lab Challenge Engine + fixtures + flag sintético | **PRESENTE** | `MotorLab` (66): 3 escenarios sintéticos, juez independiente (ground truth del motor), fixtures efímeros con reset, `LAB_FLAG` no falsificable. CLI `/lab`. Positivo/negativo/falso-positivo discriminados |
 | §9 ExecutionBroker / LocalRunner / Receipts con hash+git | **PRESENTE** | `BrokerEjecucion` (67): argv tipado (shell=False), bloqueos de dispositivo, **revalida `PuertaAlcance` por operación** (red fuera de alcance NO ejecuta), timeout, tope de salida, cancelación. Emite `ReciboEjecucion` con hash sha256 + git-rev + preview redactado. CLI `/ejecutar` |
 | §9 SSHRunner / LabRunner (VM aislada) | **AUSENTE** | Opt-in, requiere config del operador |
-| §10 Análisis de malware estático (defensivo) | **AUSENTE** | Por construir; nunca ejecutar muestras |
+| §10 Análisis de malware estático (defensivo) | **PRESENTE** | `analizar_muestra` (68): hashes/formato/entropía/strings/IOCs + `generar_regla_yara`, nunca ejecuta. CLI `/muestra`. Análisis dinámico (VM aislada) PLANNED |
 | §11/§24.7 Privacidad / `/privacy report` / redacción de secretos | **PARCIAL** | `redactar_secretos` existe (sanea stdout); falta `/privacy report` y política `no_upload_sensitive_artifacts` |
 | §12 Máquina de estados de tareas en SQLite | **PARCIAL** | Hay checkpoints/sesiones; falta la FSM `CREATED→…→SUCCEEDED/PARTIAL/FAILED/BLOCKED` persistida |
 | §13 Tests anti-mock / anti-falso-verde | **PRESENTE** | Test Intelligence (15c), discriminación en torneo (22), Evidence Gate (62) |

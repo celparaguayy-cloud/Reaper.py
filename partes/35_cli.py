@@ -927,6 +927,28 @@ class App:
         self.ui.aviso("  REAPER hará trabajo ofensivo SOLO dentro de ese alcance. Fuera de ahí, frena y avisa.")
         self.ui.tenue("  Seguís protegido: sudo, rm -rf, apagar el equipo y leer .env siguen bloqueados.")
 
+    def cmd_muestra(self, arg: str) -> None:
+        """Análisis ESTÁTICO de una muestra local (hashes, formato, entropía, strings, IOCs). No la ejecuta."""
+        ruta = (arg or "").strip()
+        if not ruta:
+            self.ui.error("Uso: /muestra <archivo>  (análisis estático; la muestra NUNCA se ejecuta)")
+            return
+        try:
+            datos = Path(self.ws.ruta(ruta)).read_bytes()
+        except (OSError, ValueError, ErrorRuta) as e:
+            self.ui.error(f"No pude leer {ruta}: {e}")
+            return
+        info = analizar_muestra(datos, ruta)
+        self.ui.info(f"Muestra {info['nombre']} · {info['tamano']} bytes · {info['formato']} · entropía {info['entropia']}")
+        self.ui.tenue(f"  sha256: {info['sha256']}")
+        self.ui.tenue(f"  md5: {info['md5']} · sha1: {info['sha1']}")
+        if info["urls"]:
+            self.ui.info("  URLs embebidas: " + ", ".join(info["urls"][:5]))
+        if info["apis_sospechosas"]:
+            self.ui.info("  APIs/cadenas sensibles: " + ", ".join(info["apis_sospechosas"][:10]))
+        self.ui.linea(resumen_hallazgos(info["hallazgos"]))
+        self.ui.tenue("  " + info["nota"])
+
     def cmd_ejecutar(self, arg: str) -> None:
         """Corre un comando LOCAL por el ExecutionBroker y muestra el recibo de evidencia (hash + git-rev + veredicto)."""
         if not arg.strip():
