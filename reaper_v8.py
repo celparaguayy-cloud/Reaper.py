@@ -26968,6 +26968,55 @@ class App:
         self.ui.aviso("  REAPER hará trabajo ofensivo SOLO dentro de ese alcance. Fuera de ahí, frena y avisa.")
         self.ui.tenue("  Seguís protegido: sudo, rm -rf, apagar el equipo y leer .env siguen bloqueados.")
 
+    def cmd_auditar(self, arg: str) -> None:
+        """Auditoría ESTÁTICA offline de un archivo/proyecto local (config insegura + dependencias). No toca la red."""
+        objetivo = (arg or "").strip() or "."
+        hallazgos = []
+        try:
+            rel = self.ws.rel(self.ws.ruta(objetivo))
+            archivos = [rel]
+        except (ErrorRuta, ValueError, OSError):
+            archivos = []
+        if not archivos:
+            self.ui.error(f"No pude abrir {objetivo} en el workspace.")
+            return
+        for rel in archivos:
+            try:
+                texto = self.ws.leer(rel)
+            except (OSError, ValueError, ErrorRuta):
+                continue
+            hallazgos += auditar_config(texto, rel)
+            if rel.endswith(("requirements.txt", "requirements.lock")):
+                hallazgos += analizar_dependencias(texto, rel)
+        self.ui.info(f"Auditoría estática de {objetivo} (offline, sin red):")
+        self.ui.linea(resumen_hallazgos(hallazgos))
+
+    def cmd_analizar(self, arg: str) -> None:
+        """Importa y analiza resultados de escaneos YA guardados (offline). Hoy: nmap XML."""
+        partes = (arg or "").split(maxsplit=1)
+        if len(partes) < 2:
+            self.ui.error("Uso: /analizar nmap <archivo.xml>  (analiza un resultado guardado; no ejecuta escaneos)")
+            return
+        tipo, ruta = partes[0].lower(), partes[1].strip()
+        try:
+            texto = self.ws.leer(self.ws.rel(self.ws.ruta(ruta)))
+        except (OSError, ValueError, ErrorRuta):
+            self.ui.error(f"No pude abrir {ruta}.")
+            return
+        if tipo == "nmap":
+            try:
+                inv = importar_nmap_xml(texto)
+            except ValueError as e:
+                self.ui.error(str(e))
+                return
+            for h in inv["hosts"]:
+                abiertos = [p for p in h["puertos"] if p["estado"] == "open"]
+                self.ui.info(f"  {h['host']}: {len(abiertos)} puerto(s) abierto(s)")
+                for p in abiertos:
+                    self.ui.tenue(f"    {p['puerto']}/{p['protocolo']} {p['servicio']}")
+        else:
+            self.ui.error(f"Analizador '{tipo}' no disponible. Hoy: nmap (XML guardado).")
+
     def cmd_desempeno(self, arg: str) -> None:
         if getattr(self, "desempeno", None) is None:
             self.ui.info("No hay memoria de desempeño en esta sesión.")
@@ -39969,6 +40018,99 @@ class TestHallazgoYRecibo(BaseTest):
 
 
 # ======================================================================
+# MÓDULO: autotest_auditor
+# ======================================================================
+"""Autotests de los auditores offline y del importador nmap (REAPER v11, §7/§21 iteración A)."""
+
+# Fixtures sintéticos (datos inventados). Positivo = inseguro; negativo = corregido.
+_AUD_VULN = (
+    "DEBUG = True\n"
+    "ALLOWED_HOSTS = ['*']\n"
+    "SESSION_COOKIE_SECURE = False\n"
+    "API_KEY = 'sk-abcdef123456'\n"
+    "import requests\n"
+    "requests.get(url, verify=False)\n"
+)
+_AUD_OK = (
+    "import os\n"
+    "DEBUG = False\n"
+    "ALLOWED_HOSTS = ['example.com']\n"
+    "SESSION_COOKIE_SECURE = True\n"
+    "API_KEY = os.environ['API_KEY']\n"
+    "import requests\n"
+    "requests.get(url, verify=True)\n"
+)
+_AUD_NMAP = (
+    '<?xml version="1.0"?>\n<nmaprun>\n'
+    '  <host>\n    <address addr="127.0.0.1" addrtype="ipv4"/>\n    <ports>\n'
+    '      <port protocol="tcp" portid="443"><state state="open"/><service name="https"/></port>\n'
+    '      <port protocol="tcp" portid="80"><state state="open"/><service name="http"/></port>\n'
+    '    </ports>\n  </host>\n</nmaprun>\n'
+)
+
+
+class TestAuditorConfig(BaseTest):
+    def test_detecta_config_insegura(self):
+        hs = auditar_config(_AUD_VULN, "settings.py")
+        self.assertTrue(hs)
+        self.assertTrue(any(h.severidad == "alta" for h in hs))
+        self.assertTrue(all(h.estado == "STATIC_FINDING" for h in hs))
+
+    def test_fixture_corregido_no_da_falsos_positivos(self):
+        # discriminación tipo laboratorio: el fixture parcheado NO debe disparar hallazgos
+        self.assertEqual(auditar_config(_AUD_OK, "settings.py"), [])
+
+    def test_hallazgos_no_son_confirmados(self):
+        # un hallazgo estático jamás es "confirmado en laboratorio"
+        self.assertFalse(any(h.confirmado() for h in auditar_config(_AUD_VULN)))
+
+
+class TestAnalizarDependencias(BaseTest):
+    def test_version_vieja_marca_version_match_only(self):
+        hs = analizar_dependencias("pyyaml==5.1\nflask==0.10\n")
+        self.assertTrue(hs)
+        self.assertTrue(all(h.estado == "VERSION_MATCH_ONLY" for h in hs))
+        self.assertFalse(any(h.confirmado() for h in hs))
+
+    def test_version_nueva_no_marca(self):
+        self.assertEqual(analizar_dependencias("pyyaml==6.0.1\n"), [])
+
+    def test_paquete_desconocido_no_marca(self):
+        self.assertEqual(analizar_dependencias("paquete-inventado==1.0\n"), [])
+
+
+class TestImportarNmap(BaseTest):
+    def test_parsea_inventario(self):
+        inv = importar_nmap_xml(_AUD_NMAP)
+        self.assertEqual(len(inv["hosts"]), 1)
+        host = inv["hosts"][0]
+        self.assertEqual(host["host"], "127.0.0.1")
+        self.assertEqual(len(host["puertos"]), 2)
+        self.assertEqual(host["puertos"][0]["puerto"], 80)       # ordenado
+        self.assertEqual(host["puertos"][0]["servicio"], "http")
+
+    def test_determinista(self):
+        self.assertEqual(importar_nmap_xml(_AUD_NMAP), importar_nmap_xml(_AUD_NMAP))
+
+    def test_xml_corrupto_rechazado(self):
+        with self.assertRaises(ValueError):
+            importar_nmap_xml("<nmaprun><host>")        # sin cerrar
+
+    def test_xml_no_nmap_rechazado(self):
+        with self.assertRaises(ValueError):
+            importar_nmap_xml("<algo><x/></algo>")
+
+
+class TestAuditorCLI(BaseTest):
+    def test_comando_auditar(self):
+        ws = self.proyecto({"settings.py": _AUD_VULN})
+        app = App(self.ajustes(forense=False, escalar=False), MockLLM([]), self.ui(), ws, persistir=False)
+        app.comando("/auditar settings.py")
+        texto = app.ui.texto_registrado()
+        self.assertIn("hallazgo", texto.lower())
+
+
+# ======================================================================
 # MÓDULO: autotest_runner
 # ======================================================================
 """Ejecutor del autotest interno."""
@@ -43456,6 +43598,155 @@ def recibo_de_ejecucion(run_id: str, argv, *, cwd="", exit_code=None, stdout="",
         scope_id=scope_id, veredicto_alcance=veredicto,
         started_at="", finished_at=datetime.now().isoformat(timespec="seconds"),
     )
+
+
+# ======================================================================
+# MÓDULO: auditor
+# ======================================================================
+"""
+Auditores OFFLINE y adaptadores de importación (REAPER v11, §7 Research + §21 adaptadores, iteración A).
+
+Todo acá es ESTÁTICO y sin red: analiza archivos que ya están en el workspace o importa resultados de
+escaneos guardados por el operador. No ejecuta herramientas de red ni toca objetivos. Produce `Hallazgo`
+con etiquetas honestas (STATIC_FINDING / VERSION_MATCH_ONLY): señala algo a revisar, no afirma compromiso.
+
+  - auditar_config(texto): detecta configuraciones inseguras típicas (SAST-lite defensivo).
+  - analizar_dependencias(texto): marca dependencias con versión potencialmente afectada como
+    VERSION_MATCH_ONLY (nunca "confirmado"; no inventa CVE ni consulta la red).
+  - importar_nmap_xml(texto): parsea un XML de nmap YA guardado y devuelve un inventario estructurado
+    (sin ejecutar nmap ni resolver nada por red); rechaza XML corrupto.
+"""
+
+import xml.etree.ElementTree as _au_ET
+
+# Reglas de configuración insegura: (regex, severidad, título, detalle/mitigación).
+REGLAS_CONFIG = [
+    (re.compile(r"\bDEBUG\s*=\s*True\b"), "alta", "DEBUG activado",
+     "DEBUG=True expone trazas y datos internos; desactivalo en entornos no locales."),
+    (re.compile(r"ALLOWED_HOSTS\s*=\s*\[\s*['\"]\*['\"]\s*\]"), "alta", "ALLOWED_HOSTS comodín",
+     "ALLOWED_HOSTS=['*'] acepta cualquier Host header; restringí a dominios conocidos."),
+    (re.compile(r"\b(?:verify|ssl_verify|verify_ssl|check_hostname)\s*=\s*False\b"), "alta",
+     "Verificación TLS desactivada", "Desactivar la verificación de certificados permite MITM; dejala en True."),
+    (re.compile(r"PermitRootLogin\s+yes", re.I), "alta", "Login root por SSH habilitado",
+     "PermitRootLogin yes amplía la superficie de ataque; usá un usuario sin privilegios + sudo controlado."),
+    (re.compile(r"\b(?:secure|httponly|http_only)\s*=\s*False\b", re.I), "media", "Cookie insegura",
+     "Cookies sin Secure/HttpOnly quedan expuestas; activá ambos flags."),
+    (re.compile(r"\b(?:password|passwd|secret|api_key|apikey|token)\s*=\s*['\"][^'\"]{6,}['\"]", re.I), "alta",
+     "Secreto embebido", "Credencial en texto en el código/config; movela a variables de entorno o un gestor."),
+    (re.compile(r"\bhashlib\.(?:md5|sha1)\b"), "media", "Hash débil",
+     "MD5/SHA1 no sirven para contraseñas/integridad sensible; usá SHA-256+ o un KDF (bcrypt/scrypt/argon2)."),
+    (re.compile(r"\byaml\.load\s*\((?![^)]*Loader)"), "alta", "yaml.load inseguro",
+     "yaml.load sin Loader seguro permite ejecución; usá yaml.safe_load."),
+    (re.compile(r"\bpickle\.loads?\s*\("), "media", "Deserialización con pickle",
+     "pickle sobre datos no confiables ejecuta código; usá json o valida el origen."),
+    (re.compile(r"subprocess\.\w+\([^)]*shell\s*=\s*True"), "media", "shell=True en subprocess",
+     "shell=True con entrada variable habilita inyección de comandos; pasá argv como lista con shell=False."),
+]
+
+# Dependencias cuyo nombre sugiere revisar versión (ejemplo acotado; NO es una base CVE ni afirma vulnerabilidad).
+# Formato: paquete -> (version_maxima_afectada, nota). Marca VERSION_MATCH_ONLY, nunca confirmado.
+_AU_DEPS_REVISAR = {
+    "pyyaml": ("5.3.1", "versiones viejas de PyYAML tuvieron problemas con load(); verificá la versión real"),
+    "requests": ("2.19.1", "versiones muy viejas de requests arrastran dependencias con avisos; verificá"),
+    "flask": ("0.12.2", "Flask muy antiguo; revisá avisos de seguridad de tu versión exacta"),
+    "django": ("2.2.0", "Django por debajo de una LTS parcheada; confirmá la versión exacta y sus parches"),
+    "jinja2": ("2.10.0", "Jinja2 antiguo tuvo avisos de sandbox; verificá la versión"),
+}
+
+
+def _au_lineno(texto: str, pos: int) -> int:
+    return texto.count("\n", 0, pos) + 1
+
+
+def auditar_config(texto: str, nombre: str = "") -> list:
+    """Hallazgos estáticos de configuración insegura. Cada uno es STATIC_FINDING (a revisar, no confirmado)."""
+    hallazgos = []
+    for i, (patron, severidad, titulo, detalle) in enumerate(REGLAS_CONFIG):
+        for m in patron.finditer(texto or ""):
+            linea = _au_lineno(texto, m.start())
+            hallazgos.append(Hallazgo(
+                id=f"cfg-{i}-{linea}", titulo=titulo, estado="STATIC_FINDING", severidad=severidad,
+                detalle=(f"{nombre}:{linea}: " if nombre else f"línea {linea}: ") + detalle,
+                limitaciones=["hallazgo estático; requiere comprobación contextual (no es un compromiso confirmado)"],
+            ))
+    return hallazgos
+
+
+def _au_version_menor_o_igual(a: str, b: str) -> bool:
+    def partes(v):
+        return [int(x) for x in re.findall(r"\d+", v)] or [0]
+    pa, pb = partes(a), partes(b)
+    n = max(len(pa), len(pb))
+    pa += [0] * (n - len(pa))
+    pb += [0] * (n - len(pb))
+    return pa <= pb
+
+
+def analizar_dependencias(texto: str, nombre: str = "requirements") -> list:
+    """
+    Lee un requirements.txt (paquete==version) y marca como VERSION_MATCH_ONLY lo que convenga revisar.
+    NO consulta la red ni inventa CVE: solo señala 'esta versión podría estar afectada, verificá'.
+    """
+    hallazgos = []
+    for linea in (texto or "").splitlines():
+        linea = linea.strip()
+        if not linea or linea.startswith("#"):
+            continue
+        m = re.match(r"^([A-Za-z0-9_.\-]+)\s*==\s*([0-9][0-9A-Za-z.\-]*)", linea)
+        if not m:
+            continue
+        paquete, version = m.group(1).lower(), m.group(2)
+        regla = _AU_DEPS_REVISAR.get(paquete)
+        if regla and _au_version_menor_o_igual(version, regla[0]):
+            hallazgos.append(Hallazgo(
+                id=f"dep-{paquete}", titulo=f"{paquete} {version}: revisar versión", estado="VERSION_MATCH_ONLY",
+                severidad="media", detalle=f"{nombre}: {paquete}=={version}. {regla[1]}.",
+                limitaciones=["coincidencia por versión; NO probado. No equivale a vulnerabilidad confirmada."],
+            ))
+    return hallazgos
+
+
+def importar_nmap_xml(texto: str) -> dict:
+    """
+    Parsea un XML de nmap YA guardado (sin ejecutar nada ni tocar la red) a un inventario estructurado:
+      {"hosts": [{"host": ip, "puertos": [{"puerto", "protocolo", "estado", "servicio"}]}]}
+    Lanza ValueError si el XML es inválido. Determinista: el mismo XML da el mismo resultado.
+    """
+    try:
+        raiz = _au_ET.fromstring(texto or "")
+    except _au_ET.ParseError as e:
+        raise ValueError(f"XML de nmap inválido: {e}") from e
+    if raiz.tag != "nmaprun":
+        raise ValueError("no parece un XML de nmap (falta <nmaprun>)")
+    hosts = []
+    for host in raiz.findall("host"):
+        dir_el = host.find("address")
+        ip = dir_el.get("addr") if dir_el is not None else ""
+        puertos = []
+        for p in host.findall("./ports/port"):
+            estado_el = p.find("state")
+            serv_el = p.find("service")
+            puertos.append({
+                "puerto": int(p.get("portid", "0") or 0),
+                "protocolo": p.get("protocol", ""),
+                "estado": estado_el.get("state", "") if estado_el is not None else "",
+                "servicio": serv_el.get("name", "") if serv_el is not None else "",
+            })
+        puertos.sort(key=lambda x: (x["protocolo"], x["puerto"]))
+        hosts.append({"host": ip, "puertos": puertos})
+    hosts.sort(key=lambda h: h["host"])
+    return {"hosts": hosts}
+
+
+def resumen_hallazgos(hallazgos: list) -> str:
+    if not hallazgos:
+        return "Sin hallazgos."
+    orden = {"critica": 0, "alta": 1, "media": 2, "baja": 3, "info": 4}
+    hs = sorted(hallazgos, key=lambda h: orden.get(h.severidad, 5))
+    lineas = [f"- [{h.severidad}/{h.estado}] {h.titulo} — {recortar(h.detalle, 160)}" for h in hs[:20]]
+    confirmados = sum(1 for h in hallazgos if h.confirmado())
+    return (f"{len(hallazgos)} hallazgo(s), {confirmados} confirmado(s) en laboratorio.\n" + "\n".join(lineas)
+            + "\n(STATIC_FINDING/VERSION_MATCH_ONLY = a revisar; no es compromiso confirmado.)")
 
 
 # ======================================================================

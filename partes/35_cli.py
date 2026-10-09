@@ -927,6 +927,55 @@ class App:
         self.ui.aviso("  REAPER hará trabajo ofensivo SOLO dentro de ese alcance. Fuera de ahí, frena y avisa.")
         self.ui.tenue("  Seguís protegido: sudo, rm -rf, apagar el equipo y leer .env siguen bloqueados.")
 
+    def cmd_auditar(self, arg: str) -> None:
+        """Auditoría ESTÁTICA offline de un archivo/proyecto local (config insegura + dependencias). No toca la red."""
+        objetivo = (arg or "").strip() or "."
+        hallazgos = []
+        try:
+            rel = self.ws.rel(self.ws.ruta(objetivo))
+            archivos = [rel]
+        except (ErrorRuta, ValueError, OSError):
+            archivos = []
+        if not archivos:
+            self.ui.error(f"No pude abrir {objetivo} en el workspace.")
+            return
+        for rel in archivos:
+            try:
+                texto = self.ws.leer(rel)
+            except (OSError, ValueError, ErrorRuta):
+                continue
+            hallazgos += auditar_config(texto, rel)
+            if rel.endswith(("requirements.txt", "requirements.lock")):
+                hallazgos += analizar_dependencias(texto, rel)
+        self.ui.info(f"Auditoría estática de {objetivo} (offline, sin red):")
+        self.ui.linea(resumen_hallazgos(hallazgos))
+
+    def cmd_analizar(self, arg: str) -> None:
+        """Importa y analiza resultados de escaneos YA guardados (offline). Hoy: nmap XML."""
+        partes = (arg or "").split(maxsplit=1)
+        if len(partes) < 2:
+            self.ui.error("Uso: /analizar nmap <archivo.xml>  (analiza un resultado guardado; no ejecuta escaneos)")
+            return
+        tipo, ruta = partes[0].lower(), partes[1].strip()
+        try:
+            texto = self.ws.leer(self.ws.rel(self.ws.ruta(ruta)))
+        except (OSError, ValueError, ErrorRuta):
+            self.ui.error(f"No pude abrir {ruta}.")
+            return
+        if tipo == "nmap":
+            try:
+                inv = importar_nmap_xml(texto)
+            except ValueError as e:
+                self.ui.error(str(e))
+                return
+            for h in inv["hosts"]:
+                abiertos = [p for p in h["puertos"] if p["estado"] == "open"]
+                self.ui.info(f"  {h['host']}: {len(abiertos)} puerto(s) abierto(s)")
+                for p in abiertos:
+                    self.ui.tenue(f"    {p['puerto']}/{p['protocolo']} {p['servicio']}")
+        else:
+            self.ui.error(f"Analizador '{tipo}' no disponible. Hoy: nmap (XML guardado).")
+
     def cmd_desempeno(self, arg: str) -> None:
         if getattr(self, "desempeno", None) is None:
             self.ui.info("No hay memoria de desempeño en esta sesión.")
