@@ -277,6 +277,9 @@ class App:
         if res.escalado:
             detalle.append("con escalada")
         self.ui.tenue("  " + " · ".join(detalle))
+        claim = getattr(self.principal, "_ultimo_claim", None)
+        if claim is not None and claim.nivel and claim.nivel != "BEHAVIOR_VERIFIED":
+            self.ui.tenue(f"  verificación: {claim.nivel}" + (f" — {recortar(claim.motivo, 120)}" if claim.motivo else ""))
         if not res.ok:
             self.ui.aviso(f"  (terminó con estado: {res.motivo})")
         self.ui.linea("")

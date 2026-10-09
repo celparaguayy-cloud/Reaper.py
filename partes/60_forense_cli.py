@@ -26,3 +26,25 @@ def _cmd_forense(self: "App", arg: str) -> None:
 
 setattr(App, "cmd_forense", _cmd_forense)
 COMANDOS_AYUDA[0][1].append(("/forense [tests]", "investiga un fallo con método: aislar, estado compartido, bisección, hipótesis"))
+
+
+def _cmd_claims(self: "App", arg: str) -> None:
+    claim = getattr(self.principal, "_ultimo_claim", None)
+    if claim is None:
+        self.ui.tenue("Todavía no hay claims evaluados (el Evidence Gate corre al cerrar un pedido).")
+        return
+    self.ui.info(f"Última afirmación evaluada · estado {claim.status} · nivel {claim.nivel}")
+    mostrar_markdown(self.ui, recortar(claim.statement, 600))
+    if claim.motivo:
+        self.ui.aviso("  " + claim.motivo)
+    if claim.evidence:
+        self.ui.tenue("  evidencia:")
+        for e in claim.evidence[-8:]:
+            marca = "✓" if e.ok else "✗"
+            extra = f" discr={e.discriminacion}" if e.source == "run_tests" and e.discriminacion < 1.0 else ""
+            self.ui.tenue(f"    {marca} {e.source}{extra}")
+
+
+setattr(App, "cmd_claims", _cmd_claims)
+setattr(App, "cmd_evidence", _cmd_claims)
+COMANDOS_AYUDA[0][1].append(("/claims", "muestra la última afirmación y su nivel de evidencia (TEST_SUITE_GREEN, BEHAVIOR_VERIFIED...)"))

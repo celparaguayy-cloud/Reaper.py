@@ -356,6 +356,7 @@ class Agente:
         self._escrituras_en_test = 0
         self._forense_hecho = False
         self._informe_forense: Optional["InformeForense"] = None
+        self._ultimo_claim = None
         self._comandos_mutaron = False
         self._confirmado_en: Optional[int] = None
         self._cid_propio: Optional[int] = None
@@ -402,6 +403,7 @@ class Agente:
         self._escrituras_en_test = 0
         self._forense_hecho = False
         self._informe_forense = None
+        self._ultimo_claim = None
         self._comandos_mutaron = False
         self._confirmado_en = None
         if self.ctx.cid_inicio is None and self.rol.nombre in ROLES_CON_GUARDIA and not self.rol.solo_lectura:
@@ -1047,9 +1049,36 @@ class Agente:
     def _nota_afirmacion(self, texto: str) -> str:
         motivo = self._falta_evidencia(texto)
         if not motivo:
-            return ""
+            return self._nota_evidence_gate(texto)
         self.ui.aviso(f"  [{self.etiqueta}] el informe afirma una verificación sin evidencia: {motivo}")
         return f"\n\n⚠ REAPER: este informe afirma una verificación, pero {motivo}. Tomalo como NO verificado."
+
+    def _evaluar_claim(self, texto: str) -> Optional["Claim"]:
+        """Pasa el informe por el Evidence Gate (Fase 2) y guarda el claim para el informe final."""
+        if self.rol.nombre not in ROLES_CON_GUARDIA or not self.settings.forense:
+            return None
+        try:
+            claim = evaluar_cierre(self.ws, texto, self._evidencias, self.rol.nombre)
+        except (OSError, ValueError):
+            return None
+        self._ultimo_claim = claim
+        return claim
+
+    def _rechazo_evidence_gate(self, texto: str) -> str:
+        """Rechazo para los casos que el Evidence Gate agrega: alcance excedido, verde sin discriminación, stale."""
+        claim = self._evaluar_claim(texto)
+        if claim is None or not claim.motivo:
+            return ""
+        if claim.status in ("PARTIALLY_SUPPORTED", "CONTRADICTED", "STALE"):
+            self.ui.aviso(f"  [{self.etiqueta}] cierre observado por el Evidence Gate: {claim.nivel}")
+            return "No acepto el cierre tal cual. EVIDENCE GATE: " + claim.motivo
+        return ""
+
+    def _nota_evidence_gate(self, texto: str) -> str:
+        claim = self._evaluar_claim(texto)
+        if claim is None or not claim.motivo or claim.status == "SUPPORTED":
+            return ""
+        return f"\n\n⚠ EVIDENCE GATE [{claim.nivel}]: {claim.motivo}"
 
     def _cierre_en_texto(self, texto: str, paso: int, sin_herramienta: int, anuncios: int) -> Optional[ResultadoAgente]:
         """
@@ -1096,6 +1125,12 @@ class Agente:
             self.ctx.tropiezo("cumplimiento_falso")
             self.ui.aviso(f"  [{self.etiqueta}] respuesta rechazada: afirma una verificación sin evidencia")
             self._aviso_pendiente = self._rechazo_afirmacion(motivo)
+            return None
+        rechazo_gate = self._rechazo_evidence_gate(texto)
+        if rechazo_gate and self._rechazos < 2 and not sin_tools:
+            self._rechazos += 1
+            self.ctx.tropiezo("evidence_gate")
+            self._aviso_pendiente = rechazo_gate
             return None
         return self._cerrar(texto + self._nota_afirmacion(texto), paso, "respuesta")
 
@@ -1309,6 +1344,11 @@ class Agente:
             self.ctx.tropiezo("cumplimiento_falso")
             self.ui.aviso(f"  [{self.etiqueta}] cierre rechazado: afirma una verificación sin evidencia")
             return False, obs(self._rechazo_afirmacion(motivo)), False
+        rechazo_gate = self._rechazo_evidence_gate(informe)
+        if rechazo_gate and self._rechazos < 3:
+            self._rechazos += 1
+            self.ctx.tropiezo("evidence_gate")
+            return False, obs(rechazo_gate), False
         return True, "", ok
 
     def _delegar(self, grupo: list) -> tuple[list[str], bool]:

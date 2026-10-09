@@ -10072,6 +10072,7 @@ class Agente:
         self._escrituras_en_test = 0
         self._forense_hecho = False
         self._informe_forense: Optional["InformeForense"] = None
+        self._ultimo_claim = None
         self._comandos_mutaron = False
         self._confirmado_en: Optional[int] = None
         self._cid_propio: Optional[int] = None
@@ -10118,6 +10119,7 @@ class Agente:
         self._escrituras_en_test = 0
         self._forense_hecho = False
         self._informe_forense = None
+        self._ultimo_claim = None
         self._comandos_mutaron = False
         self._confirmado_en = None
         if self.ctx.cid_inicio is None and self.rol.nombre in ROLES_CON_GUARDIA and not self.rol.solo_lectura:
@@ -10763,9 +10765,36 @@ class Agente:
     def _nota_afirmacion(self, texto: str) -> str:
         motivo = self._falta_evidencia(texto)
         if not motivo:
-            return ""
+            return self._nota_evidence_gate(texto)
         self.ui.aviso(f"  [{self.etiqueta}] el informe afirma una verificación sin evidencia: {motivo}")
         return f"\n\n⚠ REAPER: este informe afirma una verificación, pero {motivo}. Tomalo como NO verificado."
+
+    def _evaluar_claim(self, texto: str) -> Optional["Claim"]:
+        """Pasa el informe por el Evidence Gate (Fase 2) y guarda el claim para el informe final."""
+        if self.rol.nombre not in ROLES_CON_GUARDIA or not self.settings.forense:
+            return None
+        try:
+            claim = evaluar_cierre(self.ws, texto, self._evidencias, self.rol.nombre)
+        except (OSError, ValueError):
+            return None
+        self._ultimo_claim = claim
+        return claim
+
+    def _rechazo_evidence_gate(self, texto: str) -> str:
+        """Rechazo para los casos que el Evidence Gate agrega: alcance excedido, verde sin discriminación, stale."""
+        claim = self._evaluar_claim(texto)
+        if claim is None or not claim.motivo:
+            return ""
+        if claim.status in ("PARTIALLY_SUPPORTED", "CONTRADICTED", "STALE"):
+            self.ui.aviso(f"  [{self.etiqueta}] cierre observado por el Evidence Gate: {claim.nivel}")
+            return "No acepto el cierre tal cual. EVIDENCE GATE: " + claim.motivo
+        return ""
+
+    def _nota_evidence_gate(self, texto: str) -> str:
+        claim = self._evaluar_claim(texto)
+        if claim is None or not claim.motivo or claim.status == "SUPPORTED":
+            return ""
+        return f"\n\n⚠ EVIDENCE GATE [{claim.nivel}]: {claim.motivo}"
 
     def _cierre_en_texto(self, texto: str, paso: int, sin_herramienta: int, anuncios: int) -> Optional[ResultadoAgente]:
         """
@@ -10812,6 +10841,12 @@ class Agente:
             self.ctx.tropiezo("cumplimiento_falso")
             self.ui.aviso(f"  [{self.etiqueta}] respuesta rechazada: afirma una verificación sin evidencia")
             self._aviso_pendiente = self._rechazo_afirmacion(motivo)
+            return None
+        rechazo_gate = self._rechazo_evidence_gate(texto)
+        if rechazo_gate and self._rechazos < 2 and not sin_tools:
+            self._rechazos += 1
+            self.ctx.tropiezo("evidence_gate")
+            self._aviso_pendiente = rechazo_gate
             return None
         return self._cerrar(texto + self._nota_afirmacion(texto), paso, "respuesta")
 
@@ -11025,6 +11060,11 @@ class Agente:
             self.ctx.tropiezo("cumplimiento_falso")
             self.ui.aviso(f"  [{self.etiqueta}] cierre rechazado: afirma una verificación sin evidencia")
             return False, obs(self._rechazo_afirmacion(motivo)), False
+        rechazo_gate = self._rechazo_evidence_gate(informe)
+        if rechazo_gate and self._rechazos < 3:
+            self._rechazos += 1
+            self.ctx.tropiezo("evidence_gate")
+            return False, obs(rechazo_gate), False
         return True, "", ok
 
     def _delegar(self, grupo: list) -> tuple[list[str], bool]:
@@ -25664,6 +25704,9 @@ class App:
         if res.escalado:
             detalle.append("con escalada")
         self.ui.tenue("  " + " · ".join(detalle))
+        claim = getattr(self.principal, "_ultimo_claim", None)
+        if claim is not None and claim.nivel and claim.nivel != "BEHAVIOR_VERIFIED":
+            self.ui.tenue(f"  verificación: {claim.nivel}" + (f" — {recortar(claim.motivo, 120)}" if claim.motivo else ""))
         if not res.ok:
             self.ui.aviso(f"  (terminó con estado: {res.motivo})")
         self.ui.linea("")
@@ -38392,6 +38435,135 @@ class TestForenseEvidencia(BaseTest):
 
 
 # ======================================================================
+# MÓDULO: autotest_evidence
+# ======================================================================
+"""Autotests del Evidence Core (Fase 2 / v9): EvidenceGate, niveles de verificación y cierre del agente."""
+
+_TAUT_EV = ('import unittest\nfrom suma import suma\nclass T(unittest.TestCase):\n'
+         '    def test_a(self):\n        self.assertTrue(True)\n'
+         '    def test_b(self):\n        suma(2, 3)\n        self.assertEqual(1, 1)\n')
+_BUENO_EV = ('import unittest\nfrom suma import suma\nclass T(unittest.TestCase):\n'
+          '    def test_a(self):\n        self.assertEqual(suma(2, 3), 5)\n'
+          '    def test_b(self):\n        self.assertEqual(suma(-1, 1), 0)\n')
+
+
+class TestEvidenceGate(BaseTest):
+    def _receipt(self, source, ok=True, exit_code=0, revision="", discr=1.0):
+        return ToolReceipt(source=source, ok=ok, exit_code=exit_code, revision=revision, discriminacion=discr)
+
+    def test_sin_evidencia_unverified(self):
+        c = Claim("Listo, los tests pasan y todo funciona.")
+        EvidenceGate().evaluar(c)
+        self.assertEqual(c.status, "UNVERIFIED")
+        self.assertIn("evidencia", c.motivo.lower())
+
+    def test_tests_pasan_contradicho_si_fallo(self):
+        c = Claim("Todos los tests pasan.", evidence=[self._receipt("run_tests", ok=False)])
+        EvidenceGate().evaluar(c)
+        self.assertEqual(c.status, "CONTRADICTED")
+
+    def test_scope_excede_evidencia(self):
+        c = Claim("Los tests pasan: no hay ningún bug y funciona perfectamente.",
+                  evidence=[self._receipt("run_tests", ok=True), self._receipt("execute_command", ok=True)])
+        EvidenceGate().evaluar(c)
+        self.assertEqual(c.status, "PARTIALLY_SUPPORTED")
+        self.assertIn("CLAIM_SCOPE_EXCEEDS_EVIDENCE", c.motivo)
+
+    def test_behavior_verified(self):
+        c = Claim("Corrí los tests y el programa: dan el resultado esperado.",
+                  evidence=[self._receipt("run_tests", ok=True), self._receipt("execute_command", ok=True)])
+        EvidenceGate().evaluar(c)
+        self.assertEqual((c.status, c.nivel), ("SUPPORTED", "BEHAVIOR_VERIFIED"))
+
+    def test_green_sin_discriminacion(self):
+        ws = self.proyecto({"suma.py": "def suma(a, b):\n    return a + b\n", "tests/test_suma.py": _TAUT_EV})
+        c = Claim("Los tests pasan, el comportamiento es correcto.", evidence=[self._receipt("run_tests", ok=True)])
+        EvidenceGate(ws).evaluar(c)
+        self.assertEqual(c.nivel, "TEST_SUITE_GREEN")
+        self.assertIn("NO BEHAVIOR_VERIFIED", c.motivo)
+
+    def test_green_discriminante_ok(self):
+        ws = self.proyecto({"suma.py": "def suma(a, b):\n    return a + b\n", "tests/test_suma.py": _BUENO_EV})
+        c = Claim("Los tests pasan.", evidence=[self._receipt("run_tests", ok=True)])
+        EvidenceGate(ws).evaluar(c)
+        self.assertEqual((c.status, c.nivel), ("SUPPORTED", "TEST_SUITE_GREEN"))
+        self.assertEqual(c.motivo, "")
+
+    def test_stale_evidence(self):
+        ws = self.proyecto({"a.py": "X = 1\n"})
+        viejo = ws.huella()
+        c = Claim("Los tests pasan.", evidence=[self._receipt("run_tests", ok=True, revision=viejo)])
+        ws.escribir("a.py", "X = 2\n")     # el código cambió después de la evidencia
+        EvidenceGate(ws).evaluar(c)
+        self.assertEqual(c.status, "STALE")
+        self.assertIn("STALE_EVIDENCE", c.motivo)
+
+    def test_discriminacion_de_tests(self):
+        ws = self.proyecto({"suma.py": "def suma(a, b):\n    return a + b\n", "tests/test_suma.py": _TAUT_EV})
+        discr, problemas = discriminacion_de_tests(ws)
+        self.assertLess(discr, 0.7)
+        self.assertTrue(problemas)
+
+
+class TestEvidenceGateEnAgente(BaseTest):
+    def _obs(self, llm):
+        return [MockLLM.ultimo_usuario(c["mensajes"]) for c in llm.llamadas]
+
+    def test_rechaza_afirmacion_que_excede_evidencia(self):
+        ws = self.proyecto()
+        llm = MockLLM([
+            herramienta_xml("execute_command", command='python3 -c "print(2+2)"'),
+            terminar_xml("2+2 da 4. No hay ningún bug y el programa funciona perfectamente."),
+            terminar_xml("Ejecuté 2+2 con python y devuelve 4."),
+        ])
+        res = Agente("principal", llm, ws, self.ajustes(forense=True, escalar=False), self.ui(),
+                     memoria=None, mostrar_progreso=False).ejecutar("cuánto es 2+2 con python")
+        obs = self._obs(llm)
+        self.assertTrue(any("EVIDENCE GATE" in o and "CLAIM_SCOPE" in o for o in obs))
+        self.assertTrue(res.ok)
+        self.assertIn("4", res.resumen)
+
+    def test_green_sin_discriminacion_se_marca_al_cerrar(self):
+        ws = self.proyecto({"suma.py": "def suma(a, b):\n    return a + b\n", "tests/test_suma.py": _TAUT_EV})
+        llm = MockLLM([
+            herramienta_xml("run_tests"),
+            terminar_xml("Los tests pasan y el comportamiento es correcto."),
+            terminar_xml("Corrí los tests: 2 pasan. No verifican casos borde (tautológicos)."),
+        ])
+        res = Agente("principal", llm, ws, self.ajustes(forense=True, escalar=False), self.ui(),
+                     memoria=None, mostrar_progreso=False).ejecutar("revisá suma.py")
+        obs = self._obs(llm)
+        self.assertTrue(any("EVIDENCE GATE" in o for o in obs))
+        self.assertTrue(res.ok)
+
+    def test_informe_honesto_no_se_rechaza(self):
+        ws = self.proyecto()
+        llm = MockLLM([
+            herramienta_xml("execute_command", command='python3 -c "print(2+2)"'),
+            terminar_xml("Ejecuté 2+2 con python: devuelve 4."),
+        ])
+        res = Agente("principal", llm, ws, self.ajustes(forense=True, escalar=False), self.ui(),
+                     memoria=None, mostrar_progreso=False).ejecutar("cuánto es 2+2 con python")
+        self.assertEqual(res.pasos, 2)
+        self.assertNotIn("EVIDENCE GATE", res.resumen)
+
+
+class TestClaimsCLI(BaseTest):
+    def test_comando_claims(self):
+        ws = self.proyecto()
+        llm = MockLLM([
+            herramienta_xml("execute_command", command='python3 -c "print(2+2)"'),
+            terminar_xml("Ejecuté 2+2: da 4."),
+        ])
+        app = App(self.ajustes(forense=True, escalar=False), llm, self.ui(), ws, persistir=False)
+        app.turno("cuánto es 2+2 con python")
+        app.comando("/claims")
+        texto = app.ui.texto_registrado()
+        self.assertIn("nivel", texto.lower())
+        self.assertIn("BEHAVIOR_VERIFIED", texto)
+
+
+# ======================================================================
 # MÓDULO: autotest_runner
 # ======================================================================
 """Ejecutor del autotest interno."""
@@ -40727,6 +40899,288 @@ def _cmd_forense(self: "App", arg: str) -> None:
 
 setattr(App, "cmd_forense", _cmd_forense)
 COMANDOS_AYUDA[0][1].append(("/forense [tests]", "investiga un fallo con método: aislar, estado compartido, bisección, hipótesis"))
+
+
+def _cmd_claims(self: "App", arg: str) -> None:
+    claim = getattr(self.principal, "_ultimo_claim", None)
+    if claim is None:
+        self.ui.tenue("Todavía no hay claims evaluados (el Evidence Gate corre al cerrar un pedido).")
+        return
+    self.ui.info(f"Última afirmación evaluada · estado {claim.status} · nivel {claim.nivel}")
+    mostrar_markdown(self.ui, recortar(claim.statement, 600))
+    if claim.motivo:
+        self.ui.aviso("  " + claim.motivo)
+    if claim.evidence:
+        self.ui.tenue("  evidencia:")
+        for e in claim.evidence[-8:]:
+            marca = "✓" if e.ok else "✗"
+            extra = f" discr={e.discriminacion}" if e.source == "run_tests" and e.discriminacion < 1.0 else ""
+            self.ui.tenue(f"    {marca} {e.source}{extra}")
+
+
+setattr(App, "cmd_claims", _cmd_claims)
+setattr(App, "cmd_evidence", _cmd_claims)
+COMANDOS_AYUDA[0][1].append(("/claims", "muestra la última afirmación y su nivel de evidencia (TEST_SUITE_GREEN, BEHAVIOR_VERIFIED...)"))
+
+
+# ======================================================================
+# MÓDULO: evidence
+# ======================================================================
+"""
+Evidence Core (v9, Fase 2): separar CLAIM (lo que un agente afirma) de EVIDENCE (lo que una herramienta
+observó), y un EvidenceGate que decide el NIVEL de verificación en vez de aceptar "funciona" a secas.
+
+Ataca los fallos de v8:
+  §1.4 "todos los tests pasan, por lo tanto no hay errores"  → CLAIM_SCOPE_EXCEEDS_EVIDENCE
+  §1.1/1.2 tests verdes pero tautológicos o que mockean el sistema → TEST_SUITE_GREEN ≠ BEHAVIOR_VERIFIED
+  §31 evidencia de una revisión vieja → STALE_EVIDENCE
+
+La filosofía: los modelos proponen, las herramientas observan, la evidencia decide.
+"""
+
+# Niveles de verificación, de menor a mayor fuerza (MASTER SPEC §1.4).
+NIVELES_VERIFICACION = ("UNVERIFIED", "TEST_SUITE_GREEN", "PARTIALLY_VERIFIED", "BEHAVIOR_VERIFIED",
+                        "INTEGRATION_VERIFIED", "SPEC_VERIFIED")
+# Estados de un claim.
+ESTADOS_CLAIM = ("UNVERIFIED", "SUPPORTED", "PARTIALLY_SUPPORTED", "CONTRADICTED", "REJECTED", "STALE")
+
+
+@dataclass
+class ToolReceipt:
+    """Observación cruda de una herramienta (lo único en lo que el gate confía)."""
+    source: str                       # run_tests | validate | execute_command | run_python | inspect_tests
+    exit_code: Optional[int] = None
+    ok: bool = False
+    resumen: str = ""
+    revision: str = ""                # huella del workspace cuando se observó
+    discriminacion: float = 1.0       # si aplica (tests): 1.0 = discriminan; <1 = débiles
+    timestamp: float = field(default_factory=time.time)
+
+    def como_dict(self) -> dict:
+        return {"source": self.source, "exit_code": self.exit_code, "ok": self.ok,
+                "resumen": recortar(self.resumen, 400), "revision": self.revision,
+                "discriminacion": self.discriminacion}
+
+
+@dataclass
+class Claim:
+    statement: str
+    agent: str = ""
+    tipo: str = "resultado"           # resultado | tests | comportamiento | spec
+    confidence: float = 0.5
+    evidence: list = field(default_factory=list)   # ToolReceipt
+    status: str = "UNVERIFIED"
+    nivel: str = "UNVERIFIED"
+    motivo: str = ""
+
+    def como_dict(self) -> dict:
+        return {"statement": recortar(self.statement, 300), "agent": self.agent, "tipo": self.tipo,
+                "status": self.status, "nivel": self.nivel, "motivo": self.motivo,
+                "evidence": [e.como_dict() for e in self.evidence]}
+
+
+# Afirmaciones que EXCEDEN lo que un test verde puede demostrar (§1.4).
+_RE_EXCEDE = re.compile(
+    r"\b(no\s+(?:hay|tiene|existen?|quedan)\s+(?:errores|bugs?|fallos?|problemas?)"
+    r"|sin\s+(?:errores|bugs?|fallos?)\b"
+    r"|(?:100|cien)\s*%?\s*(?:correcto|funcional|cubierto)"
+    r"|funciona\s+(?:perfectamente|a\s+la\s+perfecci[óo]n)"
+    r"|listo\s+para\s+producci[óo]n|production[- ]ready"
+    r"|totalmente\s+(?:correcto|verificad|probad)|completamente\s+(?:correcto|verificad|probad)"
+    r"|garantiz\w+\s+que|imposible\s+que\s+falle|no\s+puede\s+fallar"
+    r"|bug[- ]free|no\s+bugs?\b)",
+    re.I,
+)
+# Afirmaciones de que los tests pasan.
+_RE_TESTS_PASAN = re.compile(
+    r"\b(?:todos\s+los\s+)?tests?\s+(?:pasan|pasaron|est[áa]n\s+en\s+verde|ok)\b"
+    r"|\b(?:all\s+)?tests?\s+pass(?:ed)?\b|\b\d+\s*/\s*\d+\b|pytest\b.*\bok\b|unittest.*\bok\b",
+    re.I,
+)
+# Afirmaciones de comportamiento ("funciona", "anda", "corre bien").
+_RE_COMPORTAMIENTO = re.compile(
+    r"\b(funciona|anda|corre|ejecuta)\b(?!\s+(?:de|como))|se\s+comporta|produce\s+(?:el|la)\s+(?:resultado|salida)"
+    r"\s+(?:correct|esperad)|verifiqu[ée]\s+el\s+comportamiento",
+    re.I,
+)
+
+
+def _revision(ws) -> str:
+    try:
+        return ws.huella()
+    except (OSError, AttributeError):
+        return ""
+
+
+def receipt_de_evidencia(tipo: str, estado: str, ws=None, resumen: str = "",
+                         discriminacion: float = 1.0) -> ToolReceipt:
+    """Construye un ToolReceipt a partir de la evidencia que el agente ya registra (tipo, estado)."""
+    ok = estado == "ok"
+    return ToolReceipt(source=tipo, ok=ok, exit_code=0 if ok else 1, resumen=resumen,
+                       revision=_revision(ws) if ws is not None else "", discriminacion=discriminacion)
+
+
+def discriminacion_de_tests(ws, limite: int = 60) -> tuple[float, list[str]]:
+    """
+    Discriminación media de los tests Python del proyecto y los problemas ALTA (tautología, mock del sujeto).
+    1.0 y [] si no hay tests Python o están sanos.
+    """
+    try:
+        archivos = [ws.rel(p) for p in ws.iterar(limite=limite * 3)
+                    if ws.rel(p).endswith(".py") and es_archivo_de_test(ws.rel(p))][:limite]
+    except OSError:
+        return 1.0, []
+    if not archivos:
+        return 1.0, []
+    valores, problemas = [], []
+    for rel in archivos:
+        try:
+            res = analizar_tests_python(ws.leer(rel))
+        except (OSError, ValueError, ErrorRuta):
+            continue
+        valores.append(res.discriminacion)
+        for p in res.problemas:
+            if p.severidad == "alta" and p.tipo in ("TAUTOLOGIA", "MOCK_SISTEMA_BAJO_PRUEBA", "VALOR_DESDE_MOCK",
+                                                    "INTEGRACION_MOCKEADA"):
+                problemas.append(f"{rel}: {p.test} [{p.tipo}]")
+    if not valores:
+        return 1.0, []
+    return round(sum(valores) / len(valores), 2), problemas[:12]
+
+
+class EvidenceGate:
+    """
+    Evalúa un claim contra evidencia real + inteligencia de tests. No decide 'verdadero/falso':
+    asigna un NIVEL de verificación y explica qué falta para subir.
+    """
+
+    def __init__(self, ws=None):
+        self.ws = ws
+
+    def evaluar(self, claim: Claim) -> Claim:
+        texto = claim.statement or ""
+        afirma_tests = bool(_RE_TESTS_PASAN.search(texto))
+        afirma_comportamiento = bool(_RE_COMPORTAMIENTO.search(texto))
+        afirma_exceso = bool(_RE_EXCEDE.search(texto))
+
+        receipts = claim.evidence
+        tests_ok = [r for r in receipts if r.source == "run_tests" and r.ok]
+        tests_fallan = [r for r in receipts if r.source == "run_tests" and not r.ok]
+        corridas = [r for r in receipts if r.source in ("execute_command", "run_python") and r.ok]
+        bloqueadas = [r for r in receipts if r.source in ("run_tests", "validate", "execute_command", "run_python")
+                      and r.exit_code in (None,) and not r.ok]
+
+        # revisión obsoleta: la última evidencia es de otra revisión que la actual
+        revision_actual = _revision(self.ws) if self.ws is not None else ""
+        if revision_actual and receipts:
+            frescas = [r for r in receipts if not r.revision or r.revision == revision_actual]
+            if not frescas and tests_ok:
+                claim.status, claim.nivel = "STALE", "UNVERIFIED"
+                claim.motivo = ("STALE_EVIDENCE: la evidencia es de una revisión anterior; el código cambió después. "
+                                "Volvé a correr los tests sobre el estado actual.")
+                return claim
+
+        # discriminación de los tests (Fase 1)
+        discriminacion = 1.0
+        problemas_tests: list[str] = []
+        if self.ws is not None and (afirma_tests or afirma_comportamiento):
+            discriminacion, problemas_tests = discriminacion_de_tests(self.ws)
+            for r in tests_ok:
+                r.discriminacion = discriminacion
+
+        # 0) dijo que los tests pasan pero el último run_tests falló (un run fallido ES evidencia de ejecución)
+        if afirma_tests and tests_fallan and not tests_ok:
+            claim.status, claim.nivel = "CONTRADICTED", "UNVERIFIED"
+            claim.motivo = "decís que los tests pasan pero el último run_tests FALLÓ. Contradice la evidencia."
+            return claim
+
+        # 1) nada ejecutado pero afirma éxito
+        if (afirma_tests or afirma_comportamiento or afirma_exceso) and not (tests_ok or corridas):
+            claim.status, claim.nivel = "UNVERIFIED", "UNVERIFIED"
+            if bloqueadas:
+                claim.motivo = ("las ejecuciones fueron BLOQUEADAS/rechazadas: no hay evidencia real. "
+                                "Corré run_tests o execute_command de verdad.")
+            else:
+                claim.motivo = "no hay evidencia de ejecución (run_tests / execute_command). Ejecutá antes de afirmar."
+            return claim
+
+        # nivel base por lo observado
+        nivel = "UNVERIFIED"
+        if tests_ok:
+            nivel = "TEST_SUITE_GREEN"
+        if tests_ok and corridas:
+            nivel = "BEHAVIOR_VERIFIED"
+        elif corridas and not (afirma_tests or tests_ok):
+            nivel = "BEHAVIOR_VERIFIED"
+
+        # 3) tests verdes pero no discriminan → no sube a BEHAVIOR_VERIFIED
+        if tests_ok and discriminacion < 0.7 and problemas_tests:
+            claim.status, claim.nivel = "PARTIALLY_SUPPORTED", "TEST_SUITE_GREEN"
+            claim.motivo = ("TEST_SUITE_GREEN pero NO BEHAVIOR_VERIFIED: los tests pasan pero no discriminan "
+                            f"(discriminación {discriminacion}). Problemas: " + "; ".join(problemas_tests[:4])
+                            + ". Verde no equivale a correcto; corregí los tests o agregá casos que fallen si el "
+                            "código se rompe.")
+            return claim
+
+        # 4) el alcance del claim excede la evidencia (§1.4)
+        if afirma_exceso:
+            claim.status, claim.nivel = "PARTIALLY_SUPPORTED", nivel
+            cuanto = (f"{len(tests_ok)} corrida(s) de tests" if tests_ok else "la evidencia disponible")
+            claim.motivo = ("CLAIM_SCOPE_EXCEEDS_EVIDENCE: afirmás ausencia total de errores / correctitud "
+                            f"absoluta, pero {cuanto} solo demuestra que esos casos pasan. Acotá la afirmación a "
+                            "lo que la evidencia respalda (p. ej. 'los N tests pasan sobre esta revisión').")
+            return claim
+
+        claim.status = "SUPPORTED" if nivel != "UNVERIFIED" else "UNVERIFIED"
+        claim.nivel = nivel
+        claim.confidence = {"BEHAVIOR_VERIFIED": 0.85, "TEST_SUITE_GREEN": 0.65, "UNVERIFIED": 0.3}.get(nivel, 0.5)
+        return claim
+
+
+class LibroEvidencia:
+    """Registro de claims de una tarea (para el informe final y /claims). Opcional en disco."""
+
+    def __init__(self, ws=None):
+        self.ws = ws
+        self.claims: list[Claim] = []
+
+    def registrar(self, claim: Claim) -> Claim:
+        self.claims.append(claim)
+        return claim
+
+    def resumen(self) -> str:
+        if not self.claims:
+            return "Sin claims registrados."
+        lineas = []
+        for c in self.claims[-12:]:
+            lineas.append(f"[{c.status}/{c.nivel}] {recortar(c.statement, 90)}"
+                          + (f"  → {recortar(c.motivo, 120)}" if c.motivo else ""))
+        return "\n".join(lineas)
+
+    def guardar(self) -> Optional[Path]:
+        if self.ws is None or not self.claims:
+            return None
+        try:
+            carpeta = self.ws.raiz / ".reaper" / "evidencia"
+            carpeta.mkdir(parents=True, exist_ok=True)
+            ruta = carpeta / f"claims_{datetime.now():%Y%m%d_%H%M%S}.json"
+            escritura_atomica(ruta, json.dumps([c.como_dict() for c in self.claims], ensure_ascii=False, indent=2))
+            return ruta
+        except OSError:
+            return None
+
+
+def evaluar_cierre(ws, informe: str, evidencias: list, agente: str = "") -> Claim:
+    """
+    Construye un Claim desde el informe final + la evidencia que el agente registró (lista de tuplas
+    (tipo, estado, version)) y lo pasa por el EvidenceGate. Devuelve el Claim evaluado.
+    """
+    receipts = []
+    for ev in evidencias[-12:]:
+        tipo, estado = ev[0], ev[1]
+        receipts.append(receipt_de_evidencia(tipo, estado, ws))
+    claim = Claim(statement=informe, agent=agente, evidence=receipts)
+    return EvidenceGate(ws).evaluar(claim)
 
 
 # ======================================================================
