@@ -7246,6 +7246,443 @@ PALABRAS_GUIA.extend([
 
 
 # ======================================================================
+# MÓDULO: test_intelligence
+# ======================================================================
+"""
+Test Intelligence (v9, Fase 1): REAPER mira los tests con lupa antes de creerse un "17/17 verde".
+
+Ataca los fallos reales de v8 (MASTER SPEC §1):
+  - tests tautológicos (assertTrue(True), assertEqual(1, 1), x == x): no discriminan nada;
+  - mocks que reemplazan EL sistema bajo prueba (patch de la función que el test dice probar);
+  - "integración" que en realidad mockea subprocess/socket/open: no es integración real;
+  - valor esperado FABRICADO por el propio mock (return_value="X" ... assertEqual(r, "X"));
+  - clasificación UNIT / INTEGRATION / E2E / ... y si el test está MAL ETIQUETADO.
+
+Todo es análisis estático con AST (no ejecuta nada). La MutationProbe (ejecuta) está en otra función.
+Es la base del Evidence Gate: una afirmación "los tests pasan" vale menos si los tests no discriminan.
+"""
+
+NIVELES_TEST = ("unit", "integration", "e2e", "smoke", "regression", "property", "security", "performance")
+
+# Operaciones de E/S reales: mockearlas convierte una "integración" en unit.
+_IO_REAL = (
+    "subprocess.run", "subprocess.Popen", "subprocess.call", "subprocess.check_output", "subprocess.check_call",
+    "os.system", "os.popen", "os.exec", "pty.spawn",
+    "socket.socket", "socket.create_connection",
+    "urllib.request.urlopen", "requests.get", "requests.post", "requests.request", "requests.put",
+    "http.client.HTTPConnection", "httpx.get", "httpx.post", "httpx.Client",
+    "sqlite3.connect", "psycopg2.connect", "pymysql.connect",
+    "builtins.open", "open", "pathlib.Path.open", "io.open",
+    "smtplib.SMTP", "ftplib.FTP",
+)
+_OPS_ARCHIVO = ("open", "subprocess.run", "subprocess.Popen", "os.system", "Path.open", "Path.write_text",
+                "Path.read_text")
+
+
+@dataclass
+class ProblemaTest:
+    tipo: str                 # TAUTOLOGIA | MOCK_SISTEMA_BAJO_PRUEBA | INTEGRACION_MOCKEADA | VALOR_DESDE_MOCK | SIN_ASSERT | MAL_ETIQUETADO
+    test: str
+    linea: int
+    severidad: str            # alta | media | baja
+    detalle: str
+
+
+@dataclass
+class InfoTest:
+    nombre: str
+    linea: int
+    nivel_declarado: str = ""     # por nombre/docstring/marcador
+    nivel_real: str = "unit"      # lo que de verdad hace
+    mocks: list = field(default_factory=list)
+    asserts: int = 0
+    tautologias: int = 0
+
+
+@dataclass
+class ResultadoInteligencia:
+    tests: list = field(default_factory=list)       # InfoTest
+    problemas: list = field(default_factory=list)   # ProblemaTest
+
+    @property
+    def ok(self) -> bool:
+        return not any(p.severidad == "alta" for p in self.problemas)
+
+    @property
+    def discriminacion(self) -> float:
+        """Fracción de tests sin tautologías y con al menos un assert real (1.0 = todos discriminan)."""
+        if not self.tests:
+            return 1.0
+        buenos = sum(1 for t in self.tests if t.asserts > t.tautologias and t.asserts > 0)
+        return round(buenos / len(self.tests), 2)
+
+
+def _ti_walk(nodo, tipo):
+    return [n for n in ast.walk(nodo) if isinstance(n, tipo)]
+
+
+def _ti_src(nodo) -> str:
+    try:
+        return ast.unparse(nodo)
+    except Exception:
+        return ""
+
+
+def _es_tautologia(nodo) -> Optional[str]:
+    """Si el assert/compare no puede distinguir nada, devuelve el motivo."""
+    # assert <constante>  → assert True / assert 1 / assert "x"
+    if isinstance(nodo, ast.Constant):
+        return f"constante {nodo.value!r}: siempre es {'verdadera' if nodo.value else 'falsa'}"
+    if isinstance(nodo, ast.Compare) and len(nodo.ops) == 1:
+        izq, der = _ti_src(nodo.left), _ti_src(nodo.comparators[0])
+        op = nodo.ops[0]
+        if izq == der and isinstance(op, (ast.Eq, ast.Is, ast.LtE, ast.GtE)):
+            return f"{izq} comparado consigo mismo"
+        if izq == der and isinstance(op, (ast.NotEq, ast.IsNot, ast.Lt, ast.Gt)):
+            return f"{izq} != {der}: siempre falso"
+        if isinstance(nodo.left, ast.Constant) and isinstance(nodo.comparators[0], ast.Constant):
+            return f"dos constantes ({izq} {_ti_sym(op)} {der}): no depende del código"
+    return None
+
+
+def _ti_sym(op) -> str:
+    return {ast.Eq: "==", ast.NotEq: "!=", ast.Is: "is", ast.IsNot: "is not",
+            ast.Lt: "<", ast.Gt: ">", ast.LtE: "<=", ast.GtE: ">="}.get(type(op), "?")
+
+
+_ASSERT_UNO = {"assertTrue", "assertFalse", "assertIsNone", "assertIsNotNone", "assertIsInstance"}
+_ASSERT_DOS = {"assertEqual", "assertNotEqual", "assertIs", "assertIsNot", "assertGreater", "assertLess",
+               "assertGreaterEqual", "assertLessEqual", "assertAlmostEqual"}
+_CONST_TRIVIAL = {"assertTrue": True, "assertFalse": False, "assertIsNone": None}
+
+
+def _tautologia_en_assert_metodo(call: ast.Call) -> Optional[str]:
+    metodo = call.func.attr if isinstance(call.func, ast.Attribute) else ""
+    args = call.args
+    if metodo in _ASSERT_UNO and args:
+        a = args[0]
+        if isinstance(a, ast.Constant):
+            if metodo in _CONST_TRIVIAL and a.value == _CONST_TRIVIAL[metodo]:
+                return f"{metodo}({a.value!r}): no prueba nada"
+            if metodo == "assertTrue" and a.value:
+                return f"{metodo}({a.value!r}): siempre verdadero"
+            if metodo == "assertFalse" and not a.value:
+                return f"{metodo}({a.value!r}): siempre verdadero"
+    if metodo in _ASSERT_DOS and len(args) >= 2:
+        a, b = _ti_src(args[0]), _ti_src(args[1])
+        if a == b and metodo in ("assertEqual", "assertIs", "assertAlmostEqual", "assertGreaterEqual",
+                                  "assertLessEqual"):
+            return f"{metodo}({a}, {b}): compara algo consigo mismo"
+        if isinstance(args[0], ast.Constant) and isinstance(args[1], ast.Constant) and metodo == "assertEqual":
+            if args[0].value == args[1].value:
+                return f"{metodo}({a}, {b}): dos constantes iguales"
+    return None
+
+
+def _patches_de(nodo) -> list[tuple[str, int, Optional[ast.Call]]]:
+    """Objetivos mockeados en un test: (target, línea, call). Cubre @patch, with patch(), patch.object()."""
+    salida = []
+    decoradores = getattr(nodo, "decorator_list", [])
+    for call in _ti_walk(nodo, ast.Call) + [d for d in decoradores if isinstance(d, ast.Call)]:
+        f = _ti_src(call.func)
+        if not (f.endswith("patch") or f.endswith("patch.object") or f == "mock.patch" or f.endswith(".patch")):
+            continue
+        if f.endswith("object") and len(call.args) >= 2:
+            base = _ti_src(call.args[0])
+            attr = call.args[1].value if isinstance(call.args[1], ast.Constant) else _ti_src(call.args[1])
+            objetivo = f"{base}.{attr}"
+        elif call.args and isinstance(call.args[0], ast.Constant) and isinstance(call.args[0].value, str):
+            objetivo = call.args[0].value
+        else:
+            continue
+        salida.append((objetivo, getattr(call, "lineno", nodo.lineno), call))
+    return salida
+
+
+def _valores_de_mock(call: ast.Call) -> list:
+    """Literales que un patch inyecta como resultado: return_value=, side_effect=, Mock(stdout=...), etc."""
+    valores = []
+    for kw in call.keywords:
+        if kw.arg in ("return_value", "side_effect") and isinstance(kw.value, ast.Constant):
+            valores.append(kw.value.value)
+        # patch(..., return_value=Mock(stdout="X", returncode=0))
+        if kw.arg == "return_value" and isinstance(kw.value, ast.Call):
+            for kw2 in kw.value.keywords:
+                if isinstance(kw2.value, ast.Constant):
+                    valores.append(kw2.value.value)
+    return valores
+
+
+def _importa_sujetos(arbol: ast.Module) -> dict[str, str]:
+    """Nombres importados con su módulo origen: {'procesar': 'app.core', 'run': 'subprocess'}."""
+    sujetos = {}
+    for nodo in ast.walk(arbol):
+        if isinstance(nodo, ast.ImportFrom) and nodo.module:
+            for alias in nodo.names:
+                sujetos[alias.asname or alias.name] = nodo.module
+        elif isinstance(nodo, ast.Import):
+            for alias in nodo.names:
+                sujetos[alias.asname or alias.name.split(".")[0]] = alias.name
+    return sujetos
+
+
+def _nivel_declarado(nombre: str, docstring: str, decoradores: list) -> str:
+    texto = (nombre + " " + (docstring or "") + " " + " ".join(_ti_src(d) for d in decoradores)).lower()
+    for nivel in ("e2e", "end_to_end", "end-to-end"):
+        if nivel in texto:
+            return "e2e"
+    for clave, nivel in (("integration", "integration"), ("integrac", "integration"), ("security", "security"),
+                         ("perf", "performance"), ("smoke", "smoke"), ("property", "property"), ("regress", "regression")):
+        if clave in texto:
+            return nivel
+    return ""
+
+
+def analizar_tests_python(fuente: str) -> ResultadoInteligencia:
+    """Análisis estático de un archivo de tests Python. No ejecuta nada."""
+    res = ResultadoInteligencia()
+    try:
+        arbol = ast.parse(fuente)
+    except SyntaxError:
+        return res
+    sujetos = _importa_sujetos(arbol)
+    nombres_importados = set(sujetos)
+
+    for fn in ast.walk(arbol):
+        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)) or not fn.name.startswith("test"):
+            continue
+        doc = ast.get_docstring(fn) or ""
+        info = InfoTest(fn.name, fn.lineno, nivel_declarado=_nivel_declarado(fn.name, doc, fn.decorator_list))
+
+        # ---- asserts y tautologías
+        asserts = 0
+        for a in _ti_walk(fn, ast.Assert):
+            asserts += 1
+            motivo = _es_tautologia(a.test)
+            if motivo:
+                info.tautologias += 1
+                res.problemas.append(ProblemaTest("TAUTOLOGIA", fn.name, a.lineno, "alta",
+                                                   f"assert {_ti_src(a.test)}: {motivo}"))
+        for call in _ti_walk(fn, ast.Call):
+            metodo = call.func.attr if isinstance(call.func, ast.Attribute) else ""
+            if metodo in _ASSERT_UNO | _ASSERT_DOS or metodo == "assertRaises":
+                asserts += 1
+                motivo = _tautologia_en_assert_metodo(call)
+                if motivo:
+                    info.tautologias += 1
+                    res.problemas.append(ProblemaTest("TAUTOLOGIA", fn.name, call.lineno, "alta", motivo))
+        info.asserts = asserts
+        if asserts == 0 and not any(_ti_src(c.func).endswith("raises") for c in _ti_walk(fn, ast.Call)):
+            res.problemas.append(ProblemaTest("SIN_ASSERT", fn.name, fn.lineno, "alta",
+                                              "el test no tiene ningún assert: no verifica nada"))
+
+        # ---- mocks
+        patches = _patches_de(fn)
+        info.mocks = [t for t, _l, _c in patches]
+        mockea_io = False
+        valores_mock = []
+        for objetivo, linea, call in patches:
+            base = objetivo.split(".")[-1]
+            raiz = objetivo.split(".")[0]
+            valores_mock.extend(_valores_de_mock(call) if call else [])
+            # ¿mockea una operación de E/S real?
+            if any(objetivo == io or objetivo.endswith("." + io.split(".")[-1]) for io in _IO_REAL) or raiz in (
+                    "subprocess", "socket", "requests", "httpx", "urllib"):
+                mockea_io = True
+            # ¿mockea EL sujeto que el test dice probar? (importado del módulo bajo prueba)
+            if base in nombres_importados and sujetos.get(base) and not sujetos[base].startswith(
+                    ("unittest", "mock", "pytest")):
+                res.problemas.append(ProblemaTest(
+                    "MOCK_SISTEMA_BAJO_PRUEBA", fn.name, linea, "alta",
+                    f"mockea '{objetivo}', que es justo lo que el test debería ejercitar ('{base}' viene de "
+                    f"'{sujetos[base]}'). El test pasa aunque el código real esté roto."))
+
+        # ---- valor esperado fabricado por el mock
+        if valores_mock:
+            constantes_mock = {v for v in valores_mock if isinstance(v, (str, int, float, bool))}
+            for call in _ti_walk(fn, ast.Call):
+                metodo = call.func.attr if isinstance(call.func, ast.Attribute) else ""
+                if metodo in ("assertEqual", "assertIn") and len(call.args) >= 2:
+                    for arg in call.args[:2]:
+                        if isinstance(arg, ast.Constant) and arg.value in constantes_mock:
+                            res.problemas.append(ProblemaTest(
+                                "VALOR_DESDE_MOCK", fn.name, call.lineno, "alta",
+                                f"el valor esperado {arg.value!r} lo inyectó el propio mock: el test comprueba "
+                                "lo que el mock inventó, no lo que hace el código."))
+                            break
+
+        # ---- clasificación real vs declarada
+        corre_io_real = any(_ti_src(c.func).split(".")[-1] in ("run", "Popen", "urlopen", "connect", "socket")
+                            or _ti_src(c.func) in ("open",) for c in _ti_walk(fn, ast.Call)) and not mockea_io
+        if info.nivel_declarado in ("integration", "e2e"):
+            info.nivel_real = info.nivel_declarado
+            if mockea_io:
+                res.problemas.append(ProblemaTest(
+                    "INTEGRACION_MOCKEADA", fn.name, fn.lineno, "alta",
+                    f"se declara '{info.nivel_declarado}' pero mockea la operación real ({', '.join(info.mocks)}): "
+                    "no es integración de verdad. Clasificar como UNIT o no mockear la operación bajo prueba."))
+                info.nivel_real = "unit"
+        else:
+            info.nivel_real = "integration" if corre_io_real else "unit"
+        res.tests.append(info)
+    return res
+
+
+def inteligencia_para_prompt(fuente: str, maximo: int = 8) -> str:
+    """Resumen para avisarle al agente/al Evidence Gate (vacío si los tests están bien)."""
+    res = analizar_tests_python(fuente)
+    if not res.problemas:
+        return ""
+    orden = {"alta": 0, "media": 1, "baja": 2}
+    problemas = sorted(res.problemas, key=lambda p: orden.get(p.severidad, 3))[:maximo]
+    lineas = [f"- {p.test} (línea {p.linea}) [{p.tipo}]: {p.detalle}" for p in problemas]
+    return ("INTELIGENCIA DE TESTS (REAPER los analizó; un test que no discrimina NO demuestra nada):\n"
+            + "\n".join(lineas))
+
+
+# ============================================================================ MutationProbe (ejecuta)
+_MUTACIONES = [
+    (ast.Eq, ast.NotEq), (ast.NotEq, ast.Eq), (ast.Lt, ast.GtE), (ast.Gt, ast.LtE),
+    (ast.LtE, ast.Gt), (ast.GtE, ast.Lt), (ast.Is, ast.IsNot),
+    (ast.Add, ast.Sub), (ast.Sub, ast.Add), (ast.Mult, ast.Add), (ast.And, ast.Or), (ast.Or, ast.And),
+]
+_MAP_MUT = {a: b for a, b in _MUTACIONES}
+
+
+class _Mutador(ast.NodeTransformer):
+    """Aplica UNA mutación (la número objetivo) y recuerda qué cambió."""
+    def __init__(self, objetivo: int):
+        self.objetivo = objetivo
+        self.contador = 0
+        self.aplicada = ""
+
+    def _quizas(self, nodo, descripcion, reemplazo):
+        if self.contador == self.objetivo:
+            self.aplicada = f"línea {getattr(nodo, 'lineno', '?')}: {descripcion}"
+            self.contador += 1
+            return reemplazo
+        self.contador += 1
+        return nodo
+
+    def visit_Compare(self, nodo):
+        self.generic_visit(nodo)
+        if len(nodo.ops) == 1 and type(nodo.ops[0]) in _MAP_MUT:
+            nuevo = _MAP_MUT[type(nodo.ops[0])]()
+            r = self._quizas(nodo, f"{_ti_sym(nodo.ops[0])} → {_ti_sym(nuevo)}",
+                             ast.Compare(left=nodo.left, ops=[nuevo], comparators=nodo.comparators))
+            return ast.copy_location(r, nodo) if r is not nodo else nodo
+        return nodo
+
+    def visit_BinOp(self, nodo):
+        self.generic_visit(nodo)
+        if type(nodo.op) in _MAP_MUT:
+            nuevo = _MAP_MUT[type(nodo.op)]()
+            r = self._quizas(nodo, f"operador binario mutado", ast.BinOp(left=nodo.left, op=nuevo, right=nodo.right))
+            return ast.copy_location(r, nodo) if r is not nodo else nodo
+        return nodo
+
+    def visit_Constant(self, nodo):
+        if isinstance(nodo.value, bool):
+            r = self._quizas(nodo, f"{nodo.value} → {not nodo.value}", ast.Constant(value=not nodo.value))
+            return ast.copy_location(r, nodo) if r is not nodo else nodo
+        if isinstance(nodo.value, int) and not isinstance(nodo.value, bool):
+            r = self._quizas(nodo, f"{nodo.value} → {nodo.value + 1}", ast.Constant(value=nodo.value + 1))
+            return ast.copy_location(r, nodo) if r is not nodo else nodo
+        return nodo
+
+
+def _contar_mutaciones(fuente: str) -> int:
+    try:
+        arbol = ast.parse(fuente)
+    except SyntaxError:
+        return 0
+    m = _Mutador(-1)
+    m.visit(arbol)
+    return m.contador
+
+
+def generar_mutante(fuente: str, indice: int) -> Optional[tuple[str, str]]:
+    """Devuelve (código mutado, descripción) para la mutación número `indice`, o None."""
+    try:
+        arbol = ast.parse(fuente)
+    except SyntaxError:
+        return None
+    mut = _Mutador(indice)
+    nuevo = mut.visit(arbol)
+    if not mut.aplicada:
+        return None
+    ast.fix_missing_locations(nuevo)
+    try:
+        return ast.unparse(nuevo), mut.aplicada
+    except Exception:
+        return None
+
+
+@dataclass
+class ResultadoMutacion:
+    total: int = 0
+    detectadas: int = 0
+    sobrevivientes: list = field(default_factory=list)   # (descripción,)
+    error: str = ""
+
+    @property
+    def puntaje(self) -> float:
+        return round(self.detectadas / self.total, 2) if self.total else 1.0
+
+
+def probar_discriminacion(ws, archivo: str, correr_tests: Callable[[], bool], maximo: int = 12,
+                          leer: Optional[Callable[[str], str]] = None,
+                          escribir: Optional[Callable[[str, str], None]] = None) -> ResultadoMutacion:
+    """
+    Mutation testing: muta `archivo` (código de producción) una vez por vez y corre los tests.
+    correr_tests() → True si la suite pasa. Si pasa CON la mutación, esa mutación SOBREVIVIÓ:
+    los tests no discriminan ese comportamiento. SIEMPRE restaura el archivo original.
+    """
+    leer = leer or (lambda rel: (ws.raiz / rel).read_text(encoding="utf-8", errors="replace"))
+    escribir = escribir or (lambda rel, c: ws.escribir(rel, c))
+    try:
+        original = leer(archivo)
+    except (OSError, ValueError):
+        return ResultadoMutacion(error=f"no pude leer {archivo}")
+    total_mut = _contar_mutaciones(original)
+    if total_mut == 0:
+        return ResultadoMutacion(error="no hay mutaciones aplicables (nada que mutar)")
+    if not correr_tests():
+        return ResultadoMutacion(error="los tests no pasan en el estado base: no se puede medir discriminación")
+    resultado = ResultadoMutacion(total=0)
+    indices = list(range(total_mut))
+    if len(indices) > maximo:
+        indices = indices[:: max(1, len(indices) // maximo)][:maximo]
+    try:
+        for i in indices:
+            mutante = generar_mutante(original, i)
+            if not mutante:
+                continue
+            codigo, descripcion = mutante
+            if codigo == original:
+                continue
+            resultado.total += 1
+            try:
+                escribir(archivo, codigo)
+            except (OSError, ValueError):
+                continue
+            paso = False
+            try:
+                paso = correr_tests()
+            except Exception:
+                paso = False
+            finally:
+                escribir(archivo, original)
+            if paso:
+                resultado.sobrevivientes.append(descripcion)   # mutación no detectada
+            else:
+                resultado.detectadas += 1
+    finally:
+        escribir(archivo, original)
+    return resultado
+
+
+# ======================================================================
 # MÓDULO: lessons
 # ======================================================================
 """
@@ -7755,6 +8192,12 @@ def _post_escritura(ctx: Contexto, rel: str, antes: Optional[str], despues: str,
             avisos = avisos + advertencias_tests_python(despues)
         if avisos:
             texto += "\nAdvertencias:\n" + "\n".join(f"- {a}" for a in avisos[:6])
+    if rel.endswith(".py") and es_archivo_de_test(rel):
+        # Fase 1 (v9): tautologías, mocks del sistema bajo prueba, valor fabricado por el mock...
+        # Se avisa aunque la validación falle (un import roto no debe tapar un test tautológico).
+        inteligencia = inteligencia_para_prompt(despues)
+        if inteligencia:
+            texto += "\n" + inteligencia
     extra_hooks = _hook_post_escritura(ctx, rel)
     if extra_hooks:
         texto += "\n" + extra_hooks
@@ -8889,6 +9332,85 @@ def run_python(ctx: Contexto, p: dict) -> str:
     return texto
 
 
+# ==================================================================
+# inspect_tests — REAPER analiza sus propios tests (Fase 1 / v9)
+# ==================================================================
+def _archivos_de_test(ctx: Contexto, limite: int = 400) -> list[str]:
+    salida = []
+    for ruta in ctx.ws.iterar(limite=limite * 3):
+        rel = ctx.ws.rel(ruta)
+        if rel.endswith(".py") and es_archivo_de_test(rel):
+            salida.append(rel)
+    return salida[:limite]
+
+
+@herramienta(
+    "inspect_tests",
+    "Analiza los tests (estático) buscando lo que los vuelve engañosos: tautologías (assertTrue(True)), "
+    "mocks que reemplazan el sistema bajo prueba, valor esperado fabricado por el propio mock, tests sin "
+    "assert y clasificación unit/integration mal etiquetada. Sin path, inspecciona todos los tests del proyecto. "
+    "Con mutacion=true y un archivo de código en 'target', mide discriminación mutando el código y re-ejecutando.",
+    [Param("path", "archivo de tests a analizar (opcional; por defecto todos)", requerido=False),
+     Param("mutacion", "true para medir discriminación por mutación (ejecuta los tests)", requerido=False),
+     Param("target", "archivo de código a mutar (con mutacion=true)", requerido=False)],
+    "<inspect_tests>\n<path>tests/test_app.py</path>\n</inspect_tests>",
+)
+def inspect_tests(ctx: Contexto, p: dict) -> str:
+    objetivo = (p.get("path") or "").strip()
+    if objetivo:
+        archivos = [ctx.ws.rel(ctx.ws.ruta(objetivo))]
+    else:
+        archivos = _archivos_de_test(ctx)
+    if not archivos:
+        return ("No encontré archivos de tests Python para analizar. (El análisis estático es para Python; "
+                "para JS/Go usá run_tests.)")
+    bloques, total_problemas, discriminaciones = [], 0, []
+    for rel in archivos:
+        try:
+            fuente = ctx.ws.leer(rel)
+        except (OSError, ValueError, ErrorRuta):
+            continue
+        res = analizar_tests_python(fuente)
+        discriminaciones.append(res.discriminacion)
+        if res.problemas:
+            total_problemas += len(res.problemas)
+            problemas = sorted(res.problemas, key=lambda x: {"alta": 0, "media": 1}.get(x.severidad, 2))
+            detalle = "\n".join(f"  [{x.severidad}] {x.tipo} · {x.test} (L{x.linea}): {x.detalle}"
+                                for x in problemas[:10])
+            niveles = ", ".join(sorted({t.nivel_real for t in res.tests}))
+            bloques.append(f"### {rel}  (discriminación {res.discriminacion}; niveles: {niveles or '—'})\n{detalle}")
+        else:
+            bloques.append(f"### {rel}  ✓ sin problemas detectados (discriminación {res.discriminacion})")
+
+    cabecera = (f"INSPECCIÓN DE TESTS: {len(archivos)} archivo(s), {total_problemas} problema(s). "
+                f"Discriminación media: {round(sum(discriminaciones) / len(discriminaciones), 2) if discriminaciones else 1.0}.\n"
+                "(Un test que no discrimina NO demuestra que el código sea correcto, aunque esté verde.)\n")
+    texto = cabecera + "\n".join(bloques)
+
+    if str(p.get("mutacion", "")).strip().lower() in ("true", "1", "sí", "si"):
+        target = (p.get("target") or "").strip()
+        if not target:
+            texto += "\n\n(mutacion=true necesita 'target': el archivo de código a mutar.)"
+        else:
+            try:
+                rel_target = ctx.ws.rel(ctx.ws.ruta(target))
+            except (ErrorRuta, ValueError):
+                return texto + f"\n\nNo existe el target {target}."
+            def correr() -> bool:
+                r = ejecutar_tests(ctx.ws, timeout=ctx.settings.tests_timeout, completo=True)
+                return bool(r and r.ok)
+            res_mut = probar_discriminacion(ctx.ws, rel_target, correr)
+            if res_mut.error:
+                texto += f"\n\nMUTACIÓN ({rel_target}): {res_mut.error}"
+            else:
+                texto += (f"\n\nMUTACIÓN ({rel_target}): {res_mut.detectadas}/{res_mut.total} mutaciones detectadas "
+                          f"(puntaje {res_mut.puntaje}).")
+                if res_mut.sobrevivientes:
+                    texto += "\nMutaciones NO detectadas (los tests pasan igual → faltan casos):\n" + "\n".join(
+                        f"  - {s}" for s in res_mut.sobrevivientes[:8])
+    return texto
+
+
 # ======================================================================
 # MÓDULO: roles
 # ======================================================================
@@ -8897,7 +9419,7 @@ def run_python(ctx: Contexto, p: dict) -> str:
 LECTURA = ("read_file", "read_symbol", "list_files", "search_files", "code_outline", "find_references")
 ESCRITURA = ("write_to_file", "replace_in_file", "replace_symbol", "insert_after_symbol", "append_to_file",
              "insert_lines", "replace_lines")
-VERIFICACION = ("validate", "run_tests")
+VERIFICACION = ("validate", "run_tests", "inspect_tests")
 ARCHIVOS = ("delete_file", "move_file", "revert_file")
 
 PATRONES_TESTS = ("tests/*", "test/*", "tests/**", "test/**", "test_*.py", "*_test.py", "*/test_*.py",
@@ -9023,7 +9545,7 @@ Tu attempt_completion DEBE empezar con UNA de estas líneas:
 VEREDICTO: APROBADO
 VEREDICTO: CAMBIOS
 Si es CAMBIOS, seguí con una lista numerada: archivo, problema concreto, corrección exacta.""",
-        LECTURA + ("view_diff", "validate", "attempt_completion"),
+        LECTURA + ("view_diff", "validate", "inspect_tests", "attempt_completion"),
         0.2,
         solo_lectura=True,
     ),
@@ -36959,6 +37481,190 @@ class TestAdvertenciasDeTests(BaseTest):
 
 
 # ======================================================================
+# MÓDULO: autotest_inteligencia
+# ======================================================================
+"""Autotests de Test Intelligence (Fase 1 / v9): detectores estáticos + MutationProbe + herramienta."""
+
+_TAUT = '''
+import unittest
+class T(unittest.TestCase):
+    def test_a(self):
+        self.assertTrue(True)
+    def test_b(self):
+        x = 5
+        assert x == x
+    def test_c(self):
+        self.assertEqual(1, 1)
+    def test_d(self):
+        assert True
+'''
+
+_MOCK_SUJETO = '''
+import unittest
+from app.core import procesar
+from unittest.mock import patch
+class T(unittest.TestCase):
+    def test_proc(self):
+        with patch("app.core.procesar", return_value="ok"):
+            self.assertEqual(procesar(), "ok")
+'''
+
+_INTEGRACION_FALSA = '''
+import unittest
+import subprocess
+from unittest.mock import patch
+class T(unittest.TestCase):
+    def test_script_integration(self):
+        """integration test del script real"""
+        with patch("subprocess.run", return_value="Denuncia enviada"):
+            r = subprocess.run(["x"])
+            self.assertEqual(r, "Denuncia enviada")
+'''
+
+_BUENO = '''
+import unittest
+from calc import suma, dividir
+class T(unittest.TestCase):
+    def test_suma(self):
+        self.assertEqual(suma(2, 3), 5)
+    def test_dividir_cero(self):
+        with self.assertRaises(ZeroDivisionError):
+            dividir(1, 0)
+'''
+
+
+class TestTautologias(BaseTest):
+    def test_detecta_variantes(self):
+        res = analizar_tests_python(_TAUT)
+        tipos = [p.tipo for p in res.problemas]
+        self.assertEqual(tipos.count("TAUTOLOGIA"), 4)
+        self.assertFalse(res.ok)
+        self.assertEqual(res.discriminacion, 0.0)
+
+    def test_assert_bueno_no_es_tautologia(self):
+        res = analizar_tests_python(_BUENO)
+        self.assertEqual(res.problemas, [])
+        self.assertTrue(res.ok)
+        self.assertEqual(res.discriminacion, 1.0)
+
+
+class TestMocks(BaseTest):
+    def test_mock_del_sistema_bajo_prueba(self):
+        res = analizar_tests_python(_MOCK_SUJETO)
+        tipos = {p.tipo for p in res.problemas}
+        self.assertIn("MOCK_SISTEMA_BAJO_PRUEBA", tipos)
+        self.assertIn("VALOR_DESDE_MOCK", tipos)
+        self.assertFalse(res.ok)
+
+    def test_integracion_mockeada_mal_etiquetada(self):
+        res = analizar_tests_python(_INTEGRACION_FALSA)
+        tipos = {p.tipo for p in res.problemas}
+        self.assertIn("INTEGRACION_MOCKEADA", tipos)
+        self.assertIn("VALOR_DESDE_MOCK", tipos)
+        t = res.tests[0]
+        self.assertEqual(t.nivel_declarado, "integration")
+        self.assertEqual(t.nivel_real, "unit")        # mockea subprocess → no es integración real
+
+    def test_mock_externo_legitimo(self):
+        # mockear la red en un unit test está bien y NO debe marcarse si no finge ser integración
+        fuente = ('import unittest\nfrom clima import temperatura\nfrom unittest.mock import patch\n'
+                  'class T(unittest.TestCase):\n'
+                  '    def test_temp(self):\n'
+                  '        with patch("urllib.request.urlopen"):\n'
+                  '            self.assertIsInstance(temperatura("rosario"), float)\n')
+        res = analizar_tests_python(fuente)
+        self.assertNotIn("INTEGRACION_MOCKEADA", {p.tipo for p in res.problemas})
+        self.assertNotIn("MOCK_SISTEMA_BAJO_PRUEBA", {p.tipo for p in res.problemas})
+
+
+class TestSinAssert(BaseTest):
+    def test_sin_assert(self):
+        fuente = 'import unittest\nclass T(unittest.TestCase):\n    def test_x(self):\n        resultado = 1 + 1\n'
+        res = analizar_tests_python(fuente)
+        self.assertIn("SIN_ASSERT", {p.tipo for p in res.problemas})
+
+    def test_assert_raises_cuenta_como_verificacion(self):
+        fuente = ('import unittest\nfrom m import f\nclass T(unittest.TestCase):\n'
+                  '    def test_x(self):\n        with self.assertRaises(ValueError):\n            f(-1)\n')
+        res = analizar_tests_python(fuente)
+        self.assertNotIn("SIN_ASSERT", {p.tipo for p in res.problemas})
+
+
+class TestMutationProbe(BaseTest):
+    def _ws(self, codigo: str, test: str):
+        ws = self.proyecto({"calc.py": codigo, "tests/test_calc.py": test})
+        def correr() -> bool:
+            r = ejecutar_tests(ws, timeout=90, completo=True)
+            return bool(r and r.ok)
+        return ws, correr
+
+    def test_tests_debiles_dejan_mutantes_vivos(self):
+        codigo = "def clasificar(n):\n    if n < 0:\n        return 'neg'\n    if n == 0:\n        return 'cero'\n    return 'pos'\n"
+        test = "import unittest\nfrom calc import clasificar\nclass T(unittest.TestCase):\n    def test_pos(self):\n        self.assertEqual(clasificar(5), 'pos')\n"
+        ws, correr = self._ws(codigo, test)
+        res = probar_discriminacion(ws, "calc.py", correr, maximo=12)
+        self.assertEqual(res.error, "")
+        self.assertGreater(len(res.sobrevivientes), 0)
+        self.assertLess(res.puntaje, 1.0)
+        self.assertEqual(ws.leer("calc.py"), codigo)       # restaurado
+
+    def test_tests_fuertes_matan_mutantes(self):
+        codigo = "def suma(a, b):\n    return a + b\n"
+        test = ("import unittest\nfrom calc import suma\nclass T(unittest.TestCase):\n"
+                "    def test_s(self):\n        self.assertEqual(suma(2, 3), 5)\n"
+                "    def test_neg(self):\n        self.assertEqual(suma(-1, 1), 0)\n")
+        ws, correr = self._ws(codigo, test)
+        res = probar_discriminacion(ws, "calc.py", correr, maximo=12)
+        self.assertEqual(res.sobrevivientes, [])
+        self.assertEqual(res.puntaje, 1.0)
+
+    def test_base_rojo_no_mide(self):
+        codigo = "def suma(a, b):\n    return a - b\n"   # roto a propósito
+        test = "import unittest\nfrom calc import suma\nclass T(unittest.TestCase):\n    def test_s(self):\n        self.assertEqual(suma(2, 3), 5)\n"
+        ws, correr = self._ws(codigo, test)
+        res = probar_discriminacion(ws, "calc.py", correr)
+        self.assertIn("base", res.error)
+
+
+class TestHerramientaInspect(BaseTest):
+    def test_inspect_tests_reporta(self):
+        ws = self.proyecto({"tests/test_x.py": _TAUT})
+        salida = self.herramienta(self.contexto(ws), "inspect_tests")
+        self.assertIn("TAUTOLOGIA", salida)
+        self.assertIn("discriminación", salida)
+
+    def test_inspect_tests_con_path(self):
+        ws = self.proyecto({"tests/test_mock.py": _MOCK_SUJETO, "tests/test_ok.py": _BUENO})
+        salida = self.herramienta(self.contexto(ws), "inspect_tests", path="tests/test_mock.py")
+        self.assertIn("MOCK_SISTEMA_BAJO_PRUEBA", salida)
+        self.assertNotIn("test_ok.py", salida)
+
+    def test_inspect_tests_mutacion(self):
+        ws = self.proyecto({
+            "calc.py": "def clasificar(n):\n    return 'pos' if n > 0 else 'no'\n",
+            "tests/test_calc.py": "import unittest\nfrom calc import clasificar\nclass T(unittest.TestCase):\n    def test_p(self):\n        self.assertEqual(clasificar(5), 'pos')\n",
+        })
+        salida = self.herramienta(self.contexto(ws), "inspect_tests", mutacion="true", target="calc.py")
+        self.assertIn("MUTACIÓN", salida)
+
+    def test_rol_tiene_la_herramienta(self):
+        for rol in ("principal", "implementador", "qa", "especificador", "revisor", "reparador"):
+            self.assertIn("inspect_tests", ROLES[rol].herramientas)
+
+
+class TestAvisoAlEscribirTests(BaseTest):
+    def test_escribir_test_tautologico_avisa(self):
+        ws = self.proyecto()
+        salida = self.herramienta(self.contexto(ws), "write_to_file", path="tests/test_x.py", content=_MOCK_SUJETO)
+        self.assertIn("MOCK_SISTEMA_BAJO_PRUEBA", salida)
+
+    def test_escribir_codigo_normal_no_avisa(self):
+        ws = self.proyecto()
+        salida = self.herramienta(self.contexto(ws), "write_to_file", path="app.py", content="def f(x):\n    return x * 2\n")
+        self.assertNotIn("INTELIGENCIA DE TESTS", salida)
+
+
+# ======================================================================
 # MÓDULO: autotest_permisos
 # ======================================================================
 """Autotests de permisos con memoria ("permitir siempre") y del modo plan."""
@@ -38584,6 +39290,8 @@ attempt_completion with the list of implemented functions.""",
 }
 
 DOCS_EN = {
+    "inspect_tests": ("Statically analyzes tests for tautologies (assertTrue(True)), mocks that replace the system under test, expected values fabricated by the mock itself, missing asserts and mislabeled unit/integration tests. Without path, inspects all project tests.",
+                      {"path": "test file (optional)", "mutacion": "true to run mutation testing", "target": "code file to mutate"}),
     "read_file": ("Reads a text file. Returns numbered lines ('  12| code'); the numbers are NOT part of the file.",
                   {"path": "path relative to the workspace", "desde": "first line to show", "hasta": "last line to show"}),
     "list_files": ("Lists workspace files (ignores .git, node_modules, venv, etc.).",

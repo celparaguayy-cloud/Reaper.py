@@ -3,7 +3,7 @@
 LECTURA = ("read_file", "read_symbol", "list_files", "search_files", "code_outline", "find_references")
 ESCRITURA = ("write_to_file", "replace_in_file", "replace_symbol", "insert_after_symbol", "append_to_file",
              "insert_lines", "replace_lines")
-VERIFICACION = ("validate", "run_tests")
+VERIFICACION = ("validate", "run_tests", "inspect_tests")
 ARCHIVOS = ("delete_file", "move_file", "revert_file")
 
 PATRONES_TESTS = ("tests/*", "test/*", "tests/**", "test/**", "test_*.py", "*_test.py", "*/test_*.py",
@@ -129,7 +129,7 @@ Tu attempt_completion DEBE empezar con UNA de estas líneas:
 VEREDICTO: APROBADO
 VEREDICTO: CAMBIOS
 Si es CAMBIOS, seguí con una lista numerada: archivo, problema concreto, corrección exacta.""",
-        LECTURA + ("view_diff", "validate", "attempt_completion"),
+        LECTURA + ("view_diff", "validate", "inspect_tests", "attempt_completion"),
         0.2,
         solo_lectura=True,
     ),

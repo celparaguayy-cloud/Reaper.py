@@ -159,6 +159,8 @@ attempt_completion with the list of implemented functions.""",
 }
 
 DOCS_EN = {
+    "inspect_tests": ("Statically analyzes tests for tautologies (assertTrue(True)), mocks that replace the system under test, expected values fabricated by the mock itself, missing asserts and mislabeled unit/integration tests. Without path, inspects all project tests.",
+                      {"path": "test file (optional)", "mutacion": "true to run mutation testing", "target": "code file to mutate"}),
     "read_file": ("Reads a text file. Returns numbered lines ('  12| code'); the numbers are NOT part of the file.",
                   {"path": "path relative to the workspace", "desde": "first line to show", "hasta": "last line to show"}),
     "list_files": ("Lists workspace files (ignores .git, node_modules, venv, etc.).",

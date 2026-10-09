@@ -541,3 +541,82 @@ def run_python(ctx: Contexto, p: dict) -> str:
     elif not r.ok and ctx.settings.pistas_errores:
         texto = anexar_pistas(texto, 2)
     return texto
+
+
+# ==================================================================
+# inspect_tests — REAPER analiza sus propios tests (Fase 1 / v9)
+# ==================================================================
+def _archivos_de_test(ctx: Contexto, limite: int = 400) -> list[str]:
+    salida = []
+    for ruta in ctx.ws.iterar(limite=limite * 3):
+        rel = ctx.ws.rel(ruta)
+        if rel.endswith(".py") and es_archivo_de_test(rel):
+            salida.append(rel)
+    return salida[:limite]
+
+
+@herramienta(
+    "inspect_tests",
+    "Analiza los tests (estático) buscando lo que los vuelve engañosos: tautologías (assertTrue(True)), "
+    "mocks que reemplazan el sistema bajo prueba, valor esperado fabricado por el propio mock, tests sin "
+    "assert y clasificación unit/integration mal etiquetada. Sin path, inspecciona todos los tests del proyecto. "
+    "Con mutacion=true y un archivo de código en 'target', mide discriminación mutando el código y re-ejecutando.",
+    [Param("path", "archivo de tests a analizar (opcional; por defecto todos)", requerido=False),
+     Param("mutacion", "true para medir discriminación por mutación (ejecuta los tests)", requerido=False),
+     Param("target", "archivo de código a mutar (con mutacion=true)", requerido=False)],
+    "<inspect_tests>\n<path>tests/test_app.py</path>\n</inspect_tests>",
+)
+def inspect_tests(ctx: Contexto, p: dict) -> str:
+    objetivo = (p.get("path") or "").strip()
+    if objetivo:
+        archivos = [ctx.ws.rel(ctx.ws.ruta(objetivo))]
+    else:
+        archivos = _archivos_de_test(ctx)
+    if not archivos:
+        return ("No encontré archivos de tests Python para analizar. (El análisis estático es para Python; "
+                "para JS/Go usá run_tests.)")
+    bloques, total_problemas, discriminaciones = [], 0, []
+    for rel in archivos:
+        try:
+            fuente = ctx.ws.leer(rel)
+        except (OSError, ValueError, ErrorRuta):
+            continue
+        res = analizar_tests_python(fuente)
+        discriminaciones.append(res.discriminacion)
+        if res.problemas:
+            total_problemas += len(res.problemas)
+            problemas = sorted(res.problemas, key=lambda x: {"alta": 0, "media": 1}.get(x.severidad, 2))
+            detalle = "\n".join(f"  [{x.severidad}] {x.tipo} · {x.test} (L{x.linea}): {x.detalle}"
+                                for x in problemas[:10])
+            niveles = ", ".join(sorted({t.nivel_real for t in res.tests}))
+            bloques.append(f"### {rel}  (discriminación {res.discriminacion}; niveles: {niveles or '—'})\n{detalle}")
+        else:
+            bloques.append(f"### {rel}  ✓ sin problemas detectados (discriminación {res.discriminacion})")
+
+    cabecera = (f"INSPECCIÓN DE TESTS: {len(archivos)} archivo(s), {total_problemas} problema(s). "
+                f"Discriminación media: {round(sum(discriminaciones) / len(discriminaciones), 2) if discriminaciones else 1.0}.\n"
+                "(Un test que no discrimina NO demuestra que el código sea correcto, aunque esté verde.)\n")
+    texto = cabecera + "\n".join(bloques)
+
+    if str(p.get("mutacion", "")).strip().lower() in ("true", "1", "sí", "si"):
+        target = (p.get("target") or "").strip()
+        if not target:
+            texto += "\n\n(mutacion=true necesita 'target': el archivo de código a mutar.)"
+        else:
+            try:
+                rel_target = ctx.ws.rel(ctx.ws.ruta(target))
+            except (ErrorRuta, ValueError):
+                return texto + f"\n\nNo existe el target {target}."
+            def correr() -> bool:
+                r = ejecutar_tests(ctx.ws, timeout=ctx.settings.tests_timeout, completo=True)
+                return bool(r and r.ok)
+            res_mut = probar_discriminacion(ctx.ws, rel_target, correr)
+            if res_mut.error:
+                texto += f"\n\nMUTACIÓN ({rel_target}): {res_mut.error}"
+            else:
+                texto += (f"\n\nMUTACIÓN ({rel_target}): {res_mut.detectadas}/{res_mut.total} mutaciones detectadas "
+                          f"(puntaje {res_mut.puntaje}).")
+                if res_mut.sobrevivientes:
+                    texto += "\nMutaciones NO detectadas (los tests pasan igual → faltan casos):\n" + "\n".join(
+                        f"  - {s}" for s in res_mut.sobrevivientes[:8])
+    return texto

@@ -193,6 +193,12 @@ def _post_escritura(ctx: Contexto, rel: str, antes: Optional[str], despues: str,
             avisos = avisos + advertencias_tests_python(despues)
         if avisos:
             texto += "\nAdvertencias:\n" + "\n".join(f"- {a}" for a in avisos[:6])
+    if rel.endswith(".py") and es_archivo_de_test(rel):
+        # Fase 1 (v9): tautologías, mocks del sistema bajo prueba, valor fabricado por el mock...
+        # Se avisa aunque la validación falle (un import roto no debe tapar un test tautológico).
+        inteligencia = inteligencia_para_prompt(despues)
+        if inteligencia:
+            texto += "\n" + inteligencia
     extra_hooks = _hook_post_escritura(ctx, rel)
     if extra_hooks:
         texto += "\n" + extra_hooks
