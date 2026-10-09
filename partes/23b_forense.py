@@ -416,9 +416,12 @@ CÓDIGO RELEVANTE:
 PROMPT_CONCLUSION = """Estos son los resultados REALES de los experimentos:
 {resultados}
 
-Con esa evidencia escribí:
+{spec}
+
+Con esa evidencia escribí (distinguí lo OBSERVADO de lo INTERPRETADO; no presentes una suposición como hecho):
+CLASIFICACIÓN: <IMPLEMENTATION_BUG | TEST_BUG | SPEC_GAP | PATH_BUG | INPUT_MODEL_BUG | FIXTURE_BUG | DEPENDENCY_BUG | FLAKY_TEST>
 CAUSA RAÍZ: <una o dos frases, solo lo que la evidencia respalda>
-ARREGLO: <cambio mínimo y exacto: archivo, función y qué cambiar>
+ARREGLO: <cambio mínimo y exacto: archivo, función y qué cambiar. Si el test exige algo que la spec no pide, el arreglo es corregir el TEST, no el código>
 """
 
 
@@ -704,7 +707,44 @@ def _hipotesis_y_conclusion(ws: Workspace, informe: InformeForense, llm, context
             resultados = "\n\n".join(f"H{i}: {h.texto}\nEXPERIMENTO:\n{h.experimento}\nSALIDA REAL:\n{h.resultado}"
                                      for i, h in enumerate(informe.hipotesis, 1))
             try:
-                informe.conclusion = (llm.chat_simple(PROMPT_CONCLUSION.format(resultados=resultados), modelo=modelo,
-                                                      temperatura=0.1, max_tokens=900, rol="consultor") or "").strip()
+                informe.conclusion = (llm.chat_simple(
+                    PROMPT_CONCLUSION.format(resultados=resultados, spec=_bloque_spec(ws, informe)), modelo=modelo,
+                    temperatura=0.1, max_tokens=900, rol="consultor") or "").strip()
             except LLMError as e:
                 informe.notas.append(f"no pude pedir la conclusión: {e}")
+
+
+def _errores_forenses(informe: InformeForense, limite: int = 1200) -> str:
+    """Junta los mensajes de error REALES del informe para clasificar el fallo."""
+    trozos: list = []
+    for a in informe.aislados[:4]:
+        for d in (a.get("detalles") or [])[:1]:
+            err = (d.get("error") or "").strip()
+            if err:
+                trozos.append(err)
+    return recortar("\n".join(trozos), limite)
+
+
+def _modulos_del_proyecto(ws: Workspace, limite: int = 200) -> set:
+    """Nombres de módulos/paquetes top-level del proyecto (para distinguir PATH_BUG de DEPENDENCY_BUG)."""
+    nombres: set = set()
+    try:
+        for ruta in ws.iterar(limite=limite):
+            rel = ws.rel(ruta)
+            if "/" in rel:
+                nombres.add(rel.split("/", 1)[0])
+            if rel.endswith(".py"):
+                nombres.add(os.path.splitext(os.path.basename(rel))[0])
+    except OSError:
+        pass
+    nombres.discard("__init__")
+    return nombres
+
+
+def _bloque_spec(ws: Workspace, informe: InformeForense) -> str:
+    """Nota de autoridad + observación + clasificación heurística del fallo, para el prompt de conclusión."""
+    partes = [nota_spec()]
+    error = _errores_forenses(informe)
+    if error:
+        partes.append(clasificacion_para_prompt(error, modulos_proyecto=_modulos_del_proyecto(ws)))
+    return "\n\n".join(partes)

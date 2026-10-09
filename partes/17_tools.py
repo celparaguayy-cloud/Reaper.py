@@ -29,6 +29,7 @@ class Contexto:
     permitidos: tuple = ()                          # globs de rutas escribibles (vacío = todas)
     llm: Any = None                                 # cliente del modelo (lo usa write_large_file)
     ultimo_conteo: Any = None                       # ConteoTests del último run_tests (guardia de regresión)
+    pedido: str = ""                                # tarea/pedido actual (para detectar requisitos inventados)
 
     def tropiezo(self, tipo: str) -> None:
         if self.memoria is not None:

@@ -598,6 +598,19 @@ def inspect_tests(ctx: Contexto, p: dict) -> str:
                 "(Un test que no discrimina NO demuestra que el código sea correcto, aunque esté verde.)\n")
     texto = cabecera + "\n".join(bloques)
 
+    if ctx.pedido:
+        inventados = []
+        for rel in archivos:
+            try:
+                fuente = ctx.ws.leer(rel)
+            except (OSError, ValueError, ErrorRuta):
+                continue
+            for req in requisito_inventado(fuente, ctx.pedido):
+                inventados.append(f"  {rel}: {req.test} (L{req.linea}) [{req.tipo}]: {req.detalle}")
+        if inventados:
+            texto += ("\n\nREQUISITOS INVENTADOS (el test exige algo que el pedido no pide; ajustá el TEST a la "
+                      "spec, no el código al test):\n" + "\n".join(inventados[:8]))
+
     if str(p.get("mutacion", "")).strip().lower() in ("true", "1", "sí", "si"):
         target = (p.get("target") or "").strip()
         if not target:

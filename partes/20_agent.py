@@ -368,6 +368,7 @@ class Agente:
         if cid_inicio is not None:
             self.ctx.cid_inicio = cid_inicio
         principal = self.rol.nombre == "principal"
+        self.ctx.pedido = tarea
         self._prohibido = prohibiciones(tarea) if principal else set()
         self._pide_cambios = pide_cambios(tarea) if principal else True
         self._pregunta_simple = principal and es_pregunta_simple(tarea)
