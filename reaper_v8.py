@@ -26408,7 +26408,7 @@ class App:
         arg = partes[1].strip() if len(partes) > 1 else ""
         alias = {
             "/help": "ayuda", "/h": "ayuda", "/?": "ayuda", "/exit": "salir", "/quit": "salir", "/q": "salir",
-            "/equipo": "plan", "/undo": "deshacer", "/redo": "rehacer", "/build": "construir", "/b": "construir",
+            "/undo": "deshacer", "/redo": "rehacer", "/build": "construir", "/b": "construir",
             "/symbol": "simbolo", "/sym": "simbolo", "/refs": "referencias", "/map": "mapa", "/new": "nuevo",
             "/templates": "plantillas", "/lessons": "lecciones", "/notes": "notas", "/watch": "vigilar",
             "/profile": "perfil", "/theme": "tema", "/usage": "uso", "/costos": "uso", "/write": "escribir",
@@ -27026,6 +27026,29 @@ class App:
         self.ui.info(f"  Alcance autorizado: {arg}")
         self.ui.aviso("  REAPER hará trabajo ofensivo SOLO dentro de ese alcance. Fuera de ahí, frena y avisa.")
         self.ui.tenue("  Seguís protegido: sudo, rm -rf, apagar el equipo y leer .env siguen bloqueados.")
+
+    def cmd_equipo(self, arg: str) -> None:
+        """Muestra los seis roles → proveedor/modelo asignado + independencia real. Conectividad NO VERIFICADA."""
+        sub = (arg or "").strip().lower()
+        estado = estado_equipo(self.settings)
+        ind = independencia_equipo(estado)
+        if sub in ("independencia", "independence"):
+            self.ui.info(f"Proveedores distintos: {ind['proveedores_distintos']} · "
+                         f"modelos distintos: {ind['modelos_distintos']}")
+            if ind["reducida"]:
+                self.ui.aviso("  Independencia REDUCIDA: todos los roles caen en un solo proveedor.")
+            return
+        if sub in ("probar", "auto"):
+            self.ui.aviso("  Probar cada rol de extremo a extremo requiere peticiones reales con claves: "
+                          "NO VERIFICADO hasta ejecutarse con tu consentimiento (/proveedores probar).")
+        self.ui.info("Equipo de seis roles (asignación actual; conectividad NO VERIFICADA):")
+        for e in estado:
+            marca = "✓ clave" if e["tiene_clave"] else "⚠ FALTA CLAVE"
+            self.ui.info(f"  {e['rol']:<13} → {e['proveedor']}/{e['modelo']}   {marca}")
+        self.ui.tenue(f"  proveedores distintos: {ind['proveedores_distintos']} · "
+                      f"modelos distintos: {ind['modelos_distintos']}"
+                      + ("  · independencia REDUCIDA" if ind["reducida"] else ""))
+        self.ui.tenue("  Asignar por rol: /modelo <rol> <alias> · prueba real: /proveedores probar")
 
     def cmd_proveedores(self, arg: str) -> None:
         """Estado de proveedores SIN exponer secretos. Las claves salen de env o .clave_<proveedor>."""
@@ -40754,6 +40777,55 @@ class TestProveedoresCLI(_BaseCred):
 
 
 # ======================================================================
+# MÓDULO: autotest_equipo
+# ======================================================================
+"""Autotests del display de seis agentes + independencia (REAPER AUTO-6-IA §6/§9)."""
+
+
+class TestEstadoEquipo(BaseTest):
+    def test_seis_roles(self):
+        estado = estado_equipo(self.ajustes())
+        self.assertEqual(len(estado), 6)
+        self.assertEqual([e["rol"] for e in estado],
+                         ["coordinador", "arquitecto", "implementador", "revisor", "qa", "reparador"])
+
+    def test_un_solo_proveedor_es_independencia_reducida(self):
+        # por defecto todos los roles resuelven al mismo proveedor
+        ind = independencia_equipo(estado_equipo(self.ajustes()))
+        self.assertEqual(ind["proveedores_distintos"], 1)
+        self.assertTrue(ind["reducida"])
+
+    def test_rol_en_otro_proveedor_sube_independencia(self):
+        s = self.ajustes(modelos_rol={"revisor": "ollama-qwen"})
+        estado = estado_equipo(s)
+        rev = next(e for e in estado if e["rol"] == "revisor")
+        self.assertEqual(rev["proveedor"], "ollama")
+        ind = independencia_equipo(estado)
+        self.assertEqual(ind["proveedores_distintos"], 2)
+        self.assertFalse(ind["reducida"])
+
+
+class TestEquipoCLI(BaseTest):
+    def test_comando_equipo(self):
+        ws = self.proyecto()
+        app = App(self.ajustes(forense=False, escalar=False), MockLLM([]), self.ui(), ws, persistir=False)
+        app.comando("/equipo")
+        texto = app.ui.texto_registrado()
+        self.assertIn("coordinador", texto)
+        self.assertIn("NO VERIFICADA", texto)
+
+    def test_comando_equipo_independencia(self):
+        ws = self.proyecto()
+        app = App(self.ajustes(forense=False, escalar=False), MockLLM([]), self.ui(), ws, persistir=False)
+        app.comando("/equipo independencia")
+        self.assertIn("Proveedores distintos", app.ui.texto_registrado())
+
+    def test_plan_sigue_funcionando(self):
+        # repurposar /equipo no rompe el planificador: /plan sigue siendo cmd_plan
+        self.assertTrue(hasattr(App, "cmd_plan"))
+
+
+# ======================================================================
 # MÓDULO: autotest_runner
 # ======================================================================
 """Ejecutor del autotest interno."""
@@ -45006,6 +45078,52 @@ def manifiesto_demo(tool_id: str = "detector-debug") -> ManifiestoHerramienta:
         resumen="Detecta 'DEBUG = True' en un archivo (herramienta de demostración forjada por REAPER).",
         entrypoint="tool.py", permisos=("local_no_network",),
         limitaciones=("heurística simple; un hallazgo requiere revisión contextual",))
+
+
+# ======================================================================
+# MÓDULO: equipo
+# ======================================================================
+"""
+Display de los seis agentes + métrica de independencia (REAPER AUTO-6-IA §6/§9).
+
+Muestra, de forma HONESTA, qué proveedor/modelo tiene asignado cada uno de los seis roles lógicos y cuántos
+proveedores/modelos DISTINTOS hay de verdad: "seis IAs" no puede ocultar que en realidad son tres modelos o
+un solo proveedor. No afirma conectividad: la asignación es configuración; la prueba real (NO VERIFICADO
+hasta ejecutarse) la hace /proveedores probar con las claves del usuario.
+"""
+
+# Seis roles lógicos del spec → rol real de REAPER que los implementa.
+ROLES_EQUIPO_SEIS = (
+    ("coordinador", "principal"),
+    ("arquitecto", "arquitecto"),
+    ("implementador", "implementador"),
+    ("revisor", "revisor"),
+    ("qa", "qa"),
+    ("reparador", "reparador"),
+)
+
+
+def estado_equipo(settings) -> list:
+    """Para cada rol: modelo asignado, proveedor de destino y si hay credencial para ese proveedor."""
+    salida = []
+    for etiqueta, rol in ROLES_EQUIPO_SEIS:
+        modelo = settings.modelo_para(rol)
+        destino = destino_modelo(modelo, settings)
+        try:
+            tiene = bool(clave_de_proveedor(destino.proveedor, replace(settings, proveedor=destino.proveedor)))
+        except (TypeError, ValueError):
+            tiene = False
+        salida.append({"rol": etiqueta, "reaper_rol": rol, "modelo": modelo,
+                       "proveedor": destino.proveedor, "tiene_clave": tiene})
+    return salida
+
+
+def independencia_equipo(estado: list) -> dict:
+    """Independencia REAL: proveedores y modelos distintos (no premiar seis alias al mismo endpoint)."""
+    provs = {e["proveedor"] for e in estado}
+    modelos = {e["modelo"] for e in estado}
+    return {"proveedores_distintos": len(provs), "modelos_distintos": len(modelos),
+            "reducida": len(provs) <= 1}
 
 
 # ======================================================================

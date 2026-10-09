@@ -308,7 +308,7 @@ class App:
         arg = partes[1].strip() if len(partes) > 1 else ""
         alias = {
             "/help": "ayuda", "/h": "ayuda", "/?": "ayuda", "/exit": "salir", "/quit": "salir", "/q": "salir",
-            "/equipo": "plan", "/undo": "deshacer", "/redo": "rehacer", "/build": "construir", "/b": "construir",
+            "/undo": "deshacer", "/redo": "rehacer", "/build": "construir", "/b": "construir",
             "/symbol": "simbolo", "/sym": "simbolo", "/refs": "referencias", "/map": "mapa", "/new": "nuevo",
             "/templates": "plantillas", "/lessons": "lecciones", "/notes": "notas", "/watch": "vigilar",
             "/profile": "perfil", "/theme": "tema", "/usage": "uso", "/costos": "uso", "/write": "escribir",
@@ -926,6 +926,29 @@ class App:
         self.ui.info(f"  Alcance autorizado: {arg}")
         self.ui.aviso("  REAPER hará trabajo ofensivo SOLO dentro de ese alcance. Fuera de ahí, frena y avisa.")
         self.ui.tenue("  Seguís protegido: sudo, rm -rf, apagar el equipo y leer .env siguen bloqueados.")
+
+    def cmd_equipo(self, arg: str) -> None:
+        """Muestra los seis roles → proveedor/modelo asignado + independencia real. Conectividad NO VERIFICADA."""
+        sub = (arg or "").strip().lower()
+        estado = estado_equipo(self.settings)
+        ind = independencia_equipo(estado)
+        if sub in ("independencia", "independence"):
+            self.ui.info(f"Proveedores distintos: {ind['proveedores_distintos']} · "
+                         f"modelos distintos: {ind['modelos_distintos']}")
+            if ind["reducida"]:
+                self.ui.aviso("  Independencia REDUCIDA: todos los roles caen en un solo proveedor.")
+            return
+        if sub in ("probar", "auto"):
+            self.ui.aviso("  Probar cada rol de extremo a extremo requiere peticiones reales con claves: "
+                          "NO VERIFICADO hasta ejecutarse con tu consentimiento (/proveedores probar).")
+        self.ui.info("Equipo de seis roles (asignación actual; conectividad NO VERIFICADA):")
+        for e in estado:
+            marca = "✓ clave" if e["tiene_clave"] else "⚠ FALTA CLAVE"
+            self.ui.info(f"  {e['rol']:<13} → {e['proveedor']}/{e['modelo']}   {marca}")
+        self.ui.tenue(f"  proveedores distintos: {ind['proveedores_distintos']} · "
+                      f"modelos distintos: {ind['modelos_distintos']}"
+                      + ("  · independencia REDUCIDA" if ind["reducida"] else ""))
+        self.ui.tenue("  Asignar por rol: /modelo <rol> <alias> · prueba real: /proveedores probar")
 
     def cmd_proveedores(self, arg: str) -> None:
         """Estado de proveedores SIN exponer secretos. Las claves salen de env o .clave_<proveedor>."""
