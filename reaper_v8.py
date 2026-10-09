@@ -12104,9 +12104,10 @@ def _investigar_con_corridas(ws: Workspace, settings: Settings, informe: Informe
                     informe.dependientes_de_orden.append(n)
             informe.notas.append(f"en orden directo fallan {len(directo['fallan'])} y en orden inverso "
                                  f"{len(inverso['fallan'])}: el resultado depende del orden")
+    elif _aislar_generico(ws, settings, informe):
+        pass
     else:
-        informe.notas.append("aislamiento detallado solo para Python (unittest/pytest); para este lenguaje se compara "
-                             "la suite completa entre dos corridas")
+        informe.notas.append("no pude aislar tests individuales en este lenguaje; comparo la suite completa entre corridas")
         primera = conteo_actual(ws, settings.tests_timeout)
         segunda = conteo_actual(ws, settings.tests_timeout)
         if (primera.reconocido and segunda.reconocido and
@@ -12118,6 +12119,83 @@ def _investigar_con_corridas(ws: Workspace, settings: Settings, informe: Informe
             informe.culpables = biseccion(ws, estado_bueno, timeout=settings.tests_timeout)
         except (OSError, ValueError) as e:
             informe.notas.append(f"la bisección falló: {e}")
+
+
+def _foto_archivos(ws: Workspace, limite: int = 3000) -> dict:
+    foto = {}
+    for ruta in ws.iterar(limite=limite):
+        try:
+            st = ruta.stat()
+        except OSError:
+            continue
+        foto[ws.rel(ruta)] = (st.st_size, st.st_mtime_ns)
+    return foto
+
+
+def _comando_test_individual(ws: Workspace, nombre: str) -> Optional[tuple[str, str]]:
+    """
+    (comando, lenguaje) para correr UN test aislado en JS (node:test) o Go. None si no se puede.
+    En JS filtra por nombre de test; en Go por -run con el nombre de la función.
+    """
+    detectado = detectar_comando_tests(ws, completo=True)
+    if not detectado:
+        return None
+    comando, tipo = detectado
+    if tipo == "node --test" and shutil.which("node"):
+        # se reusa el comando detectado (trae la lista de archivos) y se le inyecta el filtro por nombre,
+        # porque `node --test <dir>` trata el directorio como script y falla
+        patron = shlex.quote(nombre.strip())
+        if "--test" in comando:
+            filtrado = comando.replace("--test", f"--test --test-name-pattern={patron}", 1)
+        else:
+            filtrado = f"{comando} --test-name-pattern={patron}"
+        return (filtrado, "javascript")
+    if tipo in ("go test", "go test (paquetes)") and shutil.which("go"):
+        funcion = nombre.split("/")[0].strip()        # TestX/sub → TestX
+        if not re.fullmatch(r"[A-Za-z_]\w*", funcion):
+            return None
+        return (f"go test -run {shlex.quote('^' + funcion + '$')} ./...", "go")
+    return None
+
+
+def _aislar_generico(ws: Workspace, settings: Settings, informe: InformeForense) -> bool:
+    """Aísla cada test que falla en JS/Go: lo corre solo, lo repite y mira qué archivos toca. True si pudo."""
+    pudo = False
+    for nombre in informe.fallidos[:5]:
+        armado = _comando_test_individual(ws, nombre)
+        if armado is None:
+            continue
+        pudo = True
+        comando, lenguaje = armado
+
+        def una_corrida() -> tuple:
+            antes = _foto_archivos(ws)
+            r = ejecutar(comando_portable(comando), cwd=ws.raiz, timeout=settings.tests_timeout, shell=True)
+            conteo = contar_tests(r.stdout + r.stderr, r.codigo)
+            despues = _foto_archivos(ws)
+            tocados = sorted(k for k in set(antes) | set(despues) if antes.get(k) != despues.get(k))
+            if conteo.reconocido and conteo.total == conteo.omitidos:
+                estado = "no_corrio"      # el filtro no seleccionó ningún test (todos omitidos o ninguno)
+            elif r.codigo == 0 and not (conteo.fallados or conteo.errores):
+                estado = "pasa"
+            else:
+                estado = "falla"
+            return estado, tocados, (r.stdout + r.stderr)
+
+        estado1, tocados, salida = una_corrida()
+        if estado1 == "no_corrio":
+            continue
+        informe.aislados.append({"nombre": nombre, "estado": estado1, "detalles": [], "archivos_tocados": tocados,
+                                 "salida": salida[-800:]})
+        if estado1 == "pasa":
+            informe.dependientes_de_orden.append(nombre)
+        for rel in tocados:
+            if rel not in informe.archivos_tocados_por_tests and not rel.endswith(".pyc"):
+                informe.archivos_tocados_por_tests.append(rel)
+        estado2, _t2, _s2 = una_corrida()      # repetir: si cambia sin tocar el código, hay estado que persiste
+        if estado2 != estado1:
+            informe.inestables.append(f"{nombre}: 1ª corrida → {estado1} | 2ª corrida → {estado2}")
+    return pudo
 
 
 def _hipotesis_y_conclusion(ws: Workspace, informe: InformeForense, llm, contexto: str, con_hipotesis: bool,
