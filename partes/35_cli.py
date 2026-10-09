@@ -927,6 +927,42 @@ class App:
         self.ui.aviso("  REAPER hará trabajo ofensivo SOLO dentro de ese alcance. Fuera de ahí, frena y avisa.")
         self.ui.tenue("  Seguís protegido: sudo, rm -rf, apagar el equipo y leer .env siguen bloqueados.")
 
+    def cmd_lab(self, arg: str) -> None:
+        """Lab Challenge Engine: desafíos sintéticos locales con juez independiente (offline, sin objetivos externos)."""
+        partes = (arg or "").split(maxsplit=1)
+        sub = partes[0].lower() if partes else "escenarios"
+        resto = partes[1].strip() if len(partes) > 1 else ""
+        motor = MotorLab(self.ws.raiz)
+        if sub in ("escenarios", "list", "listar", ""):
+            self.ui.info("Escenarios de laboratorio (fixtures sintéticos, datos inventados):")
+            for e in motor.listar():
+                tag = "control" if e["control"] else e["kind"]
+                self.ui.info(f"  {e['id']} v{e['version']} [{tag}] — {e['descripcion']}")
+            self.ui.tenue("  /lab iniciar <id> · /lab probar <id> · /lab informe <id> · /lab reiniciar <id>")
+            return
+        if not resto:
+            self.ui.error(f"Uso: /lab {sub} <scenario-id>  (ver /lab escenarios)")
+            return
+        try:
+            if sub in ("iniciar", "start"):
+                info = motor.iniciar(resto)
+                self.ui.ok(f"Fixture materializado en {info['dir']}")
+                self.ui.info(f"  scope: {info['scope'].scope_id} (isolated_lab) · fixture: {info['fixture_hash'][:16]}…")
+            elif sub in ("probar", "test", "evaluar"):
+                motor.iniciar(resto)
+                res = motor.evaluar(resto, resolver_con_auditor(resto))
+                self.ui.linea(res.texto())
+            elif sub in ("informe", "report"):
+                motor.iniciar(resto)
+                res = motor.evaluar(resto, resolver_con_auditor(resto))
+                self.ui.linea(resaltar_codigo(json.dumps(res.como_dict(), ensure_ascii=False, indent=2), "json"))
+            elif sub in ("reiniciar", "restaurar", "reset"):
+                self.ui.ok("Fixture borrado (reset)." if motor.reiniciar(resto) else "No había fixture que borrar.")
+            else:
+                self.ui.error(f"Subcomando /lab desconocido: {sub} (escenarios|iniciar|probar|informe|reiniciar)")
+        except ValueError as e:
+            self.ui.error(str(e))
+
     def cmd_auditar(self, arg: str) -> None:
         """Auditoría ESTÁTICA offline de un archivo/proyecto local (config insegura + dependencias). No toca la red."""
         objetivo = (arg or "").strip() or "."

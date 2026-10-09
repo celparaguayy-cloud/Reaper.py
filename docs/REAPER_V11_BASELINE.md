@@ -26,7 +26,7 @@ construir), `NO-OBJETIVO` (el propio spec lo prohíbe).
 | §5 Security Scope Gate (fuera del LLM, no ampliable por el modelo) | **PARCIAL→** | `modo_seguridad`+`/pentest` daban postura por prompt. **Fase 1 v11 agrega `PoliticaAlcance` + `PuertaAlcance` reales en código (64_scope.py)** |
 | §6 Tool Forge (pipeline intención→…→catálogo) | **AUSENTE** | Existe `write_large_file`/torneo, pero no el pipeline con `tool.yaml`, catálogo versionado y gate de calidad |
 | §7 Discovery / Vulnerability Research + etiquetas | **PARCIAL→** | **Fase 1 v11 agrega las etiquetas de hallazgo honestas (`EstadoHallazgo`) en 64_scope.py.** Auditores (RepoAuditor, DependencyAuditor…) AUSENTES |
-| §8/§23 Lab Challenge Engine + fixtures + flag sintético | **AUSENTE** | Por construir; fixtures efímeros, evaluador independiente |
+| §8/§23 Lab Challenge Engine + fixtures + flag sintético | **PRESENTE** | `MotorLab` (66): 3 escenarios sintéticos, juez independiente (ground truth del motor), fixtures efímeros con reset, `LAB_FLAG` no falsificable. CLI `/lab`. Positivo/negativo/falso-positivo discriminados |
 | §9 ExecutionBroker / LocalRunner / Receipts con hash+git | **PARCIAL** | `execute_command`/`run_tests` ejecutan de verdad con bloqueos de dispositivo (17); `ToolReceipt` existe (62) pero no ligado a git-rev+hashes de artefactos; falta broker que revalide alcance por operación |
 | §9 SSHRunner / LabRunner (VM aislada) | **AUSENTE** | Opt-in, requiere config del operador |
 | §10 Análisis de malware estático (defensivo) | **AUSENTE** | Por construir; nunca ejecutar muestras |
