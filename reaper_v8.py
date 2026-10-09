@@ -26993,6 +26993,45 @@ class App:
         guardar_settings(self.settings)
 
     def cmd_modelos(self, arg: str) -> None:
+        partes = (arg or "").split(maxsplit=1)
+        sub = partes[0].lower() if partes else ""
+        resto = partes[1].strip() if len(partes) > 1 else ""
+        if sub in ("descubrir", "catalogo", "catálogo", "gratis", "sincronizar", "sync"):
+            cat = CatalogoModelos()
+            if sub in ("sincronizar", "sync"):
+                if not resto:
+                    self.ui.error("Uso: /modelos sincronizar <archivo.md>  (parsea un directorio Markdown LOCAL)")
+                    return
+                try:
+                    texto = self.ws.leer(self.ws.rel(self.ws.ruta(resto)))
+                except (OSError, ValueError, ErrorRuta):
+                    self.ui.error(f"No pude leer {resto}.")
+                    return
+                n = cat.sincronizar_desde_markdown(texto, source_url=resto, source_version="local")
+                self.ui.ok(f"Catálogo actualizado: {n} ficha(s) normalizada(s) desde {resto}.")
+                self.ui.tenue("  Estados: todas 'unverified'. La verificación real requiere peticiones con claves.")
+                return
+            if sub == "gratis":
+                libres = cat.gratis_verificados()
+                if not libres:
+                    self.ui.info("Ningún modelo con coste cero VERIFICADO todavía.")
+                    self.ui.tenue("  Que un directorio diga ':free' no basta: hay que confirmarlo con la cuenta.")
+                    return
+                for f in libres:
+                    self.ui.info(f"  {f.provider}/{f.model_id}  (free verificado)")
+                return
+            fichas = cat.fichas()
+            self.ui.info(f"Catálogo descubierto ({cat.estado()}):")
+            if not fichas:
+                self.ui.tenue("  Vacío. Poblalo con /modelos sincronizar <archivo.md> (directorio comunitario).")
+                return
+            for f in fichas[:40]:
+                ctx = f.context_tokens if f.context_tokens is not None else "?"
+                self.ui.info(f"  {f.provider or '?'}/{f.model_id}  ctx={ctx}  [{f.status}]")
+            meta = cat.meta()
+            self.ui.tenue(f"  fuente: {meta.get('source_url', '—')} · confianza: {meta.get('confidence', '—')} "
+                          f"· obtenido: {meta.get('retrieved_at', '—')}")
+            return
         filas = [[alias, info.nivel, (info.proveedor or self.settings.proveedor), formatear_numero(info.contexto),
                   info.id, info.nota] for alias, info in INFO_MODELOS.items()]
         self.ui.tabla(filas, ["alias", "nivel", "proveedor", "contexto", "id", "nota"], "lllrll")
@@ -27000,7 +27039,7 @@ class App:
         if len(activos) > 1:
             self.ui.info("  Proveedores en uso esta sesión: "
                          + "; ".join(f"{p} ({', '.join(ms)})" for p, ms in activos.items()))
-        self.ui.tenue("  Cualquier id de OpenRouter sirve también: /modelo proveedor/modelo")
+        self.ui.tenue("  /modelos descubrir · /modelos gratis · /modelos sincronizar <archivo.md>")
 
     def cmd_pentest(self, arg: str) -> None:
         arg = arg.strip()
@@ -40826,6 +40865,114 @@ class TestEquipoCLI(BaseTest):
 
 
 # ======================================================================
+# MÓDULO: autotest_catalogo
+# ======================================================================
+"""Autotests del catálogo vivo offline (REAPER AUTO-6-IA §4): parser tolerante, nulls honestos, TTL."""
+
+_CAT_MD = (
+    "# Directorio\n\n"
+    "| Proveedor | Modelo | Contexto | Free | URL |\n"
+    "|-----------|--------|----------|------|-----|\n"
+    "| Groq | llama-3.1-8b | 131072 | yes | https://api.groq.com |\n"
+    "| Groq | llama-3.1-8b | 131072 | yes | https://api.groq.com |\n"   # duplicado
+    "| NVIDIA | nemotron-4 | | no | ftp://raro |\n"                      # contexto vacío, URL rara
+    "| Mistral |\n"                                                      # fila incompleta
+    "\nTexto suelto, no tabla.\n"
+)
+
+
+class TestParserCatalogo(BaseTest):
+    def test_parsea_filas(self):
+        filas = parsear_tablas_markdown(_CAT_MD)
+        self.assertTrue(any(f.get("model_id") == "llama-3.1-8b" for f in filas))
+
+    def test_tolera_tabla_rota(self):
+        # encabezado sin separador: no es tabla válida, no revienta ni inventa filas
+        self.assertEqual(parsear_tablas_markdown("| a | b |\n| 1 | 2 |"), [])
+
+    def test_fila_incompleta_no_rompe(self):
+        filas = parsear_tablas_markdown(_CAT_MD)
+        mistral = [f for f in filas if f.get("provider", "").lower() == "mistral"]
+        self.assertTrue(mistral)                     # fila incompleta se tolera (campos vacíos)
+
+    def test_unicode(self):
+        md = "| Proveedor | Modelo |\n|---|---|\n| Münïç | mödël-ü |\n"
+        self.assertEqual(parsear_tablas_markdown(md)[0]["model_id"], "mödël-ü")
+
+
+class TestNormalizacion(BaseTest):
+    def test_dedup_y_nulls(self):
+        fichas = normalizar_fichas(parsear_tablas_markdown(_CAT_MD))
+        groq = [f for f in fichas if f.provider == "groq"]
+        self.assertEqual(len(groq), 1)               # duplicado colapsado
+        self.assertEqual(groq[0].context_tokens, 131072)
+
+    def test_contexto_vacio_es_null_no_cero(self):
+        fichas = normalizar_fichas(parsear_tablas_markdown(_CAT_MD))
+        nvidia = next(f for f in fichas if f.provider == "nvidia")
+        self.assertIsNone(nvidia.context_tokens)     # NUNCA 0 por defecto
+        self.assertIsNone(nvidia.supports_tools)
+
+    def test_free_del_directorio_no_es_verificado(self):
+        fichas = normalizar_fichas(parsear_tablas_markdown(_CAT_MD))
+        groq = next(f for f in fichas if f.provider == "groq")
+        self.assertFalse(groq.free_tier_verified)    # 'yes' en el directorio NO verifica coste cero
+        self.assertFalse(groq.gratis_verificado())
+        self.assertEqual(groq.status, "unverified")
+
+    def test_url_rara_se_descarta(self):
+        fichas = normalizar_fichas(parsear_tablas_markdown(_CAT_MD))
+        nvidia = next(f for f in fichas if f.provider == "nvidia")
+        self.assertNotIn("ftp://", nvidia.source)    # URL no http(s) no se usa como fuente
+
+
+class TestCacheCatalogo(BaseTest):
+    def test_sincronizar_y_cargar(self):
+        cat = CatalogoModelos(self.dir / "cat.json")
+        n = cat.sincronizar_desde_markdown(_CAT_MD, source_url="fixture.md")
+        self.assertGreaterEqual(n, 2)
+        self.assertTrue(cat.vigente())
+        self.assertEqual(cat.estado(), "actualizado")
+        self.assertEqual(cat.meta()["confidence"], "baja")
+
+    def test_ttl_vencido(self):
+        cat = CatalogoModelos(self.dir / "cat.json", ttl_horas=24)
+        cat.sincronizar_desde_markdown(_CAT_MD)
+        # con un 'ahora' 48h en el futuro, la caché está vencida pero las fichas siguen disponibles
+        self.assertFalse(cat.vigente(ahora=datetime.now() + timedelta(hours=48)))
+        self.assertTrue(cat.fichas())
+
+    def test_marcar_verificado(self):
+        cat = CatalogoModelos(self.dir / "cat.json")
+        cat.sincronizar_desde_markdown(_CAT_MD)
+        self.assertTrue(cat.marcar_verificado("groq", "llama-3.1-8b", free_tier_verified=True))
+        f = next(x for x in cat.fichas() if x.provider == "groq")
+        self.assertEqual(f.status, "verified")
+        self.assertTrue(f.gratis_verificado())
+        self.assertEqual(len(cat.gratis_verificados()), 1)
+
+    def test_vacio(self):
+        self.assertIn("vacío", CatalogoModelos(self.dir / "nada.json").estado())
+
+
+class TestCatalogoCLI(BaseTest):
+    def test_sincronizar_y_descubrir(self):
+        ws = self.proyecto({"dir.md": _CAT_MD})
+        app = App(self.ajustes(forense=False, escalar=False), MockLLM([]), self.ui(), ws, persistir=False)
+        app.comando("/modelos sincronizar dir.md")
+        app.comando("/modelos descubrir")
+        texto = app.ui.texto_registrado()
+        self.assertIn("llama-3.1-8b", texto)
+        self.assertIn("unverified", texto)
+
+    def test_gratis_vacio_honesto(self):
+        ws = self.proyecto()
+        app = App(self.ajustes(forense=False, escalar=False), MockLLM([]), self.ui(), ws, persistir=False)
+        app.comando("/modelos gratis")
+        self.assertIn("VERIFICADO", app.ui.texto_registrado())
+
+
+# ======================================================================
 # MÓDULO: autotest_runner
 # ======================================================================
 """Ejecutor del autotest interno."""
@@ -45124,6 +45271,221 @@ def independencia_equipo(estado: list) -> dict:
     modelos = {e["modelo"] for e in estado}
     return {"proveedores_distintos": len(provs), "modelos_distintos": len(modelos),
             "reducida": len(provs) <= 1}
+
+
+# ======================================================================
+# MÓDULO: catalogo
+# ======================================================================
+"""
+Catálogo vivo de modelos — OFFLINE (REAPER AUTO-6-IA §4).
+
+REAPER no debe depender de IDs de modelo hardcodeados. Este módulo normaliza candidatos descubiertos (p. ej.
+de un directorio comunitario en Markdown) a fichas honestas y los guarda en una caché con TTL y estados de
+verificación. Todo acá es OFFLINE y determinista: el parser trabaja sobre texto que ya se tiene; la descarga
+real (con ETag/If-Modified-Since, allowlist de hosts, etc.) se inyecta como fetcher y queda PLANNED.
+
+Reglas honestas del spec:
+  - `null` NUNCA se interpreta como `true` ni como `0`.
+  - Que un directorio diga "free" NO es prueba de coste cero: `free_tier_verified` solo lo pone una
+    verificación real, nunca el parser.
+  - El estado arranca en "unverified"; solo una petición real autorizada marca "verified".
+  - Si la caché venció y no se puede refrescar, se sigue con lo último y se avisa "datos desactualizados".
+"""
+
+CONFIANZA_FUENTE = {"community_markdown": "baja", "provider_api": "media", "verified": "alta"}
+
+# Encabezados de tabla → clave canónica (tolerante a sinónimos español/inglés).
+_CAT_CANON = {
+    "provider": "provider", "proveedor": "provider", "api": "provider",
+    "model": "model_id", "modelo": "model_id", "model id": "model_id", "model_id": "model_id", "id": "model_id",
+    "name": "display_name", "nombre": "display_name", "display name": "display_name",
+    "url": "url", "endpoint": "url", "base url": "url", "base_url": "url",
+    "free": "free", "gratis": "free", "free tier": "free", "free_tier": "free",
+    "context": "context", "contexto": "context", "context length": "context", "context_tokens": "context",
+    "tools": "tools", "tool calls": "tools", "herramientas": "tools",
+}
+
+
+@dataclass
+class FichaModelo:
+    provider: str
+    model_id: str
+    display_name: str = ""
+    context_tokens: Optional[int] = None
+    supports_tools: Optional[bool] = None
+    supports_json: Optional[bool] = None
+    supports_stream: Optional[bool] = None
+    cost_usd_per_m_input: Optional[float] = None
+    cost_usd_per_m_output: Optional[float] = None
+    free_tier_verified: bool = False
+    status: str = "unverified"              # unverified | verified | retired | quarantined
+    last_checked_at: Optional[str] = None
+    source: str = ""
+
+    def gratis_verificado(self) -> bool:
+        return self.free_tier_verified is True and self.status == "verified"
+
+    def como_dict(self) -> dict:
+        return dict(self.__dict__)
+
+    @staticmethod
+    def desde_dict(d: dict) -> "FichaModelo":
+        campos = {f.name for f in fields(FichaModelo)}
+        return FichaModelo(**{k: v for k, v in d.items() if k in campos})
+
+
+def _cat_celdas(linea: str) -> list:
+    linea = linea.strip()
+    if linea.startswith("|"):
+        linea = linea[1:]
+    if linea.endswith("|"):
+        linea = linea[:-1]
+    return [c.strip() for c in linea.split("|")]
+
+
+def _cat_es_separador(linea: str) -> bool:
+    cuerpo = linea.strip().strip("|")
+    return bool(cuerpo) and set(cuerpo.replace("|", "").strip()) <= set("-: ")
+
+
+def parsear_tablas_markdown(texto: str) -> list:
+    """
+    Parser TOLERANTE de tablas Markdown. Devuelve filas como dicts {clave_canónica/encabezado: valor}.
+    No revienta ante tablas rotas, filas incompletas, Unicode, duplicados, URLs raras ni columnas desconocidas.
+    """
+    filas = []
+    lineas = (texto or "").splitlines()
+    i = 0
+    while i < len(lineas):
+        linea = lineas[i]
+        if "|" in linea and i + 1 < len(lineas) and _cat_es_separador(lineas[i + 1]):
+            encabezados = [_CAT_CANON.get(c.lower(), c.lower()) for c in _cat_celdas(linea)]
+            i += 2
+            while i < len(lineas) and "|" in lineas[i] and not _cat_es_separador(lineas[i]):
+                celdas = _cat_celdas(lineas[i])
+                fila = {}
+                for j, clave in enumerate(encabezados):
+                    if not clave:
+                        continue
+                    fila[clave] = celdas[j].strip() if j < len(celdas) else ""   # filas incompletas → ""
+                if fila:
+                    filas.append(fila)
+                i += 1
+        else:
+            i += 1
+    return filas
+
+
+def _cat_int(valor) -> Optional[int]:
+    m = re.search(r"\d[\d,._]*", str(valor or ""))
+    if not m:
+        return None
+    try:
+        return int(re.sub(r"[,_.]", "", m.group(0)))
+    except ValueError:
+        return None
+
+
+def _cat_url_valida(valor: str) -> str:
+    valor = (valor or "").strip().strip("<>")
+    return valor if re.match(r"^https?://[^\s]+$", valor) else ""
+
+
+def normalizar_fichas(filas: list, source: str = "community_markdown") -> list:
+    """Convierte filas crudas a FichaModelo con nulls honestos y dedup por (provider, model_id)."""
+    vistos, salida = set(), []
+    for fila in filas or []:
+        model_id = (fila.get("model_id") or "").strip()
+        if not model_id or model_id in ("-", "n/a", "na", "tbd"):
+            continue                                   # sin id no es un modelo usable
+        provider = (fila.get("provider") or "").strip().lower()
+        clave = (provider, model_id)
+        if clave in vistos:
+            continue                                   # duplicado
+        vistos.add(clave)
+        ficha = FichaModelo(
+            provider=provider, model_id=model_id,
+            display_name=(fila.get("display_name") or model_id).strip(),
+            context_tokens=_cat_int(fila.get("context")),     # null si no se pudo leer; NUNCA 0 por defecto
+            source=_cat_url_valida(fila.get("url", "")) or source,
+            # free_tier_verified SIEMPRE False desde el parser: un directorio no verifica coste cero.
+        )
+        salida.append(ficha)
+    return salida
+
+
+class CatalogoModelos:
+    """Caché del catálogo con TTL, metadatos de procedencia y estados. Offline por defecto."""
+
+    def __init__(self, base=None, ttl_horas: int = 24):
+        self.archivo = Path(base) if base else (BASE_DIR / "catalog_modelos.json")
+        if self.archivo.is_dir():
+            self.archivo = self.archivo / "catalog_modelos.json"
+        self.ttl_horas = ttl_horas
+
+    def _cargar(self) -> dict:
+        try:
+            datos = json.loads(self.archivo.read_text(encoding="utf-8"))
+            return datos if isinstance(datos, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def guardar(self, fichas: list, source_url: str = "", source_version: str = "",
+                discovery: str = "community_markdown") -> None:
+        meta = {"source_url": source_url, "source_version": source_version,
+                "discovery": discovery, "confidence": CONFIANZA_FUENTE.get(discovery, "baja"),
+                "retrieved_at": datetime.now().isoformat(timespec="seconds")}
+        datos = {"meta": meta, "fichas": [f.como_dict() for f in fichas]}
+        self.archivo.parent.mkdir(parents=True, exist_ok=True)
+        escritura_atomica(self.archivo, json.dumps(datos, ensure_ascii=False, indent=1))
+
+    def fichas(self) -> list:
+        return [FichaModelo.desde_dict(d) for d in self._cargar().get("fichas", [])]
+
+    def meta(self) -> dict:
+        return self._cargar().get("meta", {})
+
+    def vigente(self, ahora: Optional[datetime] = None) -> bool:
+        ra = self.meta().get("retrieved_at")
+        if not ra:
+            return False
+        try:
+            t = datetime.fromisoformat(ra)
+        except ValueError:
+            return False
+        ahora = ahora or datetime.now()
+        return (ahora - t) <= timedelta(hours=self.ttl_horas)
+
+    def estado(self) -> str:
+        if not self._cargar().get("fichas"):
+            return "vacío (sin catálogo; sincronizá para poblarlo)"
+        return "actualizado" if self.vigente() else "datos desactualizados (caché vencida; sin red se usa igual)"
+
+    def sincronizar_desde_markdown(self, texto: str, source_url: str = "", source_version: str = "") -> int:
+        """Parsea un Markdown (ya obtenido) y actualiza la caché. Devuelve cuántas fichas quedaron."""
+        fichas = normalizar_fichas(parsear_tablas_markdown(texto), "community_markdown")
+        self.guardar(fichas, source_url=source_url, source_version=source_version, discovery="community_markdown")
+        return len(fichas)
+
+    def marcar_verificado(self, provider: str, model_id: str, **caps) -> bool:
+        """Marca una ficha como 'verified' tras una comprobación REAL (no desde el directorio)."""
+        datos = self._cargar()
+        cambiado = False
+        for d in datos.get("fichas", []):
+            if d.get("provider") == provider and d.get("model_id") == model_id:
+                d["status"] = "verified"
+                d["last_checked_at"] = datetime.now().isoformat(timespec="seconds")
+                for k, v in caps.items():
+                    if k in d:
+                        d[k] = v
+                cambiado = True
+        if cambiado:
+            self.archivo.parent.mkdir(parents=True, exist_ok=True)
+            escritura_atomica(self.archivo, json.dumps(datos, ensure_ascii=False, indent=1))
+        return cambiado
+
+    def gratis_verificados(self) -> list:
+        return [f for f in self.fichas() if f.gratis_verificado()]
 
 
 # ======================================================================

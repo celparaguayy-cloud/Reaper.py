@@ -893,6 +893,45 @@ class App:
         guardar_settings(self.settings)
 
     def cmd_modelos(self, arg: str) -> None:
+        partes = (arg or "").split(maxsplit=1)
+        sub = partes[0].lower() if partes else ""
+        resto = partes[1].strip() if len(partes) > 1 else ""
+        if sub in ("descubrir", "catalogo", "catálogo", "gratis", "sincronizar", "sync"):
+            cat = CatalogoModelos()
+            if sub in ("sincronizar", "sync"):
+                if not resto:
+                    self.ui.error("Uso: /modelos sincronizar <archivo.md>  (parsea un directorio Markdown LOCAL)")
+                    return
+                try:
+                    texto = self.ws.leer(self.ws.rel(self.ws.ruta(resto)))
+                except (OSError, ValueError, ErrorRuta):
+                    self.ui.error(f"No pude leer {resto}.")
+                    return
+                n = cat.sincronizar_desde_markdown(texto, source_url=resto, source_version="local")
+                self.ui.ok(f"Catálogo actualizado: {n} ficha(s) normalizada(s) desde {resto}.")
+                self.ui.tenue("  Estados: todas 'unverified'. La verificación real requiere peticiones con claves.")
+                return
+            if sub == "gratis":
+                libres = cat.gratis_verificados()
+                if not libres:
+                    self.ui.info("Ningún modelo con coste cero VERIFICADO todavía.")
+                    self.ui.tenue("  Que un directorio diga ':free' no basta: hay que confirmarlo con la cuenta.")
+                    return
+                for f in libres:
+                    self.ui.info(f"  {f.provider}/{f.model_id}  (free verificado)")
+                return
+            fichas = cat.fichas()
+            self.ui.info(f"Catálogo descubierto ({cat.estado()}):")
+            if not fichas:
+                self.ui.tenue("  Vacío. Poblalo con /modelos sincronizar <archivo.md> (directorio comunitario).")
+                return
+            for f in fichas[:40]:
+                ctx = f.context_tokens if f.context_tokens is not None else "?"
+                self.ui.info(f"  {f.provider or '?'}/{f.model_id}  ctx={ctx}  [{f.status}]")
+            meta = cat.meta()
+            self.ui.tenue(f"  fuente: {meta.get('source_url', '—')} · confianza: {meta.get('confidence', '—')} "
+                          f"· obtenido: {meta.get('retrieved_at', '—')}")
+            return
         filas = [[alias, info.nivel, (info.proveedor or self.settings.proveedor), formatear_numero(info.contexto),
                   info.id, info.nota] for alias, info in INFO_MODELOS.items()]
         self.ui.tabla(filas, ["alias", "nivel", "proveedor", "contexto", "id", "nota"], "lllrll")
@@ -900,7 +939,7 @@ class App:
         if len(activos) > 1:
             self.ui.info("  Proveedores en uso esta sesión: "
                          + "; ".join(f"{p} ({', '.join(ms)})" for p, ms in activos.items()))
-        self.ui.tenue("  Cualquier id de OpenRouter sirve también: /modelo proveedor/modelo")
+        self.ui.tenue("  /modelos descubrir · /modelos gratis · /modelos sincronizar <archivo.md>")
 
     def cmd_pentest(self, arg: str) -> None:
         arg = arg.strip()
