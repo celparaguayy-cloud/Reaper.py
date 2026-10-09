@@ -27,7 +27,7 @@ construir), `NO-OBJETIVO` (el propio spec lo prohíbe).
 | §6 Tool Forge (pipeline intención→…→catálogo) | **AUSENTE** | Existe `write_large_file`/torneo, pero no el pipeline con `tool.yaml`, catálogo versionado y gate de calidad |
 | §7 Discovery / Vulnerability Research + etiquetas | **PARCIAL→** | **Fase 1 v11 agrega las etiquetas de hallazgo honestas (`EstadoHallazgo`) en 64_scope.py.** Auditores (RepoAuditor, DependencyAuditor…) AUSENTES |
 | §8/§23 Lab Challenge Engine + fixtures + flag sintético | **PRESENTE** | `MotorLab` (66): 3 escenarios sintéticos, juez independiente (ground truth del motor), fixtures efímeros con reset, `LAB_FLAG` no falsificable. CLI `/lab`. Positivo/negativo/falso-positivo discriminados |
-| §9 ExecutionBroker / LocalRunner / Receipts con hash+git | **PARCIAL** | `execute_command`/`run_tests` ejecutan de verdad con bloqueos de dispositivo (17); `ToolReceipt` existe (62) pero no ligado a git-rev+hashes de artefactos; falta broker que revalide alcance por operación |
+| §9 ExecutionBroker / LocalRunner / Receipts con hash+git | **PRESENTE** | `BrokerEjecucion` (67): argv tipado (shell=False), bloqueos de dispositivo, **revalida `PuertaAlcance` por operación** (red fuera de alcance NO ejecuta), timeout, tope de salida, cancelación. Emite `ReciboEjecucion` con hash sha256 + git-rev + preview redactado. CLI `/ejecutar` |
 | §9 SSHRunner / LabRunner (VM aislada) | **AUSENTE** | Opt-in, requiere config del operador |
 | §10 Análisis de malware estático (defensivo) | **AUSENTE** | Por construir; nunca ejecutar muestras |
 | §11/§24.7 Privacidad / `/privacy report` / redacción de secretos | **PARCIAL** | `redactar_secretos` existe (sanea stdout); falta `/privacy report` y política `no_upload_sensitive_artifacts` |

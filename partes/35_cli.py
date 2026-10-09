@@ -927,6 +927,25 @@ class App:
         self.ui.aviso("  REAPER hará trabajo ofensivo SOLO dentro de ese alcance. Fuera de ahí, frena y avisa.")
         self.ui.tenue("  Seguís protegido: sudo, rm -rf, apagar el equipo y leer .env siguen bloqueados.")
 
+    def cmd_ejecutar(self, arg: str) -> None:
+        """Corre un comando LOCAL por el ExecutionBroker y muestra el recibo de evidencia (hash + git-rev + veredicto)."""
+        if not arg.strip():
+            self.ui.error("Uso: /ejecutar <comando>  (ejecución local con recibo; sin red salvo scope válido)")
+            return
+        try:
+            argv = shlex.split(arg)
+        except ValueError as e:
+            self.ui.error(f"No pude parsear el comando: {e}")
+            return
+        broker = BrokerEjecucion(raiz=self.ws.raiz)
+        recibo = broker.ejecutar(SolicitudEjecucion(argv=argv, cwd=str(self.ws.raiz), timeout_s=60))
+        self.ui.info(f"Recibo {recibo.run_id} · veredicto: {recibo.veredicto_alcance} · exit: {recibo.exit_code}")
+        if recibo.stdout_preview:
+            self.ui.linea(recibo.stdout_preview.rstrip())
+        if recibo.stderr_preview:
+            self.ui.tenue(recibo.stderr_preview.rstrip())
+        self.ui.tenue(f"  stdout sha256: {recibo.stdout_hash[:16]}… · git: {recibo.git_revision[:12] or '—'}")
+
     def cmd_lab(self, arg: str) -> None:
         """Lab Challenge Engine: desafíos sintéticos locales con juez independiente (offline, sin objetivos externos)."""
         partes = (arg or "").split(maxsplit=1)

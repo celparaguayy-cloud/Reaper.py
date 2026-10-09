@@ -235,6 +235,8 @@ class ReciboEjecucion:
     exit_code: Optional[int] = None
     stdout_hash: str = ""
     stderr_hash: str = ""
+    stdout_preview: str = ""        # salida truncada y con secretos redactados (§9); el hash cubre la salida completa
+    stderr_preview: str = ""
     artifact_hashes: list = field(default_factory=list)
     git_revision: str = ""
     scope_id: str = ""
@@ -245,6 +247,7 @@ class ReciboEjecucion:
     def como_dict(self) -> dict:
         return {"run_id": self.run_id, "task_id": self.task_id, "argv": list(self.argv), "cwd": self.cwd,
                 "exit_code": self.exit_code, "stdout_hash": self.stdout_hash, "stderr_hash": self.stderr_hash,
+                "stdout_preview": self.stdout_preview, "stderr_preview": self.stderr_preview,
                 "artifact_hashes": list(self.artifact_hashes), "git_revision": self.git_revision,
                 "scope_id": self.scope_id, "veredicto_alcance": self.veredicto_alcance,
                 "started_at": self.started_at, "finished_at": self.finished_at}
@@ -266,6 +269,8 @@ def recibo_de_ejecucion(run_id: str, argv, *, cwd="", exit_code=None, stdout="",
     return ReciboEjecucion(
         run_id=run_id, task_id=task_id, argv=list(argv), cwd=str(cwd),
         exit_code=exit_code, stdout_hash=_sc_sha256(stdout), stderr_hash=_sc_sha256(stderr),
+        stdout_preview=redactar_secretos(recortar(stdout or "", 2000)),
+        stderr_preview=redactar_secretos(recortar(stderr or "", 2000)),
         artifact_hashes=[_sc_sha256(a) for a in artefactos],
         git_revision=_sc_revision_git(raiz) if raiz is not None else "",
         scope_id=scope_id, veredicto_alcance=veredicto,
