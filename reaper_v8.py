@@ -10087,6 +10087,7 @@ class Agente:
         self._evidencias: list[tuple[str, str, int]] = []  # (herramienta, ok|fallo|bloqueado|sin_tests, escrituras)
         self._reusos_seguidos = 0
         self._ultima_salida_ok = ""
+        self._bucles = RompedorDeBucles()        # v9 Fase 4: oscilación / machaque / error estancado
         self._prohibido: set = set()
         self._pide_cambios = True
         self._pregunta_simple = False
@@ -10140,6 +10141,7 @@ class Agente:
         self._evidencias = []
         self._reusos_seguidos = 0
         self._ultima_salida_ok = ""
+        self._bucles = RompedorDeBucles()
         self._guardia = None
         self._reversiones = 0
         self._sin_progreso = 0
@@ -10499,7 +10501,32 @@ class Agente:
                 and not self.ctx.cambios and not self._pide_cambios and not salida_fallida(nombre, salida)):
             salida += ("\n\n(Si este resultado ya responde lo que te preguntaron, respondé AHORA en texto, sin más "
                        "herramientas. No repitas el comando.)")
+        nota_bucle = self._revisar_bucles(nombre, h, ruta, error, salida)
+        if nota_bucle:
+            salida += "\n\n" + nota_bucle
         return obs(aviso_relectura + salida, attrs), error
+
+    def _revisar_bucles(self, nombre: str, h: "Herramienta", ruta: Optional[str], error: bool, salida: str) -> str:
+        """LoopBreaker (Fase 4): oscilación, machaque del mismo objetivo y error estancado. Solo avisa (no bloquea)."""
+        if self.rol.solo_lectura:
+            return ""
+        veredictos = []
+        if h.escribe and not error and not salida.startswith("ERROR"):
+            objetivo = ruta
+            if not objetivo and nombre in ("replace_symbol", "insert_after_symbol", "rename_symbol"):
+                objetivo = (nombre + ":")  # sin ruta explícita: igual cuenta como edición
+            veredictos.append(self._bucles.registrar_edicion(objetivo or nombre))
+            try:
+                veredictos.append(self._bucles.registrar_estado(self.ws.huella()))
+            except OSError:
+                pass
+        if error and nombre not in ("read_file", "read_symbol", "list_files", "search_files"):
+            veredictos.append(self._bucles.registrar_error(ruta or nombre, _firma_error(salida)))
+        notas = [v.nota() for v in veredictos if v]
+        if notas:
+            self.ctx.tropiezo("bucle")
+            self.ui.aviso(f"  [{self.etiqueta}] bucle improductivo detectado ({len(notas)})")
+        return "\n".join(notas)
 
     # ------------------------------------------------------------ guardia de regresión y forense (v8)
     def _firma_tests(self) -> str:
@@ -11741,6 +11768,100 @@ def write_large_file(ctx: Contexto, p: dict) -> str:
     else:
         texto += "\nValidación: " + resumen_validacion(resultados)
     return texto
+
+
+# ======================================================================
+# MÓDULO: loopbreaker
+# ======================================================================
+"""
+LoopBreaker (v9, Fase 4): corta bucles IMPRODUCTIVOS que el detector de llamadas idénticas NO ve.
+
+El detector de part 20 bloquea repetir una llamada idéntica mientras el estado no cambia. Pero un modelo
+chico cae en bucles más sutiles que SÍ cambian el estado cada vuelta:
+  - OSCILACIÓN: edita A, lo revierte, lo vuelve a editar igual → el workspace vuelve a un estado ya visto.
+  - MACHAQUE: retoca el MISMO archivo/símbolo una y otra vez sin que la verificación mejore.
+  - ERROR_ESTANCADO: la misma firma de error reaparece pese a los cambios (lo que prueba no ataca la causa).
+
+El RompedorDeBucles no bloquea por su cuenta: devuelve un VEREDICTO que el agente le muestra al modelo (y
+cuenta como tropiezo) para que cambie de enfoque o active el modo forense. Cada veredicto se avisa UNA sola
+vez por objetivo, para no convertirse él mismo en ruido repetido.
+"""
+
+
+@dataclass
+class VeredictoBucle:
+    tipo: str            # OSCILACION | MACHAQUE | ERROR_ESTANCADO
+    objetivo: str
+    veces: int
+    detalle: str
+
+    def nota(self) -> str:
+        return f"⚠ REAPER detectó un BUCLE ({self.tipo}): {self.detalle}"
+
+
+class RompedorDeBucles:
+    def __init__(self, umbral_machaque: int = 4, umbral_error: int = 3, ventana: int = 16):
+        self.umbral_machaque = umbral_machaque
+        self.umbral_error = umbral_error
+        self.ventana = ventana
+        self.estados: list = []                       # huellas de estado tras escrituras (oscilación)
+        self.ediciones: collections.Counter = collections.Counter()   # objetivo → veces editado
+        self.errores: collections.Counter = collections.Counter()      # (objetivo, firma) → veces
+        self._ultimo_estado: Optional[str] = None
+        self._avisados: set = set()                   # (tipo, clave) ya avisados: no repetir el mismo aviso
+
+    def _primera_vez(self, tipo: str, clave: str) -> bool:
+        if (tipo, clave) in self._avisados:
+            return False
+        self._avisados.add((tipo, clave))
+        return True
+
+    def registrar_estado(self, huella: str) -> Optional[VeredictoBucle]:
+        """Tras una escritura: si este estado ya se vio antes (y no es el inmediato anterior) → oscilación."""
+        if not huella or huella == self._ultimo_estado:
+            self._ultimo_estado = huella or self._ultimo_estado
+            return None
+        repetido = huella in self.estados
+        self.estados.append(huella)
+        if len(self.estados) > self.ventana:
+            self.estados = self.estados[-self.ventana:]
+        self._ultimo_estado = huella
+        if repetido and self._primera_vez("OSCILACION", huella):
+            return VeredictoBucle(
+                "OSCILACION", "", 2,
+                "el workspace volvió a un estado por el que ya habías pasado: estás deshaciendo y rehaciendo lo "
+                "mismo. Pará ese ida y vuelta: el arreglo no está donde venís tocando. Entendé la causa raíz "
+                "(leé el error real, mirá otro archivo) o activá el modo forense antes de seguir editando.")
+        return None
+
+    def registrar_edicion(self, objetivo: str) -> Optional[VeredictoBucle]:
+        """Cuenta una edición exitosa sobre un objetivo (ruta o símbolo)."""
+        if not objetivo:
+            return None
+        self.ediciones[objetivo] += 1
+        veces = self.ediciones[objetivo]
+        if veces >= self.umbral_machaque and self._primera_vez("MACHAQUE", objetivo):
+            return VeredictoBucle(
+                "MACHAQUE", objetivo, veces,
+                f"editaste '{objetivo}' {veces} veces y el problema sigue. Dejá de retocar el mismo lugar a ciegas: "
+                "leé el error COMPLETO, formulá una hipótesis concreta de la causa y hacé UN cambio pensado; si no "
+                "sale, pedí un diagnóstico (consultor) o activá el modo forense en vez de seguir probando.")
+        return None
+
+    def registrar_error(self, objetivo: str, firma: str) -> Optional[VeredictoBucle]:
+        """Cuenta una firma de error sobre un objetivo; si se repite, el enfoque no ataca la causa."""
+        if not firma:
+            return None
+        clave = (objetivo or "?", firma)
+        self.errores[clave] += 1
+        veces = self.errores[clave]
+        if veces >= self.umbral_error and self._primera_vez("ERROR_ESTANCADO", f"{objetivo}:{firma}"):
+            return VeredictoBucle(
+                "ERROR_ESTANCADO", objetivo or "?", veces,
+                f"el mismo error reaparece {veces} veces sobre '{objetivo or 'el proyecto'}' pese a tus cambios. "
+                "Lo que estás probando no toca la causa real: cambiá de hipótesis, mirá el problema desde otro "
+                "ángulo o activá el modo forense; no repitas la misma clase de arreglo.")
+        return None
 
 
 # ======================================================================
@@ -36000,6 +36121,98 @@ class TestPipeline(BaseTest):
         self.assertTrue(_es_de_especificacion("test_calc.TestCalc.test_resta", {"tests/test_calc.py": ""}))
         self.assertTrue(_es_de_especificacion("tests/test_calc.py::test_resta", {"tests/test_calc.py": ""}))
         self.assertFalse(_es_de_especificacion("test_otro.T.test_x", {"tests/test_calc.py": ""}))
+
+
+# ======================================================================
+# MÓDULO: autotest_loopbreaker
+# ======================================================================
+"""Autotests del LoopBreaker (Fase 4 / v9): oscilación, machaque del mismo objetivo y error estancado."""
+
+
+class TestRompedorDeBucles(BaseTest):
+    def test_oscilacion(self):
+        rb = RompedorDeBucles()
+        self.assertIsNone(rb.registrar_estado("A"))
+        self.assertIsNone(rb.registrar_estado("B"))
+        v = rb.registrar_estado("A")             # volvió a un estado ya visto
+        self.assertIsNotNone(v)
+        self.assertEqual(v.tipo, "OSCILACION")
+
+    def test_oscilacion_estado_inmediato_no_cuenta(self):
+        rb = RompedorDeBucles()
+        rb.registrar_estado("A")
+        self.assertIsNone(rb.registrar_estado("A"))   # mismo estado seguido: no es oscilación
+
+    def test_oscilacion_avisa_una_vez(self):
+        rb = RompedorDeBucles()
+        rb.registrar_estado("A"); rb.registrar_estado("B")
+        self.assertIsNotNone(rb.registrar_estado("A"))
+        rb.registrar_estado("B")
+        self.assertIsNone(rb.registrar_estado("A"))   # ya avisó por A
+
+    def test_machaque(self):
+        rb = RompedorDeBucles(umbral_machaque=4)
+        v = None
+        for _ in range(4):
+            v = rb.registrar_edicion("app.py")
+        self.assertIsNotNone(v)
+        self.assertEqual((v.tipo, v.objetivo, v.veces), ("MACHAQUE", "app.py", 4))
+        self.assertIsNone(rb.registrar_edicion("app.py"))   # ya avisó
+
+    def test_machaque_objetivos_distintos_no_disparan(self):
+        rb = RompedorDeBucles(umbral_machaque=3)
+        for obj in ("a.py", "b.py", "c.py"):
+            self.assertIsNone(rb.registrar_edicion(obj))
+
+    def test_error_estancado(self):
+        rb = RompedorDeBucles(umbral_error=3)
+        v = None
+        for _ in range(3):
+            v = rb.registrar_error("app.py", "firma123")
+        self.assertIsNotNone(v)
+        self.assertEqual(v.tipo, "ERROR_ESTANCADO")
+
+    def test_error_firma_distinta_no_dispara(self):
+        rb = RompedorDeBucles(umbral_error=3)
+        self.assertIsNone(rb.registrar_error("app.py", "f1"))
+        self.assertIsNone(rb.registrar_error("app.py", "f2"))
+        self.assertIsNone(rb.registrar_error("app.py", "f3"))
+
+    def test_vacios_no_disparan(self):
+        rb = RompedorDeBucles()
+        self.assertIsNone(rb.registrar_estado(""))
+        self.assertIsNone(rb.registrar_edicion(""))
+        self.assertIsNone(rb.registrar_error("app.py", ""))
+
+
+class TestLoopBreakerEnAgente(BaseTest):
+    def _obs(self, llm):
+        return [MockLLM.ultimo_usuario(c["mensajes"]) for c in llm.llamadas]
+
+    def test_machaque_del_mismo_archivo_avisa(self):
+        ws = self.proyecto()
+        llm = MockLLM([
+            herramienta_xml("write_to_file", path="trabajo.py", content="x = 1\n"),
+            herramienta_xml("write_to_file", path="trabajo.py", content="x = 2\n"),
+            herramienta_xml("write_to_file", path="trabajo.py", content="x = 3\n"),
+            herramienta_xml("write_to_file", path="trabajo.py", content="x = 4\n"),
+            terminar_xml("Dejé trabajo.py con x = 4."),
+        ])
+        Agente("principal", llm, ws, self.ajustes(forense=False, escalar=False), self.ui(),
+               memoria=None, mostrar_progreso=False).ejecutar("editá trabajo.py varias veces")
+        obs = self._obs(llm)
+        self.assertTrue(any("MACHAQUE" in o for o in obs), "esperaba un aviso de MACHAQUE tras 4 ediciones")
+
+    def test_una_sola_edicion_no_avisa(self):
+        ws = self.proyecto()
+        llm = MockLLM([
+            herramienta_xml("write_to_file", path="trabajo.py", content="x = 1\n"),
+            terminar_xml("Creé trabajo.py."),
+        ])
+        Agente("principal", llm, ws, self.ajustes(forense=False, escalar=False), self.ui(),
+               memoria=None, mostrar_progreso=False).ejecutar("creá trabajo.py")
+        obs = self._obs(llm)
+        self.assertFalse(any("BUCLE" in o for o in obs))
 
 
 # ======================================================================

@@ -345,6 +345,7 @@ class Agente:
         self._evidencias: list[tuple[str, str, int]] = []  # (herramienta, ok|fallo|bloqueado|sin_tests, escrituras)
         self._reusos_seguidos = 0
         self._ultima_salida_ok = ""
+        self._bucles = RompedorDeBucles()        # v9 Fase 4: oscilación / machaque / error estancado
         self._prohibido: set = set()
         self._pide_cambios = True
         self._pregunta_simple = False
@@ -398,6 +399,7 @@ class Agente:
         self._evidencias = []
         self._reusos_seguidos = 0
         self._ultima_salida_ok = ""
+        self._bucles = RompedorDeBucles()
         self._guardia = None
         self._reversiones = 0
         self._sin_progreso = 0
@@ -757,7 +759,32 @@ class Agente:
                 and not self.ctx.cambios and not self._pide_cambios and not salida_fallida(nombre, salida)):
             salida += ("\n\n(Si este resultado ya responde lo que te preguntaron, respondé AHORA en texto, sin más "
                        "herramientas. No repitas el comando.)")
+        nota_bucle = self._revisar_bucles(nombre, h, ruta, error, salida)
+        if nota_bucle:
+            salida += "\n\n" + nota_bucle
         return obs(aviso_relectura + salida, attrs), error
+
+    def _revisar_bucles(self, nombre: str, h: "Herramienta", ruta: Optional[str], error: bool, salida: str) -> str:
+        """LoopBreaker (Fase 4): oscilación, machaque del mismo objetivo y error estancado. Solo avisa (no bloquea)."""
+        if self.rol.solo_lectura:
+            return ""
+        veredictos = []
+        if h.escribe and not error and not salida.startswith("ERROR"):
+            objetivo = ruta
+            if not objetivo and nombre in ("replace_symbol", "insert_after_symbol", "rename_symbol"):
+                objetivo = (nombre + ":")  # sin ruta explícita: igual cuenta como edición
+            veredictos.append(self._bucles.registrar_edicion(objetivo or nombre))
+            try:
+                veredictos.append(self._bucles.registrar_estado(self.ws.huella()))
+            except OSError:
+                pass
+        if error and nombre not in ("read_file", "read_symbol", "list_files", "search_files"):
+            veredictos.append(self._bucles.registrar_error(ruta or nombre, _firma_error(salida)))
+        notas = [v.nota() for v in veredictos if v]
+        if notas:
+            self.ctx.tropiezo("bucle")
+            self.ui.aviso(f"  [{self.etiqueta}] bucle improductivo detectado ({len(notas)})")
+        return "\n".join(notas)
 
     # ------------------------------------------------------------ guardia de regresión y forense (v8)
     def _firma_tests(self) -> str:
