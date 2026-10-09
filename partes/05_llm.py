@@ -220,7 +220,18 @@ class LLMClient:
         self.limitador = LimitadorTasa(settings.rpm_efectivo())
         self.disyuntor = DisyuntorModelos(umbral=getattr(settings, "disyuntor_umbral", 3),
                                           enfriamiento=getattr(settings, "disyuntor_enfriamiento", 45.0))
+        self._claves_proveedor: dict = {}       # proveedor → clave (cache; Fase 6, ruteo multi-proveedor)
         self.on_evento: Optional[Callable[[str], None]] = None
+
+    def _destino(self, modelo: str) -> "DestinoModelo":
+        return destino_modelo(modelo, self.settings)
+
+    def _clave_de(self, destino: "DestinoModelo") -> Optional[str]:
+        if destino.proveedor == self.settings.proveedor:
+            return self.api_key
+        if destino.proveedor not in self._claves_proveedor:
+            self._claves_proveedor[destino.proveedor] = clave_de_proveedor(destino.proveedor, self.settings)
+        return self._claves_proveedor[destino.proveedor]
 
     # ------------------------------------------------------------ API
     def chat(
@@ -291,8 +302,9 @@ class LLMClient:
                 presupuesto=True,
             )
 
-    def _payload(self, modelo, mensajes, temperatura, max_tokens, stop) -> dict:
+    def _payload(self, modelo, mensajes, temperatura, max_tokens, stop, proveedor=None) -> dict:
         info = info_modelo(modelo)
+        proveedor = proveedor or self._destino(modelo).proveedor
         presupuesto = Presupuesto(min(self.settings.contexto_tokens, info.contexto) if info.contexto else
                                   self.settings.contexto_tokens, max_tokens or self.settings.max_tokens)
         payload = {
@@ -302,16 +314,16 @@ class LLMClient:
             "max_tokens": presupuesto.respuesta_posible(mensajes),
             "stream": True,
         }
-        if self.settings.proveedor == "openrouter":
+        if proveedor == "openrouter":
             payload["usage"] = {"include": True}
-        elif self.settings.proveedor == "openai":
+        elif proveedor == "openai":
             payload["stream_options"] = {"include_usage": True}
         if stop:
             payload["stop"] = stop[:4]
         return payload
 
     def _con_reintentos(self, modelo, mensajes, temperatura, max_tokens, stop, on_progress):
-        payload = self._payload(modelo, mensajes, temperatura, max_tokens, stop)
+        payload = self._payload(modelo, mensajes, temperatura, max_tokens, stop, self._destino(modelo).proveedor)
         intentos = max(0, int(self.settings.reintentos))
         for intento in range(intentos + 1):
             try:
@@ -334,11 +346,13 @@ class LLMClient:
                 self.dormir(min(espera, 120.0))
         raise LLMError("No se obtuvo respuesta del modelo.")  # pragma: no cover
 
-    def _headers(self) -> dict:
+    def _headers(self, destino: Optional["DestinoModelo"] = None) -> dict:
+        proveedor = destino.proveedor if destino is not None else self.settings.proveedor
+        clave = self._clave_de(destino) if destino is not None else self.api_key
         headers = {"Content-Type": "application/json"}
-        if self.api_key and self.api_key != "sin-clave":
-            headers["Authorization"] = f"Bearer {self.api_key}"
-        if self.settings.proveedor == "openrouter":
+        if clave and clave != "sin-clave":
+            headers["Authorization"] = f"Bearer {clave}"
+        if proveedor == "openrouter":
             headers["X-Title"] = "REAPER"
             headers["HTTP-Referer"] = "https://github.com/reaper-termux"
         return headers
@@ -351,7 +365,12 @@ class LLMClient:
         primer = 0.0
         tokens_in = tokens_out = 0
 
-        for linea in self._transporte(self.url, self._headers(), payload, self.settings.timeout):
+        destino = self._destino(modelo)
+        if destino.necesita_clave() and not self._clave_de(destino):
+            raise LLMError(
+                f"falta la clave del proveedor '{destino.proveedor}' (variable {destino.clave_env}) para el modelo "
+                f"{modelo}. Exportala como variable de entorno.", probar_otro_modelo=True)
+        for linea in self._transporte(destino.url, self._headers(destino), payload, self.settings.timeout):
             evento = parsear_linea_sse(linea)
             if evento is None:
                 continue

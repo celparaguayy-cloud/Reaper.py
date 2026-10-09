@@ -891,9 +891,13 @@ class App:
         guardar_settings(self.settings)
 
     def cmd_modelos(self, arg: str) -> None:
-        filas = [[alias, info.nivel, formatear_numero(info.contexto), info.id, info.nota]
-                 for alias, info in INFO_MODELOS.items()]
-        self.ui.tabla(filas, ["alias", "nivel", "contexto", "id", "nota"], "llrll")
+        filas = [[alias, info.nivel, (info.proveedor or self.settings.proveedor), formatear_numero(info.contexto),
+                  info.id, info.nota] for alias, info in INFO_MODELOS.items()]
+        self.ui.tabla(filas, ["alias", "nivel", "proveedor", "contexto", "id", "nota"], "lllrll")
+        activos = proveedores_de(self.settings)
+        if len(activos) > 1:
+            self.ui.info("  Proveedores en uso esta sesión: "
+                         + "; ".join(f"{p} ({', '.join(ms)})" for p, ms in activos.items()))
         self.ui.tenue("  Cualquier id de OpenRouter sirve también: /modelo proveedor/modelo")
 
     def cmd_config(self, arg: str) -> None:

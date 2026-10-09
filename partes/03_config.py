@@ -47,6 +47,7 @@ class InfoModelo:
     contexto: int = 32768
     nivel: str = "base"  # base | fuerte
     nota: str = ""
+    proveedor: str = ""  # vacío = usar el proveedor activo de la sesión; si no, rutea a ese proveedor
 
 
 INFO_MODELOS = {
@@ -62,6 +63,11 @@ INFO_MODELOS = {
     "deepseek-r1": InfoModelo("deepseek/deepseek-r1", 65536, "fuerte", "razonamiento largo (lento)"),
     "devstral": InfoModelo("mistralai/devstral-small", 131072, "base", "24B entrenado para agentes de código"),
     "llama70": InfoModelo("meta-llama/llama-3.3-70b-instruct", 131072, "base", "70B general"),
+    # Modelos ruteados a OTROS proveedores (Fase 6): coordinar varias APIs independientes.
+    "ollama-qwen": InfoModelo("qwen2.5-coder:7b", 32768, "base", "Qwen Coder 7B local (Ollama, sin clave)", "ollama"),
+    "ollama-llama": InfoModelo("llama3.1:8b", 131072, "base", "Llama 3.1 8B local (Ollama, sin clave)", "ollama"),
+    "venice-directo": InfoModelo("dolphin-2.9.2-qwen2-72b", 32768, "base", "Venice API directa (VENICE_API_KEY)", "venice"),
+    "gpt4o-mini": InfoModelo("gpt-4o-mini", 128000, "fuerte", "OpenAI directo (OPENAI_API_KEY)", "openai"),
 }
 
 MODELOS = {alias: info.id for alias, info in INFO_MODELOS.items()}

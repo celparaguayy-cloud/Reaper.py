@@ -1488,6 +1488,7 @@ class InfoModelo:
     contexto: int = 32768
     nivel: str = "base"  # base | fuerte
     nota: str = ""
+    proveedor: str = ""  # vacío = usar el proveedor activo de la sesión; si no, rutea a ese proveedor
 
 
 INFO_MODELOS = {
@@ -1503,6 +1504,11 @@ INFO_MODELOS = {
     "deepseek-r1": InfoModelo("deepseek/deepseek-r1", 65536, "fuerte", "razonamiento largo (lento)"),
     "devstral": InfoModelo("mistralai/devstral-small", 131072, "base", "24B entrenado para agentes de código"),
     "llama70": InfoModelo("meta-llama/llama-3.3-70b-instruct", 131072, "base", "70B general"),
+    # Modelos ruteados a OTROS proveedores (Fase 6): coordinar varias APIs independientes.
+    "ollama-qwen": InfoModelo("qwen2.5-coder:7b", 32768, "base", "Qwen Coder 7B local (Ollama, sin clave)", "ollama"),
+    "ollama-llama": InfoModelo("llama3.1:8b", 131072, "base", "Llama 3.1 8B local (Ollama, sin clave)", "ollama"),
+    "venice-directo": InfoModelo("dolphin-2.9.2-qwen2-72b", 32768, "base", "Venice API directa (VENICE_API_KEY)", "venice"),
+    "gpt4o-mini": InfoModelo("gpt-4o-mini", 128000, "fuerte", "OpenAI directo (OPENAI_API_KEY)", "openai"),
 }
 
 MODELOS = {alias: info.id for alias, info in INFO_MODELOS.items()}
@@ -1817,6 +1823,70 @@ def obtener_clave_api(settings: Settings) -> Optional[str]:
 
 
 # ======================================================================
+# MÓDULO: registro
+# ======================================================================
+"""
+Registro multi-proveedor (v9, Fase 6): rutear cada modelo a SU proveedor.
+
+Antes REAPER hablaba con un único proveedor por sesión (un endpoint, una clave). Para coordinar varios
+modelos independientes (p. ej. uno fuerte en OpenRouter, uno local en Ollama, uno directo de Venice) cada
+modelo tiene que saber a qué endpoint va y con qué clave. InfoModelo.proveedor declara eso; cuando está vacío
+el modelo usa el proveedor activo de la sesión, así el comportamiento de un solo proveedor no cambia.
+
+Las claves SIEMPRE salen de variables de entorno (una por proveedor), nunca del repo.
+"""
+
+
+@dataclass(frozen=True)
+class DestinoModelo:
+    modelo: str           # id real del modelo
+    proveedor: str        # openrouter | venice | ollama | openai | ...
+    url: str              # endpoint de chat/completions
+    clave_env: str        # nombre de la variable de entorno con la clave ("" = sin clave, p. ej. Ollama)
+
+    def necesita_clave(self) -> bool:
+        return bool(self.clave_env)
+
+
+def destino_modelo(nombre: str, settings: "Settings") -> DestinoModelo:
+    """A qué proveedor/endpoint va un modelo. Si InfoModelo no fija proveedor, usa el activo de la sesión."""
+    real = resolver_modelo(nombre)
+    info = info_modelo(nombre)
+    prov = getattr(info, "proveedor", "") or settings.proveedor or "openrouter"
+    if prov not in PROVEEDORES:
+        prov = settings.proveedor if settings.proveedor in PROVEEDORES else "openrouter"
+    # el proveedor activo respeta el override de api_url; los demás usan su endpoint fijo
+    url = settings.url_api() if prov == settings.proveedor else PROVEEDORES[prov]["url"]
+    return DestinoModelo(real, prov, url, PROVEEDORES[prov]["clave"])
+
+
+def clave_de_proveedor(proveedor: str, settings: "Settings") -> Optional[str]:
+    """Clave para un proveedor (de entorno). Para el proveedor activo reutiliza la lógica completa."""
+    datos = PROVEEDORES.get(proveedor, PROVEEDORES["openrouter"])
+    variable = datos["clave"]
+    if not variable:
+        return "sin-clave"
+    if proveedor == settings.proveedor:
+        return obtener_clave_api(settings)
+    valor = os.getenv(variable)
+    return valor.strip() if valor else None
+
+
+def proveedores_de(settings: "Settings") -> dict:
+    """Mapa proveedor → lista de modelos (alias) que REAPER usaría en esta sesión, para /modelos y diagnóstico."""
+    usados = [settings.modelo] + list(settings.modelos_rol.values()) + list(settings.fallbacks)
+    salida: dict = {}
+    for nombre in usados:
+        if not nombre:
+            continue
+        d = destino_modelo(nombre, settings)
+        salida.setdefault(d.proveedor, [])
+        if nombre not in salida[d.proveedor]:
+            salida[d.proveedor].append(nombre)
+    return salida
+
+
+# ======================================================================
 # MÓDULO: tokens
 # ======================================================================
 """
@@ -2106,7 +2176,18 @@ class LLMClient:
         self.limitador = LimitadorTasa(settings.rpm_efectivo())
         self.disyuntor = DisyuntorModelos(umbral=getattr(settings, "disyuntor_umbral", 3),
                                           enfriamiento=getattr(settings, "disyuntor_enfriamiento", 45.0))
+        self._claves_proveedor: dict = {}       # proveedor → clave (cache; Fase 6, ruteo multi-proveedor)
         self.on_evento: Optional[Callable[[str], None]] = None
+
+    def _destino(self, modelo: str) -> "DestinoModelo":
+        return destino_modelo(modelo, self.settings)
+
+    def _clave_de(self, destino: "DestinoModelo") -> Optional[str]:
+        if destino.proveedor == self.settings.proveedor:
+            return self.api_key
+        if destino.proveedor not in self._claves_proveedor:
+            self._claves_proveedor[destino.proveedor] = clave_de_proveedor(destino.proveedor, self.settings)
+        return self._claves_proveedor[destino.proveedor]
 
     # ------------------------------------------------------------ API
     def chat(
@@ -2177,8 +2258,9 @@ class LLMClient:
                 presupuesto=True,
             )
 
-    def _payload(self, modelo, mensajes, temperatura, max_tokens, stop) -> dict:
+    def _payload(self, modelo, mensajes, temperatura, max_tokens, stop, proveedor=None) -> dict:
         info = info_modelo(modelo)
+        proveedor = proveedor or self._destino(modelo).proveedor
         presupuesto = Presupuesto(min(self.settings.contexto_tokens, info.contexto) if info.contexto else
                                   self.settings.contexto_tokens, max_tokens or self.settings.max_tokens)
         payload = {
@@ -2188,16 +2270,16 @@ class LLMClient:
             "max_tokens": presupuesto.respuesta_posible(mensajes),
             "stream": True,
         }
-        if self.settings.proveedor == "openrouter":
+        if proveedor == "openrouter":
             payload["usage"] = {"include": True}
-        elif self.settings.proveedor == "openai":
+        elif proveedor == "openai":
             payload["stream_options"] = {"include_usage": True}
         if stop:
             payload["stop"] = stop[:4]
         return payload
 
     def _con_reintentos(self, modelo, mensajes, temperatura, max_tokens, stop, on_progress):
-        payload = self._payload(modelo, mensajes, temperatura, max_tokens, stop)
+        payload = self._payload(modelo, mensajes, temperatura, max_tokens, stop, self._destino(modelo).proveedor)
         intentos = max(0, int(self.settings.reintentos))
         for intento in range(intentos + 1):
             try:
@@ -2220,11 +2302,13 @@ class LLMClient:
                 self.dormir(min(espera, 120.0))
         raise LLMError("No se obtuvo respuesta del modelo.")  # pragma: no cover
 
-    def _headers(self) -> dict:
+    def _headers(self, destino: Optional["DestinoModelo"] = None) -> dict:
+        proveedor = destino.proveedor if destino is not None else self.settings.proveedor
+        clave = self._clave_de(destino) if destino is not None else self.api_key
         headers = {"Content-Type": "application/json"}
-        if self.api_key and self.api_key != "sin-clave":
-            headers["Authorization"] = f"Bearer {self.api_key}"
-        if self.settings.proveedor == "openrouter":
+        if clave and clave != "sin-clave":
+            headers["Authorization"] = f"Bearer {clave}"
+        if proveedor == "openrouter":
             headers["X-Title"] = "REAPER"
             headers["HTTP-Referer"] = "https://github.com/reaper-termux"
         return headers
@@ -2237,7 +2321,12 @@ class LLMClient:
         primer = 0.0
         tokens_in = tokens_out = 0
 
-        for linea in self._transporte(self.url, self._headers(), payload, self.settings.timeout):
+        destino = self._destino(modelo)
+        if destino.necesita_clave() and not self._clave_de(destino):
+            raise LLMError(
+                f"falta la clave del proveedor '{destino.proveedor}' (variable {destino.clave_env}) para el modelo "
+                f"{modelo}. Exportala como variable de entorno.", probar_otro_modelo=True)
+        for linea in self._transporte(destino.url, self._headers(destino), payload, self.settings.timeout):
             evento = parsear_linea_sse(linea)
             if evento is None:
                 continue
@@ -26582,9 +26671,13 @@ class App:
         guardar_settings(self.settings)
 
     def cmd_modelos(self, arg: str) -> None:
-        filas = [[alias, info.nivel, formatear_numero(info.contexto), info.id, info.nota]
-                 for alias, info in INFO_MODELOS.items()]
-        self.ui.tabla(filas, ["alias", "nivel", "contexto", "id", "nota"], "llrll")
+        filas = [[alias, info.nivel, (info.proveedor or self.settings.proveedor), formatear_numero(info.contexto),
+                  info.id, info.nota] for alias, info in INFO_MODELOS.items()]
+        self.ui.tabla(filas, ["alias", "nivel", "proveedor", "contexto", "id", "nota"], "lllrll")
+        activos = proveedores_de(self.settings)
+        if len(activos) > 1:
+            self.ui.info("  Proveedores en uso esta sesión: "
+                         + "; ".join(f"{p} ({', '.join(ms)})" for p, ms in activos.items()))
         self.ui.tenue("  Cualquier id de OpenRouter sirve también: /modelo proveedor/modelo")
 
     def cmd_config(self, arg: str) -> None:
@@ -35542,6 +35635,83 @@ class TestDisyuntorEnCliente(BaseTest):
         c = self.cliente(["bien"])
         c.chat([{"role": "user", "content": "x"}])
         self.assertIn("operativos", c.disyuntor.resumen())
+
+
+# ======================================================================
+# MÓDULO: autotest_registro
+# ======================================================================
+"""Autotests del registro multi-proveedor (Fase 6 / v9): ruteo de cada modelo a su endpoint/clave."""
+
+
+class TestDestinoModelo(BaseTest):
+    def test_modelo_sin_proveedor_usa_el_activo(self):
+        s = self.ajustes(proveedor="openrouter")
+        d = destino_modelo("venice", s)       # alias con id de OpenRouter, sin proveedor propio
+        self.assertEqual(d.proveedor, "openrouter")
+        self.assertEqual(d.url, s.url_api())
+        self.assertTrue(d.necesita_clave())
+
+    def test_modelo_rutea_a_ollama(self):
+        s = self.ajustes(proveedor="openrouter")
+        d = destino_modelo("ollama-qwen", s)
+        self.assertEqual(d.proveedor, "ollama")
+        self.assertEqual(d.url, PROVEEDORES["ollama"]["url"])
+        self.assertFalse(d.necesita_clave())
+
+    def test_modelo_rutea_a_openai(self):
+        s = self.ajustes(proveedor="openrouter")
+        d = destino_modelo("gpt4o-mini", s)
+        self.assertEqual((d.proveedor, d.clave_env), ("openai", "OPENAI_API_KEY"))
+        self.assertEqual(d.modelo, "gpt-4o-mini")
+
+    def test_api_url_override_para_proveedor_activo(self):
+        s = self.ajustes(proveedor="openai", api_url="http://local/v1/chat")
+        self.assertEqual(destino_modelo("gpt4o-mini", s).url, "http://local/v1/chat")
+
+    def test_clave_de_proveedor_ollama_sin_clave(self):
+        self.assertEqual(clave_de_proveedor("ollama", self.ajustes()), "sin-clave")
+
+    def test_proveedores_de_cuenta_fallbacks_y_roles(self):
+        s = self.ajustes(proveedor="openrouter", modelos_rol={"revisor": "ollama-qwen"}, fallbacks=["gpt4o-mini"])
+        provs = proveedores_de(s)
+        self.assertIn("openrouter", provs)
+        self.assertIn("ollama", provs)
+        self.assertIn("openai", provs)
+
+
+class TestRuteoEnCliente(BaseTest):
+    def cliente(self, eventos, **ajustes):
+        c = LLMClient("clave-activa", self.ajustes(**ajustes), url="http://activo",
+                      transporte=transporte_falso(eventos))
+        c.dormir = lambda _s: None
+        return c
+
+    def test_headers_del_proveedor_activo(self):
+        c = self.cliente([], proveedor="openrouter")
+        h = c._headers(c._destino("venice"))
+        self.assertEqual(h["Authorization"], "Bearer clave-activa")
+        self.assertIn("X-Title", h)
+
+    def test_headers_ollama_sin_authorization(self):
+        c = self.cliente([], proveedor="openrouter")
+        h = c._headers(c._destino("ollama-qwen"))
+        self.assertNotIn("Authorization", h)
+        self.assertNotIn("X-Title", h)
+
+    def test_payload_usa_proveedor_del_modelo(self):
+        c = self.cliente([], proveedor="openrouter")
+        p = c._payload("gpt4o-mini", [{"role": "user", "content": "x"}], 0.2, 100, None, "openai")
+        self.assertIn("stream_options", p)
+        self.assertNotIn("usage", p)
+
+    def test_modelo_sin_clave_del_proveedor_falla_claro(self):
+        self.addCleanup(lambda v=os.environ.get("VENICE_API_KEY"): os.environ.__setitem__("VENICE_API_KEY", v)
+                        if v is not None else os.environ.pop("VENICE_API_KEY", None))
+        os.environ.pop("VENICE_API_KEY", None)
+        c = self.cliente(["no debería llegar"], proveedor="openrouter")
+        with self.assertRaises(LLMError) as cm:
+            c.chat([{"role": "user", "content": "x"}], modelo="venice-directo", sin_respaldo=True)
+        self.assertIn("venice", str(cm.exception).lower())
 
 
 # ======================================================================
