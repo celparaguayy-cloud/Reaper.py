@@ -9634,6 +9634,9 @@ necesario, editar, verificar con herramientas reales y reportar.
 - Para entender un proyecto grande, delegá a subagentes 'explorador' EN PARALELO (varios <delegate> en el mismo
   mensaje, cada uno con una pregunta distinta): así no llenás tu contexto leyendo archivos enteros.
 - Podés delegar una parte acotada a un 'implementador' o pedir una revisión a un 'revisor'.
+- Para verificación INDEPENDIENTE antes de dar algo por bueno, podés delegar a 'adversarial_critic' (intenta
+  romper la solución con casos borde), 'spec_judge' (¿cumple lo que se pidió, sin inventar requisitos?) o
+  'evidence_judge' (¿las afirmaciones tienen evidencia real?).
 - Antes de terminar, corré validate y, si hay tests, run_tests.""",
         LECTURA + ESCRITURA + VERIFICACION + ARCHIVOS
         + ("execute_command", "run_python", "view_diff", "update_todo", "project_map", "save_note", "learn_lesson",
@@ -9813,9 +9816,50 @@ attempt_completion con la lista de funciones implementadas.""",
          "replace_in_file", "validate", "run_tests", "attempt_completion"),
         0.15,
     ),
+    "adversarial_critic": Rol(
+        "adversarial_critic",
+        """Sos el CRÍTICO ADVERSARIO (solo lectura). Tu ÚNICO objetivo es ROMPER la solución: encontrar una
+entrada, un caso borde o una condición donde el código falle o se comporte distinto a lo esperado. No confíes
+en que los tests verdes alcanzan: pueden ser tautológicos o mockear el sujeto (verificalo con inspect_tests).
+Atacá DE VERDAD con run_python / run_tests: valores límite, vacío, cero, negativos, unicode, entradas enormes,
+tipos inesperados, errores de E/S, orden/estado compartido. Terminá con attempt_completion empezando con UNA línea:
+VEREDICTO: ROMPÍ      — y el caso EXACTO y reproducible (entrada → qué pasó vs qué se esperaba).
+VEREDICTO: NO PUDE ROMPERLO  — y qué cosas atacaste, para que quede constancia.
+No propongas el arreglo: tu trabajo es EXPONER la falla con evidencia real, no corregirla.""",
+        LECTURA + ("run_python", "run_tests", "inspect_tests", "fetch_url", "attempt_completion"),
+        0.5,
+        solo_lectura=True,
+    ),
+    "spec_judge": Rol(
+        "spec_judge",
+        """Sos el JUEZ DE ESPECIFICACIÓN (solo lectura). Verificá si la implementación cumple lo que pidió el
+usuario y el plan (objetivo, interfaz, criterios), NI MÁS NI MENOS. Orden de autoridad ante conflictos:
+usuario > spec > contrato > criterios > docs > tests. Señalá: (a) criterios que NO se cumplen; (b) requisitos
+INVENTADOS (tests o código que exigen algo que nadie pidió); (c) huecos de la spec (ambigüedades reales).
+Confirmá leyendo el código y los tests reales (inspect_tests para los tests). attempt_completion empezando con:
+VEREDICTO: CUMPLE   o   VEREDICTO: NO CUMPLE
+y una lista: criterio → cumple/no (con la evidencia), más los requisitos inventados y huecos que encuentres.""",
+        LECTURA + ("inspect_tests", "run_tests", "attempt_completion"),
+        0.2,
+        solo_lectura=True,
+    ),
+    "evidence_judge": Rol(
+        "evidence_judge",
+        """Sos el JUEZ DE EVIDENCIA (solo lectura). No opinás sobre el código: evaluás si las AFIRMACIONES del
+informe están respaldadas por EVIDENCIA real de herramientas. Para cada afirmación asigná un nivel:
+UNVERIFIED (nada la respalda), TEST_SUITE_GREEN (los tests pasan), BEHAVIOR_VERIFIED (además se ejecutó el
+programa y dio lo esperado) o CONTRADICTED (la evidencia dice lo contrario). Recordá: 'los tests pasan' NO
+implica 'no hay bugs' (eso excede la evidencia), y los tests verdes que no discriminan (inspect_tests) no
+suben de TEST_SUITE_GREEN. attempt_completion con una línea por afirmación:
+AFIRMACIÓN → NIVEL (qué evidencia la respalda y qué faltaría para subir de nivel).""",
+        LECTURA + ("inspect_tests", "run_tests", "attempt_completion"),
+        0.1,
+        solo_lectura=True,
+    ),
 }
 
-ROLES_DELEGABLES = ("explorador", "implementador", "revisor", "qa", "reparador", "arquitecto", "especificador")
+ROLES_DELEGABLES = ("explorador", "implementador", "revisor", "qa", "reparador", "arquitecto", "especificador",
+                    "adversarial_critic", "spec_judge", "evidence_judge")
 
 BASE = """Sos REAPER, un agente de programación autónomo. Trabajás DENTRO de un workspace real usando
 herramientas: leés, editás y ejecutás de verdad. Respondés siempre en español.
@@ -9947,6 +9991,9 @@ ALIAS_ROLES = {
     "tester": "qa", "test": "qa", "fixer": "reparador", "debugger": "reparador",
     "architect": "arquitecto", "planner": "arquitecto", "planificador": "arquitecto",
     "spec": "especificador", "tdd": "especificador", "tests_primero": "especificador",
+    "critic": "adversarial_critic", "critico": "adversarial_critic", "adversarial": "adversarial_critic",
+    "breaker": "adversarial_critic", "judge": "spec_judge", "juez": "spec_judge", "spec_judge": "spec_judge",
+    "evidence": "evidence_judge", "evidencia": "evidence_judge",
 }
 
 RECORDATORIO = """No usaste ninguna herramienta (o el formato no se entendió). Escribí la herramienta con etiquetas XML, por ejemplo:
@@ -36744,6 +36791,62 @@ class TestLoopBreakerEnAgente(BaseTest):
 
 
 # ======================================================================
+# MÓDULO: autotest_jueces
+# ======================================================================
+"""Autotests de los roles-juez independientes (Fase 10 / v9): adversarial_critic, spec_judge, evidence_judge."""
+
+
+class TestRolesJuez(BaseTest):
+    def test_roles_existen_y_son_delegables(self):
+        for r in ("adversarial_critic", "spec_judge", "evidence_judge"):
+            self.assertIn(r, ROLES)
+            self.assertIn(r, ROLES_DELEGABLES)
+            self.assertTrue(ROLES[r].solo_lectura)
+            self.assertIn("attempt_completion", ROLES[r].herramientas)
+
+    def test_jueces_no_pueden_escribir(self):
+        # ninguna herramienta de escritura en los roles-juez (verificación independiente, no edición)
+        for r in ("adversarial_critic", "spec_judge", "evidence_judge"):
+            self.assertFalse(set(ROLES[r].herramientas) & set(ESCRITURA))
+
+    def test_alias(self):
+        self.assertEqual(ALIAS_ROLES["critic"], "adversarial_critic")
+        self.assertEqual(ALIAS_ROLES["adversarial"], "adversarial_critic")
+        self.assertEqual(ALIAS_ROLES["juez"], "spec_judge")
+        self.assertEqual(ALIAS_ROLES["evidencia"], "evidence_judge")
+
+    def test_critico_corre_y_da_veredicto(self):
+        ws = self.proyecto({"suma.py": "def suma(a, b):\n    return a + b\n"})
+        llm = MockLLM([terminar_xml("VEREDICTO: NO PUDE ROMPERLO. Probé vacío, negativos y unicode.")])
+        res = Agente("adversarial_critic", llm, ws, self.ajustes(), self.ui(),
+                     mostrar_progreso=False).ejecutar("intentá romper suma.py")
+        self.assertTrue(res.ok)
+        self.assertIn("VEREDICTO", res.resumen)
+
+    def test_spec_judge_corre(self):
+        ws = self.proyecto({"app.py": "def f():\n    return 1\n"})
+        llm = MockLLM([terminar_xml("VEREDICTO: CUMPLE. El criterio f()==1 se cumple.")])
+        res = Agente("spec_judge", llm, ws, self.ajustes(), self.ui(),
+                     mostrar_progreso=False).ejecutar("¿cumple el plan?")
+        self.assertTrue(res.ok)
+        self.assertIn("CUMPLE", res.resumen)
+
+    def test_principal_delega_a_juez(self):
+        ws = self.proyecto({"suma.py": "def suma(a, b):\n    return a + b\n"})
+        guion = [
+            "Pido una crítica.\n<delegate>\n<role>critic</role>\n<task>rompé suma</task>\n</delegate>",
+            terminar_xml("VEREDICTO: NO PUDE ROMPERLO."),   # respuesta del subagente adversarial_critic
+            "Listo, pedí la crítica independiente y no encontró fallas.",   # cierre del principal (texto)
+        ]
+        res = Agente("principal", llm := MockLLM(guion), ws, self.ajustes(forense=False, escalar=False,
+                     max_profundidad=2), self.ui(), memoria=None, mostrar_progreso=False).ejecutar("revisá suma.py")
+        obs = [MockLLM.ultimo_usuario(c["mensajes"]) for c in llm.llamadas]
+        self.assertTrue(any('rol="adversarial_critic"' in o or "adversarial_critic" in o for o in obs),
+                        "esperaba que el subagente crítico corriera")
+        self.assertTrue(res.ok)
+
+
+# ======================================================================
 # MÓDULO: autotest_cli
 # ======================================================================
 """Autotest: CLI y comandos, recetas, benchmark, doctor, instalador, /vigilar y plantillas."""
@@ -40519,6 +40622,27 @@ docstrings with empty bodies). Implement ONLY the sections assigned to you, one 
 (complete definition: signature + real body). Don't change signatures or touch other sections.
 Check the validation each replace_symbol returns and fix what fails. When your sections are done,
 attempt_completion with the list of implemented functions.""",
+    "adversarial_critic": """You are the ADVERSARIAL CRITIC (read-only). Your ONLY goal is to BREAK the solution:
+find an input, edge case or condition where the code fails or behaves differently than expected. Don't trust
+green tests: they may be tautological or mock the subject (check with inspect_tests). Attack FOR REAL with
+run_python / run_tests: boundary values, empty, zero, negatives, unicode, huge inputs, unexpected types, I/O
+errors, order/shared state. Finish with attempt_completion starting with ONE line:
+VERDICT: BROKEN      — and the EXACT, reproducible case (input → what happened vs what was expected).
+VERDICT: COULD NOT BREAK IT  — and what you attacked, for the record.
+Don't propose the fix: your job is to EXPOSE the failure with real evidence, not to repair it.""",
+    "spec_judge": """You are the SPECIFICATION JUDGE (read-only). Check whether the implementation meets what the
+user and the plan asked for (objective, interface, criteria), NO MORE AND NO LESS. Authority order on conflict:
+user > spec > contract > criteria > docs > tests. Flag: (a) criteria that are NOT met; (b) INVENTED requirements
+(tests or code demanding something nobody asked for); (c) real spec gaps (ambiguities). Confirm by reading the
+real code and tests (inspect_tests for tests). attempt_completion starting with:
+VERDICT: MEETS   or   VERDICT: DOES NOT MEET
+and a list: criterion → met/not (with evidence), plus invented requirements and gaps you find.""",
+    "evidence_judge": """You are the EVIDENCE JUDGE (read-only). You don't judge the code: you judge whether the
+report's CLAIMS are backed by real tool EVIDENCE. For each claim assign a level: UNVERIFIED (nothing backs it),
+TEST_SUITE_GREEN (tests pass), BEHAVIOR_VERIFIED (the program was also run and gave the expected result) or
+CONTRADICTED (evidence says otherwise). Remember: 'tests pass' does NOT imply 'no bugs' (that exceeds the
+evidence), and green tests that don't discriminate (inspect_tests) don't rise above TEST_SUITE_GREEN.
+attempt_completion with one line per claim: CLAIM → LEVEL (what evidence backs it and what's missing to raise it).""",
 }
 
 DOCS_EN = {

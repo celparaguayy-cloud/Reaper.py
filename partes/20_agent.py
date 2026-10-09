@@ -34,6 +34,9 @@ ALIAS_ROLES = {
     "tester": "qa", "test": "qa", "fixer": "reparador", "debugger": "reparador",
     "architect": "arquitecto", "planner": "arquitecto", "planificador": "arquitecto",
     "spec": "especificador", "tdd": "especificador", "tests_primero": "especificador",
+    "critic": "adversarial_critic", "critico": "adversarial_critic", "adversarial": "adversarial_critic",
+    "breaker": "adversarial_critic", "judge": "spec_judge", "juez": "spec_judge", "spec_judge": "spec_judge",
+    "evidence": "evidence_judge", "evidencia": "evidence_judge",
 }
 
 RECORDATORIO = """No usaste ninguna herramienta (o el formato no se entendió). Escribí la herramienta con etiquetas XML, por ejemplo:
