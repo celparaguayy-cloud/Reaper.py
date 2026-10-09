@@ -218,6 +218,8 @@ class LLMClient:
         self._transporte = transporte or (_transporte_httpx if httpx else _transporte_urllib)
         self.dormir = time.sleep
         self.limitador = LimitadorTasa(settings.rpm_efectivo())
+        self.disyuntor = DisyuntorModelos(umbral=getattr(settings, "disyuntor_umbral", 3),
+                                          enfriamiento=getattr(settings, "disyuntor_enfriamiento", 45.0))
         self.on_evento: Optional[Callable[[str], None]] = None
 
     # ------------------------------------------------------------ API
@@ -242,13 +244,17 @@ class LLMClient:
                 if respaldo and respaldo not in candidatos:
                     candidatos.append(respaldo)
 
+        # Disyuntor (Fase 5): los modelos caídos van al final (nunca se descartan: podrían ser el único).
+        orden = self.disyuntor.ordenar(candidatos)
+
         ultimo: Optional[LLMError] = None
-        for n, candidato in enumerate(candidatos):
+        for n, candidato in enumerate(orden):
             try:
                 respuesta = self._con_reintentos(
                     candidato, mensajes, temperatura, max_tokens, stop, on_progress
                 )
-                if n:
+                self.disyuntor.exito(candidato)
+                if candidato != principal:
                     with self._lock:
                         self.uso.respaldos += 1
                 self._registrar_rol(rol, respuesta)
@@ -259,8 +265,10 @@ class LLMClient:
                     self.uso.errores += 1
                 if not e.probar_otro_modelo:
                     raise
-                if self.on_evento and n + 1 < len(candidatos):
-                    self.on_evento(f"{candidato} falló ({e}); pruebo con {candidatos[n + 1]}")
+                if self.disyuntor.fallo(candidato) and self.on_evento:
+                    self.on_evento(f"disyuntor ABIERTO para {candidato}: lo salteo un rato ({self.disyuntor.enfriamiento:.0f}s)")
+                if self.on_evento and n + 1 < len(orden):
+                    self.on_evento(f"{candidato} falló ({e}); pruebo con {orden[n + 1]}")
         assert ultimo is not None
         raise ultimo
 

@@ -945,6 +945,11 @@ class App:
             self.ui.tabla(filas, ["modelo", "llamadas", "entrada", "salida", "costo", "tiempo"], "lrrrrr")
         if u.por_rol:
             self.ui.tenue("  por rol: " + ", ".join(f"{r}: {d['llamadas']}" for r, d in sorted(u.por_rol.items())))
+        disyuntor = getattr(self.llm, "disyuntor", None)
+        if disyuntor is not None:
+            resumen = disyuntor.resumen()
+            if "operativos" not in resumen:
+                self.ui.aviso("  disyuntor: " + resumen)
         if self.settings.costo_maximo:
             self.ui.barra("presupuesto", u.costo, self.settings.costo_maximo)
 
