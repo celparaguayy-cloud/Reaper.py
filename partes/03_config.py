@@ -14,6 +14,7 @@ HISTORIAL_FILE = BASE_DIR / "historial_repl.txt"
 COMANDOS_USUARIO_DIR = BASE_DIR / "comandos"
 HERRAMIENTAS_USUARIO_DIR = BASE_DIR / "herramientas"
 ESTADISTICAS_FILE = BASE_DIR / "estadisticas.json"
+DESEMPENO_FILE = BASE_DIR / "desempeno.json"
 
 API_URL = os.getenv("REAPER_API_URL", "https://openrouter.ai/api/v1/chat/completions")
 
@@ -138,6 +139,7 @@ class Settings:
     escalar: bool = True
     # v8: revertir solo las ediciones que dejan los tests peor que el mejor estado visto
     guardia_regresion: bool = True
+    router_aprendido: bool = True   # v9 Fase 7: elegir el modelo por rol según el desempeño pasado
     # v8: modo forense (aislar tests, estado compartido, bisección, hipótesis con experimentos)
     forense: bool = True
     umbral_forense: int = 3

@@ -123,6 +123,7 @@ class App:
         self.modo_plan = False
         self.escalador = Escalador(llm, settings, ui)
         self.memoria = self._nueva_memoria()
+        self.desempeno = MemoriaDesempeno()
         self.principal = self._nuevo_principal()
         self.estadisticas = Estadisticas()
         if persistir:
@@ -142,7 +143,7 @@ class App:
 
     def _nuevo_principal(self) -> Agente:
         return Agente("principal", self.llm, self.ws, self.settings, self.ui, etiqueta="reaper",
-                      memoria=self.memoria, on_atascado=self._consultar_experto)
+                      memoria=self.memoria, on_atascado=self._consultar_experto, desempeno=self.desempeno)
 
     def _ruta_sesion(self) -> Path:
         return SESIONES_DIR / f"{self.ws.checkpoints.carpeta.name}.json"
@@ -899,6 +900,14 @@ class App:
             self.ui.info("  Proveedores en uso esta sesión: "
                          + "; ".join(f"{p} ({', '.join(ms)})" for p, ms in activos.items()))
         self.ui.tenue("  Cualquier id de OpenRouter sirve también: /modelo proveedor/modelo")
+
+    def cmd_desempeno(self, arg: str) -> None:
+        if getattr(self, "desempeno", None) is None:
+            self.ui.info("No hay memoria de desempeño en esta sesión.")
+            return
+        self.ui.info("Desempeño por rol (tasa de éxito verificado; el router elige el mejor):")
+        self.ui.linea(self.desempeno.resumen(arg.strip().lower() or None))
+        self.ui.tenue("  el router usa esto cuando router_aprendido está activo (/config router_aprendido)")
 
     def cmd_config(self, arg: str) -> None:
         if not arg:

@@ -1455,6 +1455,7 @@ HISTORIAL_FILE = BASE_DIR / "historial_repl.txt"
 COMANDOS_USUARIO_DIR = BASE_DIR / "comandos"
 HERRAMIENTAS_USUARIO_DIR = BASE_DIR / "herramientas"
 ESTADISTICAS_FILE = BASE_DIR / "estadisticas.json"
+DESEMPENO_FILE = BASE_DIR / "desempeno.json"
 
 API_URL = os.getenv("REAPER_API_URL", "https://openrouter.ai/api/v1/chat/completions")
 
@@ -1579,6 +1580,7 @@ class Settings:
     escalar: bool = True
     # v8: revertir solo las ediciones que dejan los tests peor que el mejor estado visto
     guardia_regresion: bool = True
+    router_aprendido: bool = True   # v9 Fase 7: elegir el modelo por rol según el desempeño pasado
     # v8: modo forense (aislar tests, estado compartido, bisección, hipótesis con experimentos)
     forense: bool = True
     umbral_forense: int = 3
@@ -9720,9 +9722,11 @@ Informe final: archivos tocados, qué hiciste, cómo lo verificaste (resultados 
     ),
     "revisor": Rol(
         "revisor",
-        """Sos el REVISOR senior (solo lectura). Revisá los cambios contra la tarea: bugs de lógica, imports,
-rutas, manejo de errores, casos borde, estado, seguridad de archivos, compatibilidad Termux y coherencia
-entre archivos. Confirmá leyendo el código real; no inventes problemas ni pidas cambios de estilo.
+        """Sos el REVISOR senior (solo lectura) e INDEPENDIENTE: no implementaste vos estos cambios, así que no
+asumas que están bien. Revisálos contra la tarea: bugs de lógica, imports, rutas, manejo de errores, casos
+borde, estado, seguridad de archivos, compatibilidad Termux y coherencia entre archivos. Desconfiá de los
+tests que acompañan el cambio: si pasan pero son tautológicos o mockean el sistema bajo prueba, no demuestran
+nada (usá inspect_tests). Confirmá leyendo el código real; no inventes problemas ni pidas cambios de estilo.
 Tu attempt_completion DEBE empezar con UNA de estas líneas:
 VEREDICTO: APROBADO
 VEREDICTO: CAMBIOS
@@ -10210,6 +10214,7 @@ class Agente:
         extra_prompt: str = "",
         max_pasos: Optional[int] = None,
         on_atascado: Optional[Callable[[str], Optional[str]]] = None,
+        desempeno: Optional["MemoriaDesempeno"] = None,
     ):
         self.rol = ROLES[rol]
         self.llm = llm
@@ -10231,6 +10236,8 @@ class Agente:
         self.max_pasos = max_pasos or self.rol.max_pasos or base
         self.temperatura = self.rol.temperatura if temperatura is None else temperatura
         self.modelo = modelo
+        self.desempeno = desempeno               # v9 Fase 7: router aprendido por rol
+        self._modelo_elegido: Optional[str] = None
         self.extra_prompt = extra_prompt
         self.on_atascado = on_atascado
         self.mensajes: list[dict] = []
@@ -10277,6 +10284,7 @@ class Agente:
             self.ctx.cid_inicio = cid_inicio
         principal = self.rol.nombre == "principal"
         self.ctx.pedido = tarea
+        self._elegir_modelo()
         self._prohibido = prohibiciones(tarea) if principal else set()
         self._pide_cambios = pide_cambios(tarea) if principal else True
         self._pregunta_simple = principal and es_pregunta_simple(tarea)
@@ -10486,8 +10494,38 @@ class Agente:
             ok = motivo in ("completado", "respuesta")
             if self.ctx.cambios:
                 ok = ok and not fallos(validar_archivos(self.ws, sorted(self.ctx.cambios)))
+        if self.desempeno is not None and motivo not in ("cancelado",):
+            try:
+                verificado = bool(self._ultimo_claim and self._ultimo_claim.status == "SUPPORTED")
+                self.desempeno.registrar(self.rol.nombre, self._modelo_actual(), bool(ok),
+                                         verificado=verificado, pasos=pasos)
+            except OSError:
+                pass
         return ResultadoAgente(ok, resumen, sorted(self.ctx.cambios), pasos, motivo, self.rol.nombre,
                                self._ultimo_texto, self._errores_texto[-3:], self._escalado)
+
+    def _modelo_actual(self) -> str:
+        return self._modelo_elegido or self.modelo or self.settings.modelo_para(self.rol.nombre)
+
+    def _elegir_modelo(self) -> None:
+        """Router aprendido (Fase 7): si no hay modelo fijo, elige para este rol el de mejor historial."""
+        self._modelo_elegido = None
+        if self.modelo or self.desempeno is None or not getattr(self.settings, "router_aprendido", False):
+            return
+        candidatos = [self.settings.modelo_para(self.rol.nombre)]
+        for f in self.settings.fallbacks:
+            r = resolver_modelo(f)
+            if r and r not in candidatos:
+                candidatos.append(r)
+        if len(candidatos) <= 1:
+            return
+        try:
+            elegido = self.desempeno.elegir(self.rol.nombre, candidatos)
+        except (OSError, ValueError):
+            elegido = None
+        if elegido and elegido != candidatos[0]:
+            self._modelo_elegido = elegido
+            self.ui.aviso(f"  [{self.etiqueta}] router: {elegido} rinde mejor como {self.rol.nombre}")
 
     def _llamar_modelo(self) -> Respuesta:
         progreso = (lambda n: self.ui.progreso(self.etiqueta, n)) if self.mostrar_progreso else None
@@ -10496,7 +10534,7 @@ class Agente:
         try:
             return self.llm.chat(
                 self.mensajes,
-                modelo=self.modelo or self.settings.modelo_para(self.rol.nombre),
+                modelo=self._modelo_actual(),
                 temperatura=self.temperatura,
                 stop=STOP,
                 on_progress=progreso,
@@ -11309,7 +11347,8 @@ class Agente:
             specs.append((k, rol, tarea, llamada.params.get("files") or ""))
 
         resultados = ejecutar_subagentes(
-            [(rol, tarea, archivos, "", {"memoria": self.memoria, "on_atascado": self.on_atascado})
+            [(rol, tarea, archivos, "", {"memoria": self.memoria, "on_atascado": self.on_atascado,
+                                         "desempeno": self.desempeno})
              for _, rol, tarea, archivos in specs],
             self.llm, self.ws, self.settings, self.ui,
             profundidad=self.profundidad + 1,
@@ -25903,6 +25942,7 @@ class App:
         self.modo_plan = False
         self.escalador = Escalador(llm, settings, ui)
         self.memoria = self._nueva_memoria()
+        self.desempeno = MemoriaDesempeno()
         self.principal = self._nuevo_principal()
         self.estadisticas = Estadisticas()
         if persistir:
@@ -25922,7 +25962,7 @@ class App:
 
     def _nuevo_principal(self) -> Agente:
         return Agente("principal", self.llm, self.ws, self.settings, self.ui, etiqueta="reaper",
-                      memoria=self.memoria, on_atascado=self._consultar_experto)
+                      memoria=self.memoria, on_atascado=self._consultar_experto, desempeno=self.desempeno)
 
     def _ruta_sesion(self) -> Path:
         return SESIONES_DIR / f"{self.ws.checkpoints.carpeta.name}.json"
@@ -26679,6 +26719,14 @@ class App:
             self.ui.info("  Proveedores en uso esta sesión: "
                          + "; ".join(f"{p} ({', '.join(ms)})" for p, ms in activos.items()))
         self.ui.tenue("  Cualquier id de OpenRouter sirve también: /modelo proveedor/modelo")
+
+    def cmd_desempeno(self, arg: str) -> None:
+        if getattr(self, "desempeno", None) is None:
+            self.ui.info("No hay memoria de desempeño en esta sesión.")
+            return
+        self.ui.info("Desempeño por rol (tasa de éxito verificado; el router elige el mejor):")
+        self.ui.linea(self.desempeno.resumen(arg.strip().lower() or None))
+        self.ui.tenue("  el router usa esto cuando router_aprendido está activo (/config router_aprendido)")
 
     def cmd_config(self, arg: str) -> None:
         if not arg:
@@ -34461,7 +34509,7 @@ Filtrar: REAPER_AUTOTEST=parser python3 reaper_v8.py --autotest
 
 _RUTAS_GLOBALES = ("BASE_DIR", "PROJECTS_DIR", "CHECKPOINTS_DIR", "SESIONES_DIR", "LOGS_DIR", "CACHE_DIR",
                    "PLANTILLAS_USUARIO_DIR", "CONFIG_FILE", "ESTADO_FILE", "LECCIONES_GLOBALES", "HISTORIAL_FILE",
-                   "ESTADISTICAS_FILE", "COMANDOS_USUARIO_DIR", "HERRAMIENTAS_USUARIO_DIR")
+                   "ESTADISTICAS_FILE", "DESEMPENO_FILE", "COMANDOS_USUARIO_DIR", "HERRAMIENTAS_USUARIO_DIR")
 
 
 class entorno_aislado:
@@ -34487,6 +34535,7 @@ class entorno_aislado:
             "LECCIONES_GLOBALES": self.base / "lecciones.md",
             "HISTORIAL_FILE": self.base / "historial_repl.txt",
             "ESTADISTICAS_FILE": self.base / "estadisticas.json",
+            "DESEMPENO_FILE": self.base / "desempeno.json",
             "COMANDOS_USUARIO_DIR": self.base / "comandos",
             "HERRAMIENTAS_USUARIO_DIR": self.base / "herramientas",
         }
@@ -40481,6 +40530,193 @@ def mostrar_estadisticas(ui: UI, est: Estadisticas, cantidad: int = 14) -> None:
              f"torneos: {t['torneos']} · escaladas: {t['escaladas']} · lecciones: {t['lecciones']}",
              f"tokens: {formatear_numero(t['tokens_entrada'])} entrada / {formatear_numero(t['tokens_salida'])} salida"
              + (f" · costo total ${t['costo']:.3f}" if t["costo"] else "")], titulo="TOTALES")
+
+
+# ======================================================================
+# MÓDULO: desempeno
+# ======================================================================
+"""
+Memoria de desempeño + router aprendido (v9, Fase 7): el RoleAllocator del MASTER SPEC.
+
+"Las IAs proponen, la evidencia decide": en vez de clavar un modelo por rol a mano, REAPER recuerda cómo le
+fue a cada modelo en cada rol (éxitos/fracasos verificados por herramientas) y, la próxima vez, elige para
+ese rol el modelo con mejor historial. A un modelo sin datos se le da una prior optimista para que se lo
+pruebe (exploración); así el default configurado se sigue usando hasta que haya evidencia de que otro rinde
+más. Persiste en un JSON global (desempeno.json); las claves son ids de modelo ya resueltos.
+"""
+
+
+class MemoriaDesempeno:
+    def __init__(self, ruta: Optional[Path] = None, prior: float = 0.6):
+        self.ruta = Path(ruta) if ruta else DESEMPENO_FILE
+        self.prior = prior                 # puntaje de un modelo sin datos (optimista: fomenta explorar)
+        self._lock = threading.Lock()
+
+    def _cargar(self) -> dict:
+        try:
+            datos = json.loads(self.ruta.read_text(encoding="utf-8"))
+            return datos if isinstance(datos, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def _guardar(self, datos: dict) -> None:
+        try:
+            escritura_atomica(self.ruta, json.dumps(datos, ensure_ascii=False, indent=1))
+        except OSError:
+            pass
+
+    def registrar(self, rol: str, modelo: str, exito: bool, *, verificado: bool = False, pasos: int = 0) -> None:
+        if not rol or not modelo:
+            return
+        modelo = resolver_modelo(modelo)
+        with self._lock:
+            datos = self._cargar()
+            roles = datos.setdefault("roles", {})
+            porrol = roles.setdefault(rol, {})
+            fila = porrol.setdefault(modelo, {"exitos": 0, "fallos": 0, "verificados": 0, "pasos": 0, "usos": 0})
+            fila["usos"] += 1
+            fila["pasos"] += int(pasos)
+            if exito:
+                fila["exitos"] += 1
+                if verificado:
+                    fila["verificados"] += 1
+            else:
+                fila["fallos"] += 1
+            datos["actualizado"] = datetime.now().isoformat(timespec="seconds")
+            self._guardar(datos)
+
+    def _fila(self, datos: dict, rol: str, modelo: str) -> Optional[dict]:
+        return datos.get("roles", {}).get(rol, {}).get(resolver_modelo(modelo))
+
+    def puntaje(self, rol: str, modelo: str, datos: Optional[dict] = None) -> float:
+        """Tasa de éxito suavizada (Laplace) con un pequeño bono por resultados verificados. Sin datos → prior."""
+        fila = self._fila(datos if datos is not None else self._cargar(), rol, modelo)
+        if not fila:
+            return self.prior
+        exitos, fallos = fila["exitos"], fila["fallos"]
+        total = exitos + fallos
+        if total == 0:
+            return self.prior
+        base = (exitos + 1) / (total + 2)                          # Laplace
+        bono = 0.1 * (fila.get("verificados", 0) / total)          # premia la verificación real
+        return round(min(1.0, base + bono), 4)
+
+    def elegir(self, rol: str, candidatos: Sequence[str], excluir: Iterable[str] = ()) -> Optional[str]:
+        """Mejor candidato para el rol según el historial. Empata a favor del primero (el default configurado)."""
+        lista = [c for c in candidatos if c]
+        if not lista:
+            return None
+        fuera = {resolver_modelo(e) for e in excluir}
+        permitidos = [c for c in lista if resolver_modelo(c) not in fuera] or lista
+        datos = self._cargar()
+        mejor, mejor_p = permitidos[0], self.puntaje(rol, permitidos[0], datos)
+        for c in permitidos[1:]:
+            p = self.puntaje(rol, c, datos)
+            if p > mejor_p + 1e-9:          # estrictamente mejor: ante empate gana el primero (estable)
+                mejor, mejor_p = c, p
+        return mejor
+
+    def resumen(self, rol: Optional[str] = None) -> str:
+        datos = self._cargar().get("roles", {})
+        if not datos:
+            return "Sin datos de desempeño todavía."
+        lineas = []
+        for r in sorted(datos):
+            if rol and r != rol:
+                continue
+            filas = datos[r]
+            orden = sorted(filas, key=lambda m: self.puntaje(r, m), reverse=True)
+            partes = [f"{m} {self.puntaje(r, m):.0%} ({filas[m]['exitos']}/{filas[m]['exitos'] + filas[m]['fallos']})"
+                      for m in orden[:5]]
+            lineas.append(f"{r}: " + ", ".join(partes))
+        return "\n".join(lineas) or "Sin datos de desempeño todavía."
+
+
+# ======================================================================
+# MÓDULO: autotest_desempeno
+# ======================================================================
+"""Autotests de la memoria de desempeño + router aprendido (Fase 7 / v9)."""
+
+
+class TestMemoriaDesempeno(BaseTest):
+    def memoria(self):
+        return MemoriaDesempeno(ruta=self.dir / "desempeno.json")
+
+    def test_prior_sin_datos(self):
+        m = self.memoria()
+        self.assertEqual(m.puntaje("implementador", "qwen"), m.prior)
+
+    def test_puntaje_sube_con_exitos(self):
+        m = self.memoria()
+        for _ in range(5):
+            m.registrar("implementador", "qwen", True, verificado=True)
+        m.registrar("implementador", "venice", False)
+        self.assertGreater(m.puntaje("implementador", "qwen"), m.puntaje("implementador", "venice"))
+
+    def test_elegir_mejor_modelo(self):
+        m = self.memoria()
+        for _ in range(4):
+            m.registrar("reparador", "deepseek", True, verificado=True)
+        for _ in range(4):
+            m.registrar("reparador", "venice", False)
+        self.assertEqual(m.elegir("reparador", ["venice", "deepseek"]), "deepseek")
+
+    def test_empate_gana_el_primero(self):
+        m = self.memoria()       # sin datos: todos en prior → estable, gana el default (primero)
+        self.assertEqual(m.elegir("implementador", ["venice", "qwen", "deepseek"]), "venice")
+
+    def test_excluir_para_revisor(self):
+        m = self.memoria()
+        for _ in range(4):
+            m.registrar("revisor", "qwen", True, verificado=True)
+        # aunque qwen sea el mejor, si lo excluimos (lo usó el implementador) elige otro
+        self.assertNotEqual(m.elegir("revisor", ["qwen", "deepseek"], excluir=["qwen"]), "qwen")
+
+    def test_excluir_todos_no_deja_sin_opcion(self):
+        m = self.memoria()
+        self.assertIn(m.elegir("revisor", ["qwen"], excluir=["qwen"]), ["qwen", resolver_modelo("qwen")])
+
+    def test_persiste_entre_instancias(self):
+        ruta = self.dir / "desempeno.json"
+        MemoriaDesempeno(ruta=ruta).registrar("qa", "qwen", True, verificado=True)
+        self.assertGreater(MemoriaDesempeno(ruta=ruta).puntaje("qa", "qwen"), 0.5)
+
+    def test_resumen(self):
+        m = self.memoria()
+        m.registrar("implementador", "qwen", True, verificado=True)
+        self.assertIn("implementador", m.resumen())
+        self.assertIn("qwen", m.resumen())
+
+
+class TestRouterEnAgente(BaseTest):
+    def test_agente_registra_desempeno(self):
+        ws = self.proyecto()
+        m = MemoriaDesempeno(ruta=self.dir / "d.json")
+        llm = MockLLM(lambda *_: terminar_xml("Es 4."))
+        Agente("principal", llm, ws, self.ajustes(forense=False, escalar=False), self.ui(),
+               memoria=None, mostrar_progreso=False, desempeno=m).ejecutar("cuánto es 2+2")
+        self.assertIn("principal", m.resumen())
+
+    def test_router_elige_modelo_aprendido(self):
+        ws = self.proyecto()
+        m = MemoriaDesempeno(ruta=self.dir / "d.json")
+        for _ in range(5):
+            m.registrar("principal", resolver_modelo("qwen"), True, verificado=True)
+        for _ in range(5):
+            m.registrar("principal", resolver_modelo(self.ajustes().modelo), False)
+        llm = MockLLM(lambda *_: terminar_xml("Es 4."))
+        ag = Agente("principal", llm, ws, self.ajustes(forense=False, escalar=False, fallbacks=["qwen"]),
+                    self.ui(), memoria=None, mostrar_progreso=False, desempeno=m)
+        ag.ejecutar("cuánto es 2+2")
+        self.assertEqual(ag._modelo_elegido, resolver_modelo("qwen"))
+
+    def test_sin_desempeno_no_cambia_modelo(self):
+        ws = self.proyecto()
+        llm = MockLLM(lambda *_: terminar_xml("Es 4."))
+        ag = Agente("principal", llm, ws, self.ajustes(forense=False, escalar=False, fallbacks=["qwen"]),
+                    self.ui(), memoria=None, mostrar_progreso=False)
+        ag.ejecutar("cuánto es 2+2")
+        self.assertIsNone(ag._modelo_elegido)
 
 
 # ======================================================================

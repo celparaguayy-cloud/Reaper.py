@@ -303,6 +303,7 @@ class Agente:
         extra_prompt: str = "",
         max_pasos: Optional[int] = None,
         on_atascado: Optional[Callable[[str], Optional[str]]] = None,
+        desempeno: Optional["MemoriaDesempeno"] = None,
     ):
         self.rol = ROLES[rol]
         self.llm = llm
@@ -324,6 +325,8 @@ class Agente:
         self.max_pasos = max_pasos or self.rol.max_pasos or base
         self.temperatura = self.rol.temperatura if temperatura is None else temperatura
         self.modelo = modelo
+        self.desempeno = desempeno               # v9 Fase 7: router aprendido por rol
+        self._modelo_elegido: Optional[str] = None
         self.extra_prompt = extra_prompt
         self.on_atascado = on_atascado
         self.mensajes: list[dict] = []
@@ -370,6 +373,7 @@ class Agente:
             self.ctx.cid_inicio = cid_inicio
         principal = self.rol.nombre == "principal"
         self.ctx.pedido = tarea
+        self._elegir_modelo()
         self._prohibido = prohibiciones(tarea) if principal else set()
         self._pide_cambios = pide_cambios(tarea) if principal else True
         self._pregunta_simple = principal and es_pregunta_simple(tarea)
@@ -579,8 +583,38 @@ class Agente:
             ok = motivo in ("completado", "respuesta")
             if self.ctx.cambios:
                 ok = ok and not fallos(validar_archivos(self.ws, sorted(self.ctx.cambios)))
+        if self.desempeno is not None and motivo not in ("cancelado",):
+            try:
+                verificado = bool(self._ultimo_claim and self._ultimo_claim.status == "SUPPORTED")
+                self.desempeno.registrar(self.rol.nombre, self._modelo_actual(), bool(ok),
+                                         verificado=verificado, pasos=pasos)
+            except OSError:
+                pass
         return ResultadoAgente(ok, resumen, sorted(self.ctx.cambios), pasos, motivo, self.rol.nombre,
                                self._ultimo_texto, self._errores_texto[-3:], self._escalado)
+
+    def _modelo_actual(self) -> str:
+        return self._modelo_elegido or self.modelo or self.settings.modelo_para(self.rol.nombre)
+
+    def _elegir_modelo(self) -> None:
+        """Router aprendido (Fase 7): si no hay modelo fijo, elige para este rol el de mejor historial."""
+        self._modelo_elegido = None
+        if self.modelo or self.desempeno is None or not getattr(self.settings, "router_aprendido", False):
+            return
+        candidatos = [self.settings.modelo_para(self.rol.nombre)]
+        for f in self.settings.fallbacks:
+            r = resolver_modelo(f)
+            if r and r not in candidatos:
+                candidatos.append(r)
+        if len(candidatos) <= 1:
+            return
+        try:
+            elegido = self.desempeno.elegir(self.rol.nombre, candidatos)
+        except (OSError, ValueError):
+            elegido = None
+        if elegido and elegido != candidatos[0]:
+            self._modelo_elegido = elegido
+            self.ui.aviso(f"  [{self.etiqueta}] router: {elegido} rinde mejor como {self.rol.nombre}")
 
     def _llamar_modelo(self) -> Respuesta:
         progreso = (lambda n: self.ui.progreso(self.etiqueta, n)) if self.mostrar_progreso else None
@@ -589,7 +623,7 @@ class Agente:
         try:
             return self.llm.chat(
                 self.mensajes,
-                modelo=self.modelo or self.settings.modelo_para(self.rol.nombre),
+                modelo=self._modelo_actual(),
                 temperatura=self.temperatura,
                 stop=STOP,
                 on_progress=progreso,
@@ -1402,7 +1436,8 @@ class Agente:
             specs.append((k, rol, tarea, llamada.params.get("files") or ""))
 
         resultados = ejecutar_subagentes(
-            [(rol, tarea, archivos, "", {"memoria": self.memoria, "on_atascado": self.on_atascado})
+            [(rol, tarea, archivos, "", {"memoria": self.memoria, "on_atascado": self.on_atascado,
+                                         "desempeno": self.desempeno})
              for _, rol, tarea, archivos in specs],
             self.llm, self.ws, self.settings, self.ui,
             profundidad=self.profundidad + 1,

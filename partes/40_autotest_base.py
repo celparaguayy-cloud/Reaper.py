@@ -8,7 +8,7 @@ Filtrar: REAPER_AUTOTEST=parser python3 reaper_v8.py --autotest
 
 _RUTAS_GLOBALES = ("BASE_DIR", "PROJECTS_DIR", "CHECKPOINTS_DIR", "SESIONES_DIR", "LOGS_DIR", "CACHE_DIR",
                    "PLANTILLAS_USUARIO_DIR", "CONFIG_FILE", "ESTADO_FILE", "LECCIONES_GLOBALES", "HISTORIAL_FILE",
-                   "ESTADISTICAS_FILE", "COMANDOS_USUARIO_DIR", "HERRAMIENTAS_USUARIO_DIR")
+                   "ESTADISTICAS_FILE", "DESEMPENO_FILE", "COMANDOS_USUARIO_DIR", "HERRAMIENTAS_USUARIO_DIR")
 
 
 class entorno_aislado:
@@ -34,6 +34,7 @@ class entorno_aislado:
             "LECCIONES_GLOBALES": self.base / "lecciones.md",
             "HISTORIAL_FILE": self.base / "historial_repl.txt",
             "ESTADISTICAS_FILE": self.base / "estadisticas.json",
+            "DESEMPENO_FILE": self.base / "desempeno.json",
             "COMANDOS_USUARIO_DIR": self.base / "comandos",
             "HERRAMIENTAS_USUARIO_DIR": self.base / "herramientas",
         }
