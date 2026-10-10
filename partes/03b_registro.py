@@ -37,9 +37,10 @@ class DestinoModelo:
 
 def destino_modelo(nombre: str, settings: "Settings") -> DestinoModelo:
     """A qué proveedor/endpoint va un modelo. Si InfoModelo no fija proveedor, usa el activo de la sesión."""
-    real = resolver_modelo(nombre)
-    info = info_modelo(nombre)
-    prov = getattr(info, "proveedor", "") or settings.proveedor or "openrouter"
+    explicito, sin_prefijo = separar_proveedor(resolver_modelo(nombre))   # "groq:openai/gpt-oss-120b"
+    real = resolver_modelo(sin_prefijo)
+    info = info_modelo(sin_prefijo)
+    prov = explicito or getattr(info, "proveedor", "") or settings.proveedor or "openrouter"
     if prov not in PROVEEDORES:
         prov = settings.proveedor if settings.proveedor in PROVEEDORES else "openrouter"
     # el proveedor activo respeta el override de api_url; los demás usan su endpoint fijo

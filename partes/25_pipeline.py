@@ -264,6 +264,20 @@ class Orquestador:
             profundidad=1, cid_inicio=cid,
         )[0]
 
+    def _sub_opcional(self, rol: str, tarea: str, cid: Optional[int], **kw) -> Optional[ResultadoAgente]:
+        """
+        Roles de APOYO (revisor, QA, explorador): si su modelo falla incluso después del respaldo entre las IAs
+        del equipo, se avisa y la build SIGUE (antes un 413 del revisor abortaba todo /construir). Solo el
+        presupuesto agotado corta, porque seguir gastaría más.
+        """
+        try:
+            return self._sub(rol, tarea, cid, **kw)
+        except LLMError as e:
+            if e.presupuesto:
+                raise
+            self.ui.aviso(f"  {rol}: el modelo no respondió ({recortar(str(e), 180)}). Sigo sin esa fase.")
+            return None
+
     # ------------------------------------------------------------ fases
     def explorar(self, pedido: str) -> str:
         archivos = self.ws.archivos_codigo(limite=500)
@@ -296,7 +310,13 @@ class Orquestador:
                 "cómo se ejecuta y se prueba el proyecto",
                 {"memoria": self.memoria},
             ))
-        resultados = ejecutar_subagentes(specs, self.llm, self.ws, self.settings, self.ui, profundidad=1)
+        try:
+            resultados = ejecutar_subagentes(specs, self.llm, self.ws, self.settings, self.ui, profundidad=1)
+        except LLMError as e:
+            if e.presupuesto:
+                raise
+            self.ui.aviso(f"  explorador: el modelo no respondió ({recortar(str(e), 180)}). Sigo con el mapa local.")
+            return mapa or "(exploración no disponible: el modelo no respondió)"
         informe = "\n\n".join(
             f"### Informe explorador {i}\n{r.resumen}" for i, r in enumerate(resultados, start=1)
         )
@@ -431,7 +451,12 @@ class Orquestador:
             f"Validación automática de los archivos cambiados: {validacion}\n\n"
             "Leé los archivos completos si necesitás contexto. Empezá tu informe con la línea VEREDICTO."
         )
-        res = self._sub("revisor", texto, cid, titulo=f"revisa el diff de la tarea {tarea.id}")
+        res = self._sub_opcional("revisor", texto, cid, titulo=f"revisa el diff de la tarea {tarea.id}")
+        if res is None:                      # revisor caído: decide la validación real, no un modelo ausente
+            if validacion and not validacion.startswith(("OK", "sin validadores")):
+                return False, ("VEREDICTO: CAMBIOS\n1. La validación automática falla (corregilo antes que nada):\n"
+                               + validacion)
+            return True, "(revisión omitida: el revisor no respondió; la validación real pasa)"
         aprobado, claro = veredicto(res.resumen)
         if not claro:
             self.ui.tenue("  (el revisor no usó el formato VEREDICTO: se toma como aprobado)")
@@ -441,7 +466,7 @@ class Orquestador:
                            + validacion + "\n\n" + res.resumen)
         return aprobado, res.resumen
 
-    def qa(self, pedido: str, plan: Plan, archivos: list, cid: int) -> ResultadoAgente:
+    def qa(self, pedido: str, plan: Plan, archivos: list, cid: int) -> Optional[ResultadoAgente]:
         detectado = detectar_comando_tests(self.ws)
         criterios = "\n".join(f"- {c}" for c in plan.criterios) or "- (derivalos del pedido)"
         texto = (
@@ -452,7 +477,7 @@ class Orquestador:
             "Escribí (o completá) tests automáticos que verifiquen los criterios y corrélos con run_tests. "
             "Reportá el resultado REAL."
         )
-        return self._sub("qa", texto, cid, titulo="escribe y corre tests de aceptación")
+        return self._sub_opcional("qa", texto, cid, titulo="escribe y corre tests de aceptación")
 
     def verificar(self, cid: int) -> Verificacion:
         archivos = [r for r in self.ws.checkpoints.archivos_desde(cid) if (self.ws.raiz / r).is_file()]

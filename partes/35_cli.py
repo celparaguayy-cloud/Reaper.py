@@ -922,7 +922,8 @@ class App:
         # entrada inválida: NO guardar nada (antes guardaba partes[0] como modelo e ignoraba el resto)
         if len(partes) == 2:
             self.ui.error(f"Rol desconocido: '{partes[0]}'. Roles válidos: {', '.join(sorted(ROLES))}.")
-            self.ui.tenue("  Uso: /modelo <alias>  ·  /modelo <rol> <alias>  (si el alias lleva espacios, no se admite)")
+            self.ui.tenue("  Uso: /modelo <alias>  ·  /modelo <rol> <alias>  · cualquier id en un proveedor: proveedor:id "
+                          "(p. ej. /modelo revisor groq:openai/gpt-oss-120b)")
         else:
             self.ui.error("Uso: /modelo [<alias>] | /modelo <rol> <alias>. Demasiados argumentos; no guardé nada.")
 
@@ -1057,7 +1058,7 @@ class App:
             resultados = probar_equipo(self.llm, self.settings)
             simbolos = {"RESPONDE": "✓", "SIN_CLAVE": "⚠", "FALLA": "✗"}
             for r in resultados:
-                self.ui.info(f"  {simbolos.get(r['estado'], '?')} {r['rol']:<13} {r['proveedor']}/{r['modelo']}  "
+                self.ui.info(f"  {simbolos.get(r['estado'], '?')} {r['rol']:<13} {r['proveedor']}/{r.get('modelo_real') or r['modelo']}  "
                              f"{r['estado']} ({r['detalle']})")
             responden = [r for r in resultados if r["estado"] == "RESPONDE"]
             provs = {r["proveedor"] for r in responden}
@@ -1070,7 +1071,7 @@ class App:
         self.ui.info("Equipo de seis roles (asignación actual; conectividad NO VERIFICADA):")
         for e in estado:
             marca = "✓ clave" if e["tiene_clave"] else "⚠ FALTA CLAVE"
-            self.ui.info(f"  {e['rol']:<13} → {e['proveedor']}/{e['modelo']}   {marca}")
+            self.ui.info(f"  {e['rol']:<13} → {e['proveedor']}/{e.get('modelo_real') or e['modelo']}   {marca}")
         self.ui.tenue(f"  proveedores distintos: {ind['proveedores_distintos']} · "
                       f"modelos distintos: {ind['modelos_distintos']}"
                       + ("  · independencia REDUCIDA" if ind["reducida"] else ""))

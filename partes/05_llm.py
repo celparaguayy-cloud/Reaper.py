@@ -12,19 +12,22 @@ except ImportError:  # pragma: no cover - depende del entorno
 
 class LLMError(RuntimeError):
     def __init__(self, mensaje: str, *, probar_otro_modelo: bool = False, contexto_excedido: bool = False,
-                 presupuesto: bool = False):
+                 presupuesto: bool = False, solo_razonamiento: bool = False):
         super().__init__(mensaje)
         self.probar_otro_modelo = probar_otro_modelo
         self.contexto_excedido = contexto_excedido
         self.presupuesto = presupuesto
+        # El modelo respondió, pero gastó toda la salida en razonamiento sin dar contenido (modelos "thinking").
+        self.solo_razonamiento = solo_razonamiento
 
 
 class _Transitorio(Exception):
     """Error que vale la pena reintentar (429, 5xx, red, respuesta vacía)."""
 
-    def __init__(self, mensaje: str, espera: Optional[float] = None):
+    def __init__(self, mensaje: str, espera: Optional[float] = None, vacia: bool = False):
         super().__init__(mensaje)
         self.espera = espera
+        self.vacia = vacia          # el modelo respondió 200 pero sin contenido
 
 
 @dataclass
@@ -106,7 +109,7 @@ def _lanzar_http(status: int, cuerpo: str, retry_after: Optional[str]) -> None:
     excedido = status in (400, 413) and bool(_RE_CONTEXTO.search(cuerpo or ""))
     raise LLMError(
         f"{motivo} HTTP {status}. {detalle}".strip(),
-        probar_otro_modelo=status in (400, 402, 403, 404) and not excedido,
+        probar_otro_modelo=status in (400, 402, 403, 404, 413, 422) and not excedido,
         contexto_excedido=excedido,
     )
 
@@ -253,6 +256,34 @@ class LLMClient:
             self._claves_proveedor[destino.proveedor] = clave_de_proveedor(destino.proveedor, self.settings)
         return self._claves_proveedor[destino.proveedor]
 
+    def _respaldos_equipo(self, principal: str, ya: list) -> list:
+        """
+        Los OTROS modelos del equipo (principal + los asignados a cada rol) como respaldo automático: si el
+        modelo de un rol falla (413 demasiado grande, 429 tras reintentos, vacío, 404, caído), se prueba con otro
+        en vez de abortar todo. Primero los de OTRO proveedor (un límite de cuenta no los afecta) y solo los que
+        tienen credencial. Se apaga con settings.respaldo_equipo = False.
+        """
+        if not getattr(self.settings, "respaldo_equipo", True):
+            return []
+        equipo = [self.settings.modelo] + list((self.settings.modelos_rol or {}).values())
+        try:
+            prov_principal = self._destino(principal).proveedor
+        except (ValueError, KeyError):
+            prov_principal = ""
+        otros, mismos = [], []
+        for nombre in equipo:
+            m = resolver_modelo(nombre)
+            if not m or m in ya or m in otros or m in mismos:
+                continue
+            try:
+                d = self._destino(m)
+                if d.necesita_clave() and not self._clave_de(d):
+                    continue
+            except (ValueError, KeyError, TypeError):
+                continue
+            (mismos if d.proveedor == prov_principal else otros).append(m)
+        return otros + mismos
+
     # ------------------------------------------------------------ API
     def chat(
         self,
@@ -274,6 +305,7 @@ class LLMClient:
                 respaldo = resolver_modelo(respaldo)
                 if respaldo and respaldo not in candidatos:
                     candidatos.append(respaldo)
+            candidatos += self._respaldos_equipo(principal, candidatos)
 
         # Privacidad estricta (Ω §4.3 / R-001): ÚNICO punto de egreso. Deny-by-default cuando el destino es
         # externo. Se bloquea ANTES de serializar/enviar (0 llamadas de red). chat_simple, subagentes,
@@ -351,7 +383,7 @@ class LLMClient:
         presupuesto = Presupuesto(min(self.settings.contexto_tokens, info.contexto) if info.contexto else
                                   self.settings.contexto_tokens, max_tokens or self.settings.max_tokens)
         payload = {
-            "model": modelo,
+            "model": self._destino(modelo).modelo,
             "messages": mensajes,
             "temperature": self.settings.temperatura if temperatura is None else temperatura,
             "max_tokens": presupuesto.respuesta_posible(mensajes),
@@ -368,6 +400,7 @@ class LLMClient:
     def _con_reintentos(self, modelo, mensajes, temperatura, max_tokens, stop, on_progress):
         payload = self._payload(modelo, mensajes, temperatura, max_tokens, stop, self._destino(modelo).proveedor)
         intentos = max(0, int(self.settings.reintentos))
+        vacias = 0
         for intento in range(intentos + 1):
             try:
                 cancelado = (lambda: CANCELAR.is_set()) if "CANCELAR" in globals() else None
@@ -376,6 +409,11 @@ class LLMClient:
             except _Transitorio as e:
                 with self._lock:
                     self.uso.reintentos += 1
+                vacias += int(getattr(e, "vacia", False))
+                if vacias >= 2 and intento < intentos:
+                    # Dos respuestas vacías seguidas: ese modelo no está respondiendo (típico de :free saturados);
+                    # mejor pasar a otra IA del equipo que esperar ~30 s más de reintentos.
+                    raise LLMError(f"{modelo}: {vacias} respuestas vacías seguidas", probar_otro_modelo=True) from e
                 if intento >= intentos:
                     raise LLMError(
                         f"{e} (después de {intentos + 1} intentos)",
@@ -403,6 +441,7 @@ class LLMClient:
     def _una_vez(self, modelo: str, payload: dict, on_progress) -> Respuesta:
         partes: list[str] = []
         total = 0
+        razonamiento = 0          # caracteres de razonamiento (delta.reasoning) sin contenido visible
         finish = None
         inicio = time.monotonic()
         primer = 0.0
@@ -439,6 +478,9 @@ class LLMClient:
             for choice in evento.get("choices") or []:
                 delta = choice.get("delta") or choice.get("message") or {}
                 contenido = delta.get("content")
+                pensado = delta.get("reasoning") or delta.get("reasoning_content")
+                if isinstance(pensado, str):
+                    razonamiento += len(pensado)
                 if contenido:
                     if not primer:
                         primer = time.monotonic() - inicio
@@ -458,7 +500,13 @@ class LLMClient:
 
         texto = "".join(partes)
         if not texto.strip():
-            raise _Transitorio("El modelo devolvió una respuesta vacía.")
+            if razonamiento:
+                # Modelo con razonamiento que se quedó sin salida antes de responder: reintentar igual no sirve,
+                # conviene pasar a otro modelo del equipo.
+                raise LLMError(
+                    f"{modelo} solo devolvió razonamiento ({razonamiento} caracteres) y ninguna respuesta "
+                    f"(finish={finish or '?'}).", probar_otro_modelo=True, solo_razonamiento=True)
+            raise _Transitorio("El modelo devolvió una respuesta vacía.", vacia=True)
         if not tokens_out:
             tokens_out = estimar_tokens(texto)
         return Respuesta(texto=texto, finish_reason=finish, modelo=modelo, tokens_entrada=tokens_in,

@@ -323,7 +323,8 @@ class Agente:
                 memoria = None
         self.memoria = memoria
         self.ctx = Contexto(ws, settings, ui, self.etiqueta, set(), [], cid_inicio, memoria=memoria,
-                            protegidos=set(protegidos), permitidos=tuple(self.rol.rutas_permitidas), llm=llm)
+                            protegidos=set(protegidos), permitidos=tuple(self.rol.rutas_permitidas), llm=llm,
+                            rol=self.rol.nombre)
         base = settings.max_pasos if rol == "principal" else settings.max_pasos_sub
         self.max_pasos = max_pasos or self.rol.max_pasos or base
         self.temperatura = self.rol.temperatura if temperatura is None else temperatura
@@ -1381,6 +1382,9 @@ class Agente:
         ok = True
         if self.ctx.cambios:
             resultados = validar_archivos(self.ws, sorted(self.ctx.cambios))
+            if self.rol.nombre == "especificador":
+                # Tests primero: que los tests importen módulos aún inexistentes es lo ESPERADO (lo verá run_tests).
+                resultados, _tdd = separar_imports_tdd(resultados)
             if fallos(resultados):
                 if self._rechazos < 2:
                     self._rechazos += 1

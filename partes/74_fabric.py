@@ -213,7 +213,10 @@ def probar_proveedor(llm, proveedor: str, settings, *, modelo: Optional[str] = N
                  sin_respaldo=True, rol="probe")
         reg["estado"], reg["detalle"] = "OK", "responde"
     except LLMError as e:
-        reg["estado"], reg["detalle"] = clasificar_prueba_proveedor(e)
+        if getattr(e, "solo_razonamiento", False):
+            reg["estado"], reg["detalle"] = "OK", "responde (solo razonamiento con max_tokens mínimo)"
+        else:
+            reg["estado"], reg["detalle"] = clasificar_prueba_proveedor(e)
     except (OSError, ValueError, RuntimeError) as e:
         reg["estado"], reg["detalle"] = clasificar_prueba_proveedor(e)
     reg["latencia_ms"] = round((time.monotonic() - t0) * 1000)

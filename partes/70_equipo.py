@@ -28,7 +28,7 @@ def estado_equipo(settings) -> list:
             tiene = bool(clave_de_proveedor(destino.proveedor, replace(settings, proveedor=destino.proveedor)))
         except (TypeError, ValueError):
             tiene = False
-        salida.append({"rol": etiqueta, "reaper_rol": rol, "modelo": modelo,
+        salida.append({"rol": etiqueta, "reaper_rol": rol, "modelo": modelo, "modelo_real": destino.modelo,
                        "proveedor": destino.proveedor, "tiene_clave": tiene})
     return salida
 
@@ -76,6 +76,9 @@ def _probar_modelo(llm, modelo: str) -> dict:
         ms = round((time.monotonic() - t0) * 1000)
         return {"estado": "RESPONDE", "detalle": f"{ms}ms", "modelo_servido": getattr(resp, "modelo", "")}
     except LLMError as e:
+        if getattr(e, "solo_razonamiento", False):        # respondió (pensando) aunque sin texto visible
+            ms = round((time.monotonic() - t0) * 1000)
+            return {"estado": "RESPONDE", "detalle": f"{ms}ms (razonamiento)"}
         return {"estado": "FALLA", "detalle": recortar(str(e), 120)}
     except (OSError, ValueError, RuntimeError) as e:
         return {"estado": "FALLA", "detalle": f"{type(e).__name__}: {e}"[:120]}

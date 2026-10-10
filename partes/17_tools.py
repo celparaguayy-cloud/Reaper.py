@@ -30,6 +30,7 @@ class Contexto:
     llm: Any = None                                 # cliente del modelo (lo usa write_large_file)
     ultimo_conteo: Any = None                       # ConteoTests del último run_tests (guardia de regresión)
     pedido: str = ""                                # tarea/pedido actual (para detectar requisitos inventados)
+    rol: str = ""                                   # rol del agente dueño (p. ej. "especificador")
 
     def tropiezo(self, tipo: str) -> None:
         if self.memoria is not None:
@@ -164,6 +165,11 @@ def _post_escritura(ctx: Contexto, rel: str, antes: Optional[str], despues: str,
             lineas = despues.count("\n") + (0 if despues.endswith("\n") or not despues else 1)
 
     resultados = validar_archivo(ctx.ws, rel)
+    if ctx.rol == "especificador":
+        resultados, tdd = separar_imports_tdd(resultados)
+        if tdd:
+            notas = list(notas) + ["importa módulos que todavía no existen (esperado en tests primero: "
+                                   "los crea la implementación)"]
     malos = fallos(resultados)
     accion = accion or ("Creé" if antes is None else "Modifiqué")
     texto = f"{accion} {rel} ({lineas} líneas)."

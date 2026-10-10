@@ -1106,6 +1106,17 @@ def validar_proyecto(ws: Workspace, rels: list[str]) -> list[Resultado]:
     return salida
 
 
+def separar_imports_tdd(resultados: list[Resultado]) -> tuple:
+    """
+    Separa los fallos de 'imports'/'imports-locales' de ARCHIVOS DE TEST: en la fase tests-primero los tests
+    importan módulos que la implementación todavía no creó, y eso es lo esperado (no un error a corregir).
+    Devuelve (resultados_sin_esos_fallos, fallos_tdd).
+    """
+    tdd = [r for r in resultados if not r.ok and r.comando.split(" ")[0] in ("imports", "imports-locales")
+           and es_archivo_de_test(r.archivo or "")]
+    return [r for r in resultados if r not in tdd], tdd
+
+
 def fallos(resultados: list[Resultado]) -> list[Resultado]:
     return [r for r in resultados if not r.ok]
 
@@ -1141,7 +1152,10 @@ def detectar_comando_tests(ws: Workspace, completo: bool = False) -> Optional[tu
     )
     if hay_tests_py:
         if importlib.util.find_spec("pytest") is not None:
-            corte = "" if completo else " -x"
+            # completo: además de no cortar en el primer fallo, seguir aunque un archivo de tests no se pueda
+            # importar (p. ej. tests de un módulo que una tarea POSTERIOR va a crear). Sin esto pytest aborta en
+            # la colección, corre 0 tests, y el torneo/la verificación por tarea no ven ningún progreso real.
+            corte = " --continue-on-collection-errors" if completo else " -x"
             return f"{py} -m pytest -q{corte} --tb=short -p no:cacheprovider", "pytest"
         for carpeta in ("tests", "test"):
             if (raiz / carpeta).is_dir():

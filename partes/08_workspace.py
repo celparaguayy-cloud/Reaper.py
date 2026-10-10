@@ -136,6 +136,9 @@ class Workspace:
         if not isinstance(rel, str) or not rel.strip():
             raise ErrorRuta("Ruta vacía.")
         texto = rel.strip().strip("`'\"").strip()
+        if "<" in texto:
+            # Basura de un modelo torpe: "src/db.py</script>" o "app.py</path>". Ninguna ruta real lleva etiquetas.
+            texto = re.sub(r"\s*</?[A-Za-z_][\w:-]*\s*/?>.*$", "", texto).strip()
         if texto.startswith("./"):
             texto = texto[2:]
         candidato = Path(os.path.expandvars(texto)).expanduser()

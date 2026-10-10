@@ -1569,7 +1569,21 @@ def resolver_modelo(nombre: str) -> str:
     return MODELOS.get(nombre.lower(), nombre)
 
 
+def separar_proveedor(nombre: str) -> tuple:
+    """
+    Sintaxis explícita "proveedor:modelo" para usar CUALQUIER id en un proveedor concreto, p. ej.
+    "groq:openai/gpt-oss-120b" o "ollama:qwen2.5-coder:7b". Devuelve (proveedor|"", id_sin_prefijo).
+    Solo cuenta como prefijo un nombre de PROVEEDORES sin "/" (así "deepseek/deepseek-r1:free" no se confunde).
+    """
+    nombre = (nombre or "").strip()
+    cabeza, sep, resto = nombre.partition(":")
+    if sep and resto and "/" not in cabeza and cabeza.lower() in PROVEEDORES:
+        return cabeza.lower(), resto.strip()
+    return "", nombre
+
+
 def info_modelo(nombre: str) -> InfoModelo:
+    _prov, nombre = separar_proveedor(resolver_modelo(nombre))
     real = resolver_modelo(nombre)
     for info in INFO_MODELOS.values():
         if info.id == real:
@@ -1590,6 +1604,8 @@ class Settings:
     modelos_rol: dict = field(default_factory=dict)
     # Modelos de respaldo si el principal falla (404, 402, caídas persistentes).
     fallbacks: list = field(default_factory=list)
+    # Si el modelo de un rol falla, probar con los otros modelos del equipo (los de /equipo) antes de abortar.
+    respaldo_equipo: bool = True
     proveedor: str = "openrouter"
     api_url: str = ""
 
@@ -1971,9 +1987,10 @@ class DestinoModelo:
 
 def destino_modelo(nombre: str, settings: "Settings") -> DestinoModelo:
     """A qué proveedor/endpoint va un modelo. Si InfoModelo no fija proveedor, usa el activo de la sesión."""
-    real = resolver_modelo(nombre)
-    info = info_modelo(nombre)
-    prov = getattr(info, "proveedor", "") or settings.proveedor or "openrouter"
+    explicito, sin_prefijo = separar_proveedor(resolver_modelo(nombre))   # "groq:openai/gpt-oss-120b"
+    real = resolver_modelo(sin_prefijo)
+    info = info_modelo(sin_prefijo)
+    prov = explicito or getattr(info, "proveedor", "") or settings.proveedor or "openrouter"
     if prov not in PROVEEDORES:
         prov = settings.proveedor if settings.proveedor in PROVEEDORES else "openrouter"
     # el proveedor activo respeta el override de api_url; los demás usan su endpoint fijo
@@ -2092,19 +2109,22 @@ except ImportError:  # pragma: no cover - depende del entorno
 
 class LLMError(RuntimeError):
     def __init__(self, mensaje: str, *, probar_otro_modelo: bool = False, contexto_excedido: bool = False,
-                 presupuesto: bool = False):
+                 presupuesto: bool = False, solo_razonamiento: bool = False):
         super().__init__(mensaje)
         self.probar_otro_modelo = probar_otro_modelo
         self.contexto_excedido = contexto_excedido
         self.presupuesto = presupuesto
+        # El modelo respondió, pero gastó toda la salida en razonamiento sin dar contenido (modelos "thinking").
+        self.solo_razonamiento = solo_razonamiento
 
 
 class _Transitorio(Exception):
     """Error que vale la pena reintentar (429, 5xx, red, respuesta vacía)."""
 
-    def __init__(self, mensaje: str, espera: Optional[float] = None):
+    def __init__(self, mensaje: str, espera: Optional[float] = None, vacia: bool = False):
         super().__init__(mensaje)
         self.espera = espera
+        self.vacia = vacia          # el modelo respondió 200 pero sin contenido
 
 
 @dataclass
@@ -2186,7 +2206,7 @@ def _lanzar_http(status: int, cuerpo: str, retry_after: Optional[str]) -> None:
     excedido = status in (400, 413) and bool(_RE_CONTEXTO.search(cuerpo or ""))
     raise LLMError(
         f"{motivo} HTTP {status}. {detalle}".strip(),
-        probar_otro_modelo=status in (400, 402, 403, 404) and not excedido,
+        probar_otro_modelo=status in (400, 402, 403, 404, 413, 422) and not excedido,
         contexto_excedido=excedido,
     )
 
@@ -2333,6 +2353,34 @@ class LLMClient:
             self._claves_proveedor[destino.proveedor] = clave_de_proveedor(destino.proveedor, self.settings)
         return self._claves_proveedor[destino.proveedor]
 
+    def _respaldos_equipo(self, principal: str, ya: list) -> list:
+        """
+        Los OTROS modelos del equipo (principal + los asignados a cada rol) como respaldo automático: si el
+        modelo de un rol falla (413 demasiado grande, 429 tras reintentos, vacío, 404, caído), se prueba con otro
+        en vez de abortar todo. Primero los de OTRO proveedor (un límite de cuenta no los afecta) y solo los que
+        tienen credencial. Se apaga con settings.respaldo_equipo = False.
+        """
+        if not getattr(self.settings, "respaldo_equipo", True):
+            return []
+        equipo = [self.settings.modelo] + list((self.settings.modelos_rol or {}).values())
+        try:
+            prov_principal = self._destino(principal).proveedor
+        except (ValueError, KeyError):
+            prov_principal = ""
+        otros, mismos = [], []
+        for nombre in equipo:
+            m = resolver_modelo(nombre)
+            if not m or m in ya or m in otros or m in mismos:
+                continue
+            try:
+                d = self._destino(m)
+                if d.necesita_clave() and not self._clave_de(d):
+                    continue
+            except (ValueError, KeyError, TypeError):
+                continue
+            (mismos if d.proveedor == prov_principal else otros).append(m)
+        return otros + mismos
+
     # ------------------------------------------------------------ API
     def chat(
         self,
@@ -2354,6 +2402,7 @@ class LLMClient:
                 respaldo = resolver_modelo(respaldo)
                 if respaldo and respaldo not in candidatos:
                     candidatos.append(respaldo)
+            candidatos += self._respaldos_equipo(principal, candidatos)
 
         # Privacidad estricta (Ω §4.3 / R-001): ÚNICO punto de egreso. Deny-by-default cuando el destino es
         # externo. Se bloquea ANTES de serializar/enviar (0 llamadas de red). chat_simple, subagentes,
@@ -2431,7 +2480,7 @@ class LLMClient:
         presupuesto = Presupuesto(min(self.settings.contexto_tokens, info.contexto) if info.contexto else
                                   self.settings.contexto_tokens, max_tokens or self.settings.max_tokens)
         payload = {
-            "model": modelo,
+            "model": self._destino(modelo).modelo,
             "messages": mensajes,
             "temperature": self.settings.temperatura if temperatura is None else temperatura,
             "max_tokens": presupuesto.respuesta_posible(mensajes),
@@ -2448,6 +2497,7 @@ class LLMClient:
     def _con_reintentos(self, modelo, mensajes, temperatura, max_tokens, stop, on_progress):
         payload = self._payload(modelo, mensajes, temperatura, max_tokens, stop, self._destino(modelo).proveedor)
         intentos = max(0, int(self.settings.reintentos))
+        vacias = 0
         for intento in range(intentos + 1):
             try:
                 cancelado = (lambda: CANCELAR.is_set()) if "CANCELAR" in globals() else None
@@ -2456,6 +2506,11 @@ class LLMClient:
             except _Transitorio as e:
                 with self._lock:
                     self.uso.reintentos += 1
+                vacias += int(getattr(e, "vacia", False))
+                if vacias >= 2 and intento < intentos:
+                    # Dos respuestas vacías seguidas: ese modelo no está respondiendo (típico de :free saturados);
+                    # mejor pasar a otra IA del equipo que esperar ~30 s más de reintentos.
+                    raise LLMError(f"{modelo}: {vacias} respuestas vacías seguidas", probar_otro_modelo=True) from e
                 if intento >= intentos:
                     raise LLMError(
                         f"{e} (después de {intentos + 1} intentos)",
@@ -2483,6 +2538,7 @@ class LLMClient:
     def _una_vez(self, modelo: str, payload: dict, on_progress) -> Respuesta:
         partes: list[str] = []
         total = 0
+        razonamiento = 0          # caracteres de razonamiento (delta.reasoning) sin contenido visible
         finish = None
         inicio = time.monotonic()
         primer = 0.0
@@ -2519,6 +2575,9 @@ class LLMClient:
             for choice in evento.get("choices") or []:
                 delta = choice.get("delta") or choice.get("message") or {}
                 contenido = delta.get("content")
+                pensado = delta.get("reasoning") or delta.get("reasoning_content")
+                if isinstance(pensado, str):
+                    razonamiento += len(pensado)
                 if contenido:
                     if not primer:
                         primer = time.monotonic() - inicio
@@ -2538,7 +2597,13 @@ class LLMClient:
 
         texto = "".join(partes)
         if not texto.strip():
-            raise _Transitorio("El modelo devolvió una respuesta vacía.")
+            if razonamiento:
+                # Modelo con razonamiento que se quedó sin salida antes de responder: reintentar igual no sirve,
+                # conviene pasar a otro modelo del equipo.
+                raise LLMError(
+                    f"{modelo} solo devolvió razonamiento ({razonamiento} caracteres) y ninguna respuesta "
+                    f"(finish={finish or '?'}).", probar_otro_modelo=True, solo_razonamiento=True)
+            raise _Transitorio("El modelo devolvió una respuesta vacía.", vacia=True)
         if not tokens_out:
             tokens_out = estimar_tokens(texto)
         return Respuesta(texto=texto, finish_reason=finish, modelo=modelo, tokens_entrada=tokens_in,
@@ -3579,6 +3644,9 @@ class Workspace:
         if not isinstance(rel, str) or not rel.strip():
             raise ErrorRuta("Ruta vacía.")
         texto = rel.strip().strip("`'\"").strip()
+        if "<" in texto:
+            # Basura de un modelo torpe: "src/db.py</script>" o "app.py</path>". Ninguna ruta real lleva etiquetas.
+            texto = re.sub(r"\s*</?[A-Za-z_][\w:-]*\s*/?>.*$", "", texto).strip()
         if texto.startswith("./"):
             texto = texto[2:]
         candidato = Path(os.path.expandvars(texto)).expanduser()
@@ -5335,6 +5403,17 @@ def validar_proyecto(ws: Workspace, rels: list[str]) -> list[Resultado]:
     return salida
 
 
+def separar_imports_tdd(resultados: list[Resultado]) -> tuple:
+    """
+    Separa los fallos de 'imports'/'imports-locales' de ARCHIVOS DE TEST: en la fase tests-primero los tests
+    importan módulos que la implementación todavía no creó, y eso es lo esperado (no un error a corregir).
+    Devuelve (resultados_sin_esos_fallos, fallos_tdd).
+    """
+    tdd = [r for r in resultados if not r.ok and r.comando.split(" ")[0] in ("imports", "imports-locales")
+           and es_archivo_de_test(r.archivo or "")]
+    return [r for r in resultados if r not in tdd], tdd
+
+
 def fallos(resultados: list[Resultado]) -> list[Resultado]:
     return [r for r in resultados if not r.ok]
 
@@ -5370,7 +5449,10 @@ def detectar_comando_tests(ws: Workspace, completo: bool = False) -> Optional[tu
     )
     if hay_tests_py:
         if importlib.util.find_spec("pytest") is not None:
-            corte = "" if completo else " -x"
+            # completo: además de no cortar en el primer fallo, seguir aunque un archivo de tests no se pueda
+            # importar (p. ej. tests de un módulo que una tarea POSTERIOR va a crear). Sin esto pytest aborta en
+            # la colección, corre 0 tests, y el torneo/la verificación por tarea no ven ningún progreso real.
+            corte = " --continue-on-collection-errors" if completo else " -x"
             return f"{py} -m pytest -q{corte} --tb=short -p no:cacheprovider", "pytest"
         for carpeta in ("tests", "test"):
             if (raiz / carpeta).is_dir():
@@ -8419,6 +8501,7 @@ class Contexto:
     llm: Any = None                                 # cliente del modelo (lo usa write_large_file)
     ultimo_conteo: Any = None                       # ConteoTests del último run_tests (guardia de regresión)
     pedido: str = ""                                # tarea/pedido actual (para detectar requisitos inventados)
+    rol: str = ""                                   # rol del agente dueño (p. ej. "especificador")
 
     def tropiezo(self, tipo: str) -> None:
         if self.memoria is not None:
@@ -8553,6 +8636,11 @@ def _post_escritura(ctx: Contexto, rel: str, antes: Optional[str], despues: str,
             lineas = despues.count("\n") + (0 if despues.endswith("\n") or not despues else 1)
 
     resultados = validar_archivo(ctx.ws, rel)
+    if ctx.rol == "especificador":
+        resultados, tdd = separar_imports_tdd(resultados)
+        if tdd:
+            notas = list(notas) + ["importa módulos que todavía no existen (esperado en tests primero: "
+                                   "los crea la implementación)"]
     malos = fallos(resultados)
     accion = accion or ("Creé" if antes is None else "Modifiqué")
     texto = f"{accion} {rel} ({lineas} líneas)."
@@ -10535,7 +10623,8 @@ class Agente:
                 memoria = None
         self.memoria = memoria
         self.ctx = Contexto(ws, settings, ui, self.etiqueta, set(), [], cid_inicio, memoria=memoria,
-                            protegidos=set(protegidos), permitidos=tuple(self.rol.rutas_permitidas), llm=llm)
+                            protegidos=set(protegidos), permitidos=tuple(self.rol.rutas_permitidas), llm=llm,
+                            rol=self.rol.nombre)
         base = settings.max_pasos if rol == "principal" else settings.max_pasos_sub
         self.max_pasos = max_pasos or self.rol.max_pasos or base
         self.temperatura = self.rol.temperatura if temperatura is None else temperatura
@@ -11593,6 +11682,9 @@ class Agente:
         ok = True
         if self.ctx.cambios:
             resultados = validar_archivos(self.ws, sorted(self.ctx.cambios))
+            if self.rol.nombre == "especificador":
+                # Tests primero: que los tests importen módulos aún inexistentes es lo ESPERADO (lo verá run_tests).
+                resultados, _tdd = separar_imports_tdd(resultados)
             if fallos(resultados):
                 if self._rechazos < 2:
                     self._rechazos += 1
@@ -13923,6 +14015,20 @@ class Orquestador:
             profundidad=1, cid_inicio=cid,
         )[0]
 
+    def _sub_opcional(self, rol: str, tarea: str, cid: Optional[int], **kw) -> Optional[ResultadoAgente]:
+        """
+        Roles de APOYO (revisor, QA, explorador): si su modelo falla incluso después del respaldo entre las IAs
+        del equipo, se avisa y la build SIGUE (antes un 413 del revisor abortaba todo /construir). Solo el
+        presupuesto agotado corta, porque seguir gastaría más.
+        """
+        try:
+            return self._sub(rol, tarea, cid, **kw)
+        except LLMError as e:
+            if e.presupuesto:
+                raise
+            self.ui.aviso(f"  {rol}: el modelo no respondió ({recortar(str(e), 180)}). Sigo sin esa fase.")
+            return None
+
     # ------------------------------------------------------------ fases
     def explorar(self, pedido: str) -> str:
         archivos = self.ws.archivos_codigo(limite=500)
@@ -13955,7 +14061,13 @@ class Orquestador:
                 "cómo se ejecuta y se prueba el proyecto",
                 {"memoria": self.memoria},
             ))
-        resultados = ejecutar_subagentes(specs, self.llm, self.ws, self.settings, self.ui, profundidad=1)
+        try:
+            resultados = ejecutar_subagentes(specs, self.llm, self.ws, self.settings, self.ui, profundidad=1)
+        except LLMError as e:
+            if e.presupuesto:
+                raise
+            self.ui.aviso(f"  explorador: el modelo no respondió ({recortar(str(e), 180)}). Sigo con el mapa local.")
+            return mapa or "(exploración no disponible: el modelo no respondió)"
         informe = "\n\n".join(
             f"### Informe explorador {i}\n{r.resumen}" for i, r in enumerate(resultados, start=1)
         )
@@ -14090,7 +14202,12 @@ class Orquestador:
             f"Validación automática de los archivos cambiados: {validacion}\n\n"
             "Leé los archivos completos si necesitás contexto. Empezá tu informe con la línea VEREDICTO."
         )
-        res = self._sub("revisor", texto, cid, titulo=f"revisa el diff de la tarea {tarea.id}")
+        res = self._sub_opcional("revisor", texto, cid, titulo=f"revisa el diff de la tarea {tarea.id}")
+        if res is None:                      # revisor caído: decide la validación real, no un modelo ausente
+            if validacion and not validacion.startswith(("OK", "sin validadores")):
+                return False, ("VEREDICTO: CAMBIOS\n1. La validación automática falla (corregilo antes que nada):\n"
+                               + validacion)
+            return True, "(revisión omitida: el revisor no respondió; la validación real pasa)"
         aprobado, claro = veredicto(res.resumen)
         if not claro:
             self.ui.tenue("  (el revisor no usó el formato VEREDICTO: se toma como aprobado)")
@@ -14100,7 +14217,7 @@ class Orquestador:
                            + validacion + "\n\n" + res.resumen)
         return aprobado, res.resumen
 
-    def qa(self, pedido: str, plan: Plan, archivos: list, cid: int) -> ResultadoAgente:
+    def qa(self, pedido: str, plan: Plan, archivos: list, cid: int) -> Optional[ResultadoAgente]:
         detectado = detectar_comando_tests(self.ws)
         criterios = "\n".join(f"- {c}" for c in plan.criterios) or "- (derivalos del pedido)"
         texto = (
@@ -14111,7 +14228,7 @@ class Orquestador:
             "Escribí (o completá) tests automáticos que verifiquen los criterios y corrélos con run_tests. "
             "Reportá el resultado REAL."
         )
-        return self._sub("qa", texto, cid, titulo="escribe y corre tests de aceptación")
+        return self._sub_opcional("qa", texto, cid, titulo="escribe y corre tests de aceptación")
 
     def verificar(self, cid: int) -> Verificacion:
         archivos = [r for r in self.ws.checkpoints.archivos_desde(cid) if (self.ws.raiz / r).is_file()]
@@ -27185,7 +27302,8 @@ class App:
         # entrada inválida: NO guardar nada (antes guardaba partes[0] como modelo e ignoraba el resto)
         if len(partes) == 2:
             self.ui.error(f"Rol desconocido: '{partes[0]}'. Roles válidos: {', '.join(sorted(ROLES))}.")
-            self.ui.tenue("  Uso: /modelo <alias>  ·  /modelo <rol> <alias>  (si el alias lleva espacios, no se admite)")
+            self.ui.tenue("  Uso: /modelo <alias>  ·  /modelo <rol> <alias>  · cualquier id en un proveedor: proveedor:id "
+                          "(p. ej. /modelo revisor groq:openai/gpt-oss-120b)")
         else:
             self.ui.error("Uso: /modelo [<alias>] | /modelo <rol> <alias>. Demasiados argumentos; no guardé nada.")
 
@@ -27320,7 +27438,7 @@ class App:
             resultados = probar_equipo(self.llm, self.settings)
             simbolos = {"RESPONDE": "✓", "SIN_CLAVE": "⚠", "FALLA": "✗"}
             for r in resultados:
-                self.ui.info(f"  {simbolos.get(r['estado'], '?')} {r['rol']:<13} {r['proveedor']}/{r['modelo']}  "
+                self.ui.info(f"  {simbolos.get(r['estado'], '?')} {r['rol']:<13} {r['proveedor']}/{r.get('modelo_real') or r['modelo']}  "
                              f"{r['estado']} ({r['detalle']})")
             responden = [r for r in resultados if r["estado"] == "RESPONDE"]
             provs = {r["proveedor"] for r in responden}
@@ -27333,7 +27451,7 @@ class App:
         self.ui.info("Equipo de seis roles (asignación actual; conectividad NO VERIFICADA):")
         for e in estado:
             marca = "✓ clave" if e["tiene_clave"] else "⚠ FALTA CLAVE"
-            self.ui.info(f"  {e['rol']:<13} → {e['proveedor']}/{e['modelo']}   {marca}")
+            self.ui.info(f"  {e['rol']:<13} → {e['proveedor']}/{e.get('modelo_real') or e['modelo']}   {marca}")
         self.ui.tenue(f"  proveedores distintos: {ind['proveedores_distintos']} · "
                       f"modelos distintos: {ind['modelos_distintos']}"
                       + ("  · independencia REDUCIDA" if ind["reducida"] else ""))
@@ -42280,6 +42398,216 @@ class TestExportarYMuestraSeguros(BaseTest):
 
 
 # ======================================================================
+# MÓDULO: autotest_equipo_resiliente
+# ======================================================================
+"""
+Autotests del equipo resiliente (fallos reales vistos en Termux con 6 IAs en 3 proveedores):
+  - un 413 "Request too large" de Groq en un rol abortaba todo /construir;
+  - respuestas vacías / solo razonamiento de modelos :free gastaban ~30 s de reintentos y terminaban en error;
+  - el especificador (tests primero) no podía cerrar porque sus tests importan módulos aún inexistentes;
+  - pytest abortaba en la colección y el torneo veía "0 pasaron" en todos los candidatos;
+  - rutas con basura del modelo ("src/db.py</script>");
+  - "proveedor:modelo" para usar cualquier id en un proveedor concreto.
+"""
+
+
+class _BaseEquipo(BaseTest):
+    _VARS = ("OPENROUTER_API_KEY", "GROQ_API_KEY", "GEMINI_API_KEY", "NVIDIA_API_KEY", "REAPER_CLAVE_PROVEEDOR")
+
+    def setUp(self):
+        super().setUp()
+        self._env_bak = {k: os.environ.pop(k, None) for k in self._VARS}
+
+    def tearDown(self):
+        for k, v in self._env_bak.items():
+            os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+        super().tearDown()
+
+    def cliente_espia(self, eventos, **ajustes):
+        base = transporte_falso(eventos)
+        enviados = []
+
+        def espia(url, headers, payload, timeout):
+            enviados.append((url, payload["model"]))
+            return base(url, headers, payload, timeout)
+
+        c = LLMClient("clave", self.ajustes(**ajustes), url="http://falso", transporte=espia)
+        c.dormir = lambda _s: None
+        return c, enviados
+
+
+class TestRuteoProveedorExplicito(_BaseEquipo):
+    def test_prefijo_proveedor(self):
+        d = destino_modelo("groq:openai/gpt-oss-120b", self.ajustes())
+        self.assertEqual((d.proveedor, d.modelo), ("groq", "openai/gpt-oss-120b"))
+        self.assertIn("groq.com", d.url)
+
+    def test_dos_puntos_del_id_no_son_prefijo(self):
+        d = destino_modelo("deepseek/deepseek-r1:free", self.ajustes(proveedor="openrouter"))
+        self.assertEqual((d.proveedor, d.modelo), ("openrouter", "deepseek/deepseek-r1:free"))
+        d = destino_modelo("ollama:qwen2.5-coder:7b", self.ajustes())
+        self.assertEqual((d.proveedor, d.modelo), ("ollama", "qwen2.5-coder:7b"))
+
+    def test_payload_lleva_id_real(self):
+        os.environ["GROQ_API_KEY"] = "gk"
+        c, enviados = self.cliente_espia(["hola"])
+        c.chat([{"role": "user", "content": "x"}], modelo="groq:openai/gpt-oss-120b", sin_respaldo=True)
+        url, modelo = enviados[0]
+        self.assertIn("groq.com", url)
+        self.assertEqual(modelo, "openai/gpt-oss-120b")          # sin el prefijo de ruteo
+
+    def test_alias_curado_con_prefijo_conserva_info(self):
+        self.assertTrue(es_modelo_gratis("groq:llama-3.3-70b-versatile"))
+
+
+class TestRespaldoEquipo(_BaseEquipo):
+    MSG_413 = ("El pedido es demasiado grande. HTTP 413. Request too large for model `qwen/qwen3.8-27b` on "
+               "tokens per minute (TPM): Limit 7000, Requested 8264, please reduce your message size")
+
+    def test_413_prueba_otro_modelo(self):
+        with self.assertRaises(LLMError) as cm:
+            _lanzar_http(413, "Request too large ... please reduce your message size", None)
+        self.assertTrue(cm.exception.probar_otro_modelo)
+
+    def test_413_de_un_rol_pasa_a_otra_ia_del_equipo(self):
+        os.environ["GROQ_API_KEY"] = "gk"
+        os.environ["GEMINI_API_KEY"] = "gm"
+        c, enviados = self.cliente_espia(
+            [LLMError(self.MSG_413, probar_otro_modelo=True), "revisión hecha por otra IA"],
+            modelos_rol={"revisor": "groq:qwen/qwen3.8-27b", "qa": "gemini-flash"})
+        r = c.chat([{"role": "user", "content": "revisá"}], modelo=c.settings.modelo_para("revisor"), rol="revisor")
+        self.assertEqual(r.texto, "revisión hecha por otra IA")
+        self.assertEqual(enviados[0][1], "qwen/qwen3.8-27b")
+        self.assertNotIn("groq.com", enviados[1][0])              # prefiere OTRO proveedor (límite de cuenta)
+        self.assertEqual(c.uso.respaldos, 1)
+
+    def test_respaldo_salta_ias_sin_clave(self):
+        os.environ["GROQ_API_KEY"] = "gk"                          # gemini SIN clave
+        c, enviados = self.cliente_espia(
+            [LLMError(self.MSG_413, probar_otro_modelo=True), "desde el principal"],
+            modelos_rol={"revisor": "groq:qwen/qwen3.8-27b", "qa": "gemini-flash"})
+        r = c.chat([{"role": "user", "content": "x"}], modelo=c.settings.modelo_para("revisor"))
+        self.assertEqual(r.texto, "desde el principal")
+        self.assertFalse(any("googleapis" in u for u, _m in enviados))
+
+    def test_respaldo_equipo_se_puede_apagar(self):
+        os.environ["GROQ_API_KEY"] = "gk"
+        c, _ = self.cliente_espia([LLMError(self.MSG_413, probar_otro_modelo=True), "no debería"],
+                                  modelos_rol={"revisor": "groq:qwen/qwen3.8-27b"}, respaldo_equipo=False)
+        with self.assertRaises(LLMError):
+            c.chat([{"role": "user", "content": "x"}], modelo=c.settings.modelo_para("revisor"))
+
+    def test_dos_vacias_pasan_a_otra_ia_sin_agotar_reintentos(self):
+        os.environ["GROQ_API_KEY"] = "gk"
+        c, enviados = self.cliente_espia(["", "", "respuesta de groq"], reintentos=4,
+                                         modelos_rol={"qa": "groq-llama70"})
+        r = c.chat([{"role": "user", "content": "x"}])
+        self.assertEqual(r.texto, "respuesta de groq")
+        self.assertEqual(len(enviados), 3)                         # 2 vacías + 1 en otra IA (no 5 intentos)
+        self.assertNotIn("groq.com", enviados[1][0])
+        self.assertIn("groq.com", enviados[2][0])                  # la 3ª ya fue a OTRA IA, no un reintento
+
+    def test_solo_razonamiento_es_error_distinto_y_cambia_de_ia(self):
+        os.environ["GROQ_API_KEY"] = "gk"
+        pensando = {"choices": [{"delta": {"reasoning": "Pienso mucho... " * 20}, "finish_reason": "length"}]}
+        c, enviados = self.cliente_espia([pensando, "respuesta final"], modelos_rol={"qa": "groq-llama70"})
+        r = c.chat([{"role": "user", "content": "x"}])
+        self.assertEqual(r.texto, "respuesta final")
+        self.assertEqual(len(enviados), 2)
+        self.assertIn("groq.com", enviados[1][0])                  # no reintentó el modelo que solo "piensa"
+
+    def test_probe_cuenta_razonamiento_como_responde(self):
+        os.environ["OPENROUTER_API_KEY"] = "ok"
+        pensando = {"choices": [{"delta": {"reasoning": "hmm"}, "finish_reason": "length"}]}
+        c, _ = self.cliente_espia([pensando])
+        res = probar_equipo(c, c.settings)
+        self.assertTrue(all(r["estado"] == "RESPONDE" for r in res), res)
+
+
+class TestPipelineNoAbortaPorUnRol(_BaseEquipo):
+    def test_revisor_caido_no_aborta_construir(self):
+        def guion(mensajes, kwargs):
+            rol = MockLLM.rol_de(mensajes)
+            turno = _turno(mensajes)
+            if rol == "arquitecto":
+                return terminar_xml(TestPipeline.PLAN)
+            if rol == "especificador":
+                if turno == 0:
+                    return herramienta_xml("write_to_file", path="tests/test_calc.py", content=_TEST_CALC)
+                return terminar_xml("tests escritos")
+            if rol == "implementador":
+                if turno == 0:
+                    return herramienta_xml("write_to_file", path="calc.py", content=_CALC_BIEN)
+                return terminar_xml("calc.py implementado")
+            if rol == "revisor":
+                raise LLMError("El pedido es demasiado grande. HTTP 413. Request too large", probar_otro_modelo=True)
+            return terminar_xml("ok")
+
+        ws = self.proyecto({"README.md": "# calc\n"})
+        ajustes = self.ajustes(tests_primero=True, torneo=False, max_revisiones=1, lecciones=False)
+        ui = self.ui()
+        informe = Orquestador(MockLLM(guion), ws, ajustes, ui).construir("calculadora", confirmar=False)
+        self.assertEqual(informe.estado, "verificada", informe.notas)  # antes: el 413 del revisor abortaba todo
+        self.assertEqual(ws.leer("calc.py"), _CALC_BIEN)
+        self.assertIn("revisor: el modelo no respondió", ui.texto_registrado())
+
+
+class TestEspecificadorTDD(_BaseEquipo):
+    def test_cierra_aunque_los_tests_importen_modulos_inexistentes(self):
+        test = ("import sys\nsys.path.insert(0, 'src')\nfrom inventario import agregar\n\n\n"
+                "def test_agregar():\n    assert agregar([], 1) == [1]\n")
+        guion = [herramienta_xml("write_to_file", path="tests/test_inventario.py", content=test),
+                 terminar_xml("Tests escritos: tests/test_inventario.py (fallan: falta src/inventario.py)")]
+        ws = self.proyecto({})
+        ui = self.ui()
+        llm = MockLLM(guion)
+        res = Agente("especificador", llm, ws, self.ajustes(), ui, memoria=None,
+                     mostrar_progreso=False).ejecutar("escribí los tests de inventario")
+        self.assertTrue(res.ok, res.resumen)
+        self.assertNotIn("cierre rechazado", ui.texto_registrado())
+        observado = "\n".join(m["content"] for m in llm.llamadas[-1]["mensajes"] if m["role"] == "user")
+        self.assertIn("Creé tests/test_inventario.py", observado)
+        self.assertNotIn("VALIDACIÓN FALLÓ", observado)            # escribir el test ya no se marca como error
+
+    def test_otros_roles_siguen_marcando_imports_faltantes(self):
+        resultados = [Resultado(False, "imports tests/test_x.py", 1, archivo="tests/test_x.py"),
+                      Resultado(False, "imports app.py", 1, archivo="app.py")]
+        quedan, tdd = separar_imports_tdd(resultados)
+        self.assertEqual([r.archivo for r in tdd], ["tests/test_x.py"])  # solo el de un archivo de test
+        self.assertEqual([r.archivo for r in quedan], ["app.py"])         # un import roto en código sigue fallando
+
+
+class TestPytestColeccion(_BaseEquipo):
+    def test_completo_sigue_tras_errores_de_coleccion(self):
+        ws = self.proyecto({"tests/test_a.py": "def test_a():\n    assert True\n"})
+        original = importlib.util.find_spec
+        importlib.util.find_spec = lambda nombre, *a, **k: object() if nombre == "pytest" else original(nombre, *a, **k)
+        try:
+            completo = detectar_comando_tests(ws, completo=True)[0]
+            rapido = detectar_comando_tests(ws, completo=False)[0]
+        finally:
+            importlib.util.find_spec = original
+        self.assertIn("--continue-on-collection-errors", completo)
+        self.assertIn(" -x", rapido)
+
+    def test_conteo_con_error_de_coleccion_no_es_ok(self):
+        salida = "ERROR tests/test_api.py\n2 passed, 1 error in 0.02s\n"
+        c = contar_tests(salida, 1)
+        self.assertEqual((c.pasados, c.errores), (2, 1))   # progreso visible, pero la suite no está verde
+
+
+class TestRutasSucias(BaseTest):
+    def test_etiqueta_pegada_a_la_ruta(self):
+        ws = self.proyecto({"src/db.py": "x = 1\n"})
+        self.assertEqual(ws.ruta("src/db.py</script>"), ws.raiz / "src" / "db.py")
+        self.assertEqual(ws.ruta("src/db.py</path>"), ws.raiz / "src" / "db.py")
+
+    def test_ruta_normal_intacta(self):
+        ws = self.proyecto({"a.py": ""})
+        self.assertEqual(ws.ruta("a.py"), ws.raiz / "a.py")
+
+
+# ======================================================================
 # MÓDULO: autotest_runner
 # ======================================================================
 """Ejecutor del autotest interno."""
@@ -46726,7 +47054,7 @@ def estado_equipo(settings) -> list:
             tiene = bool(clave_de_proveedor(destino.proveedor, replace(settings, proveedor=destino.proveedor)))
         except (TypeError, ValueError):
             tiene = False
-        salida.append({"rol": etiqueta, "reaper_rol": rol, "modelo": modelo,
+        salida.append({"rol": etiqueta, "reaper_rol": rol, "modelo": modelo, "modelo_real": destino.modelo,
                        "proveedor": destino.proveedor, "tiene_clave": tiene})
     return salida
 
@@ -46774,6 +47102,9 @@ def _probar_modelo(llm, modelo: str) -> dict:
         ms = round((time.monotonic() - t0) * 1000)
         return {"estado": "RESPONDE", "detalle": f"{ms}ms", "modelo_servido": getattr(resp, "modelo", "")}
     except LLMError as e:
+        if getattr(e, "solo_razonamiento", False):        # respondió (pensando) aunque sin texto visible
+            ms = round((time.monotonic() - t0) * 1000)
+            return {"estado": "RESPONDE", "detalle": f"{ms}ms (razonamiento)"}
         return {"estado": "FALLA", "detalle": recortar(str(e), 120)}
     except (OSError, ValueError, RuntimeError) as e:
         return {"estado": "FALLA", "detalle": f"{type(e).__name__}: {e}"[:120]}
@@ -47473,7 +47804,10 @@ def probar_proveedor(llm, proveedor: str, settings, *, modelo: Optional[str] = N
                  sin_respaldo=True, rol="probe")
         reg["estado"], reg["detalle"] = "OK", "responde"
     except LLMError as e:
-        reg["estado"], reg["detalle"] = clasificar_prueba_proveedor(e)
+        if getattr(e, "solo_razonamiento", False):
+            reg["estado"], reg["detalle"] = "OK", "responde (solo razonamiento con max_tokens mínimo)"
+        else:
+            reg["estado"], reg["detalle"] = clasificar_prueba_proveedor(e)
     except (OSError, ValueError, RuntimeError) as e:
         reg["estado"], reg["detalle"] = clasificar_prueba_proveedor(e)
     reg["latencia_ms"] = round((time.monotonic() - t0) * 1000)

@@ -127,7 +127,21 @@ def resolver_modelo(nombre: str) -> str:
     return MODELOS.get(nombre.lower(), nombre)
 
 
+def separar_proveedor(nombre: str) -> tuple:
+    """
+    Sintaxis explícita "proveedor:modelo" para usar CUALQUIER id en un proveedor concreto, p. ej.
+    "groq:openai/gpt-oss-120b" o "ollama:qwen2.5-coder:7b". Devuelve (proveedor|"", id_sin_prefijo).
+    Solo cuenta como prefijo un nombre de PROVEEDORES sin "/" (así "deepseek/deepseek-r1:free" no se confunde).
+    """
+    nombre = (nombre or "").strip()
+    cabeza, sep, resto = nombre.partition(":")
+    if sep and resto and "/" not in cabeza and cabeza.lower() in PROVEEDORES:
+        return cabeza.lower(), resto.strip()
+    return "", nombre
+
+
 def info_modelo(nombre: str) -> InfoModelo:
+    _prov, nombre = separar_proveedor(resolver_modelo(nombre))
     real = resolver_modelo(nombre)
     for info in INFO_MODELOS.values():
         if info.id == real:
@@ -148,6 +162,8 @@ class Settings:
     modelos_rol: dict = field(default_factory=dict)
     # Modelos de respaldo si el principal falla (404, 402, caídas persistentes).
     fallbacks: list = field(default_factory=list)
+    # Si el modelo de un rol falla, probar con los otros modelos del equipo (los de /equipo) antes de abortar.
+    respaldo_equipo: bool = True
     proveedor: str = "openrouter"
     api_url: str = ""
 
