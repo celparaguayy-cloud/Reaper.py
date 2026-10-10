@@ -1036,13 +1036,23 @@ class App:
         sub = (arg or "").strip().lower()
         if sub.startswith("x"):
             partes_x = sub.split()
-            if len(partes_x) > 1 and partes_x[1] in ("on", "off", "si", "sí", "no"):
-                self.settings.roles_x = partes_x[1] in ("on", "si", "sí")
+            opcion = partes_x[1] if len(partes_x) > 1 else ""
+            if opcion in ("on", "off", "si", "sí", "no", "preset"):
+                self.settings.roles_x = opcion != "off" and opcion != "no"
+                if opcion == "preset":
+                    # El equipo que respondió en la cuenta del usuario, con Dolphin Venice 24B como director.
+                    self.settings.modelos_rol.update(EQUIPO_X_USUARIO)
+                    self.ui.ok("Preset REAPER X aplicado: " + ", ".join(f"{r}→{a}" for r, a in EQUIPO_X_USUARIO.items()))
+                    self.ui.tenue("  integrador, seguridad y auditor_entrega usan el modelo principal (compartido) "
+                                  "hasta que les asignes y pruebes otro: /modelo integrador <alias>")
+                elif self.settings.roles_x and "director" not in self.settings.modelos_rol:
+                    self.settings.modelos_rol["director"] = DIRECTOR_POR_DEFECTO
+                    self.ui.tenue(f"  director → {DIRECTOR_POR_DEFECTO} (Dolphin Mistral 24B Venice, solo texto/JSON)")
                 self._guardar_settings()
             self.ui.ok(f"REAPER X (10 roles): {'ON' if self.settings.roles_x else 'OFF'}")
             self.ui.tenue("  ON agrega director y supervisor (dictámenes JSON validados), integrador, seguridad "
                           "defensiva y auditor de entrega a /construir. El estado final lo sigue decidiendo la "
-                          "verificación real. /equipo x on | /equipo x off")
+                          "verificación real. /equipo x on | /equipo x preset | /equipo x off")
             sub = ""
         estado = estado_equipo(self.settings)
         ind = independencia_equipo(estado)

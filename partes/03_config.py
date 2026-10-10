@@ -115,7 +115,37 @@ INFO_MODELOS = {
                                       "DeepSeek R1 gratis en OpenRouter (con límites de uso)", "openrouter", True),
     "or-llama70-free": InfoModelo("meta-llama/llama-3.3-70b-instruct:free", 131072, "fuerte",
                                   "Llama 3.3 70B gratis en OpenRouter (con límites)", "openrouter", True),
+    # Equipo REAPER X del usuario: ids tomados de SU /equipo probar (respondieron en su cuenta). La etiqueta
+    # ":free" de OpenRouter no prueba coste cero: free=False hasta verificarlo con la cuenta.
+    "or-dolphin-jefe-free": InfoModelo("cognitivecomputations/dolphin-mistral-24b-venice-edition:free", 32768,
+                                       "base", "Dolphin Mistral 24B Venice Edition (uncensored): DIRECTOR, solo "
+                                       "texto/JSON (sin tool calls nativos)", "openrouter", False),
+    "or-nemotron3-ultra-free": InfoModelo("nvidia/nemotron-3-ultra-550b-a55b:free", 32768, "fuerte",
+                                          "Nemotron 3 Ultra: SUPERVISOR (razonamiento; puede tardar)", "openrouter", False),
+    "groq-gptoss120": InfoModelo("openai/gpt-oss-120b", 131072, "fuerte",
+                                 "GPT-OSS 120B en Groq: ARQUITECTO (cuenta free: límite de tokens/minuto bajo)", "groq", False),
+    "or-north-mini-code-free": InfoModelo("cohere/north-mini-code:free", 32768, "fuerte",
+                                          "North Mini Code: IMPLEMENTADOR", "openrouter", False),
+    "groq-qwen38": InfoModelo("qwen/qwen3.8-27b", 32768, "fuerte",
+                              "Qwen 3.8 27B en Groq: REVISOR (cuenta free: ~7000 tokens/minuto)", "groq", False),
+    "gemini35-flash-lite": InfoModelo("gemini-3.5-flash-lite", 131072, "fuerte",
+                                      "Gemini 3.5 Flash-Lite: QA", "gemini", False),
+    "or-nemotron3-super-free": InfoModelo("nvidia/nemotron-3-super-120b-a12b:free", 32768, "fuerte",
+                                          "Nemotron 3 Super: REPARADOR (razonamiento)", "openrouter", False),
 }
+
+# Preset REAPER X con el equipo que respondió en la cuenta del usuario (Dolphin dirige). integrador, seguridad y
+# auditor_entrega quedan con el modelo principal (compartido) hasta probar modelos propios para ellos.
+EQUIPO_X_USUARIO = {
+    "director": "or-dolphin-jefe-free",
+    "supervisor": "or-nemotron3-ultra-free",
+    "arquitecto": "groq-gptoss120",
+    "implementador": "or-north-mini-code-free",
+    "revisor": "groq-qwen38",
+    "qa": "gemini35-flash-lite",
+    "reparador": "or-nemotron3-super-free",
+}
+DIRECTOR_POR_DEFECTO = "or-dolphin-jefe-free"
 
 MODELOS = {alias: info.id for alias, info in INFO_MODELOS.items()}
 

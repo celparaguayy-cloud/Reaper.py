@@ -156,3 +156,42 @@ class TestPipelineReaperX(BaseTest):
         informe, _l, _t = self._construir('{"decision": "APPROVE", "evidence_ids": ["EV-PLAN"]}', "Todo perfecto, aprobado")
         self.assertEqual(informe.estado, "verificada")         # la verificación real sigue mandando
         self.assertTrue(any("descartado" in n for n in informe.notas))
+
+
+class TestEquipoXUsuario(BaseTest):
+    def _app(self):
+        return App(self.ajustes(forense=False, escalar=False), MockLLM([]), self.ui(), self.proyecto(), persistir=False)
+
+    def test_x_on_pone_a_dolphin_de_director(self):
+        app = self._app()
+        app.comando("/equipo x on")
+        self.assertEqual(app.settings.modelos_rol.get("director"), "or-dolphin-jefe-free")
+        d = destino_modelo(app.settings.modelo_para("director"), app.settings)
+        self.assertEqual((d.proveedor, d.modelo), ("openrouter", "cognitivecomputations/dolphin-mistral-24b-venice-edition:free"))
+
+    def test_x_on_respeta_un_director_ya_asignado(self):
+        app = self._app()
+        app.comando("/modelo director qwen")
+        app.comando("/equipo x on")
+        self.assertEqual(app.settings.modelos_rol["director"], resolver_modelo("qwen"))
+
+    def test_preset_arma_el_equipo_del_usuario_con_ruteo_correcto(self):
+        app = self._app()
+        app.comando("/equipo x preset")
+        self.assertTrue(app.settings.roles_x)
+        esperado = {"director": ("openrouter", "cognitivecomputations/dolphin-mistral-24b-venice-edition:free"),
+                    "supervisor": ("openrouter", "nvidia/nemotron-3-ultra-550b-a55b:free"),
+                    "arquitecto": ("groq", "openai/gpt-oss-120b"),
+                    "implementador": ("openrouter", "cohere/north-mini-code:free"),
+                    "revisor": ("groq", "qwen/qwen3.8-27b"),
+                    "qa": ("gemini", "gemini-3.5-flash-lite"),
+                    "reparador": ("openrouter", "nvidia/nemotron-3-super-120b-a12b:free")}
+        for rol, (prov, modelo) in esperado.items():
+            d = destino_modelo(app.settings.modelo_para(rol), app.settings)
+            self.assertEqual((d.proveedor, d.modelo), (prov, modelo), rol)
+        c = conteo_equipo_x(app.settings)
+        self.assertEqual((c["roles"], c["proveedores"]), (10, 3))
+        self.assertEqual(c["modelos_verificados"], 0)          # configurar no es verificar
+
+    def test_tags_free_no_se_dan_por_verificados(self):
+        self.assertFalse(INFO_MODELOS["or-dolphin-jefe-free"].free)

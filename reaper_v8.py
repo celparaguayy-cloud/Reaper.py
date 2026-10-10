@@ -1557,7 +1557,37 @@ INFO_MODELOS = {
                                       "DeepSeek R1 gratis en OpenRouter (con límites de uso)", "openrouter", True),
     "or-llama70-free": InfoModelo("meta-llama/llama-3.3-70b-instruct:free", 131072, "fuerte",
                                   "Llama 3.3 70B gratis en OpenRouter (con límites)", "openrouter", True),
+    # Equipo REAPER X del usuario: ids tomados de SU /equipo probar (respondieron en su cuenta). La etiqueta
+    # ":free" de OpenRouter no prueba coste cero: free=False hasta verificarlo con la cuenta.
+    "or-dolphin-jefe-free": InfoModelo("cognitivecomputations/dolphin-mistral-24b-venice-edition:free", 32768,
+                                       "base", "Dolphin Mistral 24B Venice Edition (uncensored): DIRECTOR, solo "
+                                       "texto/JSON (sin tool calls nativos)", "openrouter", False),
+    "or-nemotron3-ultra-free": InfoModelo("nvidia/nemotron-3-ultra-550b-a55b:free", 32768, "fuerte",
+                                          "Nemotron 3 Ultra: SUPERVISOR (razonamiento; puede tardar)", "openrouter", False),
+    "groq-gptoss120": InfoModelo("openai/gpt-oss-120b", 131072, "fuerte",
+                                 "GPT-OSS 120B en Groq: ARQUITECTO (cuenta free: límite de tokens/minuto bajo)", "groq", False),
+    "or-north-mini-code-free": InfoModelo("cohere/north-mini-code:free", 32768, "fuerte",
+                                          "North Mini Code: IMPLEMENTADOR", "openrouter", False),
+    "groq-qwen38": InfoModelo("qwen/qwen3.8-27b", 32768, "fuerte",
+                              "Qwen 3.8 27B en Groq: REVISOR (cuenta free: ~7000 tokens/minuto)", "groq", False),
+    "gemini35-flash-lite": InfoModelo("gemini-3.5-flash-lite", 131072, "fuerte",
+                                      "Gemini 3.5 Flash-Lite: QA", "gemini", False),
+    "or-nemotron3-super-free": InfoModelo("nvidia/nemotron-3-super-120b-a12b:free", 32768, "fuerte",
+                                          "Nemotron 3 Super: REPARADOR (razonamiento)", "openrouter", False),
 }
+
+# Preset REAPER X con el equipo que respondió en la cuenta del usuario (Dolphin dirige). integrador, seguridad y
+# auditor_entrega quedan con el modelo principal (compartido) hasta probar modelos propios para ellos.
+EQUIPO_X_USUARIO = {
+    "director": "or-dolphin-jefe-free",
+    "supervisor": "or-nemotron3-ultra-free",
+    "arquitecto": "groq-gptoss120",
+    "implementador": "or-north-mini-code-free",
+    "revisor": "groq-qwen38",
+    "qa": "gemini35-flash-lite",
+    "reparador": "or-nemotron3-super-free",
+}
+DIRECTOR_POR_DEFECTO = "or-dolphin-jefe-free"
 
 MODELOS = {alias: info.id for alias, info in INFO_MODELOS.items()}
 
@@ -27696,13 +27726,23 @@ class App:
         sub = (arg or "").strip().lower()
         if sub.startswith("x"):
             partes_x = sub.split()
-            if len(partes_x) > 1 and partes_x[1] in ("on", "off", "si", "sí", "no"):
-                self.settings.roles_x = partes_x[1] in ("on", "si", "sí")
+            opcion = partes_x[1] if len(partes_x) > 1 else ""
+            if opcion in ("on", "off", "si", "sí", "no", "preset"):
+                self.settings.roles_x = opcion != "off" and opcion != "no"
+                if opcion == "preset":
+                    # El equipo que respondió en la cuenta del usuario, con Dolphin Venice 24B como director.
+                    self.settings.modelos_rol.update(EQUIPO_X_USUARIO)
+                    self.ui.ok("Preset REAPER X aplicado: " + ", ".join(f"{r}→{a}" for r, a in EQUIPO_X_USUARIO.items()))
+                    self.ui.tenue("  integrador, seguridad y auditor_entrega usan el modelo principal (compartido) "
+                                  "hasta que les asignes y pruebes otro: /modelo integrador <alias>")
+                elif self.settings.roles_x and "director" not in self.settings.modelos_rol:
+                    self.settings.modelos_rol["director"] = DIRECTOR_POR_DEFECTO
+                    self.ui.tenue(f"  director → {DIRECTOR_POR_DEFECTO} (Dolphin Mistral 24B Venice, solo texto/JSON)")
                 self._guardar_settings()
             self.ui.ok(f"REAPER X (10 roles): {'ON' if self.settings.roles_x else 'OFF'}")
             self.ui.tenue("  ON agrega director y supervisor (dictámenes JSON validados), integrador, seguridad "
                           "defensiva y auditor de entrega a /construir. El estado final lo sigue decidiendo la "
-                          "verificación real. /equipo x on | /equipo x off")
+                          "verificación real. /equipo x on | /equipo x preset | /equipo x off")
             sub = ""
         estado = estado_equipo(self.settings)
         ind = independencia_equipo(estado)
@@ -43219,6 +43259,45 @@ class TestPipelineReaperX(BaseTest):
         informe, _l, _t = self._construir('{"decision": "APPROVE", "evidence_ids": ["EV-PLAN"]}', "Todo perfecto, aprobado")
         self.assertEqual(informe.estado, "verificada")         # la verificación real sigue mandando
         self.assertTrue(any("descartado" in n for n in informe.notas))
+
+
+class TestEquipoXUsuario(BaseTest):
+    def _app(self):
+        return App(self.ajustes(forense=False, escalar=False), MockLLM([]), self.ui(), self.proyecto(), persistir=False)
+
+    def test_x_on_pone_a_dolphin_de_director(self):
+        app = self._app()
+        app.comando("/equipo x on")
+        self.assertEqual(app.settings.modelos_rol.get("director"), "or-dolphin-jefe-free")
+        d = destino_modelo(app.settings.modelo_para("director"), app.settings)
+        self.assertEqual((d.proveedor, d.modelo), ("openrouter", "cognitivecomputations/dolphin-mistral-24b-venice-edition:free"))
+
+    def test_x_on_respeta_un_director_ya_asignado(self):
+        app = self._app()
+        app.comando("/modelo director qwen")
+        app.comando("/equipo x on")
+        self.assertEqual(app.settings.modelos_rol["director"], resolver_modelo("qwen"))
+
+    def test_preset_arma_el_equipo_del_usuario_con_ruteo_correcto(self):
+        app = self._app()
+        app.comando("/equipo x preset")
+        self.assertTrue(app.settings.roles_x)
+        esperado = {"director": ("openrouter", "cognitivecomputations/dolphin-mistral-24b-venice-edition:free"),
+                    "supervisor": ("openrouter", "nvidia/nemotron-3-ultra-550b-a55b:free"),
+                    "arquitecto": ("groq", "openai/gpt-oss-120b"),
+                    "implementador": ("openrouter", "cohere/north-mini-code:free"),
+                    "revisor": ("groq", "qwen/qwen3.8-27b"),
+                    "qa": ("gemini", "gemini-3.5-flash-lite"),
+                    "reparador": ("openrouter", "nvidia/nemotron-3-super-120b-a12b:free")}
+        for rol, (prov, modelo) in esperado.items():
+            d = destino_modelo(app.settings.modelo_para(rol), app.settings)
+            self.assertEqual((d.proveedor, d.modelo), (prov, modelo), rol)
+        c = conteo_equipo_x(app.settings)
+        self.assertEqual((c["roles"], c["proveedores"]), (10, 3))
+        self.assertEqual(c["modelos_verificados"], 0)          # configurar no es verificar
+
+    def test_tags_free_no_se_dan_por_verificados(self):
+        self.assertFalse(INFO_MODELOS["or-dolphin-jefe-free"].free)
 
 
 # ======================================================================
