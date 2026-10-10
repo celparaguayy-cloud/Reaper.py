@@ -117,6 +117,9 @@ class App:
         self.ui = ui
         self.ws = ws
         self.persistir = persistir
+        # Foto de los settings al arrancar (incluye flags "solo esta ejecución", overrides del proyecto y del
+        # entorno): al guardar se persiste SOLO lo que el usuario cambió en la sesión, no esos valores efímeros.
+        self._base_settings = copy.deepcopy(settings.to_dict())
         self.aviso_sesion = ""
         self.historial: list[tuple[str, str, bool]] = []
         self._rehacer: Optional[dict] = None
@@ -131,6 +134,10 @@ class App:
             self._cargar_sesion()
 
     # ------------------------------------------------------------ sesión
+    def _guardar_settings(self) -> None:
+        """Persiste en la config global solo los cambios hechos en esta sesión (ver guardar_cambios_sesion)."""
+        self._base_settings = guardar_cambios_sesion(self.settings, self._base_settings)
+
     def _nueva_memoria(self) -> Optional[MemoriaLecciones]:
         if not self.settings.lecciones:
             return None
@@ -600,6 +607,10 @@ class App:
             self.ui.info("Reintentando ejecución...")
 
     def cmd_vigilar(self, arg: str) -> None:
+        if arg.strip().lower() in ("ayuda", "help", "-h", "--help", "?"):
+            self.ui.info("Uso: /vigilar [comando]  — al cambiar un archivo corre los tests (o el comando). Ctrl+C sale.")
+            self.ui.tenue("  ej: /vigilar   ·   /vigilar python3 main.py")
+            return
         vigilar(self.ws, self.ui, comando=arg or None, timeout=self.settings.tests_timeout)
 
     def cmd_diff(self, arg: str) -> None:
@@ -828,7 +839,7 @@ class App:
             return
         self.modo_plan = False
         self.settings.modo = arg
-        guardar_settings(self.settings)
+        self._guardar_settings()
         self.ui.ok(f"Modo: {arg}")
 
     def cmd_perfil(self, arg: str) -> None:
@@ -843,7 +854,7 @@ class App:
         except KeyError:
             self.ui.error(f"Perfil desconocido: {arg} ({', '.join(PERFILES)})")
             return
-        guardar_settings(self.settings)
+        self._guardar_settings()
         self.llm.limitador = LimitadorTasa(self.settings.rpm_efectivo()) if hasattr(self.llm, "limitador") else None
         self.ui.ok(f"Perfil {arg}: " + (", ".join(cambios) or "sin cambios"))
 
@@ -853,7 +864,7 @@ class App:
             return
         nombre = aplicar_tema(arg)
         self.settings.tema = nombre
-        guardar_settings(self.settings)
+        self._guardar_settings()
         self.ui.ok(f"Tema: {nombre}")
 
     def cmd_modelo(self, arg: str) -> None:
@@ -869,7 +880,7 @@ class App:
             if partes[0].lower() in ("reset", "limpiar", "default"):      # R-021: limpiar overrides por rol
                 n = len(self.settings.modelos_rol)
                 self.settings.modelos_rol.clear()
-                guardar_settings(self.settings)
+                self._guardar_settings()
                 self.ui.ok(f"Overrides por rol limpiados ({n}). Todos los roles usan el modelo principal.")
                 return
             self.settings.modelo = resolver_modelo(partes[0])
@@ -879,7 +890,7 @@ class App:
                 roles = ", ".join(sorted(self.settings.modelos_rol))
                 self.ui.aviso(f"  Ojo: siguen activos overrides por rol ({roles}); esos roles NO usan {self.settings.modelo}.")
                 self.ui.tenue("  Limpialos con /modelo reset, o uno con /modelo <rol> -.")
-            guardar_settings(self.settings)
+            self._guardar_settings()
             return
         if len(partes) == 2 and partes[0].lower() in ROLES:
             rol = partes[0].lower()
@@ -888,7 +899,7 @@ class App:
             else:
                 self.settings.modelos_rol[rol] = resolver_modelo(partes[1])
             self.ui.ok(f"{rol} → {self.settings.modelo_para(rol)}")
-            guardar_settings(self.settings)
+            self._guardar_settings()
             return
         # entrada inválida: NO guardar nada (antes guardaba partes[0] como modelo e ignoraba el resto)
         if len(partes) == 2:
@@ -911,7 +922,7 @@ class App:
             self.settings.modelo_fuerte = arg
             self.settings.escalar = True
             self.ui.ok(f"Modelo de escalada: {resolver_modelo(arg)}")
-        guardar_settings(self.settings)
+        self._guardar_settings()
 
     def cmd_modelos(self, arg: str) -> None:
         partes = (arg or "").split(maxsplit=1)
@@ -966,12 +977,12 @@ class App:
         arg = arg.strip()
         if arg.lower() in ("off", "no", "0", "stop", "salir", "apagar"):
             self.settings.modo_seguridad = False
-            guardar_settings(self.settings)
+            self._guardar_settings()
             self.ui.ok("Modo seguridad DESACTIVADO. REAPER vuelve al comportamiento normal.")
             return
         if not arg:
             if self.settings.modo_seguridad and self.settings.alcance_autorizado:
-                self.ui.info(f"Modo seguridad ACTIVO (pentest/CTF/lab).")
+                self.ui.info("Modo seguridad ACTIVO (pentest/CTF/lab).")
                 self.ui.info(f"  Alcance autorizado: {self.settings.alcance_autorizado}")
             else:
                 self.ui.info("Modo seguridad apagado.")
@@ -981,7 +992,7 @@ class App:
             return
         self.settings.alcance_autorizado = arg
         self.settings.modo_seguridad = True
-        guardar_settings(self.settings)
+        self._guardar_settings()
         self.ui.ok("Modo seguridad ACTIVADO (pentest / CTF / lab / estudio).")
         self.ui.info(f"  Alcance autorizado: {arg}")
         self.ui.aviso("  REAPER hará trabajo ofensivo SOLO dentro de ese alcance. Fuera de ahí, frena y avisa.")
@@ -994,7 +1005,7 @@ class App:
         if sub in ("estricto", "estricta", "strict"):
             valor = len(partes) > 1 and partes[1].lower() in ("on", "si", "sí", "1", "true")
             self.settings.privacidad_estricta = valor
-            guardar_settings(self.settings)
+            self._guardar_settings()
             self.ui.ok(f"Privacidad estricta: {'ON' if valor else 'OFF'}.")
             if valor:
                 self.ui.tenue("  Los modelos externos quedan BLOQUEADOS: solo saldrá tráfico a un proveedor local (ollama).")
@@ -1019,7 +1030,7 @@ class App:
                 self.ui.tenue("  Configurá un proveedor free: export GROQ_API_KEY=... (o NVIDIA/GEMINI/OpenRouter).")
             else:
                 self.settings.modelos_rol.update(asignacion)
-                guardar_settings(self.settings)
+                self._guardar_settings()
                 self.ui.ok("Equipo autoconfigurado con modelos free potentes (conectividad NO VERIFICADA).")
                 estado = estado_equipo(self.settings)
                 ind = independencia_equipo(estado)
@@ -1359,7 +1370,7 @@ class App:
             aplicar_tema(self.settings.tema)
         if clave in ("rpm", "modelo") and hasattr(self.llm, "limitador"):
             self.llm.limitador = LimitadorTasa(self.settings.rpm_efectivo())
-        guardar_settings(self.settings)
+        self._guardar_settings()
         self.ui.ok(f"{clave} = {getattr(self.settings, clave)!r}")
 
     def cmd_uso(self, arg: str) -> None:

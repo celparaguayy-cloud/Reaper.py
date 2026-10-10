@@ -199,7 +199,7 @@ def probar_proveedor(llm, proveedor: str, settings, *, modelo: Optional[str] = N
         tiene = bool(clave_de_proveedor(proveedor, replace(settings, proveedor=proveedor)))
     except (TypeError, ValueError, KeyError):
         tiene = bool(datos.get("clave") and os.getenv(datos["clave"]))
-    if datos.get("clave") and (not tiene or tiene == "sin-clave"):
+    if datos.get("clave") and not tiene:
         reg["estado"], reg["detalle"] = "SIN_CLAVE", "falta credencial del proveedor (export de su variable)"
         return reg
     modelo = _modelo_representativo(proveedor, settings, modelo)

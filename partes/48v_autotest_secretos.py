@@ -54,13 +54,14 @@ class TestArchivoSensible(BaseTest):
 
     def test_sensibles(self):
         for n in (".env", ".env.local", ".env.production", "secrets.json", "secret.json",
-                  "credentials.json", "id_rsa", "id_ed25519", "id_ecdsa", ".netrc", ".npmrc",
+                  "credentials.json", "id_rsa", "id_ed25519", "id_ecdsa", "id_ed25519_sk", ".netrc", ".npmrc",
                   "server.key", "private.pem", "store.p12", "app.pfx", ".git-credentials"):
             self.assertTrue(es_archivo_sensible(n), f"debería ser sensible: {n}")
 
     def test_inocuos(self):
         for n in (".env.example", ".env.sample", ".env.template", "id_rsa.pub", "key.pub",
-                  "environment.py", "config.json", "app.py", "README.md", "keyboard.js", "license.txt"):
+                  "environment.py", "config.json", "app.py", "README.md", "keyboard.js", "license.txt",
+                  "id_generator", "id_usuarios"):
             self.assertFalse(es_archivo_sensible(n), f"NO debería ser sensible: {n}")
 
 

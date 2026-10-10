@@ -33,19 +33,8 @@ def construir_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: Optional[list] = None) -> int:
-    args = construir_parser().parse_args(argv)
-
-    if args.autotest:
-        return correr_autotest()
-    if args.dragon:
-        if not animar_intro():
-            print(banner_dragon())
-        return 0
-
-    asegurar_dirs()
-    settings = cargar_settings()
-    aplicar_tema(settings.tema)
+def aplicar_flags_cli(settings: Settings, args) -> Settings:
+    """Flags de línea de comandos ("solo esta ejecución"): tienen la máxima precedencia."""
     if args.perfil:
         aplicar_perfil(settings, args.perfil)
     if args.modelo:
@@ -61,6 +50,36 @@ def main(argv: Optional[list] = None) -> int:
         settings.torneo = False
     if args.sin_animacion:
         settings.animacion = False
+    return settings
+
+
+def preparar_settings_proyecto(settings: Settings, ws: Workspace, args) -> Settings:
+    """
+    Precedencia (R-011): defaults < config global < .reaper/config.json del proyecto < entorno < flags CLI.
+    Si el proyecto no trae sección "settings", devuelve los settings sin tocar.
+    """
+    local = ws.config_local()
+    if not local.get("settings"):
+        return settings
+    combinado = settings_con_local(settings, local)
+    aplicar_overrides_entorno(combinado)
+    return aplicar_flags_cli(combinado, args)
+
+
+def main(argv: Optional[list] = None) -> int:
+    args = construir_parser().parse_args(argv)
+
+    if args.autotest:
+        return correr_autotest()
+    if args.dragon:
+        if not animar_intro():
+            print(banner_dragon())
+        return 0
+
+    asegurar_dirs()
+    settings = cargar_settings()
+    aplicar_tema(settings.tema)
+    aplicar_flags_cli(settings, args)
 
     no_interactivo = bool(args.pedido or args.construir or args.plan or args.torneo or args.escribir
                           or args.evaluar is not None or args.comportamiento is not None)
@@ -107,7 +126,7 @@ def main(argv: Optional[list] = None) -> int:
     # R-011: aplicar los overrides de .reaper/config.json del proyecto ANTES de construir el cliente, para que
     # candidatos/torneo/rpm/modelo/temperatura del proyecto manden de verdad (antes se definían y se ignoraban).
     if ws.config_local().get("settings"):
-        settings = settings_con_local(settings, ws.config_local())
+        settings = preparar_settings_proyecto(settings, ws, args)
         api_key = obtener_clave_api(settings) or api_key        # el proyecto pudo cambiar el proveedor
         ui.tenue("  Apliqué overrides de .reaper/config.json (settings del proyecto).")
 

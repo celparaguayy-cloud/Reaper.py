@@ -38,7 +38,7 @@ def es_archivo_sensible(nombre: str) -> bool:
         return not any(base.endswith(suf) for suf in _SUFIJOS_ENV_EJEMPLO)
     if Path(base).suffix in _EXT_SENSIBLES:
         return True
-    if base.startswith("id_") and "." not in base:  # id_rsa, id_ed25519, id_ecdsa, ...
+    if re.fullmatch(r"id_(rsa|dsa|ecdsa|ed25519)(_sk)?", base):  # claves SSH privadas (no `id_generator`)
         return True
     return False
 

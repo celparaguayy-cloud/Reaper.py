@@ -781,7 +781,7 @@ class Orquestador:
                 f"## Plan\n```\n{informe.plan.como_texto() if informe.plan else '-'}\n```\n\n"
                 f"## Archivos\n```\n{_diffstat(diff) or '-'}\n```\n\n"
                 f"## Tests\n```\n{tests}\n```\n\n"
-                + (f"## Especificación (tests escritos antes de implementar)\n" + "\n".join(f"- {t}" for t in informe.spec_tests) + "\n\n"
+                + ("## Especificación (tests escritos antes de implementar)\n" + "\n".join(f"- {t}" for t in informe.spec_tests) + "\n\n"
                    if informe.spec_tests else "")
                 + (f"## Escaladas al modelo fuerte\n{informe.escaladas}\n\n" if informe.escaladas else "")
                 + ("## Lecciones aprendidas\n" + "\n".join(f"- {l}" for l in informe.lecciones) + "\n\n" if informe.lecciones else "")

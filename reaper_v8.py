@@ -1816,6 +1816,11 @@ def cargar_settings(ruta: Optional[Path] = None) -> Settings:
         except (OSError, ValueError, TypeError):
             settings = Settings()
 
+    return aplicar_overrides_entorno(settings)
+
+
+def aplicar_overrides_entorno(settings: Settings) -> Settings:
+    """Variables de entorno (MODEL_NAME, REAPER_MODO, REAPER_PROVEEDOR): ganan sobre config global y del proyecto."""
     if os.getenv("MODEL_NAME"):
         settings.modelo = resolver_modelo(os.environ["MODEL_NAME"])
     if os.getenv("REAPER_MODO") in MODOS:
@@ -1825,6 +1830,27 @@ def cargar_settings(ruta: Optional[Path] = None) -> Settings:
     if settings.modo not in MODOS:
         settings.modo = "auto-edicion"
     return settings.validar()
+
+
+def guardar_cambios_sesion(settings: Settings, base: dict, ruta: Optional[Path] = None) -> dict:
+    """
+    Persiste SOLO lo que el usuario cambió en esta sesión (diferencias contra `base`, la foto de los settings al
+    arrancar). Los valores efímeros (flags "solo esta ejecución", overrides del proyecto y del entorno) no se filtran
+    a la config global. Devuelve la nueva base (los settings actuales) para la próxima vez.
+    """
+    ruta = ruta or CONFIG_FILE
+    actual = settings.to_dict()
+    try:
+        disco = json.loads(ruta.read_text(encoding="utf-8")) if ruta.exists() else {}
+        if not isinstance(disco, dict):
+            disco = {}
+    except (OSError, ValueError):
+        disco = {}
+    for clave, valor in actual.items():
+        if base.get(clave) != valor:
+            disco[clave] = valor
+    guardar_settings(Settings.desde_dict(disco), ruta)
+    return copy.deepcopy(actual)
 
 
 def guardar_settings(settings: Settings, ruta: Optional[Path] = None) -> None:
@@ -3455,7 +3481,7 @@ def es_archivo_sensible(nombre: str) -> bool:
         return not any(base.endswith(suf) for suf in _SUFIJOS_ENV_EJEMPLO)
     if Path(base).suffix in _EXT_SENSIBLES:
         return True
-    if base.startswith("id_") and "." not in base:  # id_rsa, id_ed25519, id_ecdsa, ...
+    if re.fullmatch(r"id_(rsa|dsa|ecdsa|ed25519)(_sk)?", base):  # claves SSH privadas (no `id_generator`)
         return True
     return False
 
@@ -5913,7 +5939,7 @@ NOMBRES_STDLIB = {
 }
 
 _TIPOGRAFICOS = {"“": '"', "”": '"', "„": '"', "‘": "'", "’": "'", "‚": "'", "–": "-", "—": "-",
-                 " ": " ", "​": "", "﻿": ""}
+                 "\u00a0": " ", "\u200b": "", "\ufeff": ""}
 
 REGLAS_RUFF_SEGURAS = "W291,W292,W293,F541,E703,E711"
 
@@ -6858,7 +6884,7 @@ PALABRAS_VACIAS = {
     "hace", "quiero", "necesito", "podes", "puedes", "favor", "agrega", "agregá", "agregar", "agregue",
     "crea", "creá", "crear", "cree", "modifica", "modificá", "modificar", "cambia", "cambiá", "cambiar",
     "arregla", "arreglá", "arreglar", "implementa", "implementá", "implementar", "nuevo", "nueva",
-    "nuevos", "nuevas", "todo", "toda", "todos", "todas", "sea", "sean", "ser", "esta", "están", "estan",
+    "nuevos", "nuevas", "todo", "toda", "todos", "todas", "sea", "sean", "ser", "están", "estan",
     "algo", "cada", "entre", "sobre", "sin", "pero", "tambien", "también", "muy", "ya", "solo", "sólo",
     "archivo", "archivos", "codigo", "código", "funcion", "función", "funciones", "programa", "proyecto",
     "mi", "mis", "tu", "tus", "me", "te", "nos", "hola", "gracias", "bien", "mal", "usar", "usando",
@@ -7941,7 +7967,7 @@ class _Mutador(ast.NodeTransformer):
         self.generic_visit(nodo)
         if type(nodo.op) in _MAP_MUT:
             nuevo = _MAP_MUT[type(nodo.op)]()
-            r = self._quizas(nodo, f"operador binario mutado", ast.BinOp(left=nodo.left, op=nuevo, right=nodo.right))
+            r = self._quizas(nodo, "operador binario mutado", ast.BinOp(left=nodo.left, op=nuevo, right=nodo.right))
             return ast.copy_location(r, nodo) if r is not nodo else nodo
         return nodo
 
@@ -14414,7 +14440,7 @@ class Orquestador:
                 f"## Plan\n```\n{informe.plan.como_texto() if informe.plan else '-'}\n```\n\n"
                 f"## Archivos\n```\n{_diffstat(diff) or '-'}\n```\n\n"
                 f"## Tests\n```\n{tests}\n```\n\n"
-                + (f"## Especificación (tests escritos antes de implementar)\n" + "\n".join(f"- {t}" for t in informe.spec_tests) + "\n\n"
+                + ("## Especificación (tests escritos antes de implementar)\n" + "\n".join(f"- {t}" for t in informe.spec_tests) + "\n\n"
                    if informe.spec_tests else "")
                 + (f"## Escaladas al modelo fuerte\n{informe.escaladas}\n\n" if informe.escaladas else "")
                 + ("## Lecciones aprendidas\n" + "\n".join(f"- {l}" for l in informe.lecciones) + "\n\n" if informe.lecciones else "")
@@ -26354,6 +26380,9 @@ class App:
         self.ui = ui
         self.ws = ws
         self.persistir = persistir
+        # Foto de los settings al arrancar (incluye flags "solo esta ejecución", overrides del proyecto y del
+        # entorno): al guardar se persiste SOLO lo que el usuario cambió en la sesión, no esos valores efímeros.
+        self._base_settings = copy.deepcopy(settings.to_dict())
         self.aviso_sesion = ""
         self.historial: list[tuple[str, str, bool]] = []
         self._rehacer: Optional[dict] = None
@@ -26368,6 +26397,10 @@ class App:
             self._cargar_sesion()
 
     # ------------------------------------------------------------ sesión
+    def _guardar_settings(self) -> None:
+        """Persiste en la config global solo los cambios hechos en esta sesión (ver guardar_cambios_sesion)."""
+        self._base_settings = guardar_cambios_sesion(self.settings, self._base_settings)
+
     def _nueva_memoria(self) -> Optional[MemoriaLecciones]:
         if not self.settings.lecciones:
             return None
@@ -26837,6 +26870,10 @@ class App:
             self.ui.info("Reintentando ejecución...")
 
     def cmd_vigilar(self, arg: str) -> None:
+        if arg.strip().lower() in ("ayuda", "help", "-h", "--help", "?"):
+            self.ui.info("Uso: /vigilar [comando]  — al cambiar un archivo corre los tests (o el comando). Ctrl+C sale.")
+            self.ui.tenue("  ej: /vigilar   ·   /vigilar python3 main.py")
+            return
         vigilar(self.ws, self.ui, comando=arg or None, timeout=self.settings.tests_timeout)
 
     def cmd_diff(self, arg: str) -> None:
@@ -27065,7 +27102,7 @@ class App:
             return
         self.modo_plan = False
         self.settings.modo = arg
-        guardar_settings(self.settings)
+        self._guardar_settings()
         self.ui.ok(f"Modo: {arg}")
 
     def cmd_perfil(self, arg: str) -> None:
@@ -27080,7 +27117,7 @@ class App:
         except KeyError:
             self.ui.error(f"Perfil desconocido: {arg} ({', '.join(PERFILES)})")
             return
-        guardar_settings(self.settings)
+        self._guardar_settings()
         self.llm.limitador = LimitadorTasa(self.settings.rpm_efectivo()) if hasattr(self.llm, "limitador") else None
         self.ui.ok(f"Perfil {arg}: " + (", ".join(cambios) or "sin cambios"))
 
@@ -27090,7 +27127,7 @@ class App:
             return
         nombre = aplicar_tema(arg)
         self.settings.tema = nombre
-        guardar_settings(self.settings)
+        self._guardar_settings()
         self.ui.ok(f"Tema: {nombre}")
 
     def cmd_modelo(self, arg: str) -> None:
@@ -27106,7 +27143,7 @@ class App:
             if partes[0].lower() in ("reset", "limpiar", "default"):      # R-021: limpiar overrides por rol
                 n = len(self.settings.modelos_rol)
                 self.settings.modelos_rol.clear()
-                guardar_settings(self.settings)
+                self._guardar_settings()
                 self.ui.ok(f"Overrides por rol limpiados ({n}). Todos los roles usan el modelo principal.")
                 return
             self.settings.modelo = resolver_modelo(partes[0])
@@ -27116,7 +27153,7 @@ class App:
                 roles = ", ".join(sorted(self.settings.modelos_rol))
                 self.ui.aviso(f"  Ojo: siguen activos overrides por rol ({roles}); esos roles NO usan {self.settings.modelo}.")
                 self.ui.tenue("  Limpialos con /modelo reset, o uno con /modelo <rol> -.")
-            guardar_settings(self.settings)
+            self._guardar_settings()
             return
         if len(partes) == 2 and partes[0].lower() in ROLES:
             rol = partes[0].lower()
@@ -27125,7 +27162,7 @@ class App:
             else:
                 self.settings.modelos_rol[rol] = resolver_modelo(partes[1])
             self.ui.ok(f"{rol} → {self.settings.modelo_para(rol)}")
-            guardar_settings(self.settings)
+            self._guardar_settings()
             return
         # entrada inválida: NO guardar nada (antes guardaba partes[0] como modelo e ignoraba el resto)
         if len(partes) == 2:
@@ -27148,7 +27185,7 @@ class App:
             self.settings.modelo_fuerte = arg
             self.settings.escalar = True
             self.ui.ok(f"Modelo de escalada: {resolver_modelo(arg)}")
-        guardar_settings(self.settings)
+        self._guardar_settings()
 
     def cmd_modelos(self, arg: str) -> None:
         partes = (arg or "").split(maxsplit=1)
@@ -27203,12 +27240,12 @@ class App:
         arg = arg.strip()
         if arg.lower() in ("off", "no", "0", "stop", "salir", "apagar"):
             self.settings.modo_seguridad = False
-            guardar_settings(self.settings)
+            self._guardar_settings()
             self.ui.ok("Modo seguridad DESACTIVADO. REAPER vuelve al comportamiento normal.")
             return
         if not arg:
             if self.settings.modo_seguridad and self.settings.alcance_autorizado:
-                self.ui.info(f"Modo seguridad ACTIVO (pentest/CTF/lab).")
+                self.ui.info("Modo seguridad ACTIVO (pentest/CTF/lab).")
                 self.ui.info(f"  Alcance autorizado: {self.settings.alcance_autorizado}")
             else:
                 self.ui.info("Modo seguridad apagado.")
@@ -27218,7 +27255,7 @@ class App:
             return
         self.settings.alcance_autorizado = arg
         self.settings.modo_seguridad = True
-        guardar_settings(self.settings)
+        self._guardar_settings()
         self.ui.ok("Modo seguridad ACTIVADO (pentest / CTF / lab / estudio).")
         self.ui.info(f"  Alcance autorizado: {arg}")
         self.ui.aviso("  REAPER hará trabajo ofensivo SOLO dentro de ese alcance. Fuera de ahí, frena y avisa.")
@@ -27231,7 +27268,7 @@ class App:
         if sub in ("estricto", "estricta", "strict"):
             valor = len(partes) > 1 and partes[1].lower() in ("on", "si", "sí", "1", "true")
             self.settings.privacidad_estricta = valor
-            guardar_settings(self.settings)
+            self._guardar_settings()
             self.ui.ok(f"Privacidad estricta: {'ON' if valor else 'OFF'}.")
             if valor:
                 self.ui.tenue("  Los modelos externos quedan BLOQUEADOS: solo saldrá tráfico a un proveedor local (ollama).")
@@ -27256,7 +27293,7 @@ class App:
                 self.ui.tenue("  Configurá un proveedor free: export GROQ_API_KEY=... (o NVIDIA/GEMINI/OpenRouter).")
             else:
                 self.settings.modelos_rol.update(asignacion)
-                guardar_settings(self.settings)
+                self._guardar_settings()
                 self.ui.ok("Equipo autoconfigurado con modelos free potentes (conectividad NO VERIFICADA).")
                 estado = estado_equipo(self.settings)
                 ind = independencia_equipo(estado)
@@ -27596,7 +27633,7 @@ class App:
             aplicar_tema(self.settings.tema)
         if clave in ("rpm", "modelo") and hasattr(self.llm, "limitador"):
             self.llm.limitador = LimitadorTasa(self.settings.rpm_efectivo())
-        guardar_settings(self.settings)
+        self._guardar_settings()
         self.ui.ok(f"{clave} = {getattr(self.settings, clave)!r}")
 
     def cmd_uso(self, arg: str) -> None:
@@ -41690,15 +41727,8 @@ class TestEntregaArchivo(BaseTest):
         self.assertTrue(origen.exists())                 # copia, no mueve
         self.assertEqual(len(r.sha256), 64)
 
-    def test_no_declara_exito_si_destino_no_coincide(self):
-        origen = self._origen()
+    def test_no_declara_exito_si_origen_no_existe(self):
         destino = self.dir / "s" / "origen.md"
-
-        def abrir_roto(*a, **k):
-            raise AssertionError("no debería usarse")
-
-        # simular corrupción: copiar y luego alterar el destino antes de verificar es difícil;
-        # en su lugar probamos el camino de origen inexistente → no verificado
         r = entregar_archivo(self.dir / "no_existe.md", destino)
         self.assertFalse(r.verified)
         self.assertIn("origen", r.motivo.lower())
@@ -42040,13 +42070,14 @@ class TestArchivoSensible(BaseTest):
 
     def test_sensibles(self):
         for n in (".env", ".env.local", ".env.production", "secrets.json", "secret.json",
-                  "credentials.json", "id_rsa", "id_ed25519", "id_ecdsa", ".netrc", ".npmrc",
+                  "credentials.json", "id_rsa", "id_ed25519", "id_ecdsa", "id_ed25519_sk", ".netrc", ".npmrc",
                   "server.key", "private.pem", "store.p12", "app.pfx", ".git-credentials"):
             self.assertTrue(es_archivo_sensible(n), f"debería ser sensible: {n}")
 
     def test_inocuos(self):
         for n in (".env.example", ".env.sample", ".env.template", "id_rsa.pub", "key.pub",
-                  "environment.py", "config.json", "app.py", "README.md", "keyboard.js", "license.txt"):
+                  "environment.py", "config.json", "app.py", "README.md", "keyboard.js", "license.txt",
+                  "id_generator", "id_usuarios"):
             self.assertFalse(es_archivo_sensible(n), f"NO debería ser sensible: {n}")
 
 
@@ -42102,6 +42133,90 @@ class TestHerramientasSensibles(BaseTest):
     def test_read_symbol_no_expone_sensible(self):
         ws = self.proyecto({"private.key": "def secreto():\n    return 42\n"})
         self.assertEqual(indice_de(ws).de_archivo("private.key"), [])   # ni la estructura
+
+
+# ======================================================================
+# MÓDULO: autotest_precedencia
+# ======================================================================
+"""
+Autotests de precedencia y persistencia de la configuración:
+  defaults < config global < .reaper/config.json del proyecto < entorno < flags CLI,
+y los valores efímeros ("solo esta ejecución", proyecto, entorno) NO se filtran a la config global al guardar.
+"""
+
+
+class _BaseEnvModelo(BaseTest):
+    _VARS = ("MODEL_NAME", "REAPER_MODO", "REAPER_PROVEEDOR")
+
+    def setUp(self):
+        super().setUp()
+        self._env_bak = {k: os.environ.pop(k, None) for k in self._VARS}
+
+    def tearDown(self):
+        for k, v in self._env_bak.items():
+            os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+        super().tearDown()
+
+
+class TestPrecedenciaConfig(_BaseEnvModelo):
+    def _ws(self, settings_proyecto: dict):
+        return self.proyecto({".reaper/config.json": json.dumps({"settings": settings_proyecto})})
+
+    def test_cli_gana_sobre_proyecto(self):
+        ws = self._ws({"torneo": True, "modelo": "qwen"})
+        args = construir_parser().parse_args(["--sin-torneo", "--modelo", "deepseek"])
+        s = preparar_settings_proyecto(aplicar_flags_cli(Settings(), args), ws, args)
+        self.assertFalse(s.torneo)                              # --sin-torneo no lo pisa el proyecto
+        self.assertEqual(s.modelo, resolver_modelo("deepseek"))  # --modelo tampoco
+
+    def test_proyecto_gana_sobre_global(self):
+        ws = self._ws({"candidatos": 2})
+        args = construir_parser().parse_args([])
+        s = preparar_settings_proyecto(Settings(candidatos=5), ws, args)
+        self.assertEqual(s.candidatos, 2)
+
+    def test_entorno_gana_sobre_proyecto(self):
+        os.environ["MODEL_NAME"] = "deepseek"
+        ws = self._ws({"modelo": "qwen"})
+        s = preparar_settings_proyecto(Settings(), ws, construir_parser().parse_args([]))
+        self.assertEqual(s.modelo, resolver_modelo("deepseek"))
+
+    def test_sin_seccion_settings_no_toca(self):
+        ws = self.proyecto({".reaper/config.json": '{"hooks": {}}'})
+        base = Settings(candidatos=4)
+        self.assertIs(preparar_settings_proyecto(base, ws, construir_parser().parse_args([])), base)
+
+
+class TestPersistenciaSoloCambios(_BaseEnvModelo):
+    def test_efimeros_no_se_filtran_a_la_config_global(self):
+        guardar_settings(Settings(torneo=True, candidatos=3))           # config global en disco
+        efimero = cargar_settings()
+        efimero.torneo = False                                         # p. ej. --sin-torneo (solo esta ejecución)
+        base = efimero.to_dict()
+        efimero.modelo = resolver_modelo("qwen")                       # cambio real del usuario en la sesión
+        guardar_cambios_sesion(efimero, base)
+        en_disco = cargar_settings()
+        self.assertTrue(en_disco.torneo)                               # el flag efímero NO quedó permanente
+        self.assertEqual(en_disco.modelo, resolver_modelo("qwen"))     # el cambio del usuario sí
+        self.assertEqual(en_disco.candidatos, 3)
+
+    def test_app_guarda_solo_lo_que_cambia_el_comando(self):
+        guardar_settings(Settings(torneo=True))
+        s = cargar_settings()
+        s.torneo = False                                               # efímero de esta ejecución
+        app = App(s, MockLLM([]), self.ui(), self.proyecto(), persistir=False)
+        app.comando("/modelo qwen")
+        en_disco = cargar_settings()
+        self.assertTrue(en_disco.torneo)
+        self.assertEqual(en_disco.modelo, resolver_modelo("qwen"))
+
+    def test_guardados_sucesivos_acumulan(self):
+        app = App(cargar_settings(), MockLLM([]), self.ui(), self.proyecto(), persistir=False)
+        app.comando("/modelo qwen")
+        app.comando("/modelo revisor deepseek")
+        en_disco = cargar_settings()
+        self.assertEqual(en_disco.modelo, resolver_modelo("qwen"))
+        self.assertEqual(en_disco.modelos_rol.get("revisor"), resolver_modelo("deepseek"))
 
 
 # ======================================================================
@@ -47284,7 +47399,7 @@ def probar_proveedor(llm, proveedor: str, settings, *, modelo: Optional[str] = N
         tiene = bool(clave_de_proveedor(proveedor, replace(settings, proveedor=proveedor)))
     except (TypeError, ValueError, KeyError):
         tiene = bool(datos.get("clave") and os.getenv(datos["clave"]))
-    if datos.get("clave") and (not tiene or tiene == "sin-clave"):
+    if datos.get("clave") and not tiene:
         reg["estado"], reg["detalle"] = "SIN_CLAVE", "falta credencial del proveedor (export de su variable)"
         return reg
     modelo = _modelo_representativo(proveedor, settings, modelo)
@@ -47380,19 +47495,8 @@ def construir_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: Optional[list] = None) -> int:
-    args = construir_parser().parse_args(argv)
-
-    if args.autotest:
-        return correr_autotest()
-    if args.dragon:
-        if not animar_intro():
-            print(banner_dragon())
-        return 0
-
-    asegurar_dirs()
-    settings = cargar_settings()
-    aplicar_tema(settings.tema)
+def aplicar_flags_cli(settings: Settings, args) -> Settings:
+    """Flags de línea de comandos ("solo esta ejecución"): tienen la máxima precedencia."""
     if args.perfil:
         aplicar_perfil(settings, args.perfil)
     if args.modelo:
@@ -47408,6 +47512,36 @@ def main(argv: Optional[list] = None) -> int:
         settings.torneo = False
     if args.sin_animacion:
         settings.animacion = False
+    return settings
+
+
+def preparar_settings_proyecto(settings: Settings, ws: Workspace, args) -> Settings:
+    """
+    Precedencia (R-011): defaults < config global < .reaper/config.json del proyecto < entorno < flags CLI.
+    Si el proyecto no trae sección "settings", devuelve los settings sin tocar.
+    """
+    local = ws.config_local()
+    if not local.get("settings"):
+        return settings
+    combinado = settings_con_local(settings, local)
+    aplicar_overrides_entorno(combinado)
+    return aplicar_flags_cli(combinado, args)
+
+
+def main(argv: Optional[list] = None) -> int:
+    args = construir_parser().parse_args(argv)
+
+    if args.autotest:
+        return correr_autotest()
+    if args.dragon:
+        if not animar_intro():
+            print(banner_dragon())
+        return 0
+
+    asegurar_dirs()
+    settings = cargar_settings()
+    aplicar_tema(settings.tema)
+    aplicar_flags_cli(settings, args)
 
     no_interactivo = bool(args.pedido or args.construir or args.plan or args.torneo or args.escribir
                           or args.evaluar is not None or args.comportamiento is not None)
@@ -47454,7 +47588,7 @@ def main(argv: Optional[list] = None) -> int:
     # R-011: aplicar los overrides de .reaper/config.json del proyecto ANTES de construir el cliente, para que
     # candidatos/torneo/rpm/modelo/temperatura del proyecto manden de verdad (antes se definían y se ignoraban).
     if ws.config_local().get("settings"):
-        settings = settings_con_local(settings, ws.config_local())
+        settings = preparar_settings_proyecto(settings, ws, args)
         api_key = obtener_clave_api(settings) or api_key        # el proyecto pudo cambiar el proveedor
         ui.tenue("  Apliqué overrides de .reaper/config.json (settings del proyecto).")
 

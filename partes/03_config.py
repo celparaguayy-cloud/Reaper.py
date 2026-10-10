@@ -374,6 +374,11 @@ def cargar_settings(ruta: Optional[Path] = None) -> Settings:
         except (OSError, ValueError, TypeError):
             settings = Settings()
 
+    return aplicar_overrides_entorno(settings)
+
+
+def aplicar_overrides_entorno(settings: Settings) -> Settings:
+    """Variables de entorno (MODEL_NAME, REAPER_MODO, REAPER_PROVEEDOR): ganan sobre config global y del proyecto."""
     if os.getenv("MODEL_NAME"):
         settings.modelo = resolver_modelo(os.environ["MODEL_NAME"])
     if os.getenv("REAPER_MODO") in MODOS:
@@ -383,6 +388,27 @@ def cargar_settings(ruta: Optional[Path] = None) -> Settings:
     if settings.modo not in MODOS:
         settings.modo = "auto-edicion"
     return settings.validar()
+
+
+def guardar_cambios_sesion(settings: Settings, base: dict, ruta: Optional[Path] = None) -> dict:
+    """
+    Persiste SOLO lo que el usuario cambió en esta sesión (diferencias contra `base`, la foto de los settings al
+    arrancar). Los valores efímeros (flags "solo esta ejecución", overrides del proyecto y del entorno) no se filtran
+    a la config global. Devuelve la nueva base (los settings actuales) para la próxima vez.
+    """
+    ruta = ruta or CONFIG_FILE
+    actual = settings.to_dict()
+    try:
+        disco = json.loads(ruta.read_text(encoding="utf-8")) if ruta.exists() else {}
+        if not isinstance(disco, dict):
+            disco = {}
+    except (OSError, ValueError):
+        disco = {}
+    for clave, valor in actual.items():
+        if base.get(clave) != valor:
+            disco[clave] = valor
+    guardar_settings(Settings.desde_dict(disco), ruta)
+    return copy.deepcopy(actual)
 
 
 def guardar_settings(settings: Settings, ruta: Optional[Path] = None) -> None:

@@ -20,7 +20,7 @@ PALABRAS_VACIAS = {
     "hace", "quiero", "necesito", "podes", "puedes", "favor", "agrega", "agregá", "agregar", "agregue",
     "crea", "creá", "crear", "cree", "modifica", "modificá", "modificar", "cambia", "cambiá", "cambiar",
     "arregla", "arreglá", "arreglar", "implementa", "implementá", "implementar", "nuevo", "nueva",
-    "nuevos", "nuevas", "todo", "toda", "todos", "todas", "sea", "sean", "ser", "esta", "están", "estan",
+    "nuevos", "nuevas", "todo", "toda", "todos", "todas", "sea", "sean", "ser", "están", "estan",
     "algo", "cada", "entre", "sobre", "sin", "pero", "tambien", "también", "muy", "ya", "solo", "sólo",
     "archivo", "archivos", "codigo", "código", "funcion", "función", "funciones", "programa", "proyecto",
     "mi", "mis", "tu", "tus", "me", "te", "nos", "hola", "gracias", "bien", "mal", "usar", "usando",

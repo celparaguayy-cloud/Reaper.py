@@ -327,7 +327,7 @@ class _Mutador(ast.NodeTransformer):
         self.generic_visit(nodo)
         if type(nodo.op) in _MAP_MUT:
             nuevo = _MAP_MUT[type(nodo.op)]()
-            r = self._quizas(nodo, f"operador binario mutado", ast.BinOp(left=nodo.left, op=nuevo, right=nodo.right))
+            r = self._quizas(nodo, "operador binario mutado", ast.BinOp(left=nodo.left, op=nuevo, right=nodo.right))
             return ast.copy_location(r, nodo) if r is not nodo else nodo
         return nodo
 

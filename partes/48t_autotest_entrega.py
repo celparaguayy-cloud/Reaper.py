@@ -17,15 +17,8 @@ class TestEntregaArchivo(BaseTest):
         self.assertTrue(origen.exists())                 # copia, no mueve
         self.assertEqual(len(r.sha256), 64)
 
-    def test_no_declara_exito_si_destino_no_coincide(self):
-        origen = self._origen()
+    def test_no_declara_exito_si_origen_no_existe(self):
         destino = self.dir / "s" / "origen.md"
-
-        def abrir_roto(*a, **k):
-            raise AssertionError("no debería usarse")
-
-        # simular corrupción: copiar y luego alterar el destino antes de verificar es difícil;
-        # en su lugar probamos el camino de origen inexistente → no verificado
         r = entregar_archivo(self.dir / "no_existe.md", destino)
         self.assertFalse(r.verified)
         self.assertIn("origen", r.motivo.lower())
