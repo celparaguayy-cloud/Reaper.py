@@ -27071,7 +27071,25 @@ class App:
             self.ui.linea(f"  {Tema.tenue}{hora}{C.RESET} {Tema.ok + '✓' if ok else Tema.error + '✗'}{C.RESET} {texto}")
 
     def cmd_exportar(self, arg: str) -> None:
-        destino = Path(arg).expanduser() if arg else self.ws.raiz / ".reaper" / f"conversacion_{datetime.now():%Y%m%d_%H%M%S}.md"
+        arg = (arg or "").strip()
+        if arg.lower() in ("ayuda", "help", "-h", "--help", "?"):
+            self.ui.info("Uso: /exportar [archivo.md]  — guarda la conversación (sin secretos).")
+            self.ui.tenue("  Sin argumento: .reaper/conversacion_<fecha>.md · ruta relativa = dentro del proyecto.")
+            return
+        if arg:
+            destino = Path(arg).expanduser()
+            if not destino.is_absolute():               # relativo al PROYECTO, no a la carpeta desde donde se lanzó
+                destino = self.ws.raiz / destino
+            if not destino.suffix:
+                destino = destino.with_suffix(".md")
+        else:
+            destino = self.ws.raiz / ".reaper" / f"conversacion_{datetime.now():%Y%m%d_%H%M%S}.md"
+        if destino.exists():                            # nunca pisar un archivo (no hay checkpoint para esto)
+            self.ui.error(f"Ya existe {destino}: no lo sobrescribo. Elegí otro nombre.")
+            return
+        if es_archivo_sensible(destino.name):
+            self.ui.error(f"{destino.name} es un nombre reservado para secretos; elegí otro.")
+            return
         partes = [f"# Conversación REAPER · {self.ws.raiz.name}\n", f"Fecha: {datetime.now():%Y-%m-%d %H:%M}\n"]
         for m in self.principal.mensajes[1:]:
             quien = "Vos" if m["role"] == "user" else "REAPER"
@@ -27470,7 +27488,11 @@ class App:
             self.ui.error("Uso: /muestra <archivo>  (análisis estático; la muestra NUNCA se ejecuta)")
             return
         try:
-            datos = Path(self.ws.ruta(ruta)).read_bytes()
+            destino_muestra = Path(self.ws.ruta(ruta))
+            if es_archivo_sensible(destino_muestra.name):   # R-002: el informe muestra strings → expondría secretos
+                self.ui.error(f"{ruta} es un archivo sensible (credencial/clave): no lo analizo ni muestro sus strings.")
+                return
+            datos = destino_muestra.read_bytes()
         except (OSError, ValueError, ErrorRuta) as e:
             self.ui.error(f"No pude leer {ruta}: {e}")
             return
@@ -42217,6 +42239,44 @@ class TestPersistenciaSoloCambios(_BaseEnvModelo):
         en_disco = cargar_settings()
         self.assertEqual(en_disco.modelo, resolver_modelo("qwen"))
         self.assertEqual(en_disco.modelos_rol.get("revisor"), resolver_modelo("deepseek"))
+
+
+class TestExportarYMuestraSeguros(BaseTest):
+    def _app(self, archivos=None):
+        return App(self.ajustes(forense=False, escalar=False), MockLLM([]), self.ui(), self.proyecto(archivos or {}),
+                   persistir=False)
+
+    def test_exportar_relativo_va_al_proyecto_no_al_cwd(self):
+        app = self._app()
+        app.comando("/exportar charla")
+        self.assertTrue((app.ws.raiz / "charla.md").is_file())       # dentro del proyecto, con .md
+        self.assertFalse((Path.cwd() / "charla").exists())
+        self.assertFalse((Path.cwd() / "charla.md").exists())
+
+    def test_exportar_nunca_sobrescribe(self):
+        app = self._app({"README.md": "mi readme\n"})
+        app.comando("/exportar README.md")
+        self.assertEqual((app.ws.raiz / "README.md").read_text(encoding="utf-8"), "mi readme\n")
+        self.assertIn("no lo sobrescribo", app.ui.texto_registrado())
+
+    def test_exportar_ayuda_no_crea_archivo(self):
+        app = self._app()
+        app.comando("/exportar ayuda")
+        self.assertFalse((app.ws.raiz / "ayuda.md").exists())
+        self.assertFalse((app.ws.raiz / "ayuda").exists())
+        self.assertIn("Uso: /exportar", app.ui.texto_registrado())
+
+    def test_muestra_no_expone_secretos(self):
+        app = self._app({".env": "API_KEY=sk-secretisimo-1234567890abcdef\n"})
+        app.comando("/muestra .env")
+        texto = app.ui.texto_registrado()
+        self.assertNotIn("sk-secretisimo", texto)
+        self.assertIn("sensible", texto.lower())
+
+    def test_vigilar_ayuda_no_vigila(self):
+        app = self._app()
+        app.comando("/vigilar ayuda")                                # antes corría "ayuda" en bucle
+        self.assertIn("Uso: /vigilar", app.ui.texto_registrado())
 
 
 # ======================================================================

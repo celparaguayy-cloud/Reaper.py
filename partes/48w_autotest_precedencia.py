@@ -77,3 +77,41 @@ class TestPersistenciaSoloCambios(_BaseEnvModelo):
         en_disco = cargar_settings()
         self.assertEqual(en_disco.modelo, resolver_modelo("qwen"))
         self.assertEqual(en_disco.modelos_rol.get("revisor"), resolver_modelo("deepseek"))
+
+
+class TestExportarYMuestraSeguros(BaseTest):
+    def _app(self, archivos=None):
+        return App(self.ajustes(forense=False, escalar=False), MockLLM([]), self.ui(), self.proyecto(archivos or {}),
+                   persistir=False)
+
+    def test_exportar_relativo_va_al_proyecto_no_al_cwd(self):
+        app = self._app()
+        app.comando("/exportar charla")
+        self.assertTrue((app.ws.raiz / "charla.md").is_file())       # dentro del proyecto, con .md
+        self.assertFalse((Path.cwd() / "charla").exists())
+        self.assertFalse((Path.cwd() / "charla.md").exists())
+
+    def test_exportar_nunca_sobrescribe(self):
+        app = self._app({"README.md": "mi readme\n"})
+        app.comando("/exportar README.md")
+        self.assertEqual((app.ws.raiz / "README.md").read_text(encoding="utf-8"), "mi readme\n")
+        self.assertIn("no lo sobrescribo", app.ui.texto_registrado())
+
+    def test_exportar_ayuda_no_crea_archivo(self):
+        app = self._app()
+        app.comando("/exportar ayuda")
+        self.assertFalse((app.ws.raiz / "ayuda.md").exists())
+        self.assertFalse((app.ws.raiz / "ayuda").exists())
+        self.assertIn("Uso: /exportar", app.ui.texto_registrado())
+
+    def test_muestra_no_expone_secretos(self):
+        app = self._app({".env": "API_KEY=sk-secretisimo-1234567890abcdef\n"})
+        app.comando("/muestra .env")
+        texto = app.ui.texto_registrado()
+        self.assertNotIn("sk-secretisimo", texto)
+        self.assertIn("sensible", texto.lower())
+
+    def test_vigilar_ayuda_no_vigila(self):
+        app = self._app()
+        app.comando("/vigilar ayuda")                                # antes corría "ayuda" en bucle
+        self.assertIn("Uso: /vigilar", app.ui.texto_registrado())
