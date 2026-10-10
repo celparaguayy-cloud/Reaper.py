@@ -27118,8 +27118,20 @@ class App:
                 estado = estado_equipo(self.settings)
                 ind = independencia_equipo(estado)
         if sub == "probar":
-            self.ui.aviso("  Probar cada rol de extremo a extremo requiere peticiones reales con claves: "
-                          "NO VERIFICADO hasta ejecutarse con tu consentimiento (/proveedores probar).")
+            self.ui.info("Probando cada rol con una petición mínima real (puede consumir cuota)...")
+            resultados = probar_equipo(self.llm, self.settings)
+            simbolos = {"RESPONDE": "✓", "SIN_CLAVE": "⚠", "FALLA": "✗"}
+            for r in resultados:
+                self.ui.info(f"  {simbolos.get(r['estado'], '?')} {r['rol']:<13} {r['proveedor']}/{r['modelo']}  "
+                             f"{r['estado']} ({r['detalle']})")
+            responden = [r for r in resultados if r["estado"] == "RESPONDE"]
+            provs = {r["proveedor"] for r in responden}
+            modelos = {r["modelo"] for r in responden}
+            self.ui.ok(f"Agentes que RESPONDEN: {len(responden)}/6 · "
+                       f"proveedores distintos: {len(provs)} · modelos distintos: {len(modelos)}")
+            if not responden:
+                self.ui.aviso("  Ninguno respondió: configurá una clave (ej. export GROQ_API_KEY=...) y reintentá.")
+            return
         self.ui.info("Equipo de seis roles (asignación actual; conectividad NO VERIFICADA):")
         for e in estado:
             marca = "✓ clave" if e["tiene_clave"] else "⚠ FALTA CLAVE"
@@ -27547,6 +27559,7 @@ class App:
             f"{Tema.tenue}proyecto{C.RESET}  {self.ws.raiz}",
             f"{Tema.tenue}modelo{C.RESET}    {modelo_corto} · modo {self.settings.modo}",
             f"{Tema.tenue}equipo{C.RESET}    {' · '.join(funciones) or 'básico'}",
+            f"{Tema.tenue}agentes{C.RESET}   {resumen_arranque_equipo(self.settings)}",
             f"{Tema.tenue}tests{C.RESET}     {detectado[0].split()[-1] if detectado else 'no detectados'}",
         ]
         if self.aviso_sesion:
@@ -41115,6 +41128,85 @@ class TestPrivacidadCLI(_BasePriv):
 
 
 # ======================================================================
+# MÓDULO: autotest_probe
+# ======================================================================
+"""Autotests del probe real de los seis agentes (/equipo probar) y el aviso de arranque (AUTO-6-IA §8/§9)."""
+
+
+class _BaseProbe(BaseTest):
+    _VARS = ("OPENROUTER_API_KEY", "GROQ_API_KEY", "GEMINI_API_KEY", "NVIDIA_API_KEY", "REAPER_CLAVE_PROVEEDOR")
+
+    def setUp(self):
+        super().setUp()
+        self._env_bak = {k: os.environ.pop(k, None) for k in self._VARS}
+
+    def tearDown(self):
+        for k, v in self._env_bak.items():
+            os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+        super().tearDown()
+
+    def cliente(self, eventos, **ajustes):
+        c = LLMClient("clave", self.ajustes(**ajustes), url="http://falso", transporte=transporte_falso(eventos))
+        c.dormir = lambda _s: None
+        return c
+
+
+class TestProbarEquipo(_BaseProbe):
+    def test_todos_responden_con_clave(self):
+        os.environ["OPENROUTER_API_KEY"] = "ok"      # default = openrouter para los seis roles
+        c = self.cliente(["pong"] * 6)               # dedup por modelo: con 1 modelo basta 1 evento
+        res = probar_equipo(c, c.settings)
+        self.assertEqual(len(res), 6)
+        responden = [r for r in res if r["estado"] == "RESPONDE"]
+        self.assertEqual(len(responden), 6)
+        self.assertTrue(all("ms" in r["detalle"] for r in responden))
+
+    def test_sin_clave_marca_sin_clave_y_no_llama(self):
+        # sin ninguna credencial, el probe NO intenta y marca SIN_CLAVE
+        c = self.cliente([])                         # guion vacío: si intentara llamar, reventaría
+        res = probar_equipo(c, c.settings)
+        self.assertTrue(all(r["estado"] == "SIN_CLAVE" for r in res))
+        self.assertEqual(c.uso.llamadas, 0)         # no hizo ninguna petición
+
+    def test_falla_se_reporta(self):
+        os.environ["OPENROUTER_API_KEY"] = "ok"
+        c = self.cliente([LLMError("404 modelo inexistente", probar_otro_modelo=True)])
+        res = probar_equipo(c, c.settings)
+        self.assertTrue(any(r["estado"] == "FALLA" for r in res))
+        falla = next(r for r in res if r["estado"] == "FALLA")
+        self.assertIn("404", falla["detalle"])
+
+    def test_dedup_por_modelo_una_sola_llamada(self):
+        os.environ["OPENROUTER_API_KEY"] = "ok"
+        c = self.cliente(["pong"])                   # un solo evento: los 6 roles comparten modelo → 1 llamada
+        probar_equipo(c, c.settings)
+        self.assertEqual(c.uso.llamadas, 1)
+
+    def test_resumen_arranque(self):
+        texto = resumen_arranque_equipo(self.ajustes())
+        self.assertIn("6 roles", texto)
+        self.assertIn("NO VERIFICADA", texto)
+
+
+class TestProbeCLI(_BaseProbe):
+    def test_equipo_probar_cli(self):
+        os.environ["OPENROUTER_API_KEY"] = "ok"
+        ws = self.proyecto()
+        llm = self.cliente(["pong"])
+        app = App(self.ajustes(forense=False, escalar=False), llm, self.ui(), ws, persistir=False)
+        app.comando("/equipo probar")
+        texto = app.ui.texto_registrado()
+        self.assertIn("RESPONDEN", texto)
+        self.assertIn("/6", texto)
+
+    def test_banner_inicio_muestra_agentes(self):
+        ws = self.proyecto()
+        app = App(self.ajustes(forense=False, escalar=False), MockLLM([]), self.ui(), ws, persistir=False)
+        app.mostrar_inicio(animar=False)
+        self.assertIn("6 roles", app.ui.texto_registrado())
+
+
+# ======================================================================
 # MÓDULO: autotest_runner
 # ======================================================================
 """Ejecutor del autotest interno."""
@@ -45439,6 +45531,51 @@ def autoasignar_equipo_free(settings) -> tuple:
     for i, (_, rol) in enumerate(ROLES_EQUIPO_SEIS):
         asignacion[rol] = candidatos[i % len(candidatos)]
     return asignacion, ""
+
+
+def _probar_modelo(llm, modelo: str) -> dict:
+    """Petición mínima REAL a un modelo concreto (sin fallback): dice si responde de verdad."""
+    t0 = time.monotonic()
+    try:
+        resp = llm.chat([{"role": "user", "content": "ping"}], modelo=modelo, max_tokens=1,
+                        temperatura=0, sin_respaldo=True, rol="probe")
+        ms = round((time.monotonic() - t0) * 1000)
+        return {"estado": "RESPONDE", "detalle": f"{ms}ms", "modelo_servido": getattr(resp, "modelo", "")}
+    except LLMError as e:
+        return {"estado": "FALLA", "detalle": recortar(str(e), 120)}
+    except (OSError, ValueError, RuntimeError) as e:
+        return {"estado": "FALLA", "detalle": f"{type(e).__name__}: {e}"[:120]}
+
+
+def probar_equipo(llm, settings) -> list:
+    """
+    Prueba de verdad cada uno de los seis roles con una petición mínima. Dedup por modelo (no gasta de más).
+    Devuelve, por rol: estado RESPONDE / FALLA / SIN_CLAVE + detalle. Esto es lo único que confirma que
+    'las seis IAs corren': configurar no es responder.
+    """
+    cache = {}
+    salida = []
+    for e in estado_equipo(settings):
+        if not e["tiene_clave"]:
+            r = {"estado": "SIN_CLAVE", "detalle": "falta credencial del proveedor"}
+        elif e["modelo"] in cache:
+            r = dict(cache[e["modelo"]])
+            r["detalle"] = (r.get("detalle", "") + " (compartido)").strip()
+        else:
+            r = _probar_modelo(llm, e["modelo"])
+            cache[e["modelo"]] = r
+        salida.append({**e, **r})
+    return salida
+
+
+def resumen_arranque_equipo(settings) -> str:
+    """Línea para el banner de inicio: cuántos roles/modelos/proveedores y que falta verificar."""
+    estado = estado_equipo(settings)
+    ind = independencia_equipo(estado)
+    con_clave = sum(1 for e in estado if e["tiene_clave"])
+    aviso = "" if con_clave == len(estado) else f" · {len(estado) - con_clave} sin clave"
+    return (f"6 roles → {ind['modelos_distintos']} modelo(s)/{ind['proveedores_distintos']} prov{aviso}"
+            f" · conectividad NO VERIFICADA (/equipo probar)")
 
 
 def independencia_equipo(estado: list) -> dict:

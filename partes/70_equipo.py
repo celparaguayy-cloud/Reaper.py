@@ -67,6 +67,51 @@ def autoasignar_equipo_free(settings) -> tuple:
     return asignacion, ""
 
 
+def _probar_modelo(llm, modelo: str) -> dict:
+    """Petición mínima REAL a un modelo concreto (sin fallback): dice si responde de verdad."""
+    t0 = time.monotonic()
+    try:
+        resp = llm.chat([{"role": "user", "content": "ping"}], modelo=modelo, max_tokens=1,
+                        temperatura=0, sin_respaldo=True, rol="probe")
+        ms = round((time.monotonic() - t0) * 1000)
+        return {"estado": "RESPONDE", "detalle": f"{ms}ms", "modelo_servido": getattr(resp, "modelo", "")}
+    except LLMError as e:
+        return {"estado": "FALLA", "detalle": recortar(str(e), 120)}
+    except (OSError, ValueError, RuntimeError) as e:
+        return {"estado": "FALLA", "detalle": f"{type(e).__name__}: {e}"[:120]}
+
+
+def probar_equipo(llm, settings) -> list:
+    """
+    Prueba de verdad cada uno de los seis roles con una petición mínima. Dedup por modelo (no gasta de más).
+    Devuelve, por rol: estado RESPONDE / FALLA / SIN_CLAVE + detalle. Esto es lo único que confirma que
+    'las seis IAs corren': configurar no es responder.
+    """
+    cache = {}
+    salida = []
+    for e in estado_equipo(settings):
+        if not e["tiene_clave"]:
+            r = {"estado": "SIN_CLAVE", "detalle": "falta credencial del proveedor"}
+        elif e["modelo"] in cache:
+            r = dict(cache[e["modelo"]])
+            r["detalle"] = (r.get("detalle", "") + " (compartido)").strip()
+        else:
+            r = _probar_modelo(llm, e["modelo"])
+            cache[e["modelo"]] = r
+        salida.append({**e, **r})
+    return salida
+
+
+def resumen_arranque_equipo(settings) -> str:
+    """Línea para el banner de inicio: cuántos roles/modelos/proveedores y que falta verificar."""
+    estado = estado_equipo(settings)
+    ind = independencia_equipo(estado)
+    con_clave = sum(1 for e in estado if e["tiene_clave"])
+    aviso = "" if con_clave == len(estado) else f" · {len(estado) - con_clave} sin clave"
+    return (f"6 roles → {ind['modelos_distintos']} modelo(s)/{ind['proveedores_distintos']} prov{aviso}"
+            f" · conectividad NO VERIFICADA (/equipo probar)")
+
+
 def independencia_equipo(estado: list) -> dict:
     """Independencia REAL: proveedores y modelos distintos (no premiar seis alias al mismo endpoint)."""
     provs = {e["proveedor"] for e in estado}

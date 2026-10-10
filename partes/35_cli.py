@@ -1003,8 +1003,20 @@ class App:
                 estado = estado_equipo(self.settings)
                 ind = independencia_equipo(estado)
         if sub == "probar":
-            self.ui.aviso("  Probar cada rol de extremo a extremo requiere peticiones reales con claves: "
-                          "NO VERIFICADO hasta ejecutarse con tu consentimiento (/proveedores probar).")
+            self.ui.info("Probando cada rol con una petición mínima real (puede consumir cuota)...")
+            resultados = probar_equipo(self.llm, self.settings)
+            simbolos = {"RESPONDE": "✓", "SIN_CLAVE": "⚠", "FALLA": "✗"}
+            for r in resultados:
+                self.ui.info(f"  {simbolos.get(r['estado'], '?')} {r['rol']:<13} {r['proveedor']}/{r['modelo']}  "
+                             f"{r['estado']} ({r['detalle']})")
+            responden = [r for r in resultados if r["estado"] == "RESPONDE"]
+            provs = {r["proveedor"] for r in responden}
+            modelos = {r["modelo"] for r in responden}
+            self.ui.ok(f"Agentes que RESPONDEN: {len(responden)}/6 · "
+                       f"proveedores distintos: {len(provs)} · modelos distintos: {len(modelos)}")
+            if not responden:
+                self.ui.aviso("  Ninguno respondió: configurá una clave (ej. export GROQ_API_KEY=...) y reintentá.")
+            return
         self.ui.info("Equipo de seis roles (asignación actual; conectividad NO VERIFICADA):")
         for e in estado:
             marca = "✓ clave" if e["tiene_clave"] else "⚠ FALTA CLAVE"
@@ -1432,6 +1444,7 @@ class App:
             f"{Tema.tenue}proyecto{C.RESET}  {self.ws.raiz}",
             f"{Tema.tenue}modelo{C.RESET}    {modelo_corto} · modo {self.settings.modo}",
             f"{Tema.tenue}equipo{C.RESET}    {' · '.join(funciones) or 'básico'}",
+            f"{Tema.tenue}agentes{C.RESET}   {resumen_arranque_equipo(self.settings)}",
             f"{Tema.tenue}tests{C.RESET}     {detectado[0].split()[-1] if detectado else 'no detectados'}",
         ]
         if self.aviso_sesion:
