@@ -29,6 +29,20 @@ class TestModeloParser(BaseTest):
         app.comando("/modelo qwen")
         self.assertEqual(app.settings.modelo, resolver_modelo("qwen"))
 
+    def test_cambiar_principal_avisa_de_overrides(self):
+        # R-021: /modelo <alias> NO pisa los overrides por rol, pero avisa que siguen mandando
+        app = self._app()
+        app.comando("/modelo revisor qwen")
+        app.comando("/modelo venice")
+        self.assertEqual(app.settings.modelos_rol.get("revisor"), resolver_modelo("qwen"))  # no se borró solo
+        self.assertIn("override", app.ui.texto_registrado().lower())
+
+    def test_reset_limpia_overrides(self):
+        app = self._app()
+        app.comando("/modelo revisor qwen")
+        app.comando("/modelo reset")
+        self.assertEqual(app.settings.modelos_rol, {})
+
 
 class TestDisyuntorExcluye(BaseTest):
     def test_elegibles_excluye_abierto(self):

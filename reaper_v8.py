@@ -1764,9 +1764,11 @@ class Settings:
 
 PERFILES = {
     "gratis": {
-        "descripcion": "modelos :free, 2 candidatos, sin escalada paga, límite de 16 solicitudes/min",
+        "descripcion": "modelos :free, 2 candidatos, sin escalada paga, 16 solicitudes/min y tope de costo ~0",
+        # R-010: el perfil gratis impone un techo de costo casi cero. Los modelos :free reportan costo 0, así
+        # que no estorba; pero si por error se usa uno pago, el presupuesto de la sesión corta enseguida.
         "valores": {"modelo": MODELOS["venice-free"], "paralelo": 1, "paralelo_torneo": 1,
-                    "candidatos": 2, "rpm": 16, "escalar": False},
+                    "candidatos": 2, "rpm": 16, "escalar": False, "costo_maximo": 0.01},
     },
     "rapido": {
         "descripcion": "sin torneo ni tests previos: un intento por tarea (barato y veloz)",
@@ -27099,8 +27101,19 @@ class App:
             return
         # Ω §5.1: solo /modelo <alias> o /modelo <rol> <alias> con rol conocido. Nada más se guarda.
         if len(partes) == 1:
+            if partes[0].lower() in ("reset", "limpiar", "default"):      # R-021: limpiar overrides por rol
+                n = len(self.settings.modelos_rol)
+                self.settings.modelos_rol.clear()
+                guardar_settings(self.settings)
+                self.ui.ok(f"Overrides por rol limpiados ({n}). Todos los roles usan el modelo principal.")
+                return
             self.settings.modelo = resolver_modelo(partes[0])
             self.ui.ok(f"Modelo principal: {self.settings.modelo} (NO VERIFICADO; /equipo probar para confirmar)")
+            # R-021: los overrides por rol NO se pisan solos, pero el usuario debe saber que siguen mandando.
+            if self.settings.modelos_rol:
+                roles = ", ".join(sorted(self.settings.modelos_rol))
+                self.ui.aviso(f"  Ojo: siguen activos overrides por rol ({roles}); esos roles NO usan {self.settings.modelo}.")
+                self.ui.tenue("  Limpialos con /modelo reset, o uno con /modelo <rol> -.")
             guardar_settings(self.settings)
             return
         if len(partes) == 2 and partes[0].lower() in ROLES:
@@ -35578,6 +35591,8 @@ class TestConfig(BaseTest):
         cambios = aplicar_perfil(s, "gratis")
         self.assertIn("rpm=16", cambios)
         self.assertFalse(s.escalar)
+        self.assertGreater(s.costo_maximo, 0)          # R-010: gratis impone techo de costo (≠ ilimitado)
+        self.assertLessEqual(s.costo_maximo, 0.01)
         with self.assertRaises(KeyError):
             aplicar_perfil(s, "turbo")
 
@@ -41470,6 +41485,20 @@ class TestModeloParser(BaseTest):
         app = self._app()
         app.comando("/modelo qwen")
         self.assertEqual(app.settings.modelo, resolver_modelo("qwen"))
+
+    def test_cambiar_principal_avisa_de_overrides(self):
+        # R-021: /modelo <alias> NO pisa los overrides por rol, pero avisa que siguen mandando
+        app = self._app()
+        app.comando("/modelo revisor qwen")
+        app.comando("/modelo venice")
+        self.assertEqual(app.settings.modelos_rol.get("revisor"), resolver_modelo("qwen"))  # no se borró solo
+        self.assertIn("override", app.ui.texto_registrado().lower())
+
+    def test_reset_limpia_overrides(self):
+        app = self._app()
+        app.comando("/modelo revisor qwen")
+        app.comando("/modelo reset")
+        self.assertEqual(app.settings.modelos_rol, {})
 
 
 class TestDisyuntorExcluye(BaseTest):

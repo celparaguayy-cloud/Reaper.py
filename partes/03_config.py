@@ -322,9 +322,11 @@ class Settings:
 
 PERFILES = {
     "gratis": {
-        "descripcion": "modelos :free, 2 candidatos, sin escalada paga, límite de 16 solicitudes/min",
+        "descripcion": "modelos :free, 2 candidatos, sin escalada paga, 16 solicitudes/min y tope de costo ~0",
+        # R-010: el perfil gratis impone un techo de costo casi cero. Los modelos :free reportan costo 0, así
+        # que no estorba; pero si por error se usa uno pago, el presupuesto de la sesión corta enseguida.
         "valores": {"modelo": MODELOS["venice-free"], "paralelo": 1, "paralelo_torneo": 1,
-                    "candidatos": 2, "rpm": 16, "escalar": False},
+                    "candidatos": 2, "rpm": 16, "escalar": False, "costo_maximo": 0.01},
     },
     "rapido": {
         "descripcion": "sin torneo ni tests previos: un intento por tarea (barato y veloz)",

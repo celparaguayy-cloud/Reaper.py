@@ -866,8 +866,19 @@ class App:
             return
         # Ω §5.1: solo /modelo <alias> o /modelo <rol> <alias> con rol conocido. Nada más se guarda.
         if len(partes) == 1:
+            if partes[0].lower() in ("reset", "limpiar", "default"):      # R-021: limpiar overrides por rol
+                n = len(self.settings.modelos_rol)
+                self.settings.modelos_rol.clear()
+                guardar_settings(self.settings)
+                self.ui.ok(f"Overrides por rol limpiados ({n}). Todos los roles usan el modelo principal.")
+                return
             self.settings.modelo = resolver_modelo(partes[0])
             self.ui.ok(f"Modelo principal: {self.settings.modelo} (NO VERIFICADO; /equipo probar para confirmar)")
+            # R-021: los overrides por rol NO se pisan solos, pero el usuario debe saber que siguen mandando.
+            if self.settings.modelos_rol:
+                roles = ", ".join(sorted(self.settings.modelos_rol))
+                self.ui.aviso(f"  Ojo: siguen activos overrides por rol ({roles}); esos roles NO usan {self.settings.modelo}.")
+                self.ui.tenue("  Limpialos con /modelo reset, o uno con /modelo <rol> -.")
             guardar_settings(self.settings)
             return
         if len(partes) == 2 and partes[0].lower() in ROLES:

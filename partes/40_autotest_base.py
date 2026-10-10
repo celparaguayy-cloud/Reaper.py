@@ -259,6 +259,8 @@ class TestConfig(BaseTest):
         cambios = aplicar_perfil(s, "gratis")
         self.assertIn("rpm=16", cambios)
         self.assertFalse(s.escalar)
+        self.assertGreater(s.costo_maximo, 0)          # R-010: gratis impone techo de costo (≠ ilimitado)
+        self.assertLessEqual(s.costo_maximo, 0.01)
         with self.assertRaises(KeyError):
             aplicar_perfil(s, "turbo")
 
