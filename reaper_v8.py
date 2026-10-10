@@ -2607,11 +2607,13 @@ class LLMClient:
             raise LLMError(
                 f"falta la clave del proveedor '{destino.proveedor}' (variable {destino.clave_env}) para el modelo "
                 f"{modelo}. Exportala como variable de entorno.", probar_otro_modelo=True)
+        visto_done = False
         for linea in self._transporte(destino.url, self._headers(destino), payload, self.settings.timeout):
             evento = parsear_linea_sse(linea)
             if evento is None:
                 continue
             if evento == "DONE":
+                visto_done = True
                 break
 
             if "error" in evento:
@@ -2654,6 +2656,10 @@ class LLMClient:
             por.segundos += duracion
 
         texto = "".join(partes)
+        if texto.strip() and not visto_done and not finish:
+            # El stream se cortó sin [DONE] ni finish_reason: la respuesta está TRUNCADA. Aceptarla haría que el
+            # agente escriba un archivo cortado como si estuviera completo. Se reintenta / se cambia de modelo.
+            raise _Transitorio("respuesta truncada: el stream terminó sin cierre ni finish_reason")
         if not texto.strip():
             if razonamiento:
                 # Modelo con razonamiento que se quedó sin salida antes de responder: reintentar igual no sirve,
@@ -3667,7 +3673,13 @@ def escritura_atomica(ruta: Path, contenido: str) -> None:
             os.fsync(f.fileno())
         if ruta.exists():
             try:
-                shutil.copymode(ruta, temporal)
+                shutil.copymode(ruta, temporal)      # conservar permisos del archivo que se reemplaza
+            except OSError:
+                pass
+        else:
+            try:
+                u = os.umask(0); os.umask(u)          # archivo nuevo: permisos normales (0644), no 0600 de mkstemp
+                os.chmod(temporal, 0o666 & ~u)
             except OSError:
                 pass
         os.replace(temporal, ruta)
@@ -3782,11 +3794,16 @@ class Workspace:
         hacia = self.ruta(destino, escribir=True)
         if not desde.is_file():
             raise FileNotFoundError(origen)
+        if hacia.is_dir():
+            raise ErrorRuta(f"{destino} es una carpeta.")
         if hacia.exists():
             raise ErrorRuta(f"Ya existe {destino}.")
-        contenido = desde.read_text(encoding="utf-8", errors="replace")
-        self.escribir(self.rel(hacia), contenido)
-        self.borrar(self.rel(desde))
+        # Copia de BYTES (no texto): mover un PNG/zip/CSV no-UTF8 ya no lo corrompe; copy2 preserva modo y mtime.
+        self.checkpoints.registrar(self.rel(hacia))   # destino nuevo → /deshacer lo borra
+        self.checkpoints.registrar(self.rel(desde))   # origen existente → /deshacer lo restaura (bytes exactos)
+        hacia.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(desde, hacia)
+        desde.unlink()
         return hacia
 
     def existe(self, rel: str) -> bool:
@@ -4313,6 +4330,7 @@ class Copia:
         """Aplica los cambios de la copia al workspace real, registrando checkpoints."""
         excluidos = set(excluir)
         aplicados = []
+        self.conflictos: list[str] = []
         for c in cambios if cambios is not None else self.cambios():
             if c.rel in excluidos:
                 continue
@@ -4322,6 +4340,12 @@ class Copia:
                         destino.borrar(c.rel)
                         aplicados.append(c.rel)
                 elif c.despues is not None:
+                    if c.tipo == "nuevo" and destino.existe(c.rel):
+                        # El candidato lo cree NUEVO, pero en el proyecto real YA existe: quedó fuera de la copia
+                        # (archivo grande/binario) o se creó en paralelo. Pisarlo destruiría datos que el candidato
+                        # nunca vio. No se aplica (data loss, p.ej. un .csv de 21 MB reemplazado por 13 bytes).
+                        self.conflictos.append(c.rel)
+                        continue
                     destino.escribir(c.rel, c.despues)
                     aplicados.append(c.rel)
             except (ErrorRuta, OSError):
@@ -12930,6 +12954,10 @@ class Torneo:
         indice_de(self.ws).invalidar()
         self.ui.ok(f"Ganó el candidato #{ganador.indice + 1} (t={ganador.temperatura:.1f}): "
                    f"{len(resultado.aplicados)} archivo(s) aplicados al proyecto")
+        conflictos = getattr(ganador.copia, "conflictos", [])
+        if conflictos:
+            self.ui.aviso("  NO pisé archivos que ya existían en el proyecto y quedaron fuera de la copia "
+                          f"(grandes/binarios): {', '.join(conflictos[:6])}. Revisá si querías cambiarlos.")
         return resultado
 
     def _simple(self, tarea: str, archivos: str, titulo: str, rol: str,
@@ -13540,8 +13568,11 @@ class FotoProyecto:
         self.restaurados: list[str] = []
 
     def __enter__(self) -> "FotoProyecto":
+        self.existian: set = set()
         for ruta in self.ws.iterar(limite=self.limite):
             try:
+                rel = self.ws.rel(ruta)
+                self.existian.add(rel)                       # presente al empezar, aunque no capturemos su contenido
                 if ruta.stat().st_size <= self.max_bytes:
                     self.contenidos[self.ws.rel(ruta)] = ruta.read_bytes()
             except OSError:
@@ -13550,9 +13581,15 @@ class FotoProyecto:
 
     def __exit__(self, *exc) -> None:
         actuales = {self.ws.rel(r) for r in self.ws.iterar(limite=self.limite)}
-        for rel in sorted(actuales - set(self.contenidos)):
+        # Solo se borra lo que NO existía al empezar (basura real de los tests). Un archivo que ya existía y no
+        # se pudo fotografiar (demasiado grande) JAMÁS se borra: no podríamos restaurarlo (era pérdida de datos).
+        for rel in sorted(actuales - self.existian):
             if rel.startswith(".reaper/"):
                 continue
+            try:
+                self.ws.checkpoints.registrar(rel)           # recuperable con /deshacer por las dudas
+            except (OSError, AttributeError):
+                pass
             try:
                 (self.ws.raiz / rel).unlink()
                 self.restaurados.append(f"{rel} (creado por los tests, borrado)")
@@ -43477,6 +43514,108 @@ class TestSalidaComandoRedactada(_BaseFuga):
         texto = app._ruta_sesion().read_text(encoding="utf-8")
         self.assertIn("[REDACTADO]", texto)
         self.assertNotIn("gsk_0AbCdEfGhIjKl", texto)
+
+
+# ======================================================================
+# MÓDULO: autotest_dataloss
+# ======================================================================
+"""
+Autotests anti-pérdida de datos (hallazgos de la caza de bugs): mover no corrompe binarios, un stream
+truncado no se acepta como completo, el torneo no pisa archivos grandes que quedaron fuera de la copia, y el
+modo forense no borra archivos que ya existían.
+"""
+
+_PNG = b"\x89PNG\r\n\x1a\n" + bytes(range(256)) * 3 + b"\x00\xff\x80"
+
+
+class TestMoverNoCorrompe(BaseTest):
+    def test_mover_binario_conserva_bytes_y_modo(self):
+        ws = self.proyecto({})
+        (ws.raiz / "logo.png").write_bytes(_PNG)
+        os.chmod(ws.raiz / "logo.png", 0o750)
+        ws.mover("logo.png", "img/logo.png")
+        self.assertFalse((ws.raiz / "logo.png").exists())
+        self.assertEqual((ws.raiz / "img" / "logo.png").read_bytes(), _PNG)   # bytes idénticos
+        self.assertEqual((ws.raiz / "img" / "logo.png").stat().st_mode & 0o777, 0o750)  # modo preservado
+
+    def test_mover_csv_no_utf8_intacto(self):
+        ws = self.proyecto({})
+        crudo = "nombre;ciudad\r\nJosé;Córdoba\r\n".encode("latin-1")
+        (ws.raiz / "d.csv").write_bytes(crudo)
+        ws.mover("d.csv", "data/d.csv")
+        self.assertEqual((ws.raiz / "data" / "d.csv").read_bytes(), crudo)
+
+    def test_archivo_nuevo_no_queda_0600(self):
+        ws = self.proyecto({})
+        ws.escribir("nuevo.py", "x = 1\n")
+        u = os.umask(0); os.umask(u)
+        self.assertEqual((ws.raiz / "nuevo.py").stat().st_mode & 0o777, 0o666 & ~u)
+
+
+class TestStreamTruncado(BaseTest):
+    def _transporte(self, lineas):
+        def t(url, headers, payload, timeout):
+            yield from lineas
+        return t
+
+    def test_stream_sin_done_ni_finish_no_se_acepta(self):
+        # content pero el stream termina sin [DONE] ni finish_reason → truncado, no se acepta
+        lineas = ['data: {"choices":[{"delta":{"content":"def suma(a, b):\\n    return a +"}}]}']
+        c = LLMClient("k", self.ajustes(reintentos=0), url="http://x", transporte=self._transporte(lineas))
+        c.dormir = lambda _s: None
+        with self.assertRaises(LLMError) as cm:
+            c.chat([{"role": "user", "content": "x"}], sin_respaldo=True)
+        self.assertIn("truncad", str(cm.exception).lower())
+
+    def test_stream_con_finish_se_acepta(self):
+        lineas = ['data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}']
+        c = LLMClient("k", self.ajustes(reintentos=0), url="http://x", transporte=self._transporte(lineas))
+        c.dormir = lambda _s: None
+        self.assertEqual(c.chat([{"role": "user", "content": "x"}], sin_respaldo=True).texto, "ok")
+
+    def test_stream_con_done_se_acepta(self):
+        lineas = ['data: {"choices":[{"delta":{"content":"ok"}}]}', "data: [DONE]"]
+        c = LLMClient("k", self.ajustes(reintentos=0), url="http://x", transporte=self._transporte(lineas))
+        c.dormir = lambda _s: None
+        self.assertEqual(c.chat([{"role": "user", "content": "x"}], sin_respaldo=True).texto, "ok")
+
+
+class TestTorneoNoPisaGrandes(BaseTest):
+    def test_aplicar_no_pisa_archivo_existente_fuera_de_la_copia(self):
+        ws = self.proyecto({"datos.csv": "valor_real_del_usuario_muy_largo\n" * 3})
+        copia = Copia(ws, "test")
+        # el candidato "creó" datos.csv (lo vio como nuevo porque quedó fuera de la copia por tamaño)
+        cambios = [CambioArchivo("datos.csv", "nuevo", None, "13 bytes\n"),
+                   CambioArchivo("lector.py", "nuevo", None, "def contar(): return 0\n")]
+        aplicados = copia.aplicar_a(ws, cambios)
+        self.assertIn("lector.py", aplicados)                 # lo genuinamente nuevo sí se aplica
+        self.assertNotIn("datos.csv", aplicados)              # el que ya existía NO se pisa
+        self.assertIn("datos.csv", copia.conflictos)
+        self.assertTrue(ws.leer("datos.csv").startswith("valor_real_del_usuario"))
+
+    def test_modificado_existente_si_se_aplica(self):
+        ws = self.proyecto({"a.py": "viejo\n"})
+        copia = Copia(ws, "test")
+        aplicados = copia.aplicar_a(ws, [CambioArchivo("a.py", "modificado", "viejo\n", "nuevo\n")])
+        self.assertIn("a.py", aplicados)
+        self.assertEqual(ws.leer("a.py"), "nuevo\n")
+
+
+class TestForenseNoBorraExistentes(BaseTest):
+    def test_archivo_grande_preexistente_no_se_borra(self):
+        ws = self.proyecto({})
+        grande = ws.raiz / "datos.bin"
+        grande.write_bytes(b"x" * 5000)                       # > max_bytes del test (abajo)
+        with FotoProyecto(ws, max_bytes=100):                 # no captura datos.bin (5000 > 100)
+            pass
+        self.assertTrue(grande.exists(), "un archivo que ya existía no se borra aunque no se pudiera fotografiar")
+
+    def test_archivo_nuevo_se_borra_pero_es_recuperable(self):
+        ws = self.proyecto({"base.py": "x = 1\n"})
+        with FotoProyecto(ws, max_bytes=2_000_000):
+            (ws.raiz / "generado_por_test.txt").write_text("basura\n", encoding="utf-8")
+        self.assertFalse((ws.raiz / "generado_por_test.txt").exists())   # la basura del test se limpia
+        self.assertTrue(ws.checkpoints.inicio_grupo() is not None)       # ...pero quedó en un checkpoint
 
 
 # ======================================================================

@@ -101,7 +101,13 @@ def escritura_atomica(ruta: Path, contenido: str) -> None:
             os.fsync(f.fileno())
         if ruta.exists():
             try:
-                shutil.copymode(ruta, temporal)
+                shutil.copymode(ruta, temporal)      # conservar permisos del archivo que se reemplaza
+            except OSError:
+                pass
+        else:
+            try:
+                u = os.umask(0); os.umask(u)          # archivo nuevo: permisos normales (0644), no 0600 de mkstemp
+                os.chmod(temporal, 0o666 & ~u)
             except OSError:
                 pass
         os.replace(temporal, ruta)
@@ -216,11 +222,16 @@ class Workspace:
         hacia = self.ruta(destino, escribir=True)
         if not desde.is_file():
             raise FileNotFoundError(origen)
+        if hacia.is_dir():
+            raise ErrorRuta(f"{destino} es una carpeta.")
         if hacia.exists():
             raise ErrorRuta(f"Ya existe {destino}.")
-        contenido = desde.read_text(encoding="utf-8", errors="replace")
-        self.escribir(self.rel(hacia), contenido)
-        self.borrar(self.rel(desde))
+        # Copia de BYTES (no texto): mover un PNG/zip/CSV no-UTF8 ya no lo corrompe; copy2 preserva modo y mtime.
+        self.checkpoints.registrar(self.rel(hacia))   # destino nuevo → /deshacer lo borra
+        self.checkpoints.registrar(self.rel(desde))   # origen existente → /deshacer lo restaura (bytes exactos)
+        hacia.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(desde, hacia)
+        desde.unlink()
         return hacia
 
     def existe(self, rel: str) -> bool:

@@ -231,6 +231,7 @@ class Copia:
         """Aplica los cambios de la copia al workspace real, registrando checkpoints."""
         excluidos = set(excluir)
         aplicados = []
+        self.conflictos: list[str] = []
         for c in cambios if cambios is not None else self.cambios():
             if c.rel in excluidos:
                 continue
@@ -240,6 +241,12 @@ class Copia:
                         destino.borrar(c.rel)
                         aplicados.append(c.rel)
                 elif c.despues is not None:
+                    if c.tipo == "nuevo" and destino.existe(c.rel):
+                        # El candidato lo cree NUEVO, pero en el proyecto real YA existe: quedó fuera de la copia
+                        # (archivo grande/binario) o se creó en paralelo. Pisarlo destruiría datos que el candidato
+                        # nunca vio. No se aplica (data loss, p.ej. un .csv de 21 MB reemplazado por 13 bytes).
+                        self.conflictos.append(c.rel)
+                        continue
                     destino.escribir(c.rel, c.despues)
                     aplicados.append(c.rel)
             except (ErrorRuta, OSError):

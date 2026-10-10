@@ -230,6 +230,10 @@ class Torneo:
         indice_de(self.ws).invalidar()
         self.ui.ok(f"Ganó el candidato #{ganador.indice + 1} (t={ganador.temperatura:.1f}): "
                    f"{len(resultado.aplicados)} archivo(s) aplicados al proyecto")
+        conflictos = getattr(ganador.copia, "conflictos", [])
+        if conflictos:
+            self.ui.aviso("  NO pisé archivos que ya existían en el proyecto y quedaron fuera de la copia "
+                          f"(grandes/binarios): {', '.join(conflictos[:6])}. Revisá si querías cambiarlos.")
         return resultado
 
     def _simple(self, tarea: str, archivos: str, titulo: str, rol: str,

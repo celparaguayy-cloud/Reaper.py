@@ -461,11 +461,13 @@ class LLMClient:
             raise LLMError(
                 f"falta la clave del proveedor '{destino.proveedor}' (variable {destino.clave_env}) para el modelo "
                 f"{modelo}. Exportala como variable de entorno.", probar_otro_modelo=True)
+        visto_done = False
         for linea in self._transporte(destino.url, self._headers(destino), payload, self.settings.timeout):
             evento = parsear_linea_sse(linea)
             if evento is None:
                 continue
             if evento == "DONE":
+                visto_done = True
                 break
 
             if "error" in evento:
@@ -508,6 +510,10 @@ class LLMClient:
             por.segundos += duracion
 
         texto = "".join(partes)
+        if texto.strip() and not visto_done and not finish:
+            # El stream se cortó sin [DONE] ni finish_reason: la respuesta está TRUNCADA. Aceptarla haría que el
+            # agente escriba un archivo cortado como si estuviera completo. Se reintenta / se cambia de modelo.
+            raise _Transitorio("respuesta truncada: el stream terminó sin cierre ni finish_reason")
         if not texto.strip():
             if razonamiento:
                 # Modelo con razonamiento que se quedó sin salida antes de responder: reintentar igual no sirve,

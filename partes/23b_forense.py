@@ -465,8 +465,11 @@ class FotoProyecto:
         self.restaurados: list[str] = []
 
     def __enter__(self) -> "FotoProyecto":
+        self.existian: set = set()
         for ruta in self.ws.iterar(limite=self.limite):
             try:
+                rel = self.ws.rel(ruta)
+                self.existian.add(rel)                       # presente al empezar, aunque no capturemos su contenido
                 if ruta.stat().st_size <= self.max_bytes:
                     self.contenidos[self.ws.rel(ruta)] = ruta.read_bytes()
             except OSError:
@@ -475,9 +478,15 @@ class FotoProyecto:
 
     def __exit__(self, *exc) -> None:
         actuales = {self.ws.rel(r) for r in self.ws.iterar(limite=self.limite)}
-        for rel in sorted(actuales - set(self.contenidos)):
+        # Solo se borra lo que NO existía al empezar (basura real de los tests). Un archivo que ya existía y no
+        # se pudo fotografiar (demasiado grande) JAMÁS se borra: no podríamos restaurarlo (era pérdida de datos).
+        for rel in sorted(actuales - self.existian):
             if rel.startswith(".reaper/"):
                 continue
+            try:
+                self.ws.checkpoints.registrar(rel)           # recuperable con /deshacer por las dudas
+            except (OSError, AttributeError):
+                pass
             try:
                 (self.ws.raiz / rel).unlink()
                 self.restaurados.append(f"{rel} (creado por los tests, borrado)")
