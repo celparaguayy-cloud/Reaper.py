@@ -164,6 +164,10 @@ class App:
             mensajes = self.principal.mensajes[1:][-60:]
             while mensajes and mensajes[0]["role"] != "user":
                 mensajes = mensajes[1:]
+            # Nunca persistir secretos en ~/reaper/sesiones (defensa en profundidad; la salida de comandos ya
+            # se redacta antes de llegar acá).
+            mensajes = [{**m, "content": redactar_secretos(m["content"])} if isinstance(m.get("content"), str)
+                        else m for m in mensajes]
             datos = {"mensajes": mensajes, "todo": self.principal.ctx.todo,
                      "historial": self.historial[-50:], "guardado": datetime.now().isoformat(timespec="seconds")}
             escritura_atomica(self._ruta_sesion(), json.dumps(datos, ensure_ascii=False))

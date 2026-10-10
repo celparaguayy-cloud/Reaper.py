@@ -19,7 +19,12 @@ try:
 except ImportError:  # pragma: no cover - opcional
     _pyflakes_api = None
 
-_ENV_SECRETO = re.compile(r"(KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL)", re.I)
+# Variables de entorno que NO se pasan a los subprocesos del agente (podrían filtrar secretos del usuario).
+# Amplio a propósito: un comando de build que necesite una variable puntual se declara aparte, pero por
+# defecto el modelo y los procesos que lanza NO heredan credenciales ambientales.
+_ENV_SECRETO = re.compile(
+    r"(KEY|TOKEN|SECRET|PASSWORD|PASSWD|PASS|PWD|CREDENTIAL|CRED|AUTH|PRIVATE|SIGNING|BEARER|SESSION|COOKIE|"
+    r"DSN|CONTRASE|CLAVE|APIKEY|WEBHOOK|(?:^|_)PAT(?:$|_))", re.I)
 _CACHE_MODULOS: dict[str, bool] = {}
 _LOCK_IMPORTS = threading.Lock()
 MAX_SALIDA_PROCESO = 400_000

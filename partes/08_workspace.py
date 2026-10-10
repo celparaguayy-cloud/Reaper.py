@@ -56,11 +56,22 @@ NOMBRES_TEXTO = {
     "LICENSE", ".gitignore", "REAPER.md",
 }
 
-PATRONES_SECRETOS = [
-    re.compile(r"(?i)\b(api[_-]?key|token|secret|password|passwd)\b(\s*[:=]\s*)[\"']?([^\s\"']{6,})"),
-    re.compile(r"sk-[A-Za-z0-9_-]{16,}"),
-    re.compile(r"gh[pousr]_[A-Za-z0-9_]{20,}"),
-    re.compile(r"AKIA[0-9A-Z]{16}"),
+# (patrón, cómo reemplazar). El primer grupo que se quiere conservar se deja; el secreto se tapa.
+_RE_ASIGNA_SECRETO = re.compile(
+    r"(?i)([\"']?[A-Za-z0-9_.\-]*"
+    r"(?:api[_-]?key|access[_-]?key|private[_-]?key|secret|password|passwd|pwd|auth[_-]?token|token|"
+    r"contrase\w*|clave\w*)"
+    r"[\"']?\s*[:=]\s*)[\"']?([^\s\"',}]{5,})")
+_RE_URL_CRED = re.compile(r"(?i)\b([a-z][a-z0-9+.\-]*://[^\s:@/]+):([^\s:@/]{3,})@")
+PATRONES_SECRETOS = [  # se reemplazan por [REDACTADO] enteros
+    re.compile(r"\bsk-(?:proj-|ant-|or-)?[A-Za-z0-9_-]{16,}"),      # OpenAI / OpenRouter / Anthropic
+    re.compile(r"\bgsk_[A-Za-z0-9]{20,}"),                         # Groq
+    re.compile(r"\bAIza[A-Za-z0-9_\-]{20,}"),                      # Google / Gemini
+    re.compile(r"\bnvapi-[A-Za-z0-9_\-]{16,}"),                    # NVIDIA
+    re.compile(r"\bxai-[A-Za-z0-9]{16,}"),                         # xAI
+    re.compile(r"\b(?:github_pat|ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9_]{20,}"),  # GitHub
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),                           # AWS access key id
+    re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._\-]{12,}"),            # Authorization: Bearer …
 ]
 
 MAX_BYTES_LECTURA = 1_000_000
@@ -71,8 +82,11 @@ class ErrorRuta(ValueError):
 
 
 def redactar_secretos(texto: str) -> str:
-    limpio = PATRONES_SECRETOS[0].sub(lambda m: f"{m.group(1)}{m.group(2)}[REDACTADO]", texto)
-    for patron in PATRONES_SECRETOS[1:]:
+    if not texto:
+        return texto
+    limpio = _RE_ASIGNA_SECRETO.sub(lambda m: f"{m.group(1)}[REDACTADO]", texto)   # clave=... / "token": "..."
+    limpio = _RE_URL_CRED.sub(lambda m: f"{m.group(1)}:[REDACTADO]@", limpio)       # user:pass@host
+    for patron in PATRONES_SECRETOS:
         limpio = patron.sub("[REDACTADO]", limpio)
     return limpio
 

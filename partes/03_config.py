@@ -467,14 +467,30 @@ def guardar_settings(settings: Settings, ruta: Optional[Path] = None) -> None:
     os.replace(tmp, ruta)
 
 
+# Un .reaper/config.json de un repositorio NO confiable jamás puede cambiar a dónde van las credenciales ni
+# aflojar la seguridad/red (BUG-002). Estas claves se ignoran si vienen del proyecto.
+OVERRIDES_PROHIBIDOS_PROYECTO = frozenset({
+    "api_url", "proveedor", "privacidad_estricta", "web", "dominios_web", "plugins", "log",
+})
+
+
 def settings_con_local(settings: Settings, local: dict) -> Settings:
-    """Copia de settings con los overrides de .reaper/config.json del proyecto (claves 'settings')."""
+    """Copia de settings con los overrides SEGUROS de .reaper/config.json del proyecto (clave 'settings')."""
     overrides = local.get("settings") if isinstance(local, dict) else None
     if not isinstance(overrides, dict) or not overrides:
         return settings
+    seguros = {k: v for k, v in overrides.items() if k not in OVERRIDES_PROHIBIDOS_PROYECTO}
     combinado = settings.to_dict()
-    combinado.update(overrides)
+    combinado.update(seguros)
     return Settings.desde_dict(combinado)
+
+
+def overrides_proyecto_ignorados(local: dict) -> list:
+    """Claves del .reaper/config.json del proyecto que se ignoran por seguridad (para avisar al usuario)."""
+    overrides = local.get("settings") if isinstance(local, dict) else None
+    if not isinstance(overrides, dict):
+        return []
+    return [k for k in overrides if k in OVERRIDES_PROHIBIDOS_PROYECTO]
 
 
 def cargar_estado() -> dict:

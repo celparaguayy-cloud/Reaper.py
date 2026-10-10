@@ -126,9 +126,13 @@ def main(argv: Optional[list] = None) -> int:
     # R-011: aplicar los overrides de .reaper/config.json del proyecto ANTES de construir el cliente, para que
     # candidatos/torneo/rpm/modelo/temperatura del proyecto manden de verdad (antes se definían y se ignoraban).
     if ws.config_local().get("settings"):
+        ignorados = overrides_proyecto_ignorados(ws.config_local())
         settings = preparar_settings_proyecto(settings, ws, args)
-        api_key = obtener_clave_api(settings) or api_key        # el proyecto pudo cambiar el proveedor
+        api_key = obtener_clave_api(settings) or api_key        # el proyecto pudo cambiar el modelo/proveedor
         ui.tenue("  Apliqué overrides de .reaper/config.json (settings del proyecto).")
+        if ignorados:
+            ui.aviso("  Ignoré claves inseguras del .reaper/config.json del proyecto (no cambian a dónde van "
+                     f"tus credenciales ni la red): {', '.join(sorted(ignorados))}.")
 
     llm = LLMClient(api_key, settings)
     llm.on_evento = lambda texto: ui.tenue(f"  ↻ {texto}")

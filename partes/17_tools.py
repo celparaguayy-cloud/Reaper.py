@@ -620,6 +620,10 @@ def execute_command(ctx: Contexto, p: dict) -> str:
     timeout = min(600, _entero(p.get("timeout"), ctx.settings.exec_timeout) or ctx.settings.exec_timeout)
     entrada = _entrada_estandar(p)
     r = ejecutar(comando, cwd=ctx.ws.raiz, timeout=timeout, shell=True, entrada=entrada)
+    # La salida de un comando arbitrario puede contener secretos (p.ej. `grep KEY .env`, `cat .clave_x`):
+    # se redacta ANTES de dársela al modelo y de que quede en la sesión guardada.
+    r.stdout, r.stderr = redactar_secretos(r.stdout), redactar_secretos(r.stderr)
+    r.comando = redactar_secretos(r.comando)        # el comando puede llevar un token (curl -H "Authorization: …")
     texto = r.resumen(limite=MAX_SALIDA // 2)
     if entrada is not None:
         texto = texto.replace("\n", f"\n(stdin: {len(entrada.splitlines())} línea(s))\n", 1)

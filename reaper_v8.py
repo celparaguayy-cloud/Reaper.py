@@ -1909,14 +1909,30 @@ def guardar_settings(settings: Settings, ruta: Optional[Path] = None) -> None:
     os.replace(tmp, ruta)
 
 
+# Un .reaper/config.json de un repositorio NO confiable jamás puede cambiar a dónde van las credenciales ni
+# aflojar la seguridad/red (BUG-002). Estas claves se ignoran si vienen del proyecto.
+OVERRIDES_PROHIBIDOS_PROYECTO = frozenset({
+    "api_url", "proveedor", "privacidad_estricta", "web", "dominios_web", "plugins", "log",
+})
+
+
 def settings_con_local(settings: Settings, local: dict) -> Settings:
-    """Copia de settings con los overrides de .reaper/config.json del proyecto (claves 'settings')."""
+    """Copia de settings con los overrides SEGUROS de .reaper/config.json del proyecto (clave 'settings')."""
     overrides = local.get("settings") if isinstance(local, dict) else None
     if not isinstance(overrides, dict) or not overrides:
         return settings
+    seguros = {k: v for k, v in overrides.items() if k not in OVERRIDES_PROHIBIDOS_PROYECTO}
     combinado = settings.to_dict()
-    combinado.update(overrides)
+    combinado.update(seguros)
     return Settings.desde_dict(combinado)
+
+
+def overrides_proyecto_ignorados(local: dict) -> list:
+    """Claves del .reaper/config.json del proyecto que se ignoran por seguridad (para avisar al usuario)."""
+    overrides = local.get("settings") if isinstance(local, dict) else None
+    if not isinstance(overrides, dict):
+        return []
+    return [k for k in overrides if k in OVERRIDES_PROHIBIDOS_PROYECTO]
 
 
 def cargar_estado() -> dict:
@@ -2364,6 +2380,9 @@ class LLMClient:
         transporte: Optional[Transporte] = None,
     ):
         self.api_key = api_key
+        # El api_key del constructor pertenece al proveedor activo AL CREAR el cliente. Si después cambia el
+        # proveedor (p.ej. un override del proyecto), esta clave NO se reutiliza para otro proveedor (BUG-001).
+        self._proveedor_api_key = settings.proveedor
         self.settings = settings
         self.url = url or settings.url_api()
         self.uso = Uso()
@@ -2380,11 +2399,17 @@ class LLMClient:
         return destino_modelo(modelo, self.settings)
 
     def _clave_de(self, destino: "DestinoModelo") -> Optional[str]:
-        if destino.proveedor == self.settings.proveedor:
-            return self.api_key
-        if destino.proveedor not in self._claves_proveedor:
-            self._claves_proveedor[destino.proveedor] = clave_de_proveedor(destino.proveedor, self.settings)
-        return self._claves_proveedor[destino.proveedor]
+        """
+        Clave del proveedor DESTINO. Cada endpoint recibe SOLO la clave de su propio proveedor: nunca la de
+        otro, ni el api_key del constructor si pertenece a un proveedor distinto (BUG-001, fuga entre proveedores).
+        """
+        prov = destino.proveedor
+        if prov not in self._claves_proveedor:
+            if prov == self._proveedor_api_key and self.api_key:
+                self._claves_proveedor[prov] = self.api_key
+            else:
+                self._claves_proveedor[prov] = clave_de_proveedor(prov, replace(self.settings, proveedor=prov))
+        return self._claves_proveedor[prov]
 
     def _respaldos_equipo(self, principal: str, ya: list) -> list:
         """
@@ -3597,11 +3622,22 @@ NOMBRES_TEXTO = {
     "LICENSE", ".gitignore", "REAPER.md",
 }
 
-PATRONES_SECRETOS = [
-    re.compile(r"(?i)\b(api[_-]?key|token|secret|password|passwd)\b(\s*[:=]\s*)[\"']?([^\s\"']{6,})"),
-    re.compile(r"sk-[A-Za-z0-9_-]{16,}"),
-    re.compile(r"gh[pousr]_[A-Za-z0-9_]{20,}"),
-    re.compile(r"AKIA[0-9A-Z]{16}"),
+# (patrón, cómo reemplazar). El primer grupo que se quiere conservar se deja; el secreto se tapa.
+_RE_ASIGNA_SECRETO = re.compile(
+    r"(?i)([\"']?[A-Za-z0-9_.\-]*"
+    r"(?:api[_-]?key|access[_-]?key|private[_-]?key|secret|password|passwd|pwd|auth[_-]?token|token|"
+    r"contrase\w*|clave\w*)"
+    r"[\"']?\s*[:=]\s*)[\"']?([^\s\"',}]{5,})")
+_RE_URL_CRED = re.compile(r"(?i)\b([a-z][a-z0-9+.\-]*://[^\s:@/]+):([^\s:@/]{3,})@")
+PATRONES_SECRETOS = [  # se reemplazan por [REDACTADO] enteros
+    re.compile(r"\bsk-(?:proj-|ant-|or-)?[A-Za-z0-9_-]{16,}"),      # OpenAI / OpenRouter / Anthropic
+    re.compile(r"\bgsk_[A-Za-z0-9]{20,}"),                         # Groq
+    re.compile(r"\bAIza[A-Za-z0-9_\-]{20,}"),                      # Google / Gemini
+    re.compile(r"\bnvapi-[A-Za-z0-9_\-]{16,}"),                    # NVIDIA
+    re.compile(r"\bxai-[A-Za-z0-9]{16,}"),                         # xAI
+    re.compile(r"\b(?:github_pat|ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9_]{20,}"),  # GitHub
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),                           # AWS access key id
+    re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._\-]{12,}"),            # Authorization: Bearer …
 ]
 
 MAX_BYTES_LECTURA = 1_000_000
@@ -3612,8 +3648,11 @@ class ErrorRuta(ValueError):
 
 
 def redactar_secretos(texto: str) -> str:
-    limpio = PATRONES_SECRETOS[0].sub(lambda m: f"{m.group(1)}{m.group(2)}[REDACTADO]", texto)
-    for patron in PATRONES_SECRETOS[1:]:
+    if not texto:
+        return texto
+    limpio = _RE_ASIGNA_SECRETO.sub(lambda m: f"{m.group(1)}[REDACTADO]", texto)   # clave=... / "token": "..."
+    limpio = _RE_URL_CRED.sub(lambda m: f"{m.group(1)}:[REDACTADO]@", limpio)       # user:pass@host
+    for patron in PATRONES_SECRETOS:
         limpio = patron.sub("[REDACTADO]", limpio)
     return limpio
 
@@ -4349,7 +4388,12 @@ try:
 except ImportError:  # pragma: no cover - opcional
     _pyflakes_api = None
 
-_ENV_SECRETO = re.compile(r"(KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL)", re.I)
+# Variables de entorno que NO se pasan a los subprocesos del agente (podrían filtrar secretos del usuario).
+# Amplio a propósito: un comando de build que necesite una variable puntual se declara aparte, pero por
+# defecto el modelo y los procesos que lanza NO heredan credenciales ambientales.
+_ENV_SECRETO = re.compile(
+    r"(KEY|TOKEN|SECRET|PASSWORD|PASSWD|PASS|PWD|CREDENTIAL|CRED|AUTH|PRIVATE|SIGNING|BEARER|SESSION|COOKIE|"
+    r"DSN|CONTRASE|CLAVE|APIKEY|WEBHOOK|(?:^|_)PAT(?:$|_))", re.I)
 _CACHE_MODULOS: dict[str, bool] = {}
 _LOCK_IMPORTS = threading.Lock()
 MAX_SALIDA_PROCESO = 400_000
@@ -9201,6 +9245,10 @@ def execute_command(ctx: Contexto, p: dict) -> str:
     timeout = min(600, _entero(p.get("timeout"), ctx.settings.exec_timeout) or ctx.settings.exec_timeout)
     entrada = _entrada_estandar(p)
     r = ejecutar(comando, cwd=ctx.ws.raiz, timeout=timeout, shell=True, entrada=entrada)
+    # La salida de un comando arbitrario puede contener secretos (p.ej. `grep KEY .env`, `cat .clave_x`):
+    # se redacta ANTES de dársela al modelo y de que quede en la sesión guardada.
+    r.stdout, r.stderr = redactar_secretos(r.stdout), redactar_secretos(r.stderr)
+    r.comando = redactar_secretos(r.comando)        # el comando puede llevar un token (curl -H "Authorization: …")
     texto = r.resumen(limite=MAX_SALIDA // 2)
     if entrada is not None:
         texto = texto.replace("\n", f"\n(stdin: {len(entrada.splitlines())} línea(s))\n", 1)
@@ -9914,6 +9962,7 @@ def run_python(ctx: Contexto, p: dict) -> str:
         # Con entrada para input(): el código va por -c (sys.path[0] sigue siendo el proyecto) y stdin queda libre.
         r = ejecutar([sys.executable, "-c", codigo], cwd=ctx.ws.raiz, timeout=60, entrada=entrada)
     r.comando = "run_python"
+    r.stdout, r.stderr = redactar_secretos(r.stdout), redactar_secretos(r.stderr)   # no filtrar secretos al modelo
     texto = r.resumen(limite=MAX_SALIDA // 2).replace('File "<stdin>"', 'File "<fragmento>"').replace(
         'File "<string>"', 'File "<fragmento>"')
     if not r.ok and parece_interactivo(f"{r.stdout}\n{r.stderr}"):
@@ -26854,6 +26903,10 @@ class App:
             mensajes = self.principal.mensajes[1:][-60:]
             while mensajes and mensajes[0]["role"] != "user":
                 mensajes = mensajes[1:]
+            # Nunca persistir secretos en ~/reaper/sesiones (defensa en profundidad; la salida de comandos ya
+            # se redacta antes de llegar acá).
+            mensajes = [{**m, "content": redactar_secretos(m["content"])} if isinstance(m.get("content"), str)
+                        else m for m in mensajes]
             datos = {"mensajes": mensajes, "todo": self.principal.ctx.todo,
                      "historial": self.historial[-50:], "guardado": datetime.now().isoformat(timespec="seconds")}
             escritura_atomica(self._ruta_sesion(), json.dumps(datos, ensure_ascii=False))
@@ -43301,6 +43354,132 @@ class TestEquipoXUsuario(BaseTest):
 
 
 # ======================================================================
+# MÓDULO: autotest_fugas
+# ======================================================================
+"""
+Autotests anti-fuga (hallazgos de la caza de bugs): la clave de un proveedor nunca va a otro, un repo no
+confiable no puede redirigir el endpoint ni aflojar la red, los subprocesos no heredan secretos del usuario,
+y la salida de comandos / las sesiones guardadas no conservan secretos.
+"""
+
+
+class _BaseFuga(BaseTest):
+    _VARS = ("OPENROUTER_API_KEY", "GROQ_API_KEY", "GEMINI_API_KEY", "MISTRAL_API_KEY", "REAPER_CLAVE_PROVEEDOR")
+
+    def setUp(self):
+        super().setUp()
+        self._env_bak = {k: os.environ.pop(k, None) for k in self._VARS}
+
+    def tearDown(self):
+        for k, v in self._env_bak.items():
+            os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+        super().tearDown()
+
+
+class TestClaveNoCruzaProveedor(_BaseFuga):
+    def _cliente(self, api_key, **ajustes):
+        c = LLMClient(api_key, self.ajustes(**ajustes), url="http://falso", transporte=transporte_falso([]))
+        c.dormir = lambda _s: None
+        return c
+
+    def test_key_provider_a_never_sent_to_provider_b(self):
+        # cliente creado para openrouter; si el proveedor activo pasa a groq, la clave de openrouter NO se reusa
+        c = self._cliente("CLAVE-OPENROUTER", proveedor="openrouter")
+        c.settings = replace(c.settings, proveedor="groq")
+        os.environ["GROQ_API_KEY"] = "CLAVE-GROQ"
+        d_groq = destino_modelo("groq:openai/gpt-oss-120b", c.settings)
+        self.assertEqual(c._clave_de(d_groq), "CLAVE-GROQ")
+        d_or = destino_modelo("deepseek", replace(c.settings, proveedor="openrouter"))
+        self.assertEqual(c._clave_de(d_or), "CLAVE-OPENROUTER")   # solo su proveedor de origen
+
+    def test_sin_clave_del_destino_no_devuelve_la_de_otro(self):
+        c = self._cliente("CLAVE-OPENROUTER", proveedor="openrouter")
+        d_groq = destino_modelo("groq:openai/gpt-oss-120b", c.settings)   # sin GROQ_API_KEY
+        self.assertNotEqual(c._clave_de(d_groq), "CLAVE-OPENROUTER")
+        self.assertIn(c._clave_de(d_groq), (None, ""))
+
+    def test_headers_del_destino_llevan_solo_su_clave(self):
+        os.environ["GROQ_API_KEY"] = "CLAVE-GROQ"
+        c = self._cliente("CLAVE-OPENROUTER", proveedor="openrouter")
+        h = c._headers(destino_modelo("groq:openai/gpt-oss-120b", c.settings))
+        self.assertEqual(h.get("Authorization"), "Bearer CLAVE-GROQ")
+        self.assertNotIn("CLAVE-OPENROUTER", str(h))
+
+
+class TestProyectoNoRedirigeEndpoint(_BaseFuga):
+    def test_project_config_cannot_replace_provider_endpoint(self):
+        local = {"settings": {"api_url": "http://127.0.0.1:9/robar", "proveedor": "groq", "candidatos": 3}}
+        s = settings_con_local(Settings(), local)
+        self.assertEqual(s.api_url, "")                 # el api_url del repo se ignora
+        self.assertEqual(s.proveedor, "openrouter")     # el proveedor no lo cambia el repo
+        self.assertEqual(s.candidatos, 3)               # un override seguro sí se aplica
+        self.assertEqual(set(overrides_proyecto_ignorados(local)), {"api_url", "proveedor"})
+
+    def test_project_config_cannot_weaken_privacy_or_network(self):
+        base = Settings(privacidad_estricta=True, web=False)
+        s = settings_con_local(base, {"settings": {"privacidad_estricta": False, "web": True, "plugins": True}})
+        self.assertTrue(s.privacidad_estricta)          # el repo no apaga la privacidad estricta del usuario
+        self.assertFalse(s.web)
+
+
+class TestEntornoSinSecretos(_BaseFuga):
+    def test_subprocess_env_strips_secrets(self):
+        marcas = {"MI_API_KEY": "x", "DB_PASSWORD": "x", "SMTP_PASS": "x", "DB_PWD": "x", "NPM_AUTH": "x",
+                  "SENTRY_DSN": "x", "GH_PAT": "x", "CONTRASENA_DB": "x", "SIGNING_KEY": "x", "SESSION_SECRET": "x"}
+        for k, v in marcas.items():
+            os.environ[k] = v
+            self.addCleanup(os.environ.pop, k, None)
+        env = entorno_seguro()
+        for k in marcas:
+            self.assertNotIn(k, env, f"{k} no debería pasar al subproceso")
+        self.assertIn("PATH", env)                      # las variables inocuas siguen
+
+    def test_keeps_innocuous_vars(self):
+        os.environ["NODE_ENV"] = "test"; self.addCleanup(os.environ.pop, "NODE_ENV", None)
+        self.assertEqual(entorno_seguro().get("NODE_ENV"), "test")
+
+
+class TestRedaccionSecretos(_BaseFuga):
+    def test_formatos_de_clave_se_redactan(self):
+        claves = ["gsk_0AbCdEfGhIjKlMnOpQrStUvWxYz0123456789AbCdEfGhIj", "sk-or-v1-0123456789abcdef0123456789",
+                  "AIzaSyA0bCdEfGhIjKlMnOpQrStUvWxYz012345", "github_pat_11ABCDE0123456789abcdefgh",
+                  "nvapi-0123456789abcdefghijABCDEF"]
+        for k in claves:
+            self.assertNotIn(k, redactar_secretos("clave: " + k), k[:10])
+
+    def test_asignaciones_y_url(self):
+        self.assertIn("[REDACTADO]", redactar_secretos("MISTRAL_API_KEY=abcdefghijklmnop"))
+        self.assertIn("[REDACTADO]", redactar_secretos('{"api_key": "abcdefghijklmnop"}'))
+        self.assertNotIn("Secreta123", redactar_secretos("DATABASE_URL=postgres://u:Secreta123@h/db"))
+
+    def test_no_redacta_texto_inocuo(self):
+        for ok in ("author = 'Shakespeare fue un escritor'", "token_count = 5", "el total de palabras es 1234"):
+            self.assertEqual(redactar_secretos(ok), ok)
+
+
+class TestSalidaComandoRedactada(_BaseFuga):
+    def test_execute_command_redacta_la_salida(self):
+        ctx = self.contexto(self.proyecto({}), modo="auto")
+        salida = self.herramienta(ctx, "execute_command",
+                                  command="printf 'GROQ_API_KEY=gsk_0AbCdEfGhIjKlMnOpQrStUvWxYz0123456789AbCdEfGh\\n'")
+        self.assertIn("[REDACTADO]", salida)
+        self.assertNotIn("gsk_0AbCdEfGhIjKl", salida)
+
+    def test_sesion_guardada_no_conserva_secretos(self):
+        ws = self.proyecto({})
+        app = App(self.ajustes(modo="auto"), MockLLM([]), self.ui(), ws, persistir=True)
+        app.principal.mensajes = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "mirá el archivo"},
+            {"role": "assistant",
+             "content": "salida: GROQ_API_KEY=gsk_0AbCdEfGhIjKlMnOpQrStUvWxYz0123456789AbCdEfGh"}]
+        app._guardar_sesion()
+        texto = app._ruta_sesion().read_text(encoding="utf-8")
+        self.assertIn("[REDACTADO]", texto)
+        self.assertNotIn("gsk_0AbCdEfGhIjKl", texto)
+
+
+# ======================================================================
 # MÓDULO: autotest_runner
 # ======================================================================
 """Ejecutor del autotest interno."""
@@ -48897,9 +49076,13 @@ def main(argv: Optional[list] = None) -> int:
     # R-011: aplicar los overrides de .reaper/config.json del proyecto ANTES de construir el cliente, para que
     # candidatos/torneo/rpm/modelo/temperatura del proyecto manden de verdad (antes se definían y se ignoraban).
     if ws.config_local().get("settings"):
+        ignorados = overrides_proyecto_ignorados(ws.config_local())
         settings = preparar_settings_proyecto(settings, ws, args)
-        api_key = obtener_clave_api(settings) or api_key        # el proyecto pudo cambiar el proveedor
+        api_key = obtener_clave_api(settings) or api_key        # el proyecto pudo cambiar el modelo/proveedor
         ui.tenue("  Apliqué overrides de .reaper/config.json (settings del proyecto).")
+        if ignorados:
+            ui.aviso("  Ignoré claves inseguras del .reaper/config.json del proyecto (no cambian a dónde van "
+                     f"tus credenciales ni la red): {', '.join(sorted(ignorados))}.")
 
     llm = LLMClient(api_key, settings)
     llm.on_evento = lambda texto: ui.tenue(f"  ↻ {texto}")

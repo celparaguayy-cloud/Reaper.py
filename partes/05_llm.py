@@ -234,6 +234,9 @@ class LLMClient:
         transporte: Optional[Transporte] = None,
     ):
         self.api_key = api_key
+        # El api_key del constructor pertenece al proveedor activo AL CREAR el cliente. Si después cambia el
+        # proveedor (p.ej. un override del proyecto), esta clave NO se reutiliza para otro proveedor (BUG-001).
+        self._proveedor_api_key = settings.proveedor
         self.settings = settings
         self.url = url or settings.url_api()
         self.uso = Uso()
@@ -250,11 +253,17 @@ class LLMClient:
         return destino_modelo(modelo, self.settings)
 
     def _clave_de(self, destino: "DestinoModelo") -> Optional[str]:
-        if destino.proveedor == self.settings.proveedor:
-            return self.api_key
-        if destino.proveedor not in self._claves_proveedor:
-            self._claves_proveedor[destino.proveedor] = clave_de_proveedor(destino.proveedor, self.settings)
-        return self._claves_proveedor[destino.proveedor]
+        """
+        Clave del proveedor DESTINO. Cada endpoint recibe SOLO la clave de su propio proveedor: nunca la de
+        otro, ni el api_key del constructor si pertenece a un proveedor distinto (BUG-001, fuga entre proveedores).
+        """
+        prov = destino.proveedor
+        if prov not in self._claves_proveedor:
+            if prov == self._proveedor_api_key and self.api_key:
+                self._claves_proveedor[prov] = self.api_key
+            else:
+                self._claves_proveedor[prov] = clave_de_proveedor(prov, replace(self.settings, proveedor=prov))
+        return self._claves_proveedor[prov]
 
     def _respaldos_equipo(self, principal: str, ya: list) -> list:
         """

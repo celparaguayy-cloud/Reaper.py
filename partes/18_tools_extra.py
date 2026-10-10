@@ -534,6 +534,7 @@ def run_python(ctx: Contexto, p: dict) -> str:
         # Con entrada para input(): el código va por -c (sys.path[0] sigue siendo el proyecto) y stdin queda libre.
         r = ejecutar([sys.executable, "-c", codigo], cwd=ctx.ws.raiz, timeout=60, entrada=entrada)
     r.comando = "run_python"
+    r.stdout, r.stderr = redactar_secretos(r.stdout), redactar_secretos(r.stderr)   # no filtrar secretos al modelo
     texto = r.resumen(limite=MAX_SALIDA // 2).replace('File "<stdin>"', 'File "<fragmento>"').replace(
         'File "<string>"', 'File "<fragmento>"')
     if not r.ok and parece_interactivo(f"{r.stdout}\n{r.stderr}"):
