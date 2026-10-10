@@ -104,6 +104,13 @@ def main(argv: Optional[list] = None) -> int:
         ui.error(str(e) if not isinstance(e, KeyError) else f"No existe la plantilla {e}")
         return 1
 
+    # R-011: aplicar los overrides de .reaper/config.json del proyecto ANTES de construir el cliente, para que
+    # candidatos/torneo/rpm/modelo/temperatura del proyecto manden de verdad (antes se definían y se ignoraban).
+    if ws.config_local().get("settings"):
+        settings = settings_con_local(settings, ws.config_local())
+        api_key = obtener_clave_api(settings) or api_key        # el proyecto pudo cambiar el proveedor
+        ui.tenue("  Apliqué overrides de .reaper/config.json (settings del proyecto).")
+
     llm = LLMClient(api_key, settings)
     llm.on_evento = lambda texto: ui.tenue(f"  ↻ {texto}")
     app = App(settings, llm, ui, ws)

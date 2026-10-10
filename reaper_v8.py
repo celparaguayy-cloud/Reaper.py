@@ -35585,6 +35585,19 @@ class TestConfig(BaseTest):
         s = settings_con_local(Settings(), {"settings": {"candidatos": 2, "torneo": False}})
         self.assertEqual((s.candidatos, s.torneo), (2, False))
 
+    def test_overrides_proyecto_desde_archivo(self):
+        # R-011: los overrides de .reaper/config.json del proyecto SÍ se aplican (vía ws.config_local()).
+        ws = self.proyecto({".reaper/config.json": '{"settings": {"candidatos": 3, "torneo": false, "rpm": 7}}'})
+        s = settings_con_local(Settings(), ws.config_local())
+        self.assertEqual(s.candidatos, 3)
+        self.assertFalse(s.torneo)
+        self.assertEqual(s.rpm, 7)
+
+    def test_overrides_proyecto_sin_seccion_no_cambia(self):
+        ws = self.proyecto({".reaper/config.json": '{"hooks": {}}'})
+        base = Settings()
+        self.assertEqual(settings_con_local(base, ws.config_local()).candidatos, base.candidatos)
+
     def test_url_y_clave(self):
         s = Settings(proveedor="ollama")
         self.assertIn("11434", s.url_api())
@@ -47399,6 +47412,13 @@ def main(argv: Optional[list] = None) -> int:
     except (ErrorRuta, KeyError, FileExistsError, OSError) as e:
         ui.error(str(e) if not isinstance(e, KeyError) else f"No existe la plantilla {e}")
         return 1
+
+    # R-011: aplicar los overrides de .reaper/config.json del proyecto ANTES de construir el cliente, para que
+    # candidatos/torneo/rpm/modelo/temperatura del proyecto manden de verdad (antes se definían y se ignoraban).
+    if ws.config_local().get("settings"):
+        settings = settings_con_local(settings, ws.config_local())
+        api_key = obtener_clave_api(settings) or api_key        # el proyecto pudo cambiar el proveedor
+        ui.tenue("  Apliqué overrides de .reaper/config.json (settings del proyecto).")
 
     llm = LLMClient(api_key, settings)
     llm.on_evento = lambda texto: ui.tenue(f"  ↻ {texto}")

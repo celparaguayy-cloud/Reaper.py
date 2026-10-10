@@ -266,6 +266,19 @@ class TestConfig(BaseTest):
         s = settings_con_local(Settings(), {"settings": {"candidatos": 2, "torneo": False}})
         self.assertEqual((s.candidatos, s.torneo), (2, False))
 
+    def test_overrides_proyecto_desde_archivo(self):
+        # R-011: los overrides de .reaper/config.json del proyecto SÍ se aplican (vía ws.config_local()).
+        ws = self.proyecto({".reaper/config.json": '{"settings": {"candidatos": 3, "torneo": false, "rpm": 7}}'})
+        s = settings_con_local(Settings(), ws.config_local())
+        self.assertEqual(s.candidatos, 3)
+        self.assertFalse(s.torneo)
+        self.assertEqual(s.rpm, 7)
+
+    def test_overrides_proyecto_sin_seccion_no_cambia(self):
+        ws = self.proyecto({".reaper/config.json": '{"hooks": {}}'})
+        base = Settings()
+        self.assertEqual(settings_con_local(base, ws.config_local()).candidatos, base.candidatos)
+
     def test_url_y_clave(self):
         s = Settings(proveedor="ollama")
         self.assertIn("11434", s.url_api())
