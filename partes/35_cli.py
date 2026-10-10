@@ -1077,12 +1077,27 @@ class App:
                           f"{c['providers_chat_operational']} · free confirmado: {c['providers_free_confirmed']}")
             self.ui.tenue("  Un gateway (OpenRouter) es 1 proveedor, no cientos. Credencial presente ≠ autenticado.")
             return
-        if sub in ("probar", "sincronizar"):
+        if sub == "probar":
             candidatos = [p for p, d in PROVEEDORES.items()
                           if d["clave"] and clave_de_proveedor(p, replace(self.settings, proveedor=p))]
-            self.ui.info(f"Proveedores con credencial para probar: {', '.join(candidatos) or 'ninguno'}")
-            self.ui.aviso("  La prueba de conectividad real / catálogo vivo hace peticiones autorizadas; "
-                          "hasta ejecutarse con tu consentimiento y claves válidas: NO VERIFICADO.")
+            if not candidatos:
+                self.ui.aviso("Ningún proveedor tiene credencial configurada. Configurá con /proveedores configurar.")
+                return
+            self.ui.info(f"Probando (petición mínima 'ping', sin tu código) a: {', '.join(candidatos)}")
+            iconos = {"OK": "✓", "SIN_CLAVE": "—"}
+            for r in probar_proveedores(self.llm, self.settings, candidatos):
+                marca = iconos.get(r["estado"], "✗")
+                linea = f"  {marca} {r['proveedor']:<14} {r['estado']:<17} {r.get('modelo', '') or '—'}"
+                if r["estado"] == "OK":
+                    self.ui.ok(linea + f"  ({r['latencia_ms']}ms)")
+                else:
+                    self.ui.aviso(linea + (f"  {r['detalle']}" if r.get("detalle") else ""))
+            self.ui.tenue("  Credencial presente ≠ autenticado: esto SÍ distingue 401/403/404/429/timeout.")
+            return
+        if sub == "sincronizar":
+            self.ui.info("La sincronización del catálogo vivo se hace con /modelos sincronizar <archivo|url>.")
+            self.ui.tenue("  Luego /modelos descubrir y /modelos gratis. El directorio es dato no verificado "
+                          "hasta probar cada modelo con tu clave (/proveedores probar).")
             return
         self.ui.error("Uso: /proveedores [estado|configurar|estadisticas|probar|sincronizar|diagnostico]")
 

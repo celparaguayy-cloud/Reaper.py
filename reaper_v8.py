@@ -27310,12 +27310,27 @@ class App:
                           f"{c['providers_chat_operational']} · free confirmado: {c['providers_free_confirmed']}")
             self.ui.tenue("  Un gateway (OpenRouter) es 1 proveedor, no cientos. Credencial presente ≠ autenticado.")
             return
-        if sub in ("probar", "sincronizar"):
+        if sub == "probar":
             candidatos = [p for p, d in PROVEEDORES.items()
                           if d["clave"] and clave_de_proveedor(p, replace(self.settings, proveedor=p))]
-            self.ui.info(f"Proveedores con credencial para probar: {', '.join(candidatos) or 'ninguno'}")
-            self.ui.aviso("  La prueba de conectividad real / catálogo vivo hace peticiones autorizadas; "
-                          "hasta ejecutarse con tu consentimiento y claves válidas: NO VERIFICADO.")
+            if not candidatos:
+                self.ui.aviso("Ningún proveedor tiene credencial configurada. Configurá con /proveedores configurar.")
+                return
+            self.ui.info(f"Probando (petición mínima 'ping', sin tu código) a: {', '.join(candidatos)}")
+            iconos = {"OK": "✓", "SIN_CLAVE": "—"}
+            for r in probar_proveedores(self.llm, self.settings, candidatos):
+                marca = iconos.get(r["estado"], "✗")
+                linea = f"  {marca} {r['proveedor']:<14} {r['estado']:<17} {r.get('modelo', '') or '—'}"
+                if r["estado"] == "OK":
+                    self.ui.ok(linea + f"  ({r['latencia_ms']}ms)")
+                else:
+                    self.ui.aviso(linea + (f"  {r['detalle']}" if r.get("detalle") else ""))
+            self.ui.tenue("  Credencial presente ≠ autenticado: esto SÍ distingue 401/403/404/429/timeout.")
+            return
+        if sub == "sincronizar":
+            self.ui.info("La sincronización del catálogo vivo se hace con /modelos sincronizar <archivo|url>.")
+            self.ui.tenue("  Luego /modelos descubrir y /modelos gratis. El directorio es dato no verificado "
+                          "hasta probar cada modelo con tu clave (/proveedores probar).")
             return
         self.ui.error("Uso: /proveedores [estado|configurar|estadisticas|probar|sincronizar|diagnostico]")
 
@@ -41842,6 +41857,68 @@ class TestContadoresProveedores(BaseTest):
         self.assertEqual(con["providers_credentials_present"], base + 1)  # con su propia variable: cuenta
 
 
+class TestPruebaProveedor(BaseTest):
+    """R-005: /proveedores probar prueba de verdad y distingue la causa (no 'falló' a secas)."""
+
+    _VARS = ("OPENROUTER_API_KEY", "GROQ_API_KEY", "GEMINI_API_KEY", "NVIDIA_API_KEY", "VENICE_API_KEY")
+
+    def setUp(self):
+        super().setUp()
+        self._env_bak = {k: os.environ.pop(k, None) for k in self._VARS}
+
+    def tearDown(self):
+        for k, v in self._env_bak.items():
+            os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+        super().tearDown()
+
+    def _cliente(self, eventos, **ajustes):
+        c = LLMClient("clave", self.ajustes(**ajustes), url="http://falso", transporte=transporte_falso(eventos))
+        c.dormir = lambda _s: None
+        return c
+
+    def test_clasifica_por_causa(self):
+        casos = {
+            "Falta clave. HTTP 401. invalid api key": "AUTH_INVALIDA",
+            "Prohibido. HTTP 403. forbidden": "SIN_PERMISO",
+            "No existe. HTTP 404. model_not_found": "MODELO_INEXISTENTE",
+            "Lento. HTTP 429. rate limit": "LIMITE",
+            "Sin saldo. HTTP 402. payment required": "SIN_SALDO",
+            "Caído. HTTP 503. service unavailable": "CAIDO",
+            "timed out after 30s": "TIMEOUT",
+            "getaddrinfo failed": "RED",
+        }
+        for msg, esperado in casos.items():
+            estado, _ = clasificar_prueba_proveedor(LLMError(msg))
+            self.assertEqual(estado, esperado, msg)
+
+    def test_sin_clave_no_llama(self):
+        c = self._cliente([])                         # guion vacío: si intentara conectarse, reventaría
+        r = probar_proveedor(c, "groq", c.settings)
+        self.assertEqual(r["estado"], "SIN_CLAVE")
+        self.assertEqual(c.uso.llamadas, 0)
+
+    def test_ok_cuando_responde(self):
+        os.environ["OPENROUTER_API_KEY"] = "ok"
+        c = self._cliente(["pong"], proveedor="openrouter")
+        r = probar_proveedor(c, "openrouter", c.settings)
+        self.assertEqual(r["estado"], "OK")
+        self.assertTrue(r["modelo"])
+        self.assertIn("checked_at", r)
+
+    def test_404_da_modelo_inexistente(self):
+        os.environ["OPENROUTER_API_KEY"] = "ok"
+        c = self._cliente([LLMError("No existe. HTTP 404. model_not_found", probar_otro_modelo=True)],
+                          proveedor="openrouter")
+        r = probar_proveedor(c, "openrouter", c.settings)
+        self.assertEqual(r["estado"], "MODELO_INEXISTENTE")
+
+    def test_cli_probar_sin_claves_avisa(self):
+        app = App(self.ajustes(forense=False, escalar=False), self._cliente([]), self.ui(), self.proyecto(),
+                  persistir=False)
+        app.comando("/proveedores probar")
+        self.assertIn("credencial", app.ui.texto_registrado().lower())
+
+
 class TestFabricCLI(BaseTest):
     def test_comando_estadisticas(self):
         ws = self.proyecto()
@@ -47095,6 +47172,94 @@ def _hay_credencial(m: ManifiestoProveedor, settings) -> bool:
         except (TypeError, ValueError, KeyError):
             pass
     return bool(os.getenv(m.auth_env_var))    # manifiesto externo: su propia variable, nunca la de otro
+
+
+# ---------------------------------------------------------------------------------------------------------
+# Prueba de capacidad real por proveedor (R-005): /proveedores probar deja de ser un marcador.
+# ---------------------------------------------------------------------------------------------------------
+# Cada estado distingue la CAUSA (no "falló" a secas): credencial presente ≠ autenticado ≠ modelo permitido.
+ESTADOS_PRUEBA_PROVEEDOR = ("OK", "SIN_CLAVE", "AUTH_INVALIDA", "SIN_PERMISO", "MODELO_INEXISTENTE",
+                            "LIMITE", "SIN_SALDO", "CAIDO", "TIMEOUT", "RED", "ERROR")
+_RE_HTTP_STATUS = re.compile(r"\bHTTP\s+(\d{3})\b")
+
+
+def clasificar_prueba_proveedor(exc) -> tuple:
+    """Clasifica el error de una petición de prueba por CAUSA (estado, detalle). No envía código del proyecto."""
+    msg = str(exc)
+    m = _RE_HTTP_STATUS.search(msg)
+    if m:
+        code = int(m.group(1))
+        mapa = {401: "AUTH_INVALIDA", 403: "SIN_PERMISO", 404: "MODELO_INEXISTENTE",
+                429: "LIMITE", 402: "SIN_SALDO"}
+        if code in mapa:
+            return mapa[code], msg[:160]
+        if code == 408 or 500 <= code < 600:
+            return "CAIDO", msg[:160]
+        return "ERROR", msg[:160]
+    bajo = msg.lower()
+    if any(s in bajo for s in ("model_not_found", "does not exist", "no such model", "modelo o endpoint no disponible")):
+        return "MODELO_INEXISTENTE", msg[:160]
+    if any(s in bajo for s in ("timeout", "timed out", "intentos")):
+        return "TIMEOUT", msg[:160]
+    if any(s in bajo for s in ("getaddrinfo", "name resolution", "connection refused", "no se pudo conectar", "dns")):
+        return "RED", msg[:160]
+    return "ERROR", msg[:160]
+
+
+def _modelo_representativo(proveedor: str, settings, modelo: Optional[str] = None) -> str:
+    """Un alias cuyo DESTINO sea ESE proveedor con estos settings (prefiere free). '' si no se conoce ninguno."""
+    if modelo:
+        return modelo
+    frees = [a for a, info in INFO_MODELOS.items()
+             if getattr(info, "free", False) and destino_modelo(a, settings).proveedor == proveedor]
+    if frees:
+        return frees[0]
+    for a in INFO_MODELOS:
+        if destino_modelo(a, settings).proveedor == proveedor:
+            return a
+    return ""
+
+
+def probar_proveedor(llm, proveedor: str, settings, *, modelo: Optional[str] = None) -> dict:
+    """
+    Prueba REAL de un proveedor: petición mínima ('ping', max_tokens=1), SIN código del proyecto, un solo
+    intento, y clasifica el resultado por causa. Registra checked_at. Requiere consentimiento y claves
+    válidas; hasta ejecutarse con red real el resultado es NO VERIFICADO.
+    """
+    reg = {"proveedor": proveedor, "checked_at": datetime.now().isoformat(timespec="seconds"),
+           "estado": "ERROR", "detalle": "", "latencia_ms": 0, "modelo": ""}
+    datos = PROVEEDORES.get(proveedor, {})
+    try:
+        tiene = bool(clave_de_proveedor(proveedor, replace(settings, proveedor=proveedor)))
+    except (TypeError, ValueError, KeyError):
+        tiene = bool(datos.get("clave") and os.getenv(datos["clave"]))
+    if datos.get("clave") and (not tiene or tiene == "sin-clave"):
+        reg["estado"], reg["detalle"] = "SIN_CLAVE", "falta credencial del proveedor (export de su variable)"
+        return reg
+    modelo = _modelo_representativo(proveedor, settings, modelo)
+    if not modelo:
+        reg["detalle"] = "no hay un modelo conocido para probar este proveedor"
+        return reg
+    reg["modelo"] = modelo
+    t0 = time.monotonic()
+    try:
+        llm.chat([{"role": "user", "content": "ping"}], modelo=modelo, max_tokens=1, temperatura=0,
+                 sin_respaldo=True, rol="probe")
+        reg["estado"], reg["detalle"] = "OK", "responde"
+    except LLMError as e:
+        reg["estado"], reg["detalle"] = clasificar_prueba_proveedor(e)
+    except (OSError, ValueError, RuntimeError) as e:
+        reg["estado"], reg["detalle"] = clasificar_prueba_proveedor(e)
+    reg["latencia_ms"] = round((time.monotonic() - t0) * 1000)
+    return reg
+
+
+def probar_proveedores(llm, settings, proveedores: Sequence[str] = ()) -> list:
+    """Prueba cada proveedor pedido (o todos los que tengan credencial). Dedup implícito por proveedor."""
+    if not proveedores:
+        proveedores = [p for p, d in PROVEEDORES.items()
+                       if not d.get("clave") or clave_de_proveedor(p, replace(settings, proveedor=p))]
+    return [probar_proveedor(llm, p, settings) for p in proveedores]
 
 
 def contadores_proveedores(settings, manifiestos_extra: Sequence[ManifiestoProveedor] = ()) -> dict:

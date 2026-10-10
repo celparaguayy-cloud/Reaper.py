@@ -144,6 +144,68 @@ class TestContadoresProveedores(BaseTest):
         self.assertEqual(con["providers_credentials_present"], base + 1)  # con su propia variable: cuenta
 
 
+class TestPruebaProveedor(BaseTest):
+    """R-005: /proveedores probar prueba de verdad y distingue la causa (no 'falló' a secas)."""
+
+    _VARS = ("OPENROUTER_API_KEY", "GROQ_API_KEY", "GEMINI_API_KEY", "NVIDIA_API_KEY", "VENICE_API_KEY")
+
+    def setUp(self):
+        super().setUp()
+        self._env_bak = {k: os.environ.pop(k, None) for k in self._VARS}
+
+    def tearDown(self):
+        for k, v in self._env_bak.items():
+            os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+        super().tearDown()
+
+    def _cliente(self, eventos, **ajustes):
+        c = LLMClient("clave", self.ajustes(**ajustes), url="http://falso", transporte=transporte_falso(eventos))
+        c.dormir = lambda _s: None
+        return c
+
+    def test_clasifica_por_causa(self):
+        casos = {
+            "Falta clave. HTTP 401. invalid api key": "AUTH_INVALIDA",
+            "Prohibido. HTTP 403. forbidden": "SIN_PERMISO",
+            "No existe. HTTP 404. model_not_found": "MODELO_INEXISTENTE",
+            "Lento. HTTP 429. rate limit": "LIMITE",
+            "Sin saldo. HTTP 402. payment required": "SIN_SALDO",
+            "Caído. HTTP 503. service unavailable": "CAIDO",
+            "timed out after 30s": "TIMEOUT",
+            "getaddrinfo failed": "RED",
+        }
+        for msg, esperado in casos.items():
+            estado, _ = clasificar_prueba_proveedor(LLMError(msg))
+            self.assertEqual(estado, esperado, msg)
+
+    def test_sin_clave_no_llama(self):
+        c = self._cliente([])                         # guion vacío: si intentara conectarse, reventaría
+        r = probar_proveedor(c, "groq", c.settings)
+        self.assertEqual(r["estado"], "SIN_CLAVE")
+        self.assertEqual(c.uso.llamadas, 0)
+
+    def test_ok_cuando_responde(self):
+        os.environ["OPENROUTER_API_KEY"] = "ok"
+        c = self._cliente(["pong"], proveedor="openrouter")
+        r = probar_proveedor(c, "openrouter", c.settings)
+        self.assertEqual(r["estado"], "OK")
+        self.assertTrue(r["modelo"])
+        self.assertIn("checked_at", r)
+
+    def test_404_da_modelo_inexistente(self):
+        os.environ["OPENROUTER_API_KEY"] = "ok"
+        c = self._cliente([LLMError("No existe. HTTP 404. model_not_found", probar_otro_modelo=True)],
+                          proveedor="openrouter")
+        r = probar_proveedor(c, "openrouter", c.settings)
+        self.assertEqual(r["estado"], "MODELO_INEXISTENTE")
+
+    def test_cli_probar_sin_claves_avisa(self):
+        app = App(self.ajustes(forense=False, escalar=False), self._cliente([]), self.ui(), self.proyecto(),
+                  persistir=False)
+        app.comando("/proveedores probar")
+        self.assertIn("credencial", app.ui.texto_registrado().lower())
+
+
 class TestFabricCLI(BaseTest):
     def test_comando_estadisticas(self):
         ws = self.proyecto()
