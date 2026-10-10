@@ -1118,6 +1118,40 @@ class App:
             return
         self.ui.error("Uso: /forge listar | demo | verificar <id> | ejecutar <id> [archivo]")
 
+    def cmd_entregar(self, arg: str) -> None:
+        """Copia un archivo del proyecto al almacenamiento de Android y VERIFICA la llegada (sha256). No usa mv."""
+        partes = (arg or "").split()
+        seco = "--dry-run" in partes or "--seco" in partes
+        partes = [p for p in partes if not p.startswith("--")]
+        if not partes:
+            self.ui.error("Uso: /entregar <archivo> [destino]  (copia verificada; --dry-run para simular)")
+            return
+        try:
+            origen = Path(self.ws.ruta(partes[0]))
+        except (ErrorRuta, ValueError) as e:
+            self.ui.error(f"No encuentro {partes[0]}: {e}")
+            return
+        if not origen.is_file():
+            self.ui.error(f"{partes[0]} no es un archivo.")
+            return
+        if len(partes) > 1:                     # destino explícito del usuario
+            elegido = Path(partes[1]).expanduser()
+            # dir si: ya existe como dir, termina en separador, o no tiene extensión de archivo
+            es_dir = elegido.is_dir() or partes[1].endswith(("/", os.sep)) or not elegido.suffix
+            destino = (elegido / origen.name) if es_dir else elegido
+            externo = True
+        else:
+            destino, externo = ruta_destino_android(origen.name)
+        if seco:
+            self.ui.info(f"[dry-run] copiaría {origen} → {destino} (externo={externo}); no escribo nada.")
+            return
+        recibo = entregar_archivo(origen, destino, externo=externo, journal=JournalEntregas())
+        self.ui.linea(recibo.texto())
+        if recibo.verified and not externo:
+            self.ui.tenue("  (sin acceso a /sdcard: quedó en la carpeta interna de REAPER; compartila desde ahí)")
+        if recibo.verified:
+            self.ui.ok(f"Entregado y verificado en: {recibo.destination}")
+
     def cmd_muestra(self, arg: str) -> None:
         """Análisis ESTÁTICO de una muestra local (hashes, formato, entropía, strings, IOCs). No la ejecuta."""
         ruta = (arg or "").strip()

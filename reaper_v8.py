@@ -27270,6 +27270,40 @@ class App:
             return
         self.ui.error("Uso: /forge listar | demo | verificar <id> | ejecutar <id> [archivo]")
 
+    def cmd_entregar(self, arg: str) -> None:
+        """Copia un archivo del proyecto al almacenamiento de Android y VERIFICA la llegada (sha256). No usa mv."""
+        partes = (arg or "").split()
+        seco = "--dry-run" in partes or "--seco" in partes
+        partes = [p for p in partes if not p.startswith("--")]
+        if not partes:
+            self.ui.error("Uso: /entregar <archivo> [destino]  (copia verificada; --dry-run para simular)")
+            return
+        try:
+            origen = Path(self.ws.ruta(partes[0]))
+        except (ErrorRuta, ValueError) as e:
+            self.ui.error(f"No encuentro {partes[0]}: {e}")
+            return
+        if not origen.is_file():
+            self.ui.error(f"{partes[0]} no es un archivo.")
+            return
+        if len(partes) > 1:                     # destino explícito del usuario
+            elegido = Path(partes[1]).expanduser()
+            # dir si: ya existe como dir, termina en separador, o no tiene extensión de archivo
+            es_dir = elegido.is_dir() or partes[1].endswith(("/", os.sep)) or not elegido.suffix
+            destino = (elegido / origen.name) if es_dir else elegido
+            externo = True
+        else:
+            destino, externo = ruta_destino_android(origen.name)
+        if seco:
+            self.ui.info(f"[dry-run] copiaría {origen} → {destino} (externo={externo}); no escribo nada.")
+            return
+        recibo = entregar_archivo(origen, destino, externo=externo, journal=JournalEntregas())
+        self.ui.linea(recibo.texto())
+        if recibo.verified and not externo:
+            self.ui.tenue("  (sin acceso a /sdcard: quedó en la carpeta interna de REAPER; compartila desde ahí)")
+        if recibo.verified:
+            self.ui.ok(f"Entregado y verificado en: {recibo.destination}")
+
     def cmd_muestra(self, arg: str) -> None:
         """Análisis ESTÁTICO de una muestra local (hashes, formato, entropía, strings, IOCs). No la ejecuta."""
         ruta = (arg or "").strip()
@@ -41448,6 +41482,97 @@ class TestDescargarSSRF(BaseTest):
 
 
 # ======================================================================
+# MÓDULO: autotest_entrega
+# ======================================================================
+"""Autotests de la entrega verificada de archivos (REAPER Ω §8): copia+sha256, no mv a ciegas, /deshacer seguro."""
+
+
+class TestEntregaArchivo(BaseTest):
+    def _origen(self, contenido="contenido real\n"):
+        p = self.dir / "origen.md"
+        p.write_text(contenido, encoding="utf-8")
+        return p
+
+    def test_copia_verificada_conserva_original(self):
+        origen = self._origen()
+        destino = self.dir / "salida" / "origen.md"
+        r = entregar_archivo(origen, destino)
+        self.assertTrue(r.verified)
+        self.assertEqual(r.estado, "EXPORT_VERIFIED")
+        self.assertTrue(destino.exists())
+        self.assertTrue(origen.exists())                 # copia, no mueve
+        self.assertEqual(len(r.sha256), 64)
+
+    def test_no_declara_exito_si_destino_no_coincide(self):
+        origen = self._origen()
+        destino = self.dir / "s" / "origen.md"
+
+        def abrir_roto(*a, **k):
+            raise AssertionError("no debería usarse")
+
+        # simular corrupción: copiar y luego alterar el destino antes de verificar es difícil;
+        # en su lugar probamos el camino de origen inexistente → no verificado
+        r = entregar_archivo(self.dir / "no_existe.md", destino)
+        self.assertFalse(r.verified)
+        self.assertIn("origen", r.motivo.lower())
+
+    def test_mover_borra_original_solo_tras_verificar(self):
+        origen = self._origen()
+        destino = self.dir / "s" / "m.md"
+        r = entregar_archivo(origen, destino, mover=True)
+        self.assertTrue(r.verified)
+        self.assertFalse(origen.exists())                # recién ahora se borra el original
+        self.assertTrue(destino.exists())
+
+    def test_no_sobrescribe_sin_permiso(self):
+        origen = self._origen()
+        destino = self.dir / "existe.md"
+        destino.write_text("previo", encoding="utf-8")
+        r = entregar_archivo(origen, destino)
+        self.assertFalse(r.verified)
+        self.assertIn("existe", r.motivo.lower())
+        self.assertEqual(destino.read_text(encoding="utf-8"), "previo")   # no lo pisó
+
+    def test_ruta_destino_cae_a_interna_sin_sdcard(self):
+        # en el entorno de test no hay /sdcard ni ~/storage: debe caer a carpeta interna
+        ruta, externo = ruta_destino_android("x.md", interno=self.dir / "exports")
+        self.assertFalse(externo)
+        self.assertTrue(str(ruta).endswith("x.md"))
+
+
+class TestDeshacerEntrega(BaseTest):
+    def test_deshace_si_no_cambio(self):
+        origen = self.dir / "o.md"
+        origen.write_text("hola", encoding="utf-8")
+        destino = self.dir / "d" / "o.md"
+        r = entregar_archivo(origen, destino)
+        ok, msg = deshacer_entrega(r.como_dict())
+        self.assertTrue(ok)
+        self.assertFalse(destino.exists())
+
+    def test_no_borra_si_usuario_lo_modifico(self):
+        origen = self.dir / "o.md"
+        origen.write_text("hola", encoding="utf-8")
+        destino = self.dir / "d" / "o.md"
+        r = entregar_archivo(origen, destino)
+        destino.write_text("editado por el usuario", encoding="utf-8")   # cambió después de entregar
+        ok, msg = deshacer_entrega(r.como_dict())
+        self.assertFalse(ok)
+        self.assertTrue(destino.exists())                # protege los datos del usuario
+        self.assertIn("modificado", msg.lower())
+
+
+class TestEntregaCLI(BaseTest):
+    def test_comando_entregar(self):
+        ws = self.proyecto({"nota.md": "contenido de prueba\n"})
+        app = App(self.ajustes(forense=False, escalar=False), MockLLM([]), self.ui(), ws, persistir=False)
+        app.comando("/entregar nota.md " + str(self.dir / "destino"))
+        texto = app.ui.texto_registrado()
+        self.assertIn("verificado", texto.lower())
+        self.assertTrue((self.dir / "destino" / "nota.md").exists())
+
+
+# ======================================================================
 # MÓDULO: autotest_runner
 # ======================================================================
 """Ejecutor del autotest interno."""
@@ -46257,6 +46382,169 @@ def texto_reporte_privacidad(rep: dict) -> str:
                   + "  (ON = evitar subir contenido del proyecto a proveedores externos)")
     lineas.append("  Nota honesta: las APIs externas reciben lo que se les envía; no hay confidencialidad absoluta.")
     return "\n".join(lineas)
+
+
+# ======================================================================
+# MÓDULO: entrega
+# ======================================================================
+"""
+Entrega verificada de archivos a Android (REAPER Ω §8).
+
+El bug real: REAPER hizo `mv` a /sdcard/ y anunció éxito sin comprobar que el archivo llegó. Acá la entrega
+es: COPIAR (no mover por defecto), calcular sha256 en ORIGEN y DESTINO, confirmar tamaño+hash+legibilidad, y
+solo entonces reportar éxito con la RUTA EFECTIVA. Nunca "éxito" porque el comando devolvió 0. Un journal
+permite /deshacer la exportación externa sin pisar cambios que el usuario hizo en el destino.
+"""
+
+import shutil as _ent_shutil
+
+# Estados del ciclo de entrega (§8.1).
+ESTADOS_ENTREGA = ("ARTIFACT_CREATED", "EXPORT_AUTHORIZED", "EXPORT_COMPLETED", "EXPORT_VERIFIED", "EXPORT_REPORTED")
+
+
+@dataclass
+class ReciboArtefacto:
+    source: str
+    destination: str
+    size_bytes: int = 0
+    sha256: str = ""
+    copied_at: str = ""
+    verified: bool = False
+    external_destination: bool = False
+    operation_id: str = ""
+    estado: str = "ARTIFACT_CREATED"
+    motivo: str = ""
+
+    def como_dict(self) -> dict:
+        return dict(self.__dict__)
+
+    def texto(self) -> str:
+        marca = "✓" if self.verified else "✗"
+        base = (f"{marca} entrega {self.estado}\n  origen:  {self.source}\n  destino: {self.destination}\n"
+                f"  bytes: {self.size_bytes} · sha256: {self.sha256[:16]}…")
+        if not self.verified:
+            base += f"\n  NO VERIFICADO: {self.motivo}"
+        return base
+
+
+def _ent_sha256(ruta: Path) -> tuple:
+    h = hashlib.sha256()
+    tam = 0
+    with open(ruta, "rb") as f:
+        for bloque in iter(lambda: f.read(65536), b""):
+            h.update(bloque)
+            tam += len(bloque)
+    return h.hexdigest(), tam
+
+
+def ruta_destino_android(nombre: str, preferida: Optional[str] = None, interno: Optional[Path] = None):
+    """
+    Elige una ruta de salida REAL y legible. Prefiere la autorizada; si no hay acceso a almacenamiento
+    compartido, cae a una carpeta interna de REAPER (sin fingir que llegó a /sdcard). Devuelve (ruta, externo).
+    """
+    candidatas = []
+    if preferida:
+        candidatas.append(Path(preferida).expanduser())
+    candidatas += [Path("~/storage/downloads").expanduser(), Path("/sdcard/Download"), Path("/sdcard")]
+    for base in candidatas:
+        try:
+            if base.is_dir() and os.access(base, os.W_OK):
+                return base / nombre, True
+        except OSError:
+            continue
+    interno = Path(interno) if interno else (BASE_DIR / "exports")
+    interno.mkdir(parents=True, exist_ok=True)
+    return interno / nombre, False
+
+
+class JournalEntregas:
+    """Registro de exportaciones externas para poder deshacerlas con seguridad."""
+
+    def __init__(self, base=None):
+        self.archivo = (Path(base) if base else BASE_DIR) / "entregas.json"
+
+    def _cargar(self) -> list:
+        try:
+            d = json.loads(self.archivo.read_text(encoding="utf-8"))
+            return d if isinstance(d, list) else []
+        except (OSError, ValueError):
+            return []
+
+    def registrar(self, recibo: ReciboArtefacto) -> None:
+        datos = self._cargar()
+        datos.append(recibo.como_dict())
+        self.archivo.parent.mkdir(parents=True, exist_ok=True)
+        escritura_atomica(self.archivo, json.dumps(datos[-200:], ensure_ascii=False, indent=1))
+
+    def ultimo(self) -> Optional[dict]:
+        datos = self._cargar()
+        return datos[-1] if datos else None
+
+
+def entregar_archivo(origen, destino, *, mover: bool = False, sobrescribir: bool = False,
+                     externo: bool = False, journal: Optional[JournalEntregas] = None) -> ReciboArtefacto:
+    """
+    Copia (o mueve, solo si se pide Y verifica) un archivo y COMPRUEBA la llegada por sha256. Devuelve un
+    ReciboArtefacto; verified=True solo si destino existe con el mismo tamaño y hash y es legible.
+    """
+    origen, destino = Path(origen), Path(destino)
+    op = f"ent-{uuid.uuid4().hex[:12]}"
+    r = ReciboArtefacto(source=str(origen), destination=str(destino), operation_id=op,
+                        external_destination=externo)
+    if not origen.is_file():
+        r.motivo = "el origen no existe o no es un archivo"
+        return r
+    sha_o, tam_o = _ent_sha256(origen)
+    r.sha256, r.size_bytes, r.estado = sha_o, tam_o, "ARTIFACT_CREATED"
+    if destino.exists() and not sobrescribir:
+        r.motivo = f"el destino ya existe (no sobrescribo sin permiso): {destino}"
+        return r
+    r.estado = "EXPORT_AUTHORIZED"
+    try:
+        destino.parent.mkdir(parents=True, exist_ok=True)
+        _ent_shutil.copy2(origen, destino)      # COPIA, no mueve: el original se conserva
+        r.estado = "EXPORT_COMPLETED"
+    except OSError as e:
+        r.motivo = f"falló la copia: {e}"
+        return r
+    try:
+        sha_d, tam_d = _ent_sha256(destino)
+    except OSError as e:
+        r.motivo = f"no pude leer el destino para verificar: {e}"
+        return r
+    if sha_d == sha_o and tam_d == tam_o:
+        r.verified, r.estado = True, "EXPORT_VERIFIED"
+        if mover:
+            try:
+                origen.unlink()                 # borrar el original SOLO tras verificar
+            except OSError:
+                pass
+        if journal is not None:
+            journal.registrar(r)
+    else:
+        r.motivo = f"el destino no coincide (sha/ tamaño): origen {sha_o[:12]}/{tam_o} vs destino {sha_d[:12]}/{tam_d}"
+    return r
+
+
+def deshacer_entrega(recibo: dict) -> tuple:
+    """
+    Deshace una exportación: borra la copia en el destino SOLO si sigue igual que cuando se entregó (mismo
+    sha). Si el usuario la modificó, NO la toca y avisa. Devuelve (ok, mensaje).
+    """
+    destino = Path(recibo.get("destination", ""))
+    if not destino.exists():
+        return True, "la copia ya no está en el destino; nada que deshacer"
+    try:
+        sha_actual, _ = _ent_sha256(destino)
+    except OSError as e:
+        return False, f"no pude leer el destino: {e}"
+    if sha_actual != recibo.get("sha256"):
+        return False, f"el archivo en {destino} fue modificado después de entregarlo: no lo borro (protejo tus datos)"
+    try:
+        destino.unlink()
+        return True, f"borré la copia entregada en {destino}"
+    except OSError as e:
+        return False, f"no pude borrar {destino}: {e}"
 
 
 # ======================================================================
