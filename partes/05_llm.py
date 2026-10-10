@@ -181,24 +181,39 @@ class LimitadorTasa:
         self._lock = threading.Lock()
 
     def espera_necesaria(self) -> float:
+        """Peek SIN reservar: cuánto habría que esperar ahora mismo (0 = hay lugar)."""
         if self.rpm <= 0:
             return 0.0
         with self._lock:
+            return self._espera_bloqueado(self._reloj())
+
+    def _espera_bloqueado(self, ahora: float) -> float:
+        while self._marcas and ahora - self._marcas[0] >= 60.0:
+            self._marcas.popleft()
+        if len(self._marcas) < self.rpm:
+            return 0.0
+        return max(0.0, 60.0 - (ahora - self._marcas[0]) + 0.05)
+
+    def _reservar(self) -> float:
+        """
+        Atómico (R-007): si hay lugar, RESERVA el turno (append) y devuelve 0; si no, devuelve la espera sin
+        reservar. Chequear-y-reservar en el MISMO lock evita que dos hilos pasen el chequeo y superen el rpm.
+        """
+        with self._lock:
             ahora = self._reloj()
-            while self._marcas and ahora - self._marcas[0] >= 60.0:
-                self._marcas.popleft()
-            if len(self._marcas) < self.rpm:
-                return 0.0
-            return max(0.0, 60.0 - (ahora - self._marcas[0]) + 0.05)
+            espera = self._espera_bloqueado(ahora)
+            if espera <= 0:
+                self._marcas.append(ahora)
+            return espera
 
     def adquirir(self, cancelado: Optional[Callable[[], bool]] = None) -> float:
         """Bloquea hasta que haya lugar. Devuelve los segundos esperados."""
+        if self.rpm <= 0:
+            return 0.0
         esperado = 0.0
         while True:
-            espera = self.espera_necesaria()
+            espera = self._reservar()
             if espera <= 0:
-                with self._lock:
-                    self._marcas.append(self._reloj())
                 return esperado
             tramo = min(espera, 1.0)
             if cancelado and cancelado():

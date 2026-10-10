@@ -169,3 +169,32 @@ class TestRobustezModeloTorpe(BaseTest):
                 self.assertTrue((ws.raiz / "saludo.py").exists())
                 self.assertIn("Hola, {nombre}!", ws.leer("saludo.py"))
                 self.assertTrue(res.ok, res.resumen[:200])
+
+
+class TestLimitadorConcurrencia(BaseTest):
+    """R-007: chequear-y-reservar es atómico — N hilos nunca superan el rpm en la ventana."""
+
+    def test_no_supera_rpm_con_muchos_hilos(self):
+        rpm = 5
+        lim = LimitadorTasa(rpm, reloj=lambda: 0.0, dormir=lambda _s: None)   # reloj congelado: nadie expira
+        reservados = []
+        barrera = threading.Barrier(20)
+
+        def intentar():
+            barrera.wait()                       # todos arrancan a la vez (máxima contención)
+            if lim._reservar() <= 0:
+                reservados.append(1)
+
+        hilos = [threading.Thread(target=intentar) for _ in range(20)]
+        for h in hilos:
+            h.start()
+        for h in hilos:
+            h.join()
+        self.assertEqual(sum(reservados), rpm)   # exactamente rpm turnos, ni uno más (sin carrera TOCTOU)
+
+    def test_peek_no_reserva(self):
+        lim = LimitadorTasa(1, reloj=lambda: 0.0, dormir=lambda _s: None)
+        self.assertEqual(lim.espera_necesaria(), 0.0)   # peek repetido no consume el turno
+        self.assertEqual(lim.espera_necesaria(), 0.0)
+        self.assertEqual(lim.adquirir(), 0.0)           # el primer adquirir sí reserva
+        self.assertGreater(lim.espera_necesaria(), 0.0)  # ahora no hay lugar

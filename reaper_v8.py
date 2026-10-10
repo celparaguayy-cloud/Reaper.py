@@ -2231,24 +2231,39 @@ class LimitadorTasa:
         self._lock = threading.Lock()
 
     def espera_necesaria(self) -> float:
+        """Peek SIN reservar: cuánto habría que esperar ahora mismo (0 = hay lugar)."""
         if self.rpm <= 0:
             return 0.0
         with self._lock:
+            return self._espera_bloqueado(self._reloj())
+
+    def _espera_bloqueado(self, ahora: float) -> float:
+        while self._marcas and ahora - self._marcas[0] >= 60.0:
+            self._marcas.popleft()
+        if len(self._marcas) < self.rpm:
+            return 0.0
+        return max(0.0, 60.0 - (ahora - self._marcas[0]) + 0.05)
+
+    def _reservar(self) -> float:
+        """
+        Atómico (R-007): si hay lugar, RESERVA el turno (append) y devuelve 0; si no, devuelve la espera sin
+        reservar. Chequear-y-reservar en el MISMO lock evita que dos hilos pasen el chequeo y superen el rpm.
+        """
+        with self._lock:
             ahora = self._reloj()
-            while self._marcas and ahora - self._marcas[0] >= 60.0:
-                self._marcas.popleft()
-            if len(self._marcas) < self.rpm:
-                return 0.0
-            return max(0.0, 60.0 - (ahora - self._marcas[0]) + 0.05)
+            espera = self._espera_bloqueado(ahora)
+            if espera <= 0:
+                self._marcas.append(ahora)
+            return espera
 
     def adquirir(self, cancelado: Optional[Callable[[], bool]] = None) -> float:
         """Bloquea hasta que haya lugar. Devuelve los segundos esperados."""
+        if self.rpm <= 0:
+            return 0.0
         esperado = 0.0
         while True:
-            espera = self.espera_necesaria()
+            espera = self._reservar()
             if espera <= 0:
-                with self._lock:
-                    self._marcas.append(self._reloj())
                 return esperado
             tramo = min(espera, 1.0)
             if cancelado and cancelado():
@@ -38818,6 +38833,35 @@ class TestRobustezModeloTorpe(BaseTest):
                 self.assertTrue((ws.raiz / "saludo.py").exists())
                 self.assertIn("Hola, {nombre}!", ws.leer("saludo.py"))
                 self.assertTrue(res.ok, res.resumen[:200])
+
+
+class TestLimitadorConcurrencia(BaseTest):
+    """R-007: chequear-y-reservar es atómico — N hilos nunca superan el rpm en la ventana."""
+
+    def test_no_supera_rpm_con_muchos_hilos(self):
+        rpm = 5
+        lim = LimitadorTasa(rpm, reloj=lambda: 0.0, dormir=lambda _s: None)   # reloj congelado: nadie expira
+        reservados = []
+        barrera = threading.Barrier(20)
+
+        def intentar():
+            barrera.wait()                       # todos arrancan a la vez (máxima contención)
+            if lim._reservar() <= 0:
+                reservados.append(1)
+
+        hilos = [threading.Thread(target=intentar) for _ in range(20)]
+        for h in hilos:
+            h.start()
+        for h in hilos:
+            h.join()
+        self.assertEqual(sum(reservados), rpm)   # exactamente rpm turnos, ni uno más (sin carrera TOCTOU)
+
+    def test_peek_no_reserva(self):
+        lim = LimitadorTasa(1, reloj=lambda: 0.0, dormir=lambda _s: None)
+        self.assertEqual(lim.espera_necesaria(), 0.0)   # peek repetido no consume el turno
+        self.assertEqual(lim.espera_necesaria(), 0.0)
+        self.assertEqual(lim.adquirir(), 0.0)           # el primer adquirir sí reserva
+        self.assertGreater(lim.espera_necesaria(), 0.0)  # ahora no hay lugar
 
 
 # ======================================================================
