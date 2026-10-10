@@ -1066,6 +1066,17 @@ class App:
             self.ui.tenue("    2) archivo ~/reaper/.clave_<proveedor> con permisos 0600")
             self.ui.tenue("  Una clave NUNCA se comparte entre proveedores. Luego: /proveedores")
             return
+        if sub in ("estadisticas", "estadísticas", "stats"):
+            c = contadores_proveedores(self.settings)
+            self.ui.info("Contadores de proveedores (honestos y separados; §0.1):")
+            self.ui.info(f"  descubiertos: {c['providers_discovered']} · con manifiesto válido: "
+                         f"{c['providers_with_valid_manifest']} · soportados: {c['providers_supported']}")
+            self.ui.info(f"  con credencial presente: {c['providers_credentials_present']} · "
+                         f"gateways: {c['gateways']} · meta: {c['meta_objetivo']}")
+            self.ui.aviso(f"  autenticados: {c['providers_authenticated']} · chat operativo: "
+                          f"{c['providers_chat_operational']} · free confirmado: {c['providers_free_confirmed']}")
+            self.ui.tenue("  Un gateway (OpenRouter) es 1 proveedor, no cientos. Credencial presente ≠ autenticado.")
+            return
         if sub in ("probar", "sincronizar"):
             candidatos = [p for p, d in PROVEEDORES.items()
                           if d["clave"] and clave_de_proveedor(p, replace(self.settings, proveedor=p))]
@@ -1073,7 +1084,7 @@ class App:
             self.ui.aviso("  La prueba de conectividad real / catálogo vivo hace peticiones autorizadas; "
                           "hasta ejecutarse con tu consentimiento y claves válidas: NO VERIFICADO.")
             return
-        self.ui.error("Uso: /proveedores [estado|configurar|probar|sincronizar|diagnostico]")
+        self.ui.error("Uso: /proveedores [estado|configurar|estadisticas|probar|sincronizar|diagnostico]")
 
     def cmd_forge(self, arg: str) -> None:
         """Tool Forge: REAPER crea/registra sus propias herramientas (gate real: tests deben pasar)."""
