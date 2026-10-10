@@ -26,11 +26,12 @@ class DestinoModelo:
         local sale sin autorización explícita (R-001). Se mira la IP/host real, no el nombre del proveedor.
         """
         host = (urllib.parse.urlsplit(self.url).hostname or "").strip("[]").lower()
-        if host in ("localhost", "ip6-localhost") or host.endswith(".local"):
+        if host in ("localhost", "ip6-localhost"):
             return True
         try:
-            ip = ipaddress.ip_address(host)
-            return ip.is_loopback or ip.is_private or ip.is_link_local
+            # BUG-003: SOLO loopback es "en el dispositivo". Una IP de la LAN (RFC1918), link-local o un host
+            # .local es OTRA máquina: el código saldría del teléfono, así que no cuenta como local.
+            return ipaddress.ip_address(host).is_loopback
         except ValueError:
             return False
 

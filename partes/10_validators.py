@@ -1106,15 +1106,92 @@ def validar_proyecto(ws: Workspace, rels: list[str]) -> list[Resultado]:
     return salida
 
 
-def separar_imports_tdd(resultados: list[Resultado]) -> tuple:
+@dataclass
+class ClasificacionImport:
+    """Por qué falla un import en un test (fase tests primero). Solo MODULO_PROPIO_AUSENTE y
+    NOMBRE_PLANEADO_AUSENTE son rojo esperado; un typo o un paquete externo faltante son errores reales."""
+    archivo: str
+    modulo: str
+    causa: str          # MODULO_PROPIO_AUSENTE | NOMBRE_PLANEADO_AUSENTE | TYPO | PAQUETE_EXTERNO | NOMBRE_INEXISTENTE
+    detalle: str = ""
+
+    @property
+    def esperado(self) -> bool:
+        return self.causa in ("MODULO_PROPIO_AUSENTE", "NOMBRE_PLANEADO_AUSENTE")
+
+
+def modulos_planeados(texto: str) -> set:
+    """Módulos Python que el plan menciona por ruta: 'src/db.py' → {'db', 'src'}. Ignora los archivos de test."""
+    salida: set = set()
+    for ruta in re.findall(r"[\w./-]+\.py\b", texto or ""):
+        partes = [x for x in ruta.replace("\\", "/").split("/") if x and x not in (".", "..")]
+        if not partes:
+            continue
+        salida.add(Path(partes[-1]).stem)
+        if len(partes) > 1:
+            salida.add(partes[0])
+    return {m for m in salida if m.isidentifier() and not m.startswith("test")}
+
+
+def clasificar_import_faltante(modulo: str, planeados: set, existentes: set = frozenset()) -> str:
+    if modulo in planeados:
+        return "MODULO_PROPIO_AUSENTE"
+    if difflib.get_close_matches(modulo, sorted(set(planeados) | set(existentes)), n=1, cutoff=0.8):
+        return "TYPO"
+    return "PAQUETE_EXTERNO"
+
+
+def _modulos_de_resultado_imports(r: Resultado) -> list:
+    m = re.search(r"proyecto:\s*([^\n]+)", r.stderr or "")
+    return [x.strip() for x in m.group(1).split(",") if x.strip()] if m else []
+
+
+def separar_imports_tdd(resultados: list[Resultado], texto_plan: str = "",
+                        ws: Optional["Workspace"] = None) -> tuple:
     """
-    Separa los fallos de 'imports'/'imports-locales' de ARCHIVOS DE TEST: en la fase tests-primero los tests
-    importan módulos que la implementación todavía no creó, y eso es lo esperado (no un error a corregir).
-    Devuelve (resultados_sin_esos_fallos, fallos_tdd).
+    Fase tests primero: separa los fallos de imports de ARCHIVOS DE TEST que son ROJO ESPERADO (el módulo o el
+    nombre está en el plan y la implementación todavía no lo creó) de los que son errores reales (typo, paquete
+    externo no instalado, nombre que el plan no menciona). Devuelve (resultados_que_siguen, esperados,
+    clasificaciones). Los errores reales se conservan, con la causa explicada en stderr.
     """
-    tdd = [r for r in resultados if not r.ok and r.comando.split(" ")[0] in ("imports", "imports-locales")
-           and es_archivo_de_test(r.archivo or "")]
-    return [r for r in resultados if r not in tdd], tdd
+    planeados = modulos_planeados(texto_plan)
+    palabras_plan = set(re.findall(r"[A-Za-z_]\w*", texto_plan or ""))
+    existentes: set = set()
+    if ws is not None:
+        existentes = {Path(r).stem for r in ws.archivos_codigo(limite=500) if r.endswith(".py")}
+    quedan, esperados, clasificaciones = [], [], []
+    for r in resultados:
+        tipo = r.comando.split(" ")[0]
+        if r.ok or tipo not in ("imports", "imports-locales") or not es_archivo_de_test(r.archivo or ""):
+            quedan.append(r)
+            continue
+        actuales = []
+        if tipo == "imports":
+            for modulo in _modulos_de_resultado_imports(r):
+                actuales.append(ClasificacionImport(r.archivo, modulo,
+                                                    clasificar_import_faltante(modulo, planeados, existentes)))
+        else:
+            for linea in (r.stderr or "").splitlines():
+                m = re.search(r"no define '([^']+)'", linea)
+                if not m:
+                    continue
+                nombre = m.group(1)
+                causa = ("NOMBRE_PLANEADO_AUSENTE" if nombre in palabras_plan
+                         else "TYPO" if "quisiste decir" in linea else "NOMBRE_INEXISTENTE")
+                actuales.append(ClasificacionImport(r.archivo, nombre, causa, linea.strip()))
+        clasificaciones.extend(actuales)
+        if actuales and all(c.esperado for c in actuales):
+            esperados.append(r)
+            continue
+        reales = [c for c in actuales if not c.esperado]
+        if reales:
+            explicacion = {"TYPO": "parece un typo de un módulo/nombre del proyecto",
+                           "PAQUETE_EXTERNO": "paquete externo no instalado (no es rojo esperado: instalalo o no lo uses)",
+                           "NOMBRE_INEXISTENTE": "el plan no menciona ese nombre"}
+            r.stderr = (r.stderr or "") + "\nClasificación (tests primero): " + "; ".join(
+                f"{c.modulo} → {c.causa}: {explicacion.get(c.causa, '')}" for c in reales)
+        quedan.append(r)
+    return quedan, esperados, clasificaciones
 
 
 def fallos(resultados: list[Resultado]) -> list[Resultado]:

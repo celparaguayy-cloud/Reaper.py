@@ -1606,6 +1606,8 @@ class Settings:
     fallbacks: list = field(default_factory=list)
     # Si el modelo de un rol falla, probar con los otros modelos del equipo (los de /equipo) antes de abortar.
     respaldo_equipo: bool = True
+    # REAPER X: equipo de 10 roles (director, supervisor, integrador, seguridad defensiva, auditor de entrega)
+    roles_x: bool = False
     proveedor: str = "openrouter"
     api_url: str = ""
 
@@ -1976,11 +1978,12 @@ class DestinoModelo:
         local sale sin autorización explícita (R-001). Se mira la IP/host real, no el nombre del proveedor.
         """
         host = (urllib.parse.urlsplit(self.url).hostname or "").strip("[]").lower()
-        if host in ("localhost", "ip6-localhost") or host.endswith(".local"):
+        if host in ("localhost", "ip6-localhost"):
             return True
         try:
-            ip = ipaddress.ip_address(host)
-            return ip.is_loopback or ip.is_private or ip.is_link_local
+            # BUG-003: SOLO loopback es "en el dispositivo". Una IP de la LAN (RFC1918), link-local o un host
+            # .local es OTRA máquina: el código saldría del teléfono, así que no cuenta como local.
+            return ipaddress.ip_address(host).is_loopback
         except ValueError:
             return False
 
@@ -5403,15 +5406,92 @@ def validar_proyecto(ws: Workspace, rels: list[str]) -> list[Resultado]:
     return salida
 
 
-def separar_imports_tdd(resultados: list[Resultado]) -> tuple:
+@dataclass
+class ClasificacionImport:
+    """Por qué falla un import en un test (fase tests primero). Solo MODULO_PROPIO_AUSENTE y
+    NOMBRE_PLANEADO_AUSENTE son rojo esperado; un typo o un paquete externo faltante son errores reales."""
+    archivo: str
+    modulo: str
+    causa: str          # MODULO_PROPIO_AUSENTE | NOMBRE_PLANEADO_AUSENTE | TYPO | PAQUETE_EXTERNO | NOMBRE_INEXISTENTE
+    detalle: str = ""
+
+    @property
+    def esperado(self) -> bool:
+        return self.causa in ("MODULO_PROPIO_AUSENTE", "NOMBRE_PLANEADO_AUSENTE")
+
+
+def modulos_planeados(texto: str) -> set:
+    """Módulos Python que el plan menciona por ruta: 'src/db.py' → {'db', 'src'}. Ignora los archivos de test."""
+    salida: set = set()
+    for ruta in re.findall(r"[\w./-]+\.py\b", texto or ""):
+        partes = [x for x in ruta.replace("\\", "/").split("/") if x and x not in (".", "..")]
+        if not partes:
+            continue
+        salida.add(Path(partes[-1]).stem)
+        if len(partes) > 1:
+            salida.add(partes[0])
+    return {m for m in salida if m.isidentifier() and not m.startswith("test")}
+
+
+def clasificar_import_faltante(modulo: str, planeados: set, existentes: set = frozenset()) -> str:
+    if modulo in planeados:
+        return "MODULO_PROPIO_AUSENTE"
+    if difflib.get_close_matches(modulo, sorted(set(planeados) | set(existentes)), n=1, cutoff=0.8):
+        return "TYPO"
+    return "PAQUETE_EXTERNO"
+
+
+def _modulos_de_resultado_imports(r: Resultado) -> list:
+    m = re.search(r"proyecto:\s*([^\n]+)", r.stderr or "")
+    return [x.strip() for x in m.group(1).split(",") if x.strip()] if m else []
+
+
+def separar_imports_tdd(resultados: list[Resultado], texto_plan: str = "",
+                        ws: Optional["Workspace"] = None) -> tuple:
     """
-    Separa los fallos de 'imports'/'imports-locales' de ARCHIVOS DE TEST: en la fase tests-primero los tests
-    importan módulos que la implementación todavía no creó, y eso es lo esperado (no un error a corregir).
-    Devuelve (resultados_sin_esos_fallos, fallos_tdd).
+    Fase tests primero: separa los fallos de imports de ARCHIVOS DE TEST que son ROJO ESPERADO (el módulo o el
+    nombre está en el plan y la implementación todavía no lo creó) de los que son errores reales (typo, paquete
+    externo no instalado, nombre que el plan no menciona). Devuelve (resultados_que_siguen, esperados,
+    clasificaciones). Los errores reales se conservan, con la causa explicada en stderr.
     """
-    tdd = [r for r in resultados if not r.ok and r.comando.split(" ")[0] in ("imports", "imports-locales")
-           and es_archivo_de_test(r.archivo or "")]
-    return [r for r in resultados if r not in tdd], tdd
+    planeados = modulos_planeados(texto_plan)
+    palabras_plan = set(re.findall(r"[A-Za-z_]\w*", texto_plan or ""))
+    existentes: set = set()
+    if ws is not None:
+        existentes = {Path(r).stem for r in ws.archivos_codigo(limite=500) if r.endswith(".py")}
+    quedan, esperados, clasificaciones = [], [], []
+    for r in resultados:
+        tipo = r.comando.split(" ")[0]
+        if r.ok or tipo not in ("imports", "imports-locales") or not es_archivo_de_test(r.archivo or ""):
+            quedan.append(r)
+            continue
+        actuales = []
+        if tipo == "imports":
+            for modulo in _modulos_de_resultado_imports(r):
+                actuales.append(ClasificacionImport(r.archivo, modulo,
+                                                    clasificar_import_faltante(modulo, planeados, existentes)))
+        else:
+            for linea in (r.stderr or "").splitlines():
+                m = re.search(r"no define '([^']+)'", linea)
+                if not m:
+                    continue
+                nombre = m.group(1)
+                causa = ("NOMBRE_PLANEADO_AUSENTE" if nombre in palabras_plan
+                         else "TYPO" if "quisiste decir" in linea else "NOMBRE_INEXISTENTE")
+                actuales.append(ClasificacionImport(r.archivo, nombre, causa, linea.strip()))
+        clasificaciones.extend(actuales)
+        if actuales and all(c.esperado for c in actuales):
+            esperados.append(r)
+            continue
+        reales = [c for c in actuales if not c.esperado]
+        if reales:
+            explicacion = {"TYPO": "parece un typo de un módulo/nombre del proyecto",
+                           "PAQUETE_EXTERNO": "paquete externo no instalado (no es rojo esperado: instalalo o no lo uses)",
+                           "NOMBRE_INEXISTENTE": "el plan no menciona ese nombre"}
+            r.stderr = (r.stderr or "") + "\nClasificación (tests primero): " + "; ".join(
+                f"{c.modulo} → {c.causa}: {explicacion.get(c.causa, '')}" for c in reales)
+        quedan.append(r)
+    return quedan, esperados, clasificaciones
 
 
 def fallos(resultados: list[Resultado]) -> list[Resultado]:
@@ -8637,7 +8717,7 @@ def _post_escritura(ctx: Contexto, rel: str, antes: Optional[str], despues: str,
 
     resultados = validar_archivo(ctx.ws, rel)
     if ctx.rol == "especificador":
-        resultados, tdd = separar_imports_tdd(resultados)
+        resultados, tdd, _clases = separar_imports_tdd(resultados, ctx.pedido, ctx.ws)
         if tdd:
             notas = list(notas) + ["importa módulos que todavía no existen (esperado en tests primero: "
                                    "los crea la implementación)"]
@@ -10169,6 +10249,60 @@ AFIRMACIÓN → NIVEL (qué evidencia la respalda y qué faltaría para subir de
         0.1,
         solo_lectura=True,
     ),
+    # ---- REAPER X: roles de dirección y auditoría (texto/JSON, sin herramientas; los decide el controlador) ----
+    "director": Rol(
+        "director",
+        """Sos el DIRECTOR del proyecto. Convertís el pedido en una misión clara: objetivo, prioridades y
+criterios de aceptación verificables (entradas/salidas concretas, códigos HTTP, persistencia). No ejecutás
+nada ni autorizás herramientas: solo decidís prioridades. No inventes certezas técnicas.
+Respondé SOLO un objeto JSON: {"mission": "...", "priorities": ["..."], "acceptance_criteria": ["..."]}""",
+        (),
+        0.2,
+        solo_lectura=True,
+    ),
+    "supervisor": Rol(
+        "supervisor",
+        """Sos el SUPERVISOR técnico. Revisás planes y entregas contra la EVIDENCIA que se te da (cada pieza tiene
+un id EV-...). Rechazás con razones verificables; nunca aprobás sin citar evidencia. Tu dictamen NO decide
+el estado final: lo decide la verificación real (tests y validadores).
+Respondé SOLO un objeto JSON: {"decision": "APPROVE|REJECT|REWORK|ESCALATE|ABSTAIN",
+"reasons": ["requisito y evidencia"], "evidence_ids": ["EV-..."], "next_actions": ["..."],
+"confidence": "low|medium|high"}""",
+        (),
+        0.1,
+        solo_lectura=True,
+    ),
+    "integrador": Rol(
+        "integrador",
+        """Sos el INTEGRADOR. Las tareas ya están implementadas por separado; tu trabajo es que funcionen JUNTAS:
+contratos entre módulos, imports, rutas, configuración y arranque. Recibís diagnósticos REALES de la
+verificación integrada. Corregí con el cambio mínimo; nunca borres, saltees ni debilites tests.
+Después de corregir, ejecutá validate y run_tests. Informe: qué no encajaba, qué cambiaste y el resultado real.""",
+        LECTURA + ESCRITURA + VERIFICACION + ("execute_command", "run_python", "revert_file", "attempt_completion"),
+        0.15,
+    ),
+    "seguridad": Rol(
+        "seguridad",
+        """Sos el REVISOR DE SEGURIDAD DEFENSIVA del proyecto del usuario (solo lectura). Revisás el diff buscando
+problemas en el propio código: secretos en código o logs, SQL armado por concatenación, entradas sin
+validar, errores HTTP que filtran detalles internos, dependencias innecesarias, permisos de archivos.
+No proponés ataques: describís el problema y la corrección.
+Respondé SOLO un objeto JSON: {"findings": [{"severity": "high|medium|low", "file": "...",
+"issue": "...", "fix": "..."}]}  (lista vacía si no hay hallazgos reales).""",
+        (),
+        0.1,
+        solo_lectura=True,
+    ),
+    "auditor_entrega": Rol(
+        "auditor_entrega",
+        """Sos el AUDITOR DE ENTREGA. Comparás cada criterio de aceptación contra la EVIDENCIA dada (ids EV-...).
+Un criterio solo está MET si citás evidencia que lo demuestra; si no hay evidencia, es UNKNOWN.
+Respondé SOLO un objeto JSON: {"criteria": [{"criterion": "...", "status": "MET|NOT_MET|UNKNOWN",
+"evidence_ids": ["EV-..."]}]}""",
+        (),
+        0.1,
+        solo_lectura=True,
+    ),
 }
 
 ROLES_DELEGABLES = ("explorador", "implementador", "revisor", "qa", "reparador", "arquitecto", "especificador",
@@ -11055,7 +11189,17 @@ class Agente:
             error = True
         if nombre == "run_tests" and salida.startswith("Tests FALLARON"):
             error = True
-        self.ui.resultado_herramienta(not error, salida)
+        mostrar_ok, mostrar = not error, salida
+        if not error and nombre in ("execute_command", "run_python"):
+            # BUG-008: "✓" significaba "se ejecutó", no "salió bien". Un exit != 0 o un timeout se muestran ✗ con
+            # el código real (para el agente sigue siendo información, no un error de herramienta).
+            m = re.search(r"^exit code: (-?\d+)", salida, re.M)
+            timeout = "estado: TIMEOUT" in salida
+            if timeout or (m and int(m.group(1)) != 0):
+                lineas = salida.splitlines() or [""]
+                mostrar_ok = False
+                mostrar = "\n".join([f"{lineas[0]} · " + ("TIMEOUT" if timeout else f"exit {m.group(1)}")] + lineas[1:])
+        self.ui.resultado_herramienta(mostrar_ok, mostrar)
         if error:
             self._registrar_error(nombre, llamada.params.get("path", ""), salida)
             if self.settings.pistas_errores and "PISTAS DE REAPER" not in salida:
@@ -11684,7 +11828,7 @@ class Agente:
             resultados = validar_archivos(self.ws, sorted(self.ctx.cambios))
             if self.rol.nombre == "especificador":
                 # Tests primero: que los tests importen módulos aún inexistentes es lo ESPERADO (lo verá run_tests).
-                resultados, _tdd = separar_imports_tdd(resultados)
+                resultados, _tdd, _clases = separar_imports_tdd(resultados, self.ctx.pedido, self.ws)
             if fallos(resultados):
                 if self._rechazos < 2:
                     self._rechazos += 1
@@ -13962,6 +14106,8 @@ class InformeBuild:
     commit: Optional[str] = None
     spec_tests: list = field(default_factory=list)
     segundos: float = 0.0
+    tareas_fallidas: list = field(default_factory=list)    # quedaron con fallos tras reparar
+    tareas_bloqueadas: list = field(default_factory=list)  # no se ejecutaron: dependen de una fallida
 
     @property
     def ok(self) -> bool:
@@ -14238,7 +14384,12 @@ class Orquestador:
         malos = fallos(validaciones)
         tests_ok = tests is None or tests.ok
         partes = [r.resumen(2500) for r in malos]
-        if tests is not None and not tests.ok:
+        if tests is not None and tests.omitido:
+            # Hay archivos de test (si no, no habría comando) pero la suite no recolectó NINGUNO: 0 tests no es éxito.
+            tests_ok = False
+            partes.append("TESTS: hay archivos de test pero la suite no recolectó ningún test "
+                          "(funciones sin prefijo test_, clases que no heredan de TestCase o archivos vacíos).")
+        elif tests is not None and not tests.ok:
             partes.append("TESTS: " + conteo.texto() + "\n" + fallos_relevantes(f"{tests.stdout}\n{tests.stderr}",
                                                                                 maximo=3, limite=5000))
         diagnostico = "\n\n".join(partes)
@@ -14261,7 +14412,8 @@ class Orquestador:
         if diagnostico_experto:
             texto = tarea_con_diagnostico(texto, diagnostico_experto)
         protegidos = set(self._protegidos)
-        return self._sub("reparador", texto, cid, titulo="arregla los fallos reales" + (" (con diagnóstico experto)"
+        return self._sub(getattr(self, "_rol_reparacion", "reparador"), texto, cid,
+                         titulo="arregla los fallos reales" + (" (con diagnóstico experto)"
                                                                                     if diagnostico_experto else ""),
                          protegidos=protegidos)
 
@@ -14342,6 +14494,95 @@ class Orquestador:
                 verif = antes
         return verif
 
+    # ------------------------------------------------------------ REAPER X (10 roles)
+    def _consultar_rol_x(self, rol: str, prompt: str) -> tuple:
+        """
+        Rol de dirección/auditoría por TEXTO (sin herramientas): devuelve (texto|None, modelo_pedido, modelo_servido).
+        Si respondió otro modelo (respaldo del equipo), se declara: nada de degradación silenciosa.
+        """
+        pedido_modelo = self.settings.modelo_para(rol)
+        mensajes = [{"role": "system", "content": f"# TU ROL: {rol.upper()}\n{ROLES[rol].mision}"},
+                    {"role": "user", "content": prompt}]
+        try:
+            resp = self.llm.chat(mensajes, modelo=pedido_modelo, temperatura=ROLES[rol].temperatura,
+                                 max_tokens=1500, rol=rol)
+        except LLMError as e:
+            if e.presupuesto:
+                raise
+            self.ui.aviso(f"  {rol}: el modelo no respondió ({recortar(str(e), 160)}); sigo sin su dictamen.")
+            return None, pedido_modelo, "unknown"
+        servido = str(getattr(resp, "modelo", "") or "unknown")
+        if servido not in ("unknown", "mock", pedido_modelo) and resolver_modelo(servido) != resolver_modelo(pedido_modelo):
+            self.ui.tenue(f"  {rol}: pedido {pedido_modelo} → respondió {servido} (respaldo del equipo)")
+        return resp.texto, pedido_modelo, servido
+
+    def _directiva_director(self, pedido: str) -> str:
+        texto, _p, _s = self._consultar_rol_x("director", f"PEDIDO DEL USUARIO:\n{pedido}")
+        datos = extraer_json_x(texto or "")
+        if not datos or not str(datos.get("mission", "")).strip():
+            if texto is not None:
+                self.ui.aviso("  director: respuesta fuera de contrato (no es el JSON pedido); sigo sin directiva.")
+            return ""
+        criterios = _lista_str(datos.get("acceptance_criteria"))
+        prioridades = _lista_str(datos.get("priorities"))
+        self.ui.info(f"  director: {recortar(str(datos['mission']), 160)}")
+        partes = [f"DIRECTIVA DEL DIRECTOR: {str(datos['mission']).strip()}"]
+        if prioridades:
+            partes.append("Prioridades: " + "; ".join(prioridades[:8]))
+        if criterios:
+            partes.append("Criterios de aceptación pedidos:\n" + "\n".join(f"- {c}" for c in criterios[:12]))
+        return "\n".join(partes)
+
+    def _revision_supervisor_plan(self, pedido: str, plan: Plan) -> Optional[Dictamen]:
+        evidencia = {"EV-PLAN": plan.como_texto()}
+        texto, pedido_m, servido = self._consultar_rol_x(
+            "supervisor", f"PEDIDO:\n{pedido}\n\nEVIDENCIA EV-PLAN (plan propuesto):\n{evidencia['EV-PLAN']}\n\n"
+                          "¿El plan cubre el pedido con dependencias correctas y criterios verificables?")
+        if texto is None:
+            return None
+        dictamen = parsear_dictamen(texto, "supervisor", evidencia, model_requested=pedido_m, model_served=servido)
+        (self.ui.info if dictamen.valido else self.ui.aviso)("  " + dictamen.texto())
+        return dictamen
+
+    def _auditoria_x(self, pedido: str, plan: Plan, verif: Verificacion, informe: InformeBuild) -> None:
+        """Seguridad defensiva, auditor de entrega y supervisor sobre EVIDENCIA real. Solo informan: no deciden."""
+        diff = self.ws.checkpoints.diff_desde(informe.cid) if informe.cid else ""
+        evidencia = {
+            "EV-ESTADO": f"estado por verificación real: {informe.estado}; tareas fallidas: "
+                         f"{', '.join(informe.tareas_fallidas) or 'ninguna'}; bloqueadas: "
+                         f"{', '.join(informe.tareas_bloqueadas) or 'ninguna'}",
+            "EV-TESTS": (verif.conteo.texto() if verif.conteo.reconocido else
+                         ("sin suite de tests" if verif.tests is None else f"exit {verif.tests.codigo}")),
+            "EV-VALID": resumen_validacion(verif.validaciones, limite=1500),
+            "EV-DIFF": _diffstat(diff) or "(sin cambios)",
+        }
+        bloque = "\n".join(f"{k}: {v}" for k, v in evidencia.items())
+        texto, _p, _s = self._consultar_rol_x("seguridad", f"DIFF DE LA BUILD:\n```diff\n{recortar(diff, 9000)}\n```")
+        hallazgos = parsear_hallazgos_seguridad(texto or "") if texto is not None else None
+        if texto is not None and hallazgos is None:
+            self.ui.aviso("  seguridad: respuesta fuera de contrato; hallazgos descartados.")
+        for h in (hallazgos or [])[:8]:
+            linea = f"Seguridad [{h['severity']}] {h['file'] or '?'}: {h['issue']}" + (f" → {h['fix']}" if h["fix"] else "")
+            (self.ui.aviso if h["severity"] == "high" else self.ui.tenue)("  " + linea)
+            informe.notas.append(linea)
+        criterios = "\n".join(f"- {c}" for c in plan.criterios) or "- (derivalos del pedido)"
+        texto, _p, _s = self._consultar_rol_x(
+            "auditor_entrega", f"CRITERIOS:\n{criterios}\n\nEVIDENCIA:\n{bloque}")
+        auditoria = parsear_auditoria(texto or "", evidencia) if texto is not None else None
+        if auditoria is not None:
+            met = sum(1 for c in auditoria if c["status"] == "MET")
+            informe.notas.append(f"Auditor de entrega: {met}/{len(auditoria)} criterios con evidencia (MET).")
+            self.ui.tenue(f"  auditor de entrega: {met}/{len(auditoria)} criterios demostrados con evidencia")
+        elif texto is not None:
+            self.ui.aviso("  auditor de entrega: respuesta fuera de contrato; auditoría descartada.")
+        texto, pedido_m, servido = self._consultar_rol_x(
+            "supervisor", f"PEDIDO:\n{pedido}\n\nEVIDENCIA:\n{bloque}\n\n¿Se puede entregar?")
+        if texto is not None:
+            dictamen = parsear_dictamen(texto, "supervisor", evidencia, model_requested=pedido_m, model_served=servido)
+            self.ui.tenue("  " + dictamen.texto())
+            informe.estado, notas = estado_controlado(informe.estado, dictamen)
+            informe.notas.extend(notas)
+
     # ------------------------------------------------------------ flujos
     def _mostrar_plan(self, plan: Plan) -> None:
         self.ui.titulo("PLAN")
@@ -14351,7 +14592,19 @@ class Orquestador:
         self.ui.fase(1, "Exploración")
         exploracion = self.explorar(pedido)
         self.ui.fase(2, "Arquitectura")
-        plan = self.planificar(pedido, exploracion)
+        pedido_plan = pedido
+        if self.settings.roles_x:
+            directiva = self._directiva_director(pedido)
+            if directiva:
+                pedido_plan = f"{pedido}\n\n{directiva}"
+        plan = self.planificar(pedido_plan, exploracion)
+        if self.settings.roles_x:
+            dictamen = self._revision_supervisor_plan(pedido, plan)
+            if dictamen is not None and dictamen.decision in ("REWORK", "REJECT"):
+                self.ui.aviso("  El supervisor pidió rehacer el plan: lo replanifico una vez con sus razones.")
+                plan = self.planificar(pedido_plan, exploracion,
+                                       "Observaciones del supervisor:\n" + "\n".join(f"- {r}" for r in dictamen.reasons),
+                                       plan)
         for _ in range(3):
             self._mostrar_plan(plan)
             if not confirmar or self.ui.confirmar("¿Aprobás el plan y arrancamos?", defecto=True):
@@ -14454,6 +14707,14 @@ class Orquestador:
             plan.tareas = orden
         for i, tarea in enumerate(plan.tareas):
             self.ui.info(f"\n▸ Tarea {i + 1}/{len(plan.tareas)}: {recortar(tarea.descripcion.splitlines()[0], 120)}")
+            rotas = [d for d in grafo.dependencias(tarea.id)
+                     if d in informe.tareas_fallidas or d in informe.tareas_bloqueadas]
+            if rotas:
+                # BUG-012: no construir sobre una base que no pasó su verificación; la build termina PARCIAL.
+                self.ui.aviso(f"  Tarea {tarea.id} BLOQUEADA: depende de {', '.join(rotas)}, que no pasó su verificación.")
+                informe.tareas_bloqueadas.append(tarea.id)
+                informe.notas.append(f"Tarea {tarea.id}: bloqueada (depende de {', '.join(rotas)}).")
+                continue
             antes_tests = ejecutar_tests(self.ws, timeout=self.settings.tests_timeout, completo=True)
             conteo_antes = conteo_de_resultado(antes_tests)
             nombres_antes = set(conteo_antes.nombres_fallados)
@@ -14475,6 +14736,7 @@ class Orquestador:
                 )
                 if not verif_tarea.ok:
                     informe.notas.append(f"Tarea {tarea.id}: quedó con fallos de verificación.")
+                    informe.tareas_fallidas.append(tarea.id)
 
             if not verif_tarea.ok and self.settings.max_revisiones:
                 # Revisar código que no pasa su verificación no tiene sentido (y un revisor de 24B
@@ -14510,13 +14772,20 @@ class Orquestador:
         self.ui.fase(numero_fase, "Verificación real")
         verif = self.verificar(grupo)
         self._mostrar_verificacion(verif)
-        verif = self._reparar_con_escalada(pedido, verif, grupo, base_fallaba, informe, "final",
-                                           self.settings.max_reparaciones, lambda: self.verificar(grupo))
+        self._rol_reparacion = "integrador" if self.settings.roles_x else "reparador"
+        try:
+            verif = self._reparar_con_escalada(pedido, verif, grupo, base_fallaba, informe, "final",
+                                               self.settings.max_reparaciones, lambda: self.verificar(grupo))
+        finally:
+            self._rol_reparacion = "reparador"
 
         informe.archivos = verif.archivos
         informe.tests = verif.tests
         informe.diagnostico = verif.diagnostico
-        if verif.ok:
+        if verif.ok and informe.tareas_bloqueadas:
+            # Lo construido pasa, pero hay tareas del plan que nunca se hicieron: entrega INCOMPLETA.
+            informe.estado = "parcial"
+        elif verif.ok:
             informe.estado = "verificada" if verif.tests is not None and not verif.tests.omitido else "validada"
             if self.settings.git_snapshots and es_repo_git(self.ws):
                 try:
@@ -14524,6 +14793,9 @@ class Orquestador:
                                                     f"REAPER build verificada: {pedido[:72]}\n\n{plan.objetivo}")
                 except RuntimeError as e:
                     informe.notas.append(f"No pude guardar la build en git: {e}")
+        if self.settings.roles_x:
+            self.ui.fase(numero_fase + 1, "Auditoría REAPER X (seguridad defensiva · entrega · supervisor)")
+            self._auditoria_x(pedido, plan, verif, informe)
         informe.segundos = time.monotonic() - inicio
         informe.ruta_informe = self._guardar_informe(pedido, informe)
         self._mostrar_cierre(informe)
@@ -14577,6 +14849,10 @@ class Orquestador:
             self.ui.titulo("✓ BUILD VERIFICADA (validadores + tests reales)")
         elif informe.estado == "validada":
             self.ui.titulo("✓ BUILD VALIDADA (validadores OK, sin tests que correr)")
+        elif informe.estado == "parcial":
+            self.ui.titulo("◐ BUILD PARCIAL (lo hecho pasa, pero faltan tareas del plan)")
+            self.ui.aviso(f"  fallidas: {', '.join(informe.tareas_fallidas) or '—'} · "
+                          f"bloqueadas: {', '.join(informe.tareas_bloqueadas)}  → /construir de nuevo retoma")
         else:
             self.ui.titulo("✗ BUILD FALLIDA")
         diff = self.ws.checkpoints.diff_desde(informe.cid) if informe.cid else ""
@@ -14668,6 +14944,10 @@ class GrafoTareas:
             for d in deps:
                 hijos[d].append(tid)
         return hijos
+
+    def dependencias(self, tid: str) -> list:
+        """Ids de las tareas de las que depende `tid` (solo las válidas)."""
+        return list(self._deps.get(tid, []))
 
     def tiene_ciclo(self) -> bool:
         return len(self._orden_ids()) < len(self.tareas)
@@ -27412,8 +27692,18 @@ class App:
         self.ui.linea(texto_reporte_privacidad(reporte_privacidad(self.llm, self.settings)))
 
     def cmd_equipo(self, arg: str) -> None:
-        """Muestra los seis roles → proveedor/modelo asignado + independencia real. Conectividad NO VERIFICADA."""
+        """Roles → proveedor/modelo asignado + independencia real (6 clásicos, o 10 con REAPER X)."""
         sub = (arg or "").strip().lower()
+        if sub.startswith("x"):
+            partes_x = sub.split()
+            if len(partes_x) > 1 and partes_x[1] in ("on", "off", "si", "sí", "no"):
+                self.settings.roles_x = partes_x[1] in ("on", "si", "sí")
+                self._guardar_settings()
+            self.ui.ok(f"REAPER X (10 roles): {'ON' if self.settings.roles_x else 'OFF'}")
+            self.ui.tenue("  ON agrega director y supervisor (dictámenes JSON validados), integrador, seguridad "
+                          "defensiva y auditor de entrega a /construir. El estado final lo sigue decidiendo la "
+                          "verificación real. /equipo x on | /equipo x off")
+            sub = ""
         estado = estado_equipo(self.settings)
         ind = independencia_equipo(estado)
         if sub in ("independencia", "independence"):
@@ -27436,6 +27726,7 @@ class App:
         if sub == "probar":
             self.ui.info("Probando cada rol con una petición mínima real (puede consumir cuota)...")
             resultados = probar_equipo(self.llm, self.settings)
+            self._probados = {r["modelo"]: r["estado"] for r in resultados}
             simbolos = {"RESPONDE": "✓", "SIN_CLAVE": "⚠", "FALLA": "✗"}
             for r in resultados:
                 self.ui.info(f"  {simbolos.get(r['estado'], '?')} {r['rol']:<13} {r['proveedor']}/{r.get('modelo_real') or r['modelo']}  "
@@ -27443,19 +27734,23 @@ class App:
             responden = [r for r in resultados if r["estado"] == "RESPONDE"]
             provs = {r["proveedor"] for r in responden}
             modelos = {r["modelo"] for r in responden}
-            self.ui.ok(f"Agentes que RESPONDEN: {len(responden)}/6 · "
+            self.ui.ok(f"Agentes que RESPONDEN: {len(responden)}/{len(resultados)} · "
                        f"proveedores distintos: {len(provs)} · modelos distintos: {len(modelos)}")
             if not responden:
                 self.ui.aviso("  Ninguno respondió: configurá una clave (ej. export GROQ_API_KEY=...) y reintentá.")
             return
-        self.ui.info("Equipo de seis roles (asignación actual; conectividad NO VERIFICADA):")
+        self.ui.info(f"Equipo de {len(estado)} roles{' (REAPER X)' if self.settings.roles_x else ''} "
+                     "(asignación actual; conectividad NO VERIFICADA):")
         for e in estado:
             marca = "✓ clave" if e["tiene_clave"] else "⚠ FALTA CLAVE"
             self.ui.info(f"  {e['rol']:<13} → {e['proveedor']}/{e.get('modelo_real') or e['modelo']}   {marca}")
         self.ui.tenue(f"  proveedores distintos: {ind['proveedores_distintos']} · "
                       f"modelos distintos: {ind['modelos_distintos']}"
                       + ("  · independencia REDUCIDA" if ind["reducida"] else ""))
-        self.ui.tenue("  Asignar por rol: /modelo <rol> <alias> · prueba real: /proveedores probar")
+        conteo = conteo_equipo_x(self.settings, getattr(self, "_probados", {}))
+        self.ui.tenue(f"  roles: {conteo['roles']} · modelos configurados: {conteo['modelos_configurados']} · "
+                      f"modelos VERIFICADOS: {conteo['modelos_verificados']} (solo cuentan tras /equipo probar)")
+        self.ui.tenue("  Asignar por rol: /modelo <rol> <alias> · prueba real: /equipo probar · 10 roles: /equipo x on")
 
     def cmd_proveedores(self, arg: str) -> None:
         """Estado de proveedores SIN exponer secretos. Las claves salen de env o .clave_<proveedor>."""
@@ -42199,6 +42494,13 @@ class TestEgresoEstricto(BaseTest):
         c.chat([{"role": "user", "content": "x"}])
         self.assertEqual(len(llamadas), 1)
 
+    def test_privacy_strict_blocks_private_lan_and_mdns(self):
+        for url in ("http://192.168.1.20:11434/v1/chat/completions", "http://10.0.0.5/v1",
+                    "http://169.254.10.1/v1", "http://servidor.local:11434/v1"):
+            self.assertFalse(DestinoModelo("m", "ollama", url, "").es_local(), url)
+        for url in ("http://127.0.0.1:11434/v1", "http://[::1]:11434/v1", "http://localhost:11434/v1"):
+            self.assertTrue(DestinoModelo("m", "ollama", url, "").es_local(), url)
+
     def test_destino_es_local_detecta_loopback(self):
         s = self.ajustes(proveedor="ollama")
         self.assertTrue(destino_modelo("llama3", s).es_local())
@@ -42562,7 +42864,8 @@ class TestEspecificadorTDD(_BaseEquipo):
         ui = self.ui()
         llm = MockLLM(guion)
         res = Agente("especificador", llm, ws, self.ajustes(), ui, memoria=None,
-                     mostrar_progreso=False).ejecutar("escribí los tests de inventario")
+                     mostrar_progreso=False).ejecutar("escribí los tests de inventario. PLAN: src/inventario.py: "
+                                                      "def agregar(lista, x) -> list")
         self.assertTrue(res.ok, res.resumen)
         self.assertNotIn("cierre rechazado", ui.texto_registrado())
         observado = "\n".join(m["content"] for m in llm.llamadas[-1]["mensajes"] if m["role"] == "user")
@@ -42570,9 +42873,10 @@ class TestEspecificadorTDD(_BaseEquipo):
         self.assertNotIn("VALIDACIÓN FALLÓ", observado)            # escribir el test ya no se marca como error
 
     def test_otros_roles_siguen_marcando_imports_faltantes(self):
-        resultados = [Resultado(False, "imports tests/test_x.py", 1, archivo="tests/test_x.py"),
-                      Resultado(False, "imports app.py", 1, archivo="app.py")]
-        quedan, tdd = separar_imports_tdd(resultados)
+        msg = "Módulos no instalados ni presentes en el proyecto: x\n(Instalalos con pip o usá la librería estándar.)"
+        resultados = [Resultado(False, "imports tests/test_x.py", 1, stderr=msg, archivo="tests/test_x.py"),
+                      Resultado(False, "imports app.py", 1, stderr=msg, archivo="app.py")]
+        quedan, tdd, _c = separar_imports_tdd(resultados, "PLAN: x.py: def f()")
         self.assertEqual([r.archivo for r in tdd], ["tests/test_x.py"])  # solo el de un archivo de test
         self.assertEqual([r.archivo for r in quedan], ["app.py"])         # un import roto en código sigue fallando
 
@@ -42605,6 +42909,316 @@ class TestRutasSucias(BaseTest):
     def test_ruta_normal_intacta(self):
         ws = self.proyecto({"a.py": ""})
         self.assertEqual(ws.ruta("a.py"), ws.raiz / "a.py")
+
+
+# ======================================================================
+# MÓDULO: autotest_reaper_x
+# ======================================================================
+"""
+Autotests REAPER X (fases C y D de la especificación de 10 agentes), sobre la base de este repositorio:
+  - clasificación tipada de imports en tests primero (rojo esperado vs typo vs paquete externo vs sintaxis);
+  - una tarea que falla su verificación BLOQUEA a sus dependientes y la build no termina "verificada".
+"""
+
+_PLAN_INV = "PLAN: src/inventario.py: def agregar(lista, x) -> list; src/api.py: def crear_empresa(datos) -> int"
+_MSG_FALTAN = "Módulos no instalados ni presentes en el proyecto: {}\n(Instalalos con pip o usá la librería estándar.)"
+
+
+def _r_imports(modulos: str, archivo: str = "tests/test_inv.py") -> Resultado:
+    return Resultado(False, f"imports {archivo}", 1, stderr=_MSG_FALTAN.format(modulos), archivo=archivo)
+
+
+class TestClasificacionImportsTDD(BaseTest):
+    def test_tdd_expected_red_import_does_not_block_specifier(self):
+        quedan, esperados, clases = separar_imports_tdd([_r_imports("inventario")], _PLAN_INV)
+        self.assertEqual(quedan, [])
+        self.assertEqual(len(esperados), 1)
+        self.assertEqual(clases[0].causa, "MODULO_PROPIO_AUSENTE")
+        self.assertTrue(clases[0].esperado)
+
+    def test_tdd_typo_import_does_not_count_as_expected_red(self):
+        quedan, esperados, clases = separar_imports_tdd([_r_imports("inventaro")], _PLAN_INV)
+        self.assertEqual(esperados, [])
+        self.assertEqual(clases[0].causa, "TYPO")
+        self.assertIn("TYPO", quedan[0].stderr)                 # sigue fallando y explica por qué
+
+    def test_tdd_missing_external_package_is_not_expected_red(self):
+        quedan, esperados, clases = separar_imports_tdd([_r_imports("paquete_externo_zzz")], _PLAN_INV)
+        self.assertEqual(esperados, [])
+        self.assertEqual(clases[0].causa, "PAQUETE_EXTERNO")
+        self.assertEqual(len(quedan), 1)
+
+    def test_mezcla_esperado_y_real_no_se_acepta(self):
+        quedan, esperados, _c = separar_imports_tdd([_r_imports("inventario, paquete_externo_zzz")], _PLAN_INV)
+        self.assertEqual(esperados, [])                         # un solo import real alcanza para fallar
+        self.assertEqual(len(quedan), 1)
+
+    def test_tdd_syntax_error_is_never_accepted(self):
+        sintaxis = Resultado(False, "py_compile tests/test_inv.py", 1, stderr="SyntaxError", archivo="tests/test_inv.py")
+        quedan, esperados, _c = separar_imports_tdd([sintaxis], _PLAN_INV)
+        self.assertEqual(quedan, [sintaxis])
+        self.assertEqual(esperados, [])
+
+    def test_nombre_planeado_en_modulo_existente_es_esperado(self):
+        r = Resultado(False, "imports-locales tests/test_api.py", 1, archivo="tests/test_api.py",
+                      stderr="línea 3: src/api.py no define 'crear_empresa'")
+        _q, esperados, clases = separar_imports_tdd([r], _PLAN_INV)
+        self.assertEqual(clases[0].causa, "NOMBRE_PLANEADO_AUSENTE")
+        self.assertEqual(len(esperados), 1)
+
+    def test_nombre_con_typo_en_modulo_existente_no_es_esperado(self):
+        r = Resultado(False, "imports-locales tests/test_api.py", 1, archivo="tests/test_api.py",
+                      stderr="línea 3: src/api.py no define 'crear_empresaa' (¿quisiste decir 'crear_empresa'?)")
+        quedan, esperados, clases = separar_imports_tdd([r], _PLAN_INV)
+        self.assertEqual(clases[0].causa, "TYPO")
+        self.assertEqual(esperados, [])
+        self.assertEqual(len(quedan), 1)
+
+    def test_modulos_planeados_ignora_tests(self):
+        self.assertEqual(modulos_planeados("src/db.py tests/test_db.py app.py"), {"src", "db", "app"})
+
+    def test_especificador_con_typo_no_puede_cerrar(self):
+        test = "import sys\nsys.path.insert(0, 'src')\nfrom inventaro import agregar\n\n\ndef test_a():\n    assert agregar([], 1) == [1]\n"
+
+        def guion(mensajes, kwargs):
+            if _turno(mensajes) == 0:
+                return herramienta_xml("write_to_file", path="tests/test_inv.py", content=test)
+            return terminar_xml("tests escritos")
+
+        ui = self.ui()
+        Agente("especificador", MockLLM(guion), self.proyecto({}), self.ajustes(), ui, memoria=None,
+               mostrar_progreso=False).ejecutar("escribí los tests. " + _PLAN_INV)
+        self.assertIn("cierre rechazado", ui.texto_registrado())   # el typo NO se disfraza de rojo esperado
+
+
+class TestBloqueoDependientes(BaseTest):
+    PLAN = """<plan>
+<objetivo>Dos módulos</objetivo>
+<tarea id="1" archivos="a.py">Crear a.py con def uno(): return 1</tarea>
+<tarea id="2" archivos="b.py" deps="1">Crear b.py con def dos() que usa uno() de a.py</tarea>
+<criterios>
+- uno() == 1
+</criterios>
+</plan>"""
+
+    def test_failed_dependency_blocks_downstream_tasks(self):
+        pedidos_implementador = []
+
+        def guion(mensajes, kwargs):
+            rol = MockLLM.rol_de(mensajes)
+            turno = _turno(mensajes)
+            if rol == "arquitecto":
+                return terminar_xml(self.PLAN)
+            if rol == "implementador":
+                pedidos_implementador.append(mensajes[1]["content"] if len(mensajes) > 1 else "")
+                if turno == 0:
+                    return herramienta_xml("write_to_file", path="a.py", content="def uno(:\n    return 1\n")
+                return terminar_xml("hecho")
+            return terminar_xml("no pude")
+
+        ws = self.proyecto({"README.md": "# dos\n"})
+        ajustes = self.ajustes(tests_primero=False, torneo=False, max_revisiones=0, lecciones=False,
+                               max_reparaciones=1, umbral_escalada=0)
+        informe = Orquestador(MockLLM(guion), ws, ajustes, self.ui()).construir("dos módulos", confirmar=False)
+        self.assertEqual(informe.tareas_fallidas, ["1"])
+        self.assertEqual(informe.tareas_bloqueadas, ["2"])
+        self.assertNotEqual(informe.estado, "verificada")
+        self.assertEqual([tid for tid, _modo, _g in informe.torneos], ["1"])  # la tarea 2 nunca se implementó
+        self.assertTrue(pedidos_implementador)
+        self.assertFalse((ws.raiz / "b.py").exists())
+
+    def test_incomplete_product_is_partial_not_verified(self):
+        informe = InformeBuild("parcial", tareas_bloqueadas=["2"])
+        self.assertFalse(informe.ok)
+
+
+class TestResultadosVeraces(BaseTest):
+    def test_command_checkmark_does_not_mean_zero_exit_code(self):
+        guion = [herramienta_xml("execute_command", command="python3 -c \"import sys; sys.exit(3)\""),
+                 terminar_xml("listo")]
+        ui = self.ui()
+        Agente("principal", MockLLM(guion), self.proyecto({}), self.ajustes(modo="auto"), ui, memoria=None,
+               mostrar_progreso=False).ejecutar("corré el comando")
+        texto = ui.texto_registrado()
+        self.assertIn("exit 3", texto)
+        self.assertNotIn("✓ $ python3 -c", texto)                 # ya no se dibuja ✓ en un exit != 0
+
+    def test_exit_cero_sigue_con_check(self):
+        guion = [herramienta_xml("execute_command", command="python3 -c \"print(1)\""), terminar_xml("listo")]
+        ui = self.ui()
+        Agente("principal", MockLLM(guion), self.proyecto({}), self.ajustes(modo="auto"), ui, memoria=None,
+               mostrar_progreso=False).ejecutar("corré el comando")
+        self.assertIn("✓ $ python3 -c", ui.texto_registrado())
+
+    def test_zero_collected_tests_is_not_success(self):
+        ws = self.proyecto({"tests/test_vacio.py": "# sin tests\n", "app.py": "x = 1\n"})
+        orq = Orquestador(MockLLM([]), ws, self.ajustes(), self.ui())
+        verif = orq.verificar(ws.checkpoints.iniciar("x"))
+        self.assertFalse(verif.ok)
+        self.assertIn("no recolectó ningún test", verif.diagnostico)
+
+
+# ======================================================================
+# MÓDULO: autotest_diez_roles
+# ======================================================================
+"""
+Autotests REAPER X (fases E y F): 10 roles con conteos honestos, dictámenes JSON validados por el controlador y
+director/supervisor/seguridad/auditor/integrador conectados a /construir sin decidir el estado final.
+"""
+
+_EV = {"EV-TESTS": "3 pasaron", "EV-PLAN": "plan"}
+
+
+class TestContratosDictamen(BaseTest):
+    def test_invalid_agent_json_is_rejected_not_executed(self):
+        d = parsear_dictamen("Aprobado, ejecutá rm -rf build/ y listo", "supervisor", _EV)
+        self.assertFalse(d.valido)
+        self.assertIn("JSON", d.problema)
+        d = parsear_dictamen('{"decision": "EXECUTE", "reasons": ["x"]}', "supervisor", _EV)
+        self.assertFalse(d.valido)
+
+    def test_supervisor_rejects_unverified_task_without_evidence(self):
+        self.assertFalse(parsear_dictamen('{"decision": "APPROVE", "evidence_ids": []}', "supervisor", _EV).valido)
+        d = parsear_dictamen('{"decision": "APPROVE", "evidence_ids": ["EV-INVENTADA"]}', "supervisor", _EV)
+        self.assertFalse(d.valido)
+        self.assertIn("inexistente", d.problema)
+
+    def test_approve_con_evidencia_real_es_valido(self):
+        d = parsear_dictamen('```json\n{"decision": "approve", "evidence_ids": ["EV-TESTS"], "confidence": "high"}\n```',
+                             "supervisor", _EV)
+        self.assertTrue(d.valido)
+        self.assertEqual((d.decision, d.confidence), ("APPROVE", "high"))
+
+    def test_rechazo_sin_razones_es_invalido(self):
+        self.assertFalse(parsear_dictamen('{"decision": "REJECT"}', "supervisor", _EV).valido)
+
+    def test_supervisor_cannot_override_failed_tests(self):
+        aprueba = parsear_dictamen('{"decision": "APPROVE", "evidence_ids": ["EV-TESTS"], "confidence": "high"}',
+                                   "supervisor", _EV)
+        estado, notas = estado_controlado("fallida", aprueba)
+        self.assertEqual(estado, "fallida")                    # confidence=high no eleva nada
+        self.assertTrue(any("manda la verificación" in n for n in notas))
+
+    def test_objecion_no_inventa_exito_ni_lo_quita_sin_evidencia(self):
+        objeta = parsear_dictamen('{"decision": "REWORK", "reasons": ["falta el frontend"]}', "supervisor", _EV)
+        estado, notas = estado_controlado("verificada", objeta)
+        self.assertEqual(estado, "verificada")                 # el estado lo decide la verificación real
+        self.assertTrue(any("falta el frontend" in n for n in notas))
+
+    def test_model_served_distinto_queda_registrado(self):
+        d = parsear_dictamen('{"decision": "ABSTAIN"}', "supervisor", _EV, model_requested="a", model_served="b")
+        self.assertEqual((d.model_requested, d.model_served), ("a", "b"))
+
+    def test_hallazgos_y_auditoria_validados(self):
+        h = parsear_hallazgos_seguridad('{"findings": [{"severity": "critica", "file": "a.py", "issue": "SQL concatenado"}]}')
+        self.assertEqual(h[0]["severity"], "low")              # severidad fuera del enum no se acepta tal cual
+        self.assertIsNone(parsear_hallazgos_seguridad("sin json"))
+        a = parsear_auditoria('{"criteria": [{"criterion": "CRUD", "status": "MET", "evidence_ids": []}]}', _EV)
+        self.assertEqual(a[0]["status"], "UNKNOWN")            # MET sin evidencia baja a UNKNOWN
+
+
+class TestDiezRoles(BaseTest):
+    def test_ten_roles_are_distinct_even_when_models_shared(self):
+        s = self.ajustes(roles_x=True)
+        c = conteo_equipo_x(s)
+        self.assertEqual(c["roles"], 10)
+        self.assertEqual(c["modelos_configurados"], 1)         # 10 roles con el mismo modelo = 1 modelo, no 10 IAs
+        self.assertTrue(c["independencia_reducida"])
+        self.assertEqual(len({rol for _e, rol in ROLES_EQUIPO_DIEZ}), 10)
+        self.assertTrue(all(rol in ROLES for _e, rol in ROLES_EQUIPO_DIEZ))
+
+    def test_ten_distinct_models_only_count_after_real_probe(self):
+        modelos = {rol: f"openrouter:prov/m{i}" for i, (_e, rol) in enumerate(ROLES_EQUIPO_DIEZ)}
+        s = self.ajustes(roles_x=True, modelos_rol=modelos)
+        self.assertEqual(conteo_equipo_x(s)["modelos_configurados"], 10)
+        self.assertEqual(conteo_equipo_x(s)["modelos_verificados"], 0)
+        probados = {modelos["director"]: "RESPONDE", modelos["qa"]: "RESPONDE", modelos["revisor"]: "FALLA"}
+        self.assertEqual(conteo_equipo_x(s, probados)["modelos_verificados"], 2)
+
+    def test_no_false_independence_for_same_gateway(self):
+        s = self.ajustes(roles_x=True, modelos_rol={"director": "openrouter:a/x", "supervisor": "openrouter:b/y"})
+        self.assertEqual(conteo_equipo_x(s)["proveedores"], 1)  # OpenRouter es UN proveedor aunque sirva muchos modelos
+
+    def test_sin_roles_x_siguen_los_seis(self):
+        self.assertEqual(len(estado_equipo(self.ajustes())), 6)
+        self.assertEqual(len(estado_equipo(self.ajustes(roles_x=True))), 10)
+
+    def test_missing_model_cannot_cause_spurious_ten_of_ten(self):
+        previo = os.environ.pop("OPENROUTER_API_KEY", None)
+        if previo is not None:
+            self.addCleanup(os.environ.__setitem__, "OPENROUTER_API_KEY", previo)
+        res = probar_equipo(MockLLM([]), self.ajustes(roles_x=True))
+        self.assertEqual(len(res), 10)
+        self.assertEqual(sum(1 for r in res if r["estado"] == "RESPONDE"), 0)
+
+    def test_comando_equipo_x(self):
+        app = App(self.ajustes(forense=False, escalar=False), MockLLM([]), self.ui(), self.proyecto(), persistir=False)
+        app.comando("/equipo x on")
+        texto = app.ui.texto_registrado()
+        self.assertTrue(app.settings.roles_x)
+        self.assertIn("Equipo de 10 roles (REAPER X)", texto)
+        self.assertIn("modelos VERIFICADOS: 0", texto)
+        app.comando("/equipo x off")
+        self.assertFalse(app.settings.roles_x)
+
+
+class TestPipelineReaperX(BaseTest):
+    def _guion(self, supervisor_plan, supervisor_final, llamadas_por_rol):
+        def guion(mensajes, kwargs):
+            rol = MockLLM.rol_de(mensajes)
+            llamadas_por_rol[rol] = llamadas_por_rol.get(rol, 0) + 1
+            turno = _turno(mensajes)
+            if rol == "director":
+                return '{"mission": "Calculadora con suma y resta", "priorities": ["tests"], "acceptance_criteria": ["suma(2,3)==5"]}'
+            if rol == "supervisor":
+                return supervisor_plan if "EV-PLAN" in mensajes[-1]["content"] else supervisor_final
+            if rol == "seguridad":
+                return '{"findings": [{"severity": "low", "file": "calc.py", "issue": "sin validación de tipos", "fix": "validar"}]}'
+            if rol == "auditor_entrega":
+                return '{"criteria": [{"criterion": "suma(2,3)==5", "status": "MET", "evidence_ids": ["EV-TESTS"]}]}'
+            if rol == "arquitecto":
+                return terminar_xml(TestPipeline.PLAN)
+            if rol == "especificador":
+                if turno == 0:
+                    return herramienta_xml("write_to_file", path="tests/test_calc.py", content=_TEST_CALC)
+                return terminar_xml("tests escritos")
+            if rol == "implementador":
+                if turno == 0:
+                    return herramienta_xml("write_to_file", path="calc.py", content=_CALC_BIEN)
+                return terminar_xml("calc.py implementado")
+            return terminar_xml("ok")
+        return guion
+
+    def _construir(self, supervisor_plan, supervisor_final):
+        llamadas = {}
+        ws = self.proyecto({"README.md": "# calc\n"})
+        ajustes = self.ajustes(tests_primero=True, torneo=False, max_revisiones=0, lecciones=False, roles_x=True)
+        ui = self.ui()
+        informe = Orquestador(MockLLM(self._guion(supervisor_plan, supervisor_final, llamadas)), ws, ajustes, ui
+                              ).construir("calculadora", confirmar=False)
+        return informe, llamadas, ui.texto_registrado()
+
+    def test_diez_roles_participan_y_manda_la_verificacion(self):
+        aprueba_plan = '{"decision": "APPROVE", "evidence_ids": ["EV-PLAN"], "reasons": ["cubre el pedido"]}'
+        aprueba_final = '{"decision": "APPROVE", "evidence_ids": ["EV-TESTS", "EV-ESTADO"]}'
+        informe, llamadas, texto = self._construir(aprueba_plan, aprueba_final)
+        self.assertEqual(informe.estado, "verificada", informe.notas)
+        for rol in ("director", "supervisor", "seguridad", "auditor_entrega", "arquitecto", "implementador"):
+            self.assertIn(rol, llamadas, rol)
+        self.assertEqual(llamadas["supervisor"], 2)            # plan + entrega
+        self.assertTrue(any(n.startswith("Seguridad [low]") for n in informe.notas))
+        self.assertTrue(any("Auditor de entrega: 1/1" in n for n in informe.notas))
+
+    def test_supervisor_pide_rehacer_el_plan(self):
+        rehacer = '{"decision": "REWORK", "reasons": ["falta un criterio para resta"]}'
+        _informe, llamadas, texto = self._construir(rehacer, '{"decision": "ABSTAIN"}')
+        self.assertEqual(llamadas["arquitecto"], 2)            # se replanificó una vez con las razones
+        self.assertIn("rehacer el plan", texto)
+
+    def test_supervisor_que_no_responde_json_no_decide(self):
+        informe, _l, _t = self._construir('{"decision": "APPROVE", "evidence_ids": ["EV-PLAN"]}', "Todo perfecto, aprobado")
+        self.assertEqual(informe.estado, "verificada")         # la verificación real sigue mandando
+        self.assertTrue(any("descartado" in n for n in informe.notas))
 
 
 # ======================================================================
@@ -43683,6 +44297,30 @@ TEST_SUITE_GREEN (tests pass), BEHAVIOR_VERIFIED (the program was also run and g
 CONTRADICTED (evidence says otherwise). Remember: 'tests pass' does NOT imply 'no bugs' (that exceeds the
 evidence), and green tests that don't discriminate (inspect_tests) don't rise above TEST_SUITE_GREEN.
 attempt_completion with one line per claim: CLAIM → LEVEL (what evidence backs it and what's missing to raise it).""",
+    "director": """You are the project DIRECTOR. Turn the request into a clear mission: goal, priorities and verifiable
+acceptance criteria (concrete inputs/outputs, HTTP codes, persistence). You execute nothing and authorize no
+tools: you only set priorities. Don't invent technical certainty.
+Reply ONLY a JSON object: {"mission": "...", "priorities": ["..."], "acceptance_criteria": ["..."]}""",
+    "supervisor": """You are the technical SUPERVISOR. You review plans and deliveries against the EVIDENCE you are given
+(each piece has an id EV-...). Reject with verifiable reasons; never approve without citing evidence. Your
+verdict does NOT decide the final state: real verification (tests and validators) does.
+Reply ONLY a JSON object: {"decision": "APPROVE|REJECT|REWORK|ESCALATE|ABSTAIN",
+"reasons": ["requirement and evidence"], "evidence_ids": ["EV-..."], "next_actions": ["..."],
+"confidence": "low|medium|high"}""",
+    "integrador": """You are the INTEGRATOR. Tasks were implemented separately; your job is to make them work TOGETHER:
+contracts between modules, imports, paths, configuration and startup. You get REAL diagnostics from the
+integrated verification. Fix with the minimal change; never delete, skip or weaken tests.
+After fixing, run validate and run_tests. Report: what didn't fit, what you changed and the real result.""",
+    "seguridad": """You are the DEFENSIVE SECURITY REVIEWER of the user's project (read-only). Review the diff for problems
+in the code itself: secrets in code or logs, SQL built by concatenation, unvalidated input, HTTP errors that
+leak internal details, unnecessary dependencies, file permissions. Don't propose attacks: describe the problem
+and the fix.
+Reply ONLY a JSON object: {"findings": [{"severity": "high|medium|low", "file": "...",
+"issue": "...", "fix": "..."}]}  (empty list if there are no real findings).""",
+    "auditor_entrega": """You are the DELIVERY AUDITOR. Compare each acceptance criterion against the EVIDENCE given (ids EV-...).
+A criterion is MET only if you cite evidence that proves it; without evidence it is UNKNOWN.
+Reply ONLY a JSON object: {"criteria": [{"criterion": "...", "status": "MET|NOT_MET|UNKNOWN",
+"evidence_ids": ["EV-..."]}]}""",
 }
 
 DOCS_EN = {
@@ -47047,7 +47685,7 @@ ROLES_EQUIPO_SEIS = (
 def estado_equipo(settings) -> list:
     """Para cada rol: modelo asignado, proveedor de destino y si hay credencial para ese proveedor."""
     salida = []
-    for etiqueta, rol in ROLES_EQUIPO_SEIS:
+    for etiqueta, rol in roles_equipo(settings):
         modelo = settings.modelo_para(rol)
         destino = destino_modelo(modelo, settings)
         try:
@@ -47088,7 +47726,7 @@ def autoasignar_equipo_free(settings) -> tuple:
             if cola:
                 candidatos.append(cola.pop(0))
     asignacion = {}
-    for i, (_, rol) in enumerate(ROLES_EQUIPO_SEIS):
+    for i, (_, rol) in enumerate(roles_equipo(settings)):
         asignacion[rol] = candidatos[i % len(candidatos)]
     return asignacion, ""
 
@@ -47137,7 +47775,7 @@ def resumen_arranque_equipo(settings) -> str:
     ind = independencia_equipo(estado)
     con_clave = sum(1 for e in estado if e["tiene_clave"])
     aviso = "" if con_clave == len(estado) else f" · {len(estado) - con_clave} sin clave"
-    return (f"6 roles → {ind['modelos_distintos']} modelo(s)/{ind['proveedores_distintos']} prov{aviso}"
+    return (f"{len(estado)} roles → {ind['modelos_distintos']} modelo(s)/{ind['proveedores_distintos']} prov{aviso}"
             f" · conectividad NO VERIFICADA (/equipo probar)")
 
 
@@ -47849,6 +48487,204 @@ def contadores_proveedores(settings, manifiestos_extra: Sequence[ManifiestoProve
         "providers_free_confirmed": "NO VERIFICADO",
         "meta_objetivo": 100,
     }
+
+
+# ======================================================================
+# MÓDULO: reaper_x
+# ======================================================================
+"""
+REAPER X: equipo de 10 roles con dictámenes estructurados y un controlador determinista.
+
+Distinción que no se rompe: ROL (responsabilidad) ≠ MODELO (id servido por una API) ≠ PROVEEDOR (dominio de
+autenticación). Diez roles pueden compartir modelos; solo se cuentan modelos "verificados" después de una
+prueba real (/equipo probar). Los roles de dirección y auditoría (director, supervisor, seguridad defensiva,
+auditor de entrega) responden JSON por texto, sin herramientas: el controlador valida ese JSON y nunca ejecuta
+nada de lo que dice. El estado final de una build lo decide la verificación real (tests + validadores), no un
+dictamen: un APPROVE sin evidencia es inválido y ningún dictamen puede convertir una build roja en verde.
+"""
+
+ROLES_EQUIPO_DIEZ = (
+    ("director", "director"),
+    ("supervisor", "supervisor"),
+    ("arquitecto", "arquitecto"),
+    ("implementador", "implementador"),
+    ("revisor", "revisor"),
+    ("qa", "qa"),
+    ("reparador", "reparador"),
+    ("integrador", "integrador"),
+    ("seguridad", "seguridad"),
+    ("auditor_entrega", "auditor_entrega"),
+)
+
+DECISIONES_X = ("APPROVE", "REJECT", "REWORK", "ESCALATE", "ABSTAIN")
+_CONFIANZAS_X = ("low", "medium", "high")
+
+
+def roles_equipo(settings) -> tuple:
+    """Los roles del equipo según la configuración: 10 con REAPER X activado, los 6 clásicos si no."""
+    return ROLES_EQUIPO_DIEZ if getattr(settings, "roles_x", False) else ROLES_EQUIPO_SEIS
+
+
+def extraer_json_x(texto: str) -> Optional[dict]:
+    """Primer objeto JSON del texto (acepta ```json ...```). None si no hay un objeto válido. Nunca evalúa código."""
+    if not texto:
+        return None
+    candidatos = re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", texto, re.S)
+    inicio = texto.find("{")
+    if inicio >= 0:
+        profundidad = 0
+        for i in range(inicio, len(texto)):
+            if texto[i] == "{":
+                profundidad += 1
+            elif texto[i] == "}":
+                profundidad -= 1
+                if profundidad == 0:
+                    candidatos.append(texto[inicio:i + 1])
+                    break
+    for c in candidatos:
+        try:
+            datos = json.loads(c)
+        except ValueError:
+            continue
+        if isinstance(datos, dict):
+            return datos
+    return None
+
+
+def _lista_str(valor) -> list:
+    if isinstance(valor, str):
+        return [valor] if valor.strip() else []
+    if isinstance(valor, (list, tuple)):
+        return [str(x).strip() for x in valor if str(x).strip()]
+    return []
+
+
+@dataclass
+class Dictamen:
+    rol: str
+    decision: str                      # una de DECISIONES_X, o "INVALID"
+    reasons: list = field(default_factory=list)
+    evidence_ids: list = field(default_factory=list)
+    next_actions: list = field(default_factory=list)
+    confidence: str = "low"
+    model_requested: str = ""
+    model_served: str = "unknown"
+    problema: str = ""                 # por qué es INVALID
+
+    @property
+    def valido(self) -> bool:
+        return self.decision in DECISIONES_X
+
+    def texto(self) -> str:
+        if not self.valido:
+            return f"{self.rol}: dictamen INVÁLIDO ({self.problema})"
+        razones = "; ".join(self.reasons[:4]) or "sin razones"
+        return f"{self.rol}: {self.decision} [{self.confidence}] — {razones}"
+
+
+def parsear_dictamen(texto: str, rol: str, evidencia: Optional[dict] = None, *, model_requested: str = "",
+                     model_served: str = "unknown") -> Dictamen:
+    """
+    Valida la respuesta de un rol de dirección contra el contrato. Reglas: JSON obligatorio; decisión del
+    enum; APPROVE exige evidence_ids que EXISTAN en la evidencia dada; REJECT/REWORK exigen razones.
+    confidence=high no cambia nada: solo la evidencia cuenta.
+    """
+    base = Dictamen(rol, "INVALID", model_requested=model_requested, model_served=model_served or "unknown")
+    datos = extraer_json_x(texto)
+    if datos is None:
+        base.problema = "la respuesta no es un objeto JSON"
+        return base
+    decision = str(datos.get("decision", "")).strip().upper()
+    if decision not in DECISIONES_X:
+        base.problema = f"decisión fuera del contrato: {decision or '(vacía)'}"
+        return base
+    base.reasons = _lista_str(datos.get("reasons"))
+    base.evidence_ids = _lista_str(datos.get("evidence_ids"))
+    base.next_actions = _lista_str(datos.get("next_actions"))
+    confianza = str(datos.get("confidence", "low")).strip().lower()
+    base.confidence = confianza if confianza in _CONFIANZAS_X else "low"
+    if evidencia is not None:
+        inexistentes = [e for e in base.evidence_ids if e not in evidencia]
+        if inexistentes:
+            base.problema = "cita evidencia inexistente: " + ", ".join(inexistentes[:4])
+            return base
+    if decision == "APPROVE" and not base.evidence_ids:
+        base.problema = "APPROVE sin evidence_ids"
+        return base
+    if decision in ("REJECT", "REWORK") and not base.reasons:
+        base.problema = f"{decision} sin razones verificables"
+        return base
+    base.decision = decision
+    return base
+
+
+def estado_controlado(estado_determinista: str, dictamen: Optional[Dictamen]) -> tuple:
+    """
+    El controlador: el estado final es el de la verificación real. Un dictamen del supervisor solo agrega
+    observaciones (nunca convierte una build roja/parcial en verificada). Devuelve (estado, notas).
+    """
+    notas = []
+    if dictamen is None:
+        return estado_determinista, notas
+    if not dictamen.valido:
+        notas.append(f"Dictamen del supervisor descartado: {dictamen.problema}.")
+    elif dictamen.decision == "APPROVE" and estado_determinista not in ("verificada", "validada"):
+        notas.append("El supervisor aprobó, pero la verificación real no pasa: manda la verificación.")
+    elif dictamen.decision in ("REJECT", "REWORK"):
+        notas.append("Objeción del supervisor: " + "; ".join(dictamen.reasons[:4]))
+    return estado_determinista, notas
+
+
+def parsear_hallazgos_seguridad(texto: str) -> Optional[list]:
+    """[{severity, file, issue, fix}] validados; None si la respuesta no cumple el contrato."""
+    datos = extraer_json_x(texto)
+    if datos is None or not isinstance(datos.get("findings"), list):
+        return None
+    salida = []
+    for h in datos["findings"]:
+        if not isinstance(h, dict) or not str(h.get("issue", "")).strip():
+            continue
+        sev = str(h.get("severity", "low")).strip().lower()
+        salida.append({"severity": sev if sev in ("high", "medium", "low") else "low",
+                       "file": str(h.get("file", "")).strip(), "issue": str(h["issue"]).strip()[:300],
+                       "fix": str(h.get("fix", "")).strip()[:300]})
+    return salida
+
+
+def parsear_auditoria(texto: str, evidencia: dict) -> Optional[list]:
+    """[{criterion, status, evidence_ids}]; un MET sin evidencia existente baja a UNKNOWN. None si es inválido."""
+    datos = extraer_json_x(texto)
+    if datos is None or not isinstance(datos.get("criteria"), list):
+        return None
+    salida = []
+    for c in datos["criteria"]:
+        if not isinstance(c, dict) or not str(c.get("criterion", "")).strip():
+            continue
+        status = str(c.get("status", "UNKNOWN")).strip().upper()
+        ids = [e for e in _lista_str(c.get("evidence_ids")) if e in evidencia]
+        if status not in ("MET", "NOT_MET", "UNKNOWN"):
+            status = "UNKNOWN"
+        if status == "MET" and not ids:
+            status = "UNKNOWN"
+        salida.append({"criterion": str(c["criterion"]).strip()[:200], "status": status, "evidence_ids": ids})
+    return salida
+
+
+def conteo_equipo_x(settings, probados: Optional[dict] = None) -> dict:
+    """
+    Conteos honestos y separados: roles, modelos distintos configurados, modelos distintos VERIFICADOS (solo los
+    que respondieron una prueba real) y proveedores. Un gateway (OpenRouter) cuenta como UN proveedor.
+    """
+    probados = probados or {}
+    roles = roles_equipo(settings)
+    modelos, proveedores = set(), set()
+    for _etiqueta, rol in roles:
+        m = settings.modelo_para(rol)
+        modelos.add(m)
+        proveedores.add(destino_modelo(m, settings).proveedor)
+    verificados = {m for m in modelos if probados.get(m) == "RESPONDE"}
+    return {"roles": len(roles), "modelos_configurados": len(modelos), "modelos_verificados": len(verificados),
+            "proveedores": len(proveedores), "independencia_reducida": len(proveedores) <= 1}
 
 
 # ======================================================================

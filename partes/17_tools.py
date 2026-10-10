@@ -166,7 +166,7 @@ def _post_escritura(ctx: Contexto, rel: str, antes: Optional[str], despues: str,
 
     resultados = validar_archivo(ctx.ws, rel)
     if ctx.rol == "especificador":
-        resultados, tdd = separar_imports_tdd(resultados)
+        resultados, tdd, _clases = separar_imports_tdd(resultados, ctx.pedido, ctx.ws)
         if tdd:
             notas = list(notas) + ["importa módulos que todavía no existen (esperado en tests primero: "
                                    "los crea la implementación)"]

@@ -160,7 +160,8 @@ class TestEspecificadorTDD(_BaseEquipo):
         ui = self.ui()
         llm = MockLLM(guion)
         res = Agente("especificador", llm, ws, self.ajustes(), ui, memoria=None,
-                     mostrar_progreso=False).ejecutar("escribí los tests de inventario")
+                     mostrar_progreso=False).ejecutar("escribí los tests de inventario. PLAN: src/inventario.py: "
+                                                      "def agregar(lista, x) -> list")
         self.assertTrue(res.ok, res.resumen)
         self.assertNotIn("cierre rechazado", ui.texto_registrado())
         observado = "\n".join(m["content"] for m in llm.llamadas[-1]["mensajes"] if m["role"] == "user")
@@ -168,9 +169,10 @@ class TestEspecificadorTDD(_BaseEquipo):
         self.assertNotIn("VALIDACIÓN FALLÓ", observado)            # escribir el test ya no se marca como error
 
     def test_otros_roles_siguen_marcando_imports_faltantes(self):
-        resultados = [Resultado(False, "imports tests/test_x.py", 1, archivo="tests/test_x.py"),
-                      Resultado(False, "imports app.py", 1, archivo="app.py")]
-        quedan, tdd = separar_imports_tdd(resultados)
+        msg = "Módulos no instalados ni presentes en el proyecto: x\n(Instalalos con pip o usá la librería estándar.)"
+        resultados = [Resultado(False, "imports tests/test_x.py", 1, stderr=msg, archivo="tests/test_x.py"),
+                      Resultado(False, "imports app.py", 1, stderr=msg, archivo="app.py")]
+        quedan, tdd, _c = separar_imports_tdd(resultados, "PLAN: x.py: def f()")
         self.assertEqual([r.archivo for r in tdd], ["tests/test_x.py"])  # solo el de un archivo de test
         self.assertEqual([r.archivo for r in quedan], ["app.py"])         # un import roto en código sigue fallando
 

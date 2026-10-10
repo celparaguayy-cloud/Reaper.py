@@ -1032,8 +1032,18 @@ class App:
         self.ui.linea(texto_reporte_privacidad(reporte_privacidad(self.llm, self.settings)))
 
     def cmd_equipo(self, arg: str) -> None:
-        """Muestra los seis roles → proveedor/modelo asignado + independencia real. Conectividad NO VERIFICADA."""
+        """Roles → proveedor/modelo asignado + independencia real (6 clásicos, o 10 con REAPER X)."""
         sub = (arg or "").strip().lower()
+        if sub.startswith("x"):
+            partes_x = sub.split()
+            if len(partes_x) > 1 and partes_x[1] in ("on", "off", "si", "sí", "no"):
+                self.settings.roles_x = partes_x[1] in ("on", "si", "sí")
+                self._guardar_settings()
+            self.ui.ok(f"REAPER X (10 roles): {'ON' if self.settings.roles_x else 'OFF'}")
+            self.ui.tenue("  ON agrega director y supervisor (dictámenes JSON validados), integrador, seguridad "
+                          "defensiva y auditor de entrega a /construir. El estado final lo sigue decidiendo la "
+                          "verificación real. /equipo x on | /equipo x off")
+            sub = ""
         estado = estado_equipo(self.settings)
         ind = independencia_equipo(estado)
         if sub in ("independencia", "independence"):
@@ -1056,6 +1066,7 @@ class App:
         if sub == "probar":
             self.ui.info("Probando cada rol con una petición mínima real (puede consumir cuota)...")
             resultados = probar_equipo(self.llm, self.settings)
+            self._probados = {r["modelo"]: r["estado"] for r in resultados}
             simbolos = {"RESPONDE": "✓", "SIN_CLAVE": "⚠", "FALLA": "✗"}
             for r in resultados:
                 self.ui.info(f"  {simbolos.get(r['estado'], '?')} {r['rol']:<13} {r['proveedor']}/{r.get('modelo_real') or r['modelo']}  "
@@ -1063,19 +1074,23 @@ class App:
             responden = [r for r in resultados if r["estado"] == "RESPONDE"]
             provs = {r["proveedor"] for r in responden}
             modelos = {r["modelo"] for r in responden}
-            self.ui.ok(f"Agentes que RESPONDEN: {len(responden)}/6 · "
+            self.ui.ok(f"Agentes que RESPONDEN: {len(responden)}/{len(resultados)} · "
                        f"proveedores distintos: {len(provs)} · modelos distintos: {len(modelos)}")
             if not responden:
                 self.ui.aviso("  Ninguno respondió: configurá una clave (ej. export GROQ_API_KEY=...) y reintentá.")
             return
-        self.ui.info("Equipo de seis roles (asignación actual; conectividad NO VERIFICADA):")
+        self.ui.info(f"Equipo de {len(estado)} roles{' (REAPER X)' if self.settings.roles_x else ''} "
+                     "(asignación actual; conectividad NO VERIFICADA):")
         for e in estado:
             marca = "✓ clave" if e["tiene_clave"] else "⚠ FALTA CLAVE"
             self.ui.info(f"  {e['rol']:<13} → {e['proveedor']}/{e.get('modelo_real') or e['modelo']}   {marca}")
         self.ui.tenue(f"  proveedores distintos: {ind['proveedores_distintos']} · "
                       f"modelos distintos: {ind['modelos_distintos']}"
                       + ("  · independencia REDUCIDA" if ind["reducida"] else ""))
-        self.ui.tenue("  Asignar por rol: /modelo <rol> <alias> · prueba real: /proveedores probar")
+        conteo = conteo_equipo_x(self.settings, getattr(self, "_probados", {}))
+        self.ui.tenue(f"  roles: {conteo['roles']} · modelos configurados: {conteo['modelos_configurados']} · "
+                      f"modelos VERIFICADOS: {conteo['modelos_verificados']} (solo cuentan tras /equipo probar)")
+        self.ui.tenue("  Asignar por rol: /modelo <rol> <alias> · prueba real: /equipo probar · 10 roles: /equipo x on")
 
     def cmd_proveedores(self, arg: str) -> None:
         """Estado de proveedores SIN exponer secretos. Las claves salen de env o .clave_<proveedor>."""

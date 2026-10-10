@@ -39,6 +39,10 @@ class GrafoTareas:
                 hijos[d].append(tid)
         return hijos
 
+    def dependencias(self, tid: str) -> list:
+        """Ids de las tareas de las que depende `tid` (solo las válidas)."""
+        return list(self._deps.get(tid, []))
+
     def tiene_ciclo(self) -> bool:
         return len(self._orden_ids()) < len(self.tareas)
 

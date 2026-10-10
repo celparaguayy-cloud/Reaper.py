@@ -21,7 +21,7 @@ ROLES_EQUIPO_SEIS = (
 def estado_equipo(settings) -> list:
     """Para cada rol: modelo asignado, proveedor de destino y si hay credencial para ese proveedor."""
     salida = []
-    for etiqueta, rol in ROLES_EQUIPO_SEIS:
+    for etiqueta, rol in roles_equipo(settings):
         modelo = settings.modelo_para(rol)
         destino = destino_modelo(modelo, settings)
         try:
@@ -62,7 +62,7 @@ def autoasignar_equipo_free(settings) -> tuple:
             if cola:
                 candidatos.append(cola.pop(0))
     asignacion = {}
-    for i, (_, rol) in enumerate(ROLES_EQUIPO_SEIS):
+    for i, (_, rol) in enumerate(roles_equipo(settings)):
         asignacion[rol] = candidatos[i % len(candidatos)]
     return asignacion, ""
 
@@ -111,7 +111,7 @@ def resumen_arranque_equipo(settings) -> str:
     ind = independencia_equipo(estado)
     con_clave = sum(1 for e in estado if e["tiene_clave"])
     aviso = "" if con_clave == len(estado) else f" · {len(estado) - con_clave} sin clave"
-    return (f"6 roles → {ind['modelos_distintos']} modelo(s)/{ind['proveedores_distintos']} prov{aviso}"
+    return (f"{len(estado)} roles → {ind['modelos_distintos']} modelo(s)/{ind['proveedores_distintos']} prov{aviso}"
             f" · conectividad NO VERIFICADA (/equipo probar)")
 
 

@@ -164,6 +164,8 @@ class Settings:
     fallbacks: list = field(default_factory=list)
     # Si el modelo de un rol falla, probar con los otros modelos del equipo (los de /equipo) antes de abortar.
     respaldo_equipo: bool = True
+    # REAPER X: equipo de 10 roles (director, supervisor, integrador, seguridad defensiva, auditor de entrega)
+    roles_x: bool = False
     proveedor: str = "openrouter"
     api_url: str = ""
 

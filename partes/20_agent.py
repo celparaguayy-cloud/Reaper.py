@@ -755,7 +755,17 @@ class Agente:
             error = True
         if nombre == "run_tests" and salida.startswith("Tests FALLARON"):
             error = True
-        self.ui.resultado_herramienta(not error, salida)
+        mostrar_ok, mostrar = not error, salida
+        if not error and nombre in ("execute_command", "run_python"):
+            # BUG-008: "✓" significaba "se ejecutó", no "salió bien". Un exit != 0 o un timeout se muestran ✗ con
+            # el código real (para el agente sigue siendo información, no un error de herramienta).
+            m = re.search(r"^exit code: (-?\d+)", salida, re.M)
+            timeout = "estado: TIMEOUT" in salida
+            if timeout or (m and int(m.group(1)) != 0):
+                lineas = salida.splitlines() or [""]
+                mostrar_ok = False
+                mostrar = "\n".join([f"{lineas[0]} · " + ("TIMEOUT" if timeout else f"exit {m.group(1)}")] + lineas[1:])
+        self.ui.resultado_herramienta(mostrar_ok, mostrar)
         if error:
             self._registrar_error(nombre, llamada.params.get("path", ""), salida)
             if self.settings.pistas_errores and "PISTAS DE REAPER" not in salida:
@@ -1384,7 +1394,7 @@ class Agente:
             resultados = validar_archivos(self.ws, sorted(self.ctx.cambios))
             if self.rol.nombre == "especificador":
                 # Tests primero: que los tests importen módulos aún inexistentes es lo ESPERADO (lo verá run_tests).
-                resultados, _tdd = separar_imports_tdd(resultados)
+                resultados, _tdd, _clases = separar_imports_tdd(resultados, self.ctx.pedido, self.ws)
             if fallos(resultados):
                 if self._rechazos < 2:
                     self._rechazos += 1

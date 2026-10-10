@@ -211,6 +211,8 @@ class InformeBuild:
     commit: Optional[str] = None
     spec_tests: list = field(default_factory=list)
     segundos: float = 0.0
+    tareas_fallidas: list = field(default_factory=list)    # quedaron con fallos tras reparar
+    tareas_bloqueadas: list = field(default_factory=list)  # no se ejecutaron: dependen de una fallida
 
     @property
     def ok(self) -> bool:
@@ -487,7 +489,12 @@ class Orquestador:
         malos = fallos(validaciones)
         tests_ok = tests is None or tests.ok
         partes = [r.resumen(2500) for r in malos]
-        if tests is not None and not tests.ok:
+        if tests is not None and tests.omitido:
+            # Hay archivos de test (si no, no habría comando) pero la suite no recolectó NINGUNO: 0 tests no es éxito.
+            tests_ok = False
+            partes.append("TESTS: hay archivos de test pero la suite no recolectó ningún test "
+                          "(funciones sin prefijo test_, clases que no heredan de TestCase o archivos vacíos).")
+        elif tests is not None and not tests.ok:
             partes.append("TESTS: " + conteo.texto() + "\n" + fallos_relevantes(f"{tests.stdout}\n{tests.stderr}",
                                                                                 maximo=3, limite=5000))
         diagnostico = "\n\n".join(partes)
@@ -510,7 +517,8 @@ class Orquestador:
         if diagnostico_experto:
             texto = tarea_con_diagnostico(texto, diagnostico_experto)
         protegidos = set(self._protegidos)
-        return self._sub("reparador", texto, cid, titulo="arregla los fallos reales" + (" (con diagnóstico experto)"
+        return self._sub(getattr(self, "_rol_reparacion", "reparador"), texto, cid,
+                         titulo="arregla los fallos reales" + (" (con diagnóstico experto)"
                                                                                     if diagnostico_experto else ""),
                          protegidos=protegidos)
 
@@ -591,6 +599,95 @@ class Orquestador:
                 verif = antes
         return verif
 
+    # ------------------------------------------------------------ REAPER X (10 roles)
+    def _consultar_rol_x(self, rol: str, prompt: str) -> tuple:
+        """
+        Rol de dirección/auditoría por TEXTO (sin herramientas): devuelve (texto|None, modelo_pedido, modelo_servido).
+        Si respondió otro modelo (respaldo del equipo), se declara: nada de degradación silenciosa.
+        """
+        pedido_modelo = self.settings.modelo_para(rol)
+        mensajes = [{"role": "system", "content": f"# TU ROL: {rol.upper()}\n{ROLES[rol].mision}"},
+                    {"role": "user", "content": prompt}]
+        try:
+            resp = self.llm.chat(mensajes, modelo=pedido_modelo, temperatura=ROLES[rol].temperatura,
+                                 max_tokens=1500, rol=rol)
+        except LLMError as e:
+            if e.presupuesto:
+                raise
+            self.ui.aviso(f"  {rol}: el modelo no respondió ({recortar(str(e), 160)}); sigo sin su dictamen.")
+            return None, pedido_modelo, "unknown"
+        servido = str(getattr(resp, "modelo", "") or "unknown")
+        if servido not in ("unknown", "mock", pedido_modelo) and resolver_modelo(servido) != resolver_modelo(pedido_modelo):
+            self.ui.tenue(f"  {rol}: pedido {pedido_modelo} → respondió {servido} (respaldo del equipo)")
+        return resp.texto, pedido_modelo, servido
+
+    def _directiva_director(self, pedido: str) -> str:
+        texto, _p, _s = self._consultar_rol_x("director", f"PEDIDO DEL USUARIO:\n{pedido}")
+        datos = extraer_json_x(texto or "")
+        if not datos or not str(datos.get("mission", "")).strip():
+            if texto is not None:
+                self.ui.aviso("  director: respuesta fuera de contrato (no es el JSON pedido); sigo sin directiva.")
+            return ""
+        criterios = _lista_str(datos.get("acceptance_criteria"))
+        prioridades = _lista_str(datos.get("priorities"))
+        self.ui.info(f"  director: {recortar(str(datos['mission']), 160)}")
+        partes = [f"DIRECTIVA DEL DIRECTOR: {str(datos['mission']).strip()}"]
+        if prioridades:
+            partes.append("Prioridades: " + "; ".join(prioridades[:8]))
+        if criterios:
+            partes.append("Criterios de aceptación pedidos:\n" + "\n".join(f"- {c}" for c in criterios[:12]))
+        return "\n".join(partes)
+
+    def _revision_supervisor_plan(self, pedido: str, plan: Plan) -> Optional[Dictamen]:
+        evidencia = {"EV-PLAN": plan.como_texto()}
+        texto, pedido_m, servido = self._consultar_rol_x(
+            "supervisor", f"PEDIDO:\n{pedido}\n\nEVIDENCIA EV-PLAN (plan propuesto):\n{evidencia['EV-PLAN']}\n\n"
+                          "¿El plan cubre el pedido con dependencias correctas y criterios verificables?")
+        if texto is None:
+            return None
+        dictamen = parsear_dictamen(texto, "supervisor", evidencia, model_requested=pedido_m, model_served=servido)
+        (self.ui.info if dictamen.valido else self.ui.aviso)("  " + dictamen.texto())
+        return dictamen
+
+    def _auditoria_x(self, pedido: str, plan: Plan, verif: Verificacion, informe: InformeBuild) -> None:
+        """Seguridad defensiva, auditor de entrega y supervisor sobre EVIDENCIA real. Solo informan: no deciden."""
+        diff = self.ws.checkpoints.diff_desde(informe.cid) if informe.cid else ""
+        evidencia = {
+            "EV-ESTADO": f"estado por verificación real: {informe.estado}; tareas fallidas: "
+                         f"{', '.join(informe.tareas_fallidas) or 'ninguna'}; bloqueadas: "
+                         f"{', '.join(informe.tareas_bloqueadas) or 'ninguna'}",
+            "EV-TESTS": (verif.conteo.texto() if verif.conteo.reconocido else
+                         ("sin suite de tests" if verif.tests is None else f"exit {verif.tests.codigo}")),
+            "EV-VALID": resumen_validacion(verif.validaciones, limite=1500),
+            "EV-DIFF": _diffstat(diff) or "(sin cambios)",
+        }
+        bloque = "\n".join(f"{k}: {v}" for k, v in evidencia.items())
+        texto, _p, _s = self._consultar_rol_x("seguridad", f"DIFF DE LA BUILD:\n```diff\n{recortar(diff, 9000)}\n```")
+        hallazgos = parsear_hallazgos_seguridad(texto or "") if texto is not None else None
+        if texto is not None and hallazgos is None:
+            self.ui.aviso("  seguridad: respuesta fuera de contrato; hallazgos descartados.")
+        for h in (hallazgos or [])[:8]:
+            linea = f"Seguridad [{h['severity']}] {h['file'] or '?'}: {h['issue']}" + (f" → {h['fix']}" if h["fix"] else "")
+            (self.ui.aviso if h["severity"] == "high" else self.ui.tenue)("  " + linea)
+            informe.notas.append(linea)
+        criterios = "\n".join(f"- {c}" for c in plan.criterios) or "- (derivalos del pedido)"
+        texto, _p, _s = self._consultar_rol_x(
+            "auditor_entrega", f"CRITERIOS:\n{criterios}\n\nEVIDENCIA:\n{bloque}")
+        auditoria = parsear_auditoria(texto or "", evidencia) if texto is not None else None
+        if auditoria is not None:
+            met = sum(1 for c in auditoria if c["status"] == "MET")
+            informe.notas.append(f"Auditor de entrega: {met}/{len(auditoria)} criterios con evidencia (MET).")
+            self.ui.tenue(f"  auditor de entrega: {met}/{len(auditoria)} criterios demostrados con evidencia")
+        elif texto is not None:
+            self.ui.aviso("  auditor de entrega: respuesta fuera de contrato; auditoría descartada.")
+        texto, pedido_m, servido = self._consultar_rol_x(
+            "supervisor", f"PEDIDO:\n{pedido}\n\nEVIDENCIA:\n{bloque}\n\n¿Se puede entregar?")
+        if texto is not None:
+            dictamen = parsear_dictamen(texto, "supervisor", evidencia, model_requested=pedido_m, model_served=servido)
+            self.ui.tenue("  " + dictamen.texto())
+            informe.estado, notas = estado_controlado(informe.estado, dictamen)
+            informe.notas.extend(notas)
+
     # ------------------------------------------------------------ flujos
     def _mostrar_plan(self, plan: Plan) -> None:
         self.ui.titulo("PLAN")
@@ -600,7 +697,19 @@ class Orquestador:
         self.ui.fase(1, "Exploración")
         exploracion = self.explorar(pedido)
         self.ui.fase(2, "Arquitectura")
-        plan = self.planificar(pedido, exploracion)
+        pedido_plan = pedido
+        if self.settings.roles_x:
+            directiva = self._directiva_director(pedido)
+            if directiva:
+                pedido_plan = f"{pedido}\n\n{directiva}"
+        plan = self.planificar(pedido_plan, exploracion)
+        if self.settings.roles_x:
+            dictamen = self._revision_supervisor_plan(pedido, plan)
+            if dictamen is not None and dictamen.decision in ("REWORK", "REJECT"):
+                self.ui.aviso("  El supervisor pidió rehacer el plan: lo replanifico una vez con sus razones.")
+                plan = self.planificar(pedido_plan, exploracion,
+                                       "Observaciones del supervisor:\n" + "\n".join(f"- {r}" for r in dictamen.reasons),
+                                       plan)
         for _ in range(3):
             self._mostrar_plan(plan)
             if not confirmar or self.ui.confirmar("¿Aprobás el plan y arrancamos?", defecto=True):
@@ -703,6 +812,14 @@ class Orquestador:
             plan.tareas = orden
         for i, tarea in enumerate(plan.tareas):
             self.ui.info(f"\n▸ Tarea {i + 1}/{len(plan.tareas)}: {recortar(tarea.descripcion.splitlines()[0], 120)}")
+            rotas = [d for d in grafo.dependencias(tarea.id)
+                     if d in informe.tareas_fallidas or d in informe.tareas_bloqueadas]
+            if rotas:
+                # BUG-012: no construir sobre una base que no pasó su verificación; la build termina PARCIAL.
+                self.ui.aviso(f"  Tarea {tarea.id} BLOQUEADA: depende de {', '.join(rotas)}, que no pasó su verificación.")
+                informe.tareas_bloqueadas.append(tarea.id)
+                informe.notas.append(f"Tarea {tarea.id}: bloqueada (depende de {', '.join(rotas)}).")
+                continue
             antes_tests = ejecutar_tests(self.ws, timeout=self.settings.tests_timeout, completo=True)
             conteo_antes = conteo_de_resultado(antes_tests)
             nombres_antes = set(conteo_antes.nombres_fallados)
@@ -724,6 +841,7 @@ class Orquestador:
                 )
                 if not verif_tarea.ok:
                     informe.notas.append(f"Tarea {tarea.id}: quedó con fallos de verificación.")
+                    informe.tareas_fallidas.append(tarea.id)
 
             if not verif_tarea.ok and self.settings.max_revisiones:
                 # Revisar código que no pasa su verificación no tiene sentido (y un revisor de 24B
@@ -759,13 +877,20 @@ class Orquestador:
         self.ui.fase(numero_fase, "Verificación real")
         verif = self.verificar(grupo)
         self._mostrar_verificacion(verif)
-        verif = self._reparar_con_escalada(pedido, verif, grupo, base_fallaba, informe, "final",
-                                           self.settings.max_reparaciones, lambda: self.verificar(grupo))
+        self._rol_reparacion = "integrador" if self.settings.roles_x else "reparador"
+        try:
+            verif = self._reparar_con_escalada(pedido, verif, grupo, base_fallaba, informe, "final",
+                                               self.settings.max_reparaciones, lambda: self.verificar(grupo))
+        finally:
+            self._rol_reparacion = "reparador"
 
         informe.archivos = verif.archivos
         informe.tests = verif.tests
         informe.diagnostico = verif.diagnostico
-        if verif.ok:
+        if verif.ok and informe.tareas_bloqueadas:
+            # Lo construido pasa, pero hay tareas del plan que nunca se hicieron: entrega INCOMPLETA.
+            informe.estado = "parcial"
+        elif verif.ok:
             informe.estado = "verificada" if verif.tests is not None and not verif.tests.omitido else "validada"
             if self.settings.git_snapshots and es_repo_git(self.ws):
                 try:
@@ -773,6 +898,9 @@ class Orquestador:
                                                     f"REAPER build verificada: {pedido[:72]}\n\n{plan.objetivo}")
                 except RuntimeError as e:
                     informe.notas.append(f"No pude guardar la build en git: {e}")
+        if self.settings.roles_x:
+            self.ui.fase(numero_fase + 1, "Auditoría REAPER X (seguridad defensiva · entrega · supervisor)")
+            self._auditoria_x(pedido, plan, verif, informe)
         informe.segundos = time.monotonic() - inicio
         informe.ruta_informe = self._guardar_informe(pedido, informe)
         self._mostrar_cierre(informe)
@@ -826,6 +954,10 @@ class Orquestador:
             self.ui.titulo("✓ BUILD VERIFICADA (validadores + tests reales)")
         elif informe.estado == "validada":
             self.ui.titulo("✓ BUILD VALIDADA (validadores OK, sin tests que correr)")
+        elif informe.estado == "parcial":
+            self.ui.titulo("◐ BUILD PARCIAL (lo hecho pasa, pero faltan tareas del plan)")
+            self.ui.aviso(f"  fallidas: {', '.join(informe.tareas_fallidas) or '—'} · "
+                          f"bloqueadas: {', '.join(informe.tareas_bloqueadas)}  → /construir de nuevo retoma")
         else:
             self.ui.titulo("✗ BUILD FALLIDA")
         diff = self.ws.checkpoints.diff_desde(informe.cid) if informe.cid else ""

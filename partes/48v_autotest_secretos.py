@@ -43,6 +43,13 @@ class TestEgresoEstricto(BaseTest):
         c.chat([{"role": "user", "content": "x"}])
         self.assertEqual(len(llamadas), 1)
 
+    def test_privacy_strict_blocks_private_lan_and_mdns(self):
+        for url in ("http://192.168.1.20:11434/v1/chat/completions", "http://10.0.0.5/v1",
+                    "http://169.254.10.1/v1", "http://servidor.local:11434/v1"):
+            self.assertFalse(DestinoModelo("m", "ollama", url, "").es_local(), url)
+        for url in ("http://127.0.0.1:11434/v1", "http://[::1]:11434/v1", "http://localhost:11434/v1"):
+            self.assertTrue(DestinoModelo("m", "ollama", url, "").es_local(), url)
+
     def test_destino_es_local_detecta_loopback(self):
         s = self.ajustes(proveedor="ollama")
         self.assertTrue(destino_modelo("llama3", s).es_local())
