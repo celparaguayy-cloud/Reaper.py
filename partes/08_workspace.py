@@ -11,8 +11,36 @@ IGNORAR_DIRS = {
 
 ARCHIVOS_SENSIBLES = {
     ".env", ".env.local", ".env.production", ".env.development",
-    "id_rsa", "id_ed25519", "credentials.json", "secrets.json", ".netrc",
+    "id_rsa", "id_ed25519", "id_ecdsa", "id_dsa",
+    "credentials.json", "secrets.json", "secret.json",
+    ".netrc", ".pgpass", ".htpasswd", ".npmrc", ".pypirc", ".git-credentials",
 }
+# Plantillas/ejemplos SIN secretos reales: se permiten (no rechazar algo inocuo por coincidencia parcial).
+_SUFIJOS_ENV_EJEMPLO = (".example", ".sample", ".template", ".dist", ".ejemplo", ".defaults")
+# Extensiones de material criptográfico privado (una clave pública .pub NO es secreto).
+_EXT_SENSIBLES = {".pem", ".key", ".p12", ".pfx", ".pkcs12", ".keystore", ".jks"}
+
+
+def es_archivo_sensible(nombre: str) -> bool:
+    """
+    ¿El CONTENIDO de este archivo es secreto y no debe leerse ni mandarse a un modelo? (R-002).
+    Deny-by-default ACOTADO: bloquea credenciales, claves privadas y variantes `.env.*` reales, pero NO
+    rechaza archivos inocuos por coincidencia parcial (p.ej. `environment.py`, `.env.example`, `key.pub`).
+    """
+    base = (nombre or "").strip().lower()
+    if not base:
+        return False
+    if base in ARCHIVOS_SENSIBLES:
+        return True
+    if base.endswith(".pub"):                      # clave pública: no es secreto
+        return False
+    if base == ".env" or base.startswith(".env."):
+        return not any(base.endswith(suf) for suf in _SUFIJOS_ENV_EJEMPLO)
+    if Path(base).suffix in _EXT_SENSIBLES:
+        return True
+    if base.startswith("id_") and "." not in base:  # id_rsa, id_ed25519, id_ecdsa, ...
+        return True
+    return False
 
 EXTENSIONES_TEXTO = {
     ".py", ".sh", ".bash", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx",
@@ -119,7 +147,7 @@ class Workspace:
         except ValueError:
             raise ErrorRuta(f"Ruta fuera del workspace: {rel}") from None
         if escribir:
-            if destino.name in ARCHIVOS_SENSIBLES:
+            if es_archivo_sensible(destino.name):
                 raise ErrorRuta(f"Archivo sensible protegido: {rel}")
             if relativa.parts and relativa.parts[0] == ".git":
                 raise ErrorRuta("No se escribe dentro de .git")
@@ -134,13 +162,18 @@ class Workspace:
             return str(ruta)
 
     # ------------------------------------------------------------ lectura/escritura
-    def leer(self, rel: str) -> str:
+    def leer(self, rel: str, *, permitir_sensible: bool = False) -> str:
         ruta = self.ruta(rel)
+        if es_archivo_sensible(ruta.name) and not permitir_sensible:
+            # R-002: bloquear la LECTURA de secretos, no solo la escritura. La excepción pide autorización
+            # explícita (permitir_sensible=True) y, aun así, se devuelve con los secretos redactados.
+            raise ErrorRuta(f"Archivo sensible protegido (no se lee su contenido): {rel}")
         if not ruta.is_file():
             raise FileNotFoundError(rel)
         if ruta.stat().st_size > MAX_BYTES_LECTURA:
             raise ValueError(f"Archivo demasiado grande para leer entero ({ruta.stat().st_size} bytes).")
-        return ruta.read_text(encoding="utf-8", errors="replace")
+        texto = ruta.read_text(encoding="utf-8", errors="replace")
+        return redactar_secretos(texto) if (permitir_sensible and es_archivo_sensible(ruta.name)) else texto
 
     def escribir(self, rel: str, contenido: str) -> Path:
         ruta = self.ruta(rel, escribir=True)
@@ -267,7 +300,7 @@ class Workspace:
         return h.hexdigest()[:16]
 
     def es_texto(self, ruta: Path) -> bool:
-        if ruta.name in ARCHIVOS_SENSIBLES:
+        if es_archivo_sensible(ruta.name):     # búsquedas/símbolos/mapa/contexto NUNCA escanean secretos (R-002)
             return False
         return ruta.suffix.lower() in EXTENSIONES_TEXTO or ruta.name in NOMBRES_TEXTO
 

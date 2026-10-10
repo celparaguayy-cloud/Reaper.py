@@ -552,6 +552,8 @@ class IndiceSimbolos:
     def de_archivo(self, rel: str) -> list[Simbolo]:
         try:
             ruta = self.ws.ruta(rel)
+            if es_archivo_sensible(ruta.name):     # read_symbol tampoco expone estructura de secretos (R-002)
+                return []
             st = ruta.stat()
         except (ErrorRuta, OSError):
             return []

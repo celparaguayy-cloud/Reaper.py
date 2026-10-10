@@ -260,6 +260,20 @@ class LLMClient:
                 if respaldo and respaldo not in candidatos:
                     candidatos.append(respaldo)
 
+        # Privacidad estricta (Ω §4.3 / R-001): ÚNICO punto de egreso. Deny-by-default cuando el destino es
+        # externo. Se bloquea ANTES de serializar/enviar (0 llamadas de red). chat_simple, subagentes,
+        # escalada y benchmarks pasan todos por acá, así que la política no tiene rodeos.
+        if getattr(self.settings, "privacidad_estricta", False):
+            locales = [c for c in candidatos if self._destino(c).es_local()]
+            if not locales:
+                externos = sorted({self._destino(c).proveedor for c in candidatos})
+                raise LLMError(
+                    "Privacidad estricta ACTIVA: el destino es un proveedor externo "
+                    f"({', '.join(externos) or '—'}) y no se envía contenido del proyecto afuera. "
+                    "Usá un modelo local (ollama) o desactivá con /privacidad estricto off para autorizar el envío.",
+                    probar_otro_modelo=False)
+            candidatos = locales
+
         # Disyuntor (Ω §5.2): EXCLUIR los modelos abiertos/retirados; no "probar igual" contra algo caído.
         orden = self.disyuntor.elegibles(candidatos)
         if not orden:

@@ -31,7 +31,8 @@ def reporte_privacidad(llm, settings) -> dict:
         "proveedores_contactados": por_proveedor,
         "categorias": categorias_enviadas(),
         "redaccion_secretos": True,
-        "no_envia": ["claves de API / Authorization (redactadas)", "archivos .env (bloqueados)"],
+        "no_envia": ["claves de API / Authorization (redactadas)",
+                     "archivos sensibles: credenciales, claves privadas y .env* (no se leen ni se envían)"],
         "privacidad_estricta": bool(getattr(settings, "privacidad_estricta", False)),
     }
 
@@ -48,6 +49,6 @@ def texto_reporte_privacidad(rep: dict) -> str:
     lineas.append("  Redacción de secretos (claves/Authorization): " + ("ACTIVA" if rep.get("redaccion_secretos") else "OFF"))
     lineas.append("  NO se envía: " + "; ".join(rep.get("no_envia", [])))
     lineas.append("  Privacidad estricta: " + ("ON" if rep.get("privacidad_estricta") else "OFF")
-                  + "  (ON = evitar subir contenido del proyecto a proveedores externos)")
+                  + "  (ON = se BLOQUEA de verdad el envío a proveedores externos; solo modelos locales)")
     lineas.append("  Nota honesta: las APIs externas reciben lo que se les envía; no hay confidencialidad absoluta.")
     return "\n".join(lineas)

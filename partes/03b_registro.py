@@ -20,6 +20,20 @@ class DestinoModelo:
     def necesita_clave(self) -> bool:
         return bool(self.clave_env)
 
+    def es_local(self) -> bool:
+        """
+        ¿El endpoint corre en el propio dispositivo (loopback/privado)? Bajo privacidad estricta solo lo
+        local sale sin autorización explícita (R-001). Se mira la IP/host real, no el nombre del proveedor.
+        """
+        host = (urllib.parse.urlsplit(self.url).hostname or "").strip("[]").lower()
+        if host in ("localhost", "ip6-localhost") or host.endswith(".local"):
+            return True
+        try:
+            ip = ipaddress.ip_address(host)
+            return ip.is_loopback or ip.is_private or ip.is_link_local
+        except ValueError:
+            return False
+
 
 def destino_modelo(nombre: str, settings: "Settings") -> DestinoModelo:
     """A qué proveedor/endpoint va un modelo. Si InfoModelo no fija proveedor, usa el activo de la sesión."""

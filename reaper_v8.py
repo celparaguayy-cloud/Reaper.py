@@ -88,6 +88,7 @@ import hashlib
 import heapq
 import importlib.util
 import io
+import ipaddress
 import itertools
 import json
 import keyword
@@ -1923,6 +1924,20 @@ class DestinoModelo:
     def necesita_clave(self) -> bool:
         return bool(self.clave_env)
 
+    def es_local(self) -> bool:
+        """
+        ¿El endpoint corre en el propio dispositivo (loopback/privado)? Bajo privacidad estricta solo lo
+        local sale sin autorización explícita (R-001). Se mira la IP/host real, no el nombre del proveedor.
+        """
+        host = (urllib.parse.urlsplit(self.url).hostname or "").strip("[]").lower()
+        if host in ("localhost", "ip6-localhost") or host.endswith(".local"):
+            return True
+        try:
+            ip = ipaddress.ip_address(host)
+            return ip.is_loopback or ip.is_private or ip.is_link_local
+        except ValueError:
+            return False
+
 
 def destino_modelo(nombre: str, settings: "Settings") -> DestinoModelo:
     """A qué proveedor/endpoint va un modelo. Si InfoModelo no fija proveedor, usa el activo de la sesión."""
@@ -2294,6 +2309,20 @@ class LLMClient:
                 respaldo = resolver_modelo(respaldo)
                 if respaldo and respaldo not in candidatos:
                     candidatos.append(respaldo)
+
+        # Privacidad estricta (Ω §4.3 / R-001): ÚNICO punto de egreso. Deny-by-default cuando el destino es
+        # externo. Se bloquea ANTES de serializar/enviar (0 llamadas de red). chat_simple, subagentes,
+        # escalada y benchmarks pasan todos por acá, así que la política no tiene rodeos.
+        if getattr(self.settings, "privacidad_estricta", False):
+            locales = [c for c in candidatos if self._destino(c).es_local()]
+            if not locales:
+                externos = sorted({self._destino(c).proveedor for c in candidatos})
+                raise LLMError(
+                    "Privacidad estricta ACTIVA: el destino es un proveedor externo "
+                    f"({', '.join(externos) or '—'}) y no se envía contenido del proyecto afuera. "
+                    "Usá un modelo local (ollama) o desactivá con /privacidad estricto off para autorizar el envío.",
+                    probar_otro_modelo=False)
+            candidatos = locales
 
         # Disyuntor (Ω §5.2): EXCLUIR los modelos abiertos/retirados; no "probar igual" contra algo caído.
         orden = self.disyuntor.elegibles(candidatos)
@@ -3380,8 +3409,36 @@ IGNORAR_DIRS = {
 
 ARCHIVOS_SENSIBLES = {
     ".env", ".env.local", ".env.production", ".env.development",
-    "id_rsa", "id_ed25519", "credentials.json", "secrets.json", ".netrc",
+    "id_rsa", "id_ed25519", "id_ecdsa", "id_dsa",
+    "credentials.json", "secrets.json", "secret.json",
+    ".netrc", ".pgpass", ".htpasswd", ".npmrc", ".pypirc", ".git-credentials",
 }
+# Plantillas/ejemplos SIN secretos reales: se permiten (no rechazar algo inocuo por coincidencia parcial).
+_SUFIJOS_ENV_EJEMPLO = (".example", ".sample", ".template", ".dist", ".ejemplo", ".defaults")
+# Extensiones de material criptográfico privado (una clave pública .pub NO es secreto).
+_EXT_SENSIBLES = {".pem", ".key", ".p12", ".pfx", ".pkcs12", ".keystore", ".jks"}
+
+
+def es_archivo_sensible(nombre: str) -> bool:
+    """
+    ¿El CONTENIDO de este archivo es secreto y no debe leerse ni mandarse a un modelo? (R-002).
+    Deny-by-default ACOTADO: bloquea credenciales, claves privadas y variantes `.env.*` reales, pero NO
+    rechaza archivos inocuos por coincidencia parcial (p.ej. `environment.py`, `.env.example`, `key.pub`).
+    """
+    base = (nombre or "").strip().lower()
+    if not base:
+        return False
+    if base in ARCHIVOS_SENSIBLES:
+        return True
+    if base.endswith(".pub"):                      # clave pública: no es secreto
+        return False
+    if base == ".env" or base.startswith(".env."):
+        return not any(base.endswith(suf) for suf in _SUFIJOS_ENV_EJEMPLO)
+    if Path(base).suffix in _EXT_SENSIBLES:
+        return True
+    if base.startswith("id_") and "." not in base:  # id_rsa, id_ed25519, id_ecdsa, ...
+        return True
+    return False
 
 EXTENSIONES_TEXTO = {
     ".py", ".sh", ".bash", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx",
@@ -3488,7 +3545,7 @@ class Workspace:
         except ValueError:
             raise ErrorRuta(f"Ruta fuera del workspace: {rel}") from None
         if escribir:
-            if destino.name in ARCHIVOS_SENSIBLES:
+            if es_archivo_sensible(destino.name):
                 raise ErrorRuta(f"Archivo sensible protegido: {rel}")
             if relativa.parts and relativa.parts[0] == ".git":
                 raise ErrorRuta("No se escribe dentro de .git")
@@ -3503,13 +3560,18 @@ class Workspace:
             return str(ruta)
 
     # ------------------------------------------------------------ lectura/escritura
-    def leer(self, rel: str) -> str:
+    def leer(self, rel: str, *, permitir_sensible: bool = False) -> str:
         ruta = self.ruta(rel)
+        if es_archivo_sensible(ruta.name) and not permitir_sensible:
+            # R-002: bloquear la LECTURA de secretos, no solo la escritura. La excepción pide autorización
+            # explícita (permitir_sensible=True) y, aun así, se devuelve con los secretos redactados.
+            raise ErrorRuta(f"Archivo sensible protegido (no se lee su contenido): {rel}")
         if not ruta.is_file():
             raise FileNotFoundError(rel)
         if ruta.stat().st_size > MAX_BYTES_LECTURA:
             raise ValueError(f"Archivo demasiado grande para leer entero ({ruta.stat().st_size} bytes).")
-        return ruta.read_text(encoding="utf-8", errors="replace")
+        texto = ruta.read_text(encoding="utf-8", errors="replace")
+        return redactar_secretos(texto) if (permitir_sensible and es_archivo_sensible(ruta.name)) else texto
 
     def escribir(self, rel: str, contenido: str) -> Path:
         ruta = self.ruta(rel, escribir=True)
@@ -3636,7 +3698,7 @@ class Workspace:
         return h.hexdigest()[:16]
 
     def es_texto(self, ruta: Path) -> bool:
-        if ruta.name in ARCHIVOS_SENSIBLES:
+        if es_archivo_sensible(ruta.name):     # búsquedas/símbolos/mapa/contexto NUNCA escanean secretos (R-002)
             return False
         return ruta.suffix.lower() in EXTENSIONES_TEXTO or ruta.name in NOMBRES_TEXTO
 
@@ -6674,6 +6736,8 @@ class IndiceSimbolos:
     def de_archivo(self, rel: str) -> list[Simbolo]:
         try:
             ruta = self.ws.ruta(rel)
+            if es_archivo_sensible(ruta.name):     # read_symbol tampoco expone estructura de secretos (R-002)
+                return []
             st = ruta.stat()
         except (ErrorRuta, OSError):
             return []
@@ -8507,8 +8571,8 @@ def read_file(ctx: Contexto, p: dict) -> str:
         raise ErrorHerramienta(f"{rel} es una carpeta. Usá list_files.")
     if not ruta.is_file():
         raise ErrorHerramienta(f"No existe {rel}.{_sugerir_ruta(ctx, rel)}")
-    if ruta.name in (".env", "id_rsa", "id_ed25519"):
-        raise ErrorHerramienta("Archivo sensible: no se lee.")
+    if es_archivo_sensible(ruta.name):
+        raise ErrorHerramienta("Archivo sensible: no se lee su contenido (credencial o clave privada).")
     if es_binario(ruta):
         raise ErrorHerramienta(f"{rel} es binario ({ruta.stat().st_size} bytes).")
     try:
@@ -8648,6 +8712,8 @@ _JS_SIMBOLOS = re.compile(
 
 
 def outline(ruta: Path) -> list[str]:
+    if es_archivo_sensible(ruta.name):     # code_outline no mapea archivos sensibles (R-002)
+        return []
     try:
         texto = ruta.read_text(encoding="utf-8", errors="replace")
     except OSError:
@@ -27132,13 +27198,13 @@ class App:
         """Reporte de privacidad y modo estricto. No revela datos sensibles."""
         partes = (arg or "").split()
         sub = partes[0].lower() if partes else "reporte"
-        if sub in ("estricto", "strict"):
+        if sub in ("estricto", "estricta", "strict"):
             valor = len(partes) > 1 and partes[1].lower() in ("on", "si", "sí", "1", "true")
             self.settings.privacidad_estricta = valor
             guardar_settings(self.settings)
             self.ui.ok(f"Privacidad estricta: {'ON' if valor else 'OFF'}.")
             if valor:
-                self.ui.tenue("  Evitá modelos externos para contenido sensible; preferí un proveedor local (ollama).")
+                self.ui.tenue("  Los modelos externos quedan BLOQUEADOS: solo saldrá tráfico a un proveedor local (ollama).")
             return
         self.ui.linea(texto_reporte_privacidad(reporte_privacidad(self.llm, self.settings)))
 
@@ -41744,6 +41810,129 @@ class TestFabricCLI(BaseTest):
 
 
 # ======================================================================
+# MÓDULO: autotest_secretos
+# ======================================================================
+"""
+Autotests de los P0 de secretos (REAPER Ω): egreso bajo privacidad estricta (R-001) y bloqueo de lectura de
+archivos sensibles en TODAS las herramientas (R-002).
+"""
+
+
+class TestEgresoEstricto(BaseTest):
+    """R-001: con privacidad estricta y destino externo, 0 llamadas de red y error claro; local permitido."""
+
+    def _cliente_espia(self, eventos, **ajustes):
+        base = transporte_falso(eventos)
+        llamadas = []
+
+        def espia(url, headers, payload, timeout):
+            llamadas.append(url)
+            return base(url, headers, payload, timeout)
+
+        c = LLMClient("clave", self.ajustes(**ajustes), url="http://falso", transporte=espia)
+        c.dormir = lambda _s: None
+        return c, llamadas
+
+    def test_externo_bloqueado_cero_llamadas(self):
+        c, llamadas = self._cliente_espia(["no debería enviarse"], privacidad_estricta=True)  # proveedor openrouter
+        with self.assertRaises(LLMError) as cm:
+            c.chat([{"role": "user", "content": "código privado"}])
+        self.assertEqual(llamadas, [])                         # 0 conexiones al proveedor externo
+        self.assertIn("estricta", str(cm.exception).lower())
+
+    def test_chat_simple_tambien_bloqueado(self):
+        c, llamadas = self._cliente_espia(["no"], privacidad_estricta=True)
+        with self.assertRaises(LLMError):
+            c.chat_simple("resumí este archivo privado")       # el mismo punto de egreso cubre chat_simple
+        self.assertEqual(llamadas, [])
+
+    def test_local_permitido(self):
+        c, llamadas = self._cliente_espia(["hola desde ollama"], proveedor="ollama", privacidad_estricta=True)
+        r = c.chat([{"role": "user", "content": "x"}], modelo="llama3", sin_respaldo=True)
+        self.assertEqual(r.texto, "hola desde ollama")
+        self.assertEqual(len(llamadas), 1)                     # el backend local sí opera
+
+    def test_sin_estricta_sale_normal(self):
+        c, llamadas = self._cliente_espia(["respuesta"], privacidad_estricta=False)
+        c.chat([{"role": "user", "content": "x"}])
+        self.assertEqual(len(llamadas), 1)
+
+    def test_destino_es_local_detecta_loopback(self):
+        s = self.ajustes(proveedor="ollama")
+        self.assertTrue(destino_modelo("llama3", s).es_local())
+        self.assertFalse(destino_modelo("deepseek", self.ajustes(proveedor="openrouter")).es_local())
+
+
+class TestArchivoSensible(BaseTest):
+    """R-002: tabla de sensibilidad acotada (no rechaza inocuos por coincidencia parcial)."""
+
+    def test_sensibles(self):
+        for n in (".env", ".env.local", ".env.production", "secrets.json", "secret.json",
+                  "credentials.json", "id_rsa", "id_ed25519", "id_ecdsa", ".netrc", ".npmrc",
+                  "server.key", "private.pem", "store.p12", "app.pfx", ".git-credentials"):
+            self.assertTrue(es_archivo_sensible(n), f"debería ser sensible: {n}")
+
+    def test_inocuos(self):
+        for n in (".env.example", ".env.sample", ".env.template", "id_rsa.pub", "key.pub",
+                  "environment.py", "config.json", "app.py", "README.md", "keyboard.js", "license.txt"):
+            self.assertFalse(es_archivo_sensible(n), f"NO debería ser sensible: {n}")
+
+
+class TestLecturaSensible(BaseTest):
+    def test_leer_bloquea_y_permite_codigo(self):
+        ws = self.proyecto({"secrets.json": '{"token":"abc"}\n', ".env": "SECRET=1\n", "app.py": "x = 1\n"})
+        with self.assertRaises(ErrorRuta):
+            ws.leer("secrets.json")
+        with self.assertRaises(ErrorRuta):
+            ws.leer(".env")
+        self.assertEqual(ws.leer("app.py"), "x = 1\n")
+
+    def test_leer_permite_ejemplo(self):
+        ws = self.proyecto({".env.example": "SECRET=changeme\n"})
+        self.assertIn("changeme", ws.leer(".env.example"))
+
+    def test_leer_forzado_redacta(self):
+        ws = self.proyecto({".env": "API_KEY=sk-abcdefghijklmnop12345\n"})
+        texto = ws.leer(".env", permitir_sensible=True)          # autorización explícita
+        self.assertNotIn("sk-abcdefghijklmnop12345", texto)      # ...y aun así, redactado
+        self.assertIn("REDACTADO", texto)
+
+    def test_escribir_bloquea_variantes(self):
+        ws = self.proyecto({})
+        for n in (".env.local", "id_ecdsa", "server.key"):
+            with self.assertRaises(ErrorRuta):
+                ws.escribir(n, "x")
+
+    def test_archivos_codigo_excluye_sensibles(self):
+        ws = self.proyecto({".env": "X=1\n", "a.py": "y = 1\n", "server.key": "-----BEGIN KEY-----\n"})
+        archivos = ws.archivos_codigo()
+        self.assertIn("a.py", archivos)
+        self.assertNotIn(".env", archivos)
+        self.assertNotIn("server.key", archivos)
+
+
+class TestHerramientasSensibles(BaseTest):
+    def _ctx(self, archivos):
+        return self.contexto(self.proyecto(archivos))
+
+    def test_read_file_bloquea(self):
+        ctx = self._ctx({"secrets.json": '{"a":1}\n', "ok.py": "x = 1\n"})
+        with self.assertRaises(ErrorHerramienta):
+            self.herramienta(ctx, "read_file", path="secrets.json")
+        self.assertIn("x = 1", self.herramienta(ctx, "read_file", path="ok.py"))
+
+    def test_search_files_no_filtra_secretos(self):
+        ctx = self._ctx({".env": "TOKEN=supersecreto123\n", "a.py": "TOKEN_usado = 1\n"})
+        out = self.herramienta(ctx, "search_files", regex="TOKEN")
+        self.assertNotIn("supersecreto123", out)                 # el .env no se escanea
+        self.assertIn("a.py", out)
+
+    def test_read_symbol_no_expone_sensible(self):
+        ws = self.proyecto({"private.key": "def secreto():\n    return 42\n"})
+        self.assertEqual(indice_de(ws).de_archivo("private.key"), [])   # ni la estructura
+
+
+# ======================================================================
 # MÓDULO: autotest_runner
 # ======================================================================
 """Ejecutor del autotest interno."""
@@ -46533,7 +46722,8 @@ def reporte_privacidad(llm, settings) -> dict:
         "proveedores_contactados": por_proveedor,
         "categorias": categorias_enviadas(),
         "redaccion_secretos": True,
-        "no_envia": ["claves de API / Authorization (redactadas)", "archivos .env (bloqueados)"],
+        "no_envia": ["claves de API / Authorization (redactadas)",
+                     "archivos sensibles: credenciales, claves privadas y .env* (no se leen ni se envían)"],
         "privacidad_estricta": bool(getattr(settings, "privacidad_estricta", False)),
     }
 
@@ -46550,7 +46740,7 @@ def texto_reporte_privacidad(rep: dict) -> str:
     lineas.append("  Redacción de secretos (claves/Authorization): " + ("ACTIVA" if rep.get("redaccion_secretos") else "OFF"))
     lineas.append("  NO se envía: " + "; ".join(rep.get("no_envia", [])))
     lineas.append("  Privacidad estricta: " + ("ON" if rep.get("privacidad_estricta") else "OFF")
-                  + "  (ON = evitar subir contenido del proyecto a proveedores externos)")
+                  + "  (ON = se BLOQUEA de verdad el envío a proveedores externos; solo modelos locales)")
     lineas.append("  Nota honesta: las APIs externas reciben lo que se les envía; no hay confidencialidad absoluta.")
     return "\n".join(lineas)
 

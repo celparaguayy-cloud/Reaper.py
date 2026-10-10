@@ -980,13 +980,13 @@ class App:
         """Reporte de privacidad y modo estricto. No revela datos sensibles."""
         partes = (arg or "").split()
         sub = partes[0].lower() if partes else "reporte"
-        if sub in ("estricto", "strict"):
+        if sub in ("estricto", "estricta", "strict"):
             valor = len(partes) > 1 and partes[1].lower() in ("on", "si", "sí", "1", "true")
             self.settings.privacidad_estricta = valor
             guardar_settings(self.settings)
             self.ui.ok(f"Privacidad estricta: {'ON' if valor else 'OFF'}.")
             if valor:
-                self.ui.tenue("  Evitá modelos externos para contenido sensible; preferí un proveedor local (ollama).")
+                self.ui.tenue("  Los modelos externos quedan BLOQUEADOS: solo saldrá tráfico a un proveedor local (ollama).")
             return
         self.ui.linea(texto_reporte_privacidad(reporte_privacidad(self.llm, self.settings)))
 

@@ -227,8 +227,8 @@ def read_file(ctx: Contexto, p: dict) -> str:
         raise ErrorHerramienta(f"{rel} es una carpeta. Usá list_files.")
     if not ruta.is_file():
         raise ErrorHerramienta(f"No existe {rel}.{_sugerir_ruta(ctx, rel)}")
-    if ruta.name in (".env", "id_rsa", "id_ed25519"):
-        raise ErrorHerramienta("Archivo sensible: no se lee.")
+    if es_archivo_sensible(ruta.name):
+        raise ErrorHerramienta("Archivo sensible: no se lee su contenido (credencial o clave privada).")
     if es_binario(ruta):
         raise ErrorHerramienta(f"{rel} es binario ({ruta.stat().st_size} bytes).")
     try:
@@ -368,6 +368,8 @@ _JS_SIMBOLOS = re.compile(
 
 
 def outline(ruta: Path) -> list[str]:
+    if es_archivo_sensible(ruta.name):     # code_outline no mapea archivos sensibles (R-002)
+        return []
     try:
         texto = ruta.read_text(encoding="utf-8", errors="replace")
     except OSError:
