@@ -1578,7 +1578,9 @@ def info_modelo(nombre: str) -> InfoModelo:
 
 
 def es_modelo_gratis(nombre: str) -> bool:
-    return resolver_modelo(nombre).endswith(":free")
+    # R-009: no basta el sufijo ':free' (OpenRouter). Un alias curado de nivel gratuito (Groq, Gemini, ...)
+    # trae InfoModelo.free=True aunque su id no lleve ':free'; también activa el rpm gratis.
+    return resolver_modelo(nombre).endswith(":free") or bool(getattr(info_modelo(nombre), "free", False))
 
 
 @dataclass
@@ -35581,6 +35583,13 @@ class TestConfig(BaseTest):
         s.rpm = 5
         self.assertEqual(s.rpm_efectivo(), 5)
         self.assertEqual(info_modelo("qwen3-coder").contexto, 262144)
+
+    def test_rpm_free_por_flag_no_solo_sufijo(self):
+        # R-009: un alias curado free (id sin ':free') también activa el rpm gratuito
+        self.assertTrue(es_modelo_gratis("groq-llama70"))
+        self.assertFalse(es_modelo_gratis("gpt-4o"))
+        s = Settings(modelo="groq-llama70", rpm=0)
+        self.assertEqual(s.rpm_efectivo(), 16)
 
     def test_temperaturas_de_candidatos(self):
         s = Settings()

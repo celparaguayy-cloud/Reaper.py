@@ -250,6 +250,13 @@ class TestConfig(BaseTest):
         self.assertEqual(s.rpm_efectivo(), 5)
         self.assertEqual(info_modelo("qwen3-coder").contexto, 262144)
 
+    def test_rpm_free_por_flag_no_solo_sufijo(self):
+        # R-009: un alias curado free (id sin ':free') también activa el rpm gratuito
+        self.assertTrue(es_modelo_gratis("groq-llama70"))
+        self.assertFalse(es_modelo_gratis("gpt-4o"))
+        s = Settings(modelo="groq-llama70", rpm=0)
+        self.assertEqual(s.rpm_efectivo(), 16)
+
     def test_temperaturas_de_candidatos(self):
         s = Settings()
         self.assertEqual([s.temperatura_candidato(i) for i in range(4)], [0.1, 0.4, 0.7, 0.85])
