@@ -37749,13 +37749,14 @@ class TestWeb(BaseTest):
                 validar_url(mala)
 
     def test_descargar_local(self):
+        # servidor de prueba en loopback: canal local explícito (el gate SSRF bloquea loopback por defecto)
         with _ServidorDePrueba() as srv:
-            html = descargar_texto(srv.base + "/doc", usar_cache=False)
+            html = descargar_texto(srv.base + "/doc", usar_cache=False, permitir_local=True)
             self.assertEqual((html["tipo"], html["titulo"]), ("html", "Docs de prueba"))
-            api = descargar_texto(srv.base + "/api", usar_cache=False)
+            api = descargar_texto(srv.base + "/api", usar_cache=False, permitir_local=True)
             self.assertEqual(api["tipo"], "json")
             self.assertIn('"version": 7', api["texto"])
-            plano = descargar_texto(srv.base + "/texto")
+            plano = descargar_texto(srv.base + "/texto", permitir_local=True)
             self.assertEqual(plano["texto"], "línea uno\nlínea dos")
             self.assertTrue(list((CACHE_DIR / "web").glob("*.json")))
 
@@ -41338,6 +41339,115 @@ class TestChatDisyuntor(BaseTest):
 
 
 # ======================================================================
+# MÓDULO: autotest_ssrf
+# ======================================================================
+"""Autotests del gate de egreso / SSRF (REAPER Ω §4.3): deniega ANTES de conectar, valida cada salto."""
+
+
+def _resolver_fijo(ip):
+    return lambda host: [ip]
+
+
+class TestValidarDestino(BaseTest):
+    def test_https_publica_permitida(self):
+        d = validar_destino("https://docs.python.org/3/", resolver=_resolver_fijo("151.101.0.223"))
+        self.assertTrue(d.permitido)
+        self.assertTrue(d.confiable)
+
+    def test_http_denegado_por_defecto(self):
+        d = validar_destino("http://ejemplo.com/", resolver=_resolver_fijo("93.184.216.34"))
+        self.assertFalse(d.permitido)
+        self.assertEqual(d.estado, "ESQUEMA")
+
+    def test_credenciales_en_url(self):
+        d = validar_destino("https://user:pass@ejemplo.com/", resolver=_resolver_fijo("93.184.216.34"))
+        self.assertEqual(d.estado, "CREDENCIALES")
+
+    def test_esquema_no_http(self):
+        self.assertFalse(validar_destino("ftp://x/").permitido)
+        self.assertFalse(validar_destino("file:///etc/passwd").permitido)
+
+    def test_puerto_no_permitido(self):
+        d = validar_destino("https://ejemplo.com:22/", resolver=_resolver_fijo("93.184.216.34"))
+        self.assertEqual(d.estado, "PUERTO")
+
+    def test_loopback_por_dns_bloqueado(self):
+        # host público que RESUELVE a loopback: el filtro textual no lo vería; el gate sí
+        d = validar_destino("https://malicioso.example/", resolver=_resolver_fijo("127.0.0.1"))
+        self.assertFalse(d.permitido)
+        self.assertEqual(d.estado, "IP_PRIVADA")
+
+    def test_ip_privada_bloqueada(self):
+        self.assertFalse(validar_destino("https://x.example/", resolver=_resolver_fijo("192.168.1.10")).permitido)
+        self.assertFalse(validar_destino("https://x.example/", resolver=_resolver_fijo("10.0.0.5")).permitido)
+
+    def test_metadata_cloud_bloqueada(self):
+        d = validar_destino("https://x.example/", resolver=_resolver_fijo("169.254.169.254"))
+        self.assertFalse(d.permitido)
+
+    def test_ip_literal_privada(self):
+        self.assertFalse(validar_destino("https://127.0.0.1/").permitido)
+        self.assertFalse(validar_destino("https://[::1]/").permitido)
+
+    def test_permitir_local_abre_loopback(self):
+        d = validar_destino("http://127.0.0.1:8123/x", permitir_local=True)
+        self.assertTrue(d.permitido)
+
+    def test_query_sospechosa(self):
+        d = validar_destino("https://x.example/?k=sk-abcdefghijklmnopqrst", resolver=_resolver_fijo("1.2.3.4"))
+        self.assertEqual(d.estado, "SOSPECHOSA")
+
+    def test_hereda_auth_solo_mismo_host(self):
+        self.assertTrue(puede_heredar_auth("api.groq.com", "api.groq.com"))
+        self.assertFalse(puede_heredar_auth("api.groq.com", "evil.example"))
+
+
+class TestDescargarSSRF(BaseTest):
+    def test_destino_prohibido_cero_conexiones(self):
+        llamadas = []
+
+        def abrir_espia(d, url, timeout, maximo):
+            llamadas.append(url)
+            return {"status": 200, "location": None, "ctype": "text/plain", "body": b"x"}
+
+        # host que resuelve a IP privada: debe denegarse ANTES de llamar a 'abrir'
+        with self.assertRaises(ValueError):
+            descargar_texto("https://interno.example/secreto", usar_cache=False,
+                            resolver=_resolver_fijo("10.0.0.9"), abrir=abrir_espia)
+        self.assertEqual(llamadas, [])          # 0 conexiones al destino prohibido
+
+    def test_redireccion_a_privada_se_bloquea(self):
+        estados = {"n": 0}
+
+        def abrir(d, url, timeout, maximo):
+            estados["n"] += 1
+            if estados["n"] == 1:
+                return {"status": 302, "location": "https://interno.example/x", "ctype": "", "body": b""}
+            return {"status": 200, "location": None, "ctype": "text/plain", "body": b"secreto"}
+
+        def resolver(host):
+            return ["1.2.3.4"] if host == "publica.example" else ["127.0.0.1"]
+
+        with self.assertRaises(ValueError):
+            descargar_texto("https://publica.example/", usar_cache=False, resolver=resolver, abrir=abrir)
+        self.assertEqual(estados["n"], 1)       # el 2º salto (privado) se bloquea antes de conectar
+
+    def test_descarga_ok_con_abrir_inyectado(self):
+        def abrir(d, url, timeout, maximo):
+            return {"status": 200, "location": None, "ctype": "text/plain", "body": b"hola mundo"}
+        datos = descargar_texto("https://docs.python.org/x", usar_cache=False,
+                                resolver=_resolver_fijo("151.101.0.223"), abrir=abrir)
+        self.assertEqual(datos["texto"], "hola mundo")
+
+    def test_demasiadas_redirecciones(self):
+        def abrir(d, url, timeout, maximo):
+            return {"status": 302, "location": "https://docs.python.org/otra", "ctype": "", "body": b""}
+        with self.assertRaises(ValueError):
+            descargar_texto("https://docs.python.org/a", usar_cache=False,
+                            resolver=_resolver_fijo("151.101.0.223"), abrir=abrir)
+
+
+# ======================================================================
 # MÓDULO: autotest_runner
 # ======================================================================
 """Ejecutor del autotest interno."""
@@ -41514,12 +41624,157 @@ def filtrar_relevante(texto: str, buscar: str, contexto: int = 1, maximo: int = 
     return recortar("\n\n".join(seleccion), maximo)
 
 
+import ipaddress as _web_ipaddr
+import http.client as _web_httpc
+import ssl as _web_ssl
+
+PUERTOS_WEB = (80, 443, 8080, 8443)
+_WEB_MAX_REDIRECTS = 5
+
+
+@dataclass
+class DecisionEgress:
+    permitido: bool
+    razon: str = ""
+    estado: str = ""          # ALLOW | ESQUEMA | CREDENCIALES | PUERTO | DNS | IP_PRIVADA | SOSPECHOSA
+    host: str = ""
+    puerto: int = 0
+    ips: tuple = ()
+    confiable: bool = False
+
+
+def _web_es_ip_literal(host: str):
+    try:
+        return _web_ipaddr.ip_address(host.strip("[]"))
+    except ValueError:
+        return None
+
+
+def _web_motivo_ip(ip_str: str) -> str:
+    try:
+        ip = _web_ipaddr.ip_address(ip_str)
+    except ValueError:
+        return "ip inválida"
+    if ip.is_loopback:
+        return "loopback"
+    if ip.is_link_local:         # incluye 169.254.0.0/16 (metadata cloud) y fe80::/10
+        return "link-local/metadata"
+    if ip.is_multicast:
+        return "multicast"
+    if ip.is_unspecified:
+        return "no especificada"
+    if ip.is_reserved:
+        return "reservada"
+    if ip.is_private:
+        return "privada"
+    if not ip.is_global:
+        return "no global"
+    return ""
+
+
+def _web_resolver(host: str) -> list:
+    """Resuelve A y AAAA. Lanza OSError si no resuelve."""
+    infos = socket.getaddrinfo(host, None)
+    return sorted({i[4][0] for i in infos})
+
+
+def validar_destino(url: str, *, permitir_http: bool = False, permitir_local: bool = False,
+                    permitidos: Sequence[str] = (), resolver=None) -> DecisionEgress:
+    """
+    Gate de egreso REAL (Ω §4.3): resuelve el host y clasifica TODAS sus IPs; deniega loopback, privadas,
+    link-local/metadata, multicast, reservadas y no-globales. No es un filtro de texto. Deniega ANTES de
+    conectar, así un destino prohibido tiene 0 conexiones. `resolver` se inyecta en tests.
+    `permitir_local=True` es el canal explícito para servicios locales autorizados (p. ej. Ollama en
+    localhost) y para los tests; relaja IP privada/loopback y el puerto, nunca por defecto.
+    """
+    resolver = resolver or _web_resolver
+    url = (url or "").strip().strip("<>\"'")
+    partes = urllib.parse.urlparse(url)
+    scheme = (partes.scheme or "").lower()
+    if scheme not in ("http", "https"):
+        return DecisionEgress(False, "solo http(s)", "ESQUEMA")
+    if scheme == "http" and not (permitir_http or permitir_local):
+        return DecisionEgress(False, "http sin cifrar no permitido por defecto (usá https)", "ESQUEMA")
+    if partes.username or partes.password:
+        return DecisionEgress(False, "la URL lleva credenciales (user:pass@): rechazada", "CREDENCIALES")
+    host = (partes.hostname or "").lower()
+    if not host:
+        return DecisionEgress(False, "falta el host", "ESQUEMA")
+    puerto = partes.port or (443 if scheme == "https" else 80)
+    if not permitir_local and puerto not in PUERTOS_WEB:
+        return DecisionEgress(False, f"puerto {puerto} no permitido", "PUERTO")
+    if len(partes.query) > 300 or _RE_URL_SOSPECHOSA.search(url):
+        return DecisionEgress(False, "la URL lleva datos sospechosos (claves o query enorme)", "SOSPECHOSA")
+    literal = _web_es_ip_literal(host)
+    try:
+        ips = [host.strip("[]")] if literal is not None else list(resolver(host))
+    except OSError as e:
+        return DecisionEgress(False, f"no se pudo resolver {host}: {e}", "DNS")
+    if not ips:
+        return DecisionEgress(False, f"{host} no resolvió a ninguna IP", "DNS")
+    if not permitir_local:
+        for ip in ips:
+            motivo = _web_motivo_ip(ip)
+            if motivo:
+                return DecisionEgress(False, f"{host} resuelve a {ip} ({motivo}): bloqueado", "IP_PRIVADA",
+                                      host, puerto, tuple(ips))
+    confiable = any(host == d or host.endswith("." + d) for d in (*DOMINIOS_SEGUROS, *permitidos))
+    return DecisionEgress(True, "ok", "ALLOW", host, puerto, tuple(ips), confiable)
+
+
+def puede_heredar_auth(origen_host: str, destino_host: str) -> bool:
+    """Una redirección solo conserva Authorization si va al MISMO host exacto (Ω §4.3.7)."""
+    return bool(origen_host) and origen_host.lower() == (destino_host or "").lower()
+
+
 def _ruta_cache(url: str) -> Path:
     return CACHE_DIR / "web" / (hashlib.sha1(url.encode("utf-8")).hexdigest()[:20] + ".json")
 
 
-def descargar_texto(url: str, timeout: int = 20, maximo: int = 2_000_000, usar_cache: bool = True) -> dict:
-    """Descarga y convierte. Devuelve {url, titulo, tipo, texto}. Lanza ValueError/OSError."""
+def _web_charset(ctype: str) -> str:
+    m = re.search(r"charset=([\w\-]+)", ctype or "", re.I)
+    return (m.group(1) if m else "utf-8")
+
+
+def _web_abrir(decision: DecisionEgress, url: str, timeout: int, maximo: int) -> dict:
+    """Conecta PINNEADO a la IP ya validada (anti-rebinding), SNI/Host = host. GET, sin credenciales."""
+    partes = urllib.parse.urlparse(url)
+    scheme = (partes.scheme or "https").lower()
+    ip = decision.ips[0]
+    ruta = partes.path or "/"
+    if partes.query:
+        ruta += "?" + partes.query
+    raw = socket.create_connection((ip, decision.puerto), timeout=timeout)
+    try:
+        if scheme == "https":
+            sock = _web_ssl.create_default_context().wrap_socket(raw, server_hostname=decision.host)
+            conn = _web_httpc.HTTPSConnection(decision.host, decision.puerto, timeout=timeout)
+        else:
+            sock = raw
+            conn = _web_httpc.HTTPConnection(decision.host, decision.puerto, timeout=timeout)
+        conn.sock = sock
+        conn.request("GET", ruta, headers={
+            "Host": decision.host,
+            "User-Agent": "Mozilla/5.0 (Linux; Android) REAPER/" + __version__,
+            "Accept": "text/html,application/json,text/plain;q=0.9,*/*;q=0.5",
+            "Accept-Encoding": "identity",     # sin compresión: evita bombas de descompresión (Ω §4.3.5)
+            "Connection": "close",
+        })
+        r = conn.getresponse()
+        body = r.read(maximo + 1)
+        return {"status": r.status, "location": r.getheader("Location"),
+                "ctype": (r.getheader("Content-Type") or "").lower(), "body": body}
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def descargar_texto(url: str, timeout: int = 20, maximo: int = 2_000_000, usar_cache: bool = True, *,
+                    permitir_http: bool = False, permitir_local: bool = False, permitidos: Sequence[str] = (),
+                    resolver=None, abrir=None) -> dict:
+    """Descarga y convierte. Valida el destino (SSRF) en CADA salto y conecta pinneado. Lanza ValueError/OSError."""
     cache = _ruta_cache(url)
     if usar_cache:
         try:
@@ -41528,17 +41783,31 @@ def descargar_texto(url: str, timeout: int = 20, maximo: int = 2_000_000, usar_c
                 return datos
         except (OSError, ValueError):
             pass
-    pedido = urllib.request.Request(url, headers={
-        "User-Agent": "Mozilla/5.0 (Linux; Android) REAPER/" + __version__,
-        "Accept": "text/html,application/json,text/plain;q=0.9,*/*;q=0.5",
-    })
-    with urllib.request.urlopen(pedido, timeout=timeout) as r:
-        crudo = r.read(maximo + 1)
-        if len(crudo) > maximo:
-            raise ValueError(f"la página supera {maximo // 1_000_000} MB")
-        tipo = (r.headers.get("Content-Type") or "").lower()
-        codificacion = r.headers.get_content_charset() or "utf-8"
-        final = r.geturl()
+    abrir = abrir or _web_abrir
+    actual = (url or "").strip().strip("<>\"'")
+    saltos = 0
+    while True:
+        d = validar_destino(actual, permitir_http=permitir_http, permitir_local=permitir_local,
+                            permitidos=permitidos, resolver=resolver)
+        if not d.permitido:
+            raise ValueError(d.razon)       # se deniega ANTES de conectar → 0 conexiones al destino prohibido
+        resp = abrir(d, actual, timeout, maximo)
+        status = resp["status"]
+        if status in (301, 302, 303, 307, 308) and resp.get("location"):
+            saltos += 1
+            if saltos > _WEB_MAX_REDIRECTS:
+                raise ValueError("demasiadas redirecciones")
+            actual = urllib.parse.urljoin(actual, resp["location"])     # cada salto se revalida en el loop
+            continue
+        if status >= 400:
+            raise urllib.error.HTTPError(actual, status, f"HTTP {status}", None, None)
+        break
+    crudo = resp["body"]
+    if len(crudo) > maximo:
+        raise ValueError(f"la página supera {maximo // 1_000_000} MB")
+    tipo = resp["ctype"]
+    codificacion = _web_charset(tipo)
+    final = actual
     texto = crudo.decode(codificacion, errors="replace")
     titulo = ""
     if "json" in tipo or texto.lstrip()[:1] in "[{" and "html" not in tipo:

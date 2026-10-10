@@ -71,13 +71,14 @@ class TestWeb(BaseTest):
                 validar_url(mala)
 
     def test_descargar_local(self):
+        # servidor de prueba en loopback: canal local explícito (el gate SSRF bloquea loopback por defecto)
         with _ServidorDePrueba() as srv:
-            html = descargar_texto(srv.base + "/doc", usar_cache=False)
+            html = descargar_texto(srv.base + "/doc", usar_cache=False, permitir_local=True)
             self.assertEqual((html["tipo"], html["titulo"]), ("html", "Docs de prueba"))
-            api = descargar_texto(srv.base + "/api", usar_cache=False)
+            api = descargar_texto(srv.base + "/api", usar_cache=False, permitir_local=True)
             self.assertEqual(api["tipo"], "json")
             self.assertIn('"version": 7', api["texto"])
-            plano = descargar_texto(srv.base + "/texto")
+            plano = descargar_texto(srv.base + "/texto", permitir_local=True)
             self.assertEqual(plano["texto"], "línea uno\nlínea dos")
             self.assertTrue(list((CACHE_DIR / "web").glob("*.json")))
 
