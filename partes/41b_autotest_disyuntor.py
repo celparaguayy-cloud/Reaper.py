@@ -74,9 +74,9 @@ class TestDisyuntorEnCliente(BaseTest):
         return c
 
     def test_modelo_caido_se_abre_y_usa_respaldo(self):
-        c = self.cliente([LLMError("404", probar_otro_modelo=True), "ok",
-                          LLMError("404", probar_otro_modelo=True), "ok",
-                          LLMError("404", probar_otro_modelo=True), "ok"], fallbacks=["qwen"])
+        c = self.cliente([LLMError("503 proveedor caído", probar_otro_modelo=True), "ok",
+                          LLMError("503 proveedor caído", probar_otro_modelo=True), "ok",
+                          LLMError("503 proveedor caído", probar_otro_modelo=True), "ok"], fallbacks=["qwen"])
         principal = resolver_modelo(c.settings.modelo)
         for _ in range(3):
             self.assertEqual(c.chat([{"role": "user", "content": "x"}]).texto, "ok")

@@ -864,6 +864,12 @@ class App:
                 self.ui.tenue(f"  {rol}: {resolver_modelo(modelo)}")
             self.ui.tenue(f"  escalada: {resolver_modelo(self.settings.modelo_fuerte)}")
             return
+        # Ω §5.1: solo /modelo <alias> o /modelo <rol> <alias> con rol conocido. Nada más se guarda.
+        if len(partes) == 1:
+            self.settings.modelo = resolver_modelo(partes[0])
+            self.ui.ok(f"Modelo principal: {self.settings.modelo} (NO VERIFICADO; /equipo probar para confirmar)")
+            guardar_settings(self.settings)
+            return
         if len(partes) == 2 and partes[0].lower() in ROLES:
             rol = partes[0].lower()
             if partes[1] in ("-", "default", "ninguno"):
@@ -871,10 +877,14 @@ class App:
             else:
                 self.settings.modelos_rol[rol] = resolver_modelo(partes[1])
             self.ui.ok(f"{rol} → {self.settings.modelo_para(rol)}")
+            guardar_settings(self.settings)
+            return
+        # entrada inválida: NO guardar nada (antes guardaba partes[0] como modelo e ignoraba el resto)
+        if len(partes) == 2:
+            self.ui.error(f"Rol desconocido: '{partes[0]}'. Roles válidos: {', '.join(sorted(ROLES))}.")
+            self.ui.tenue("  Uso: /modelo <alias>  ·  /modelo <rol> <alias>  (si el alias lleva espacios, no se admite)")
         else:
-            self.settings.modelo = resolver_modelo(partes[0])
-            self.ui.ok(f"Modelo principal: {self.settings.modelo}")
-        guardar_settings(self.settings)
+            self.ui.error("Uso: /modelo [<alias>] | /modelo <rol> <alias>. Demasiados argumentos; no guardé nada.")
 
     def cmd_modelo_fuerte(self, arg: str) -> None:
         if not arg:

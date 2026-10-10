@@ -86,6 +86,11 @@ _RE_CONTEXTO = re.compile(
     r"context(_| )length|maximum context|too many tokens|context window|prompt is too long|reduce the length",
     re.I,
 )
+# Modelo inexistente/retirado para esta cuenta (404): se retira de la ruta, no se reintenta (Ω §5.2).
+_RE_MODELO_RETIRADO = re.compile(
+    r"\b404\b|model_not_found|does not exist|no such model|modelo o endpoint no disponible|model.*not found",
+    re.I,
+)
 
 
 def _lanzar_http(status: int, cuerpo: str, retry_after: Optional[str]) -> None:
@@ -255,8 +260,13 @@ class LLMClient:
                 if respaldo and respaldo not in candidatos:
                     candidatos.append(respaldo)
 
-        # Disyuntor (Fase 5): los modelos caídos van al final (nunca se descartan: podrían ser el único).
-        orden = self.disyuntor.ordenar(candidatos)
+        # Disyuntor (Ω §5.2): EXCLUIR los modelos abiertos/retirados; no "probar igual" contra algo caído.
+        orden = self.disyuntor.elegibles(candidatos)
+        if not orden:
+            estados = ", ".join(f"{c}:{self.disyuntor.estado(c)}" for c in candidatos)
+            raise LLMError(
+                f"Todos los modelos están en enfriamiento o retirados ({estados}). Esperá unos segundos o "
+                "elegí otro modelo/proveedor (/modelo <alias>, /equipo auto).", probar_otro_modelo=False)
 
         ultimo: Optional[LLMError] = None
         for n, candidato in enumerate(orden):
@@ -276,7 +286,11 @@ class LLMClient:
                     self.uso.errores += 1
                 if not e.probar_otro_modelo:
                     raise
-                if self.disyuntor.fallo(candidato) and self.on_evento:
+                if _RE_MODELO_RETIRADO.search(str(e)):      # 404 model_not_found → cuarentena de esa ruta
+                    self.disyuntor.retirar(candidato)
+                    if self.on_evento:
+                        self.on_evento(f"{candidato} retirado (no disponible/404): no lo vuelvo a intentar hasta que responda")
+                elif self.disyuntor.fallo(candidato) and self.on_evento:
                     self.on_evento(f"disyuntor ABIERTO para {candidato}: lo salteo un rato ({self.disyuntor.enfriamiento:.0f}s)")
                 if self.on_evento and n + 1 < len(orden):
                     self.on_evento(f"{candidato} falló ({e}); pruebo con {orden[n + 1]}")

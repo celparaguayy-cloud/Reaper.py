@@ -2121,6 +2121,11 @@ _RE_CONTEXTO = re.compile(
     r"context(_| )length|maximum context|too many tokens|context window|prompt is too long|reduce the length",
     re.I,
 )
+# Modelo inexistente/retirado para esta cuenta (404): se retira de la ruta, no se reintenta (Ω §5.2).
+_RE_MODELO_RETIRADO = re.compile(
+    r"\b404\b|model_not_found|does not exist|no such model|modelo o endpoint no disponible|model.*not found",
+    re.I,
+)
 
 
 def _lanzar_http(status: int, cuerpo: str, retry_after: Optional[str]) -> None:
@@ -2290,8 +2295,13 @@ class LLMClient:
                 if respaldo and respaldo not in candidatos:
                     candidatos.append(respaldo)
 
-        # Disyuntor (Fase 5): los modelos caídos van al final (nunca se descartan: podrían ser el único).
-        orden = self.disyuntor.ordenar(candidatos)
+        # Disyuntor (Ω §5.2): EXCLUIR los modelos abiertos/retirados; no "probar igual" contra algo caído.
+        orden = self.disyuntor.elegibles(candidatos)
+        if not orden:
+            estados = ", ".join(f"{c}:{self.disyuntor.estado(c)}" for c in candidatos)
+            raise LLMError(
+                f"Todos los modelos están en enfriamiento o retirados ({estados}). Esperá unos segundos o "
+                "elegí otro modelo/proveedor (/modelo <alias>, /equipo auto).", probar_otro_modelo=False)
 
         ultimo: Optional[LLMError] = None
         for n, candidato in enumerate(orden):
@@ -2311,7 +2321,11 @@ class LLMClient:
                     self.uso.errores += 1
                 if not e.probar_otro_modelo:
                     raise
-                if self.disyuntor.fallo(candidato) and self.on_evento:
+                if _RE_MODELO_RETIRADO.search(str(e)):      # 404 model_not_found → cuarentena de esa ruta
+                    self.disyuntor.retirar(candidato)
+                    if self.on_evento:
+                        self.on_evento(f"{candidato} retirado (no disponible/404): no lo vuelvo a intentar hasta que responda")
+                elif self.disyuntor.fallo(candidato) and self.on_evento:
                     self.on_evento(f"disyuntor ABIERTO para {candidato}: lo salteo un rato ({self.disyuntor.enfriamiento:.0f}s)")
                 if self.on_evento and n + 1 < len(orden):
                     self.on_evento(f"{candidato} falló ({e}); pruebo con {orden[n + 1]}")
@@ -2490,7 +2504,12 @@ Disyuntor de modelos (v9, Fase 5): un circuit breaker por modelo.
 Si un modelo (o su proveedor) falla varias veces seguidas, abrir el disyuntor lo saca de la rotación por un
 rato en vez de seguir gastando reintentos y latencia en algo caído. Se recupera solo: pasado el enfriamiento
 entra en modo "medio" (se permite UN intento); si ese intento anda, el disyuntor se cierra; si falla, se
-vuelve a abrir. Nunca deja al cliente sin candidatos: un modelo abierto se usa igual como último recurso.
+vuelve a abrir.
+
+REAPER Ω §5.2: un modelo ABIERTO se EXCLUYE de la selección durante el enfriamiento (no se "prueba igual
+como último recurso": eso era lo que mandaba un saludo a un Groq 404 ya marcado caído). Si TODOS están en
+enfriamiento, el cliente devuelve un diagnóstico claro en vez de insistir. Un 404 model_not_found se RETIRA
+(cuarentena por ruta/cuenta) hasta que el catálogo/acceso cambie o el modelo responda de nuevo.
 """
 
 
@@ -2502,25 +2521,36 @@ class DisyuntorModelos:
         self.reloj = reloj
         self._fallos: collections.Counter = collections.Counter()   # modelo → fallos consecutivos
         self._abierto_hasta: dict = {}                              # modelo → instante de reapertura
+        self._retirados: set = set()                               # modelo → retirado (404) hasta que responda
         self._lock = threading.Lock()
 
     def disponible(self, modelo: str) -> bool:
-        """¿Se puede intentar este modelo ahora? (cerrado o medio = sí; abierto en enfriamiento = no)."""
+        """¿Se puede intentar este modelo ahora? (cerrado o medio = sí; abierto/retirado = no)."""
         with self._lock:
+            if modelo in self._retirados:
+                return False
             hasta = self._abierto_hasta.get(modelo)
             return hasta is None or self.reloj() >= hasta
 
     def estado(self, modelo: str) -> str:
         with self._lock:
+            if modelo in self._retirados:
+                return "retirado"
             hasta = self._abierto_hasta.get(modelo)
             if hasta is None:
                 return "cerrado"
             return "medio" if self.reloj() >= hasta else "abierto"
 
+    def retirar(self, modelo: str) -> None:
+        """Marca un modelo como retirado (p. ej. 404 model_not_found): excluido hasta que vuelva a responder."""
+        with self._lock:
+            self._retirados.add(modelo)
+
     def exito(self, modelo: str) -> None:
         with self._lock:
             self._fallos.pop(modelo, None)
             self._abierto_hasta.pop(modelo, None)
+            self._retirados.discard(modelo)
 
     def fallo(self, modelo: str) -> bool:
         """Registra un fallo del modelo; devuelve True si con esto quedó ABIERTO."""
@@ -2532,21 +2562,28 @@ class DisyuntorModelos:
             return False
 
     def ordenar(self, candidatos: Sequence[str]) -> list:
-        """Mismos candidatos, pero los disponibles primero y los abiertos al final (nunca se descartan)."""
+        """Mismos candidatos, pero los disponibles primero y los no-disponibles al final (compatibilidad)."""
         disponibles = [c for c in candidatos if self.disponible(c)]
-        abiertos = [c for c in candidatos if c not in disponibles]
-        return disponibles + abiertos
+        resto = [c for c in candidatos if c not in disponibles]
+        return disponibles + resto
+
+    def elegibles(self, candidatos: Sequence[str]) -> list:
+        """
+        Candidatos que se pueden probar AHORA (excluye abiertos en enfriamiento y retirados). Puede quedar
+        vacío a propósito: el cliente debe dar un diagnóstico, no insistir contra un modelo caído (Ω §5.2).
+        """
+        return [c for c in candidatos if self.disponible(c)]
 
     def resumen(self) -> str:
         with self._lock:
-            if not self._abierto_hasta:
-                return "todos los modelos operativos"
             ahora = self.reloj()
-            partes = []
+            partes = [f"{m}: retirado" for m in self._retirados]
             for modelo, hasta in self._abierto_hasta.items():
+                if modelo in self._retirados:
+                    continue
                 restante = max(0, hasta - ahora)
                 partes.append(f"{modelo}: {'medio' if restante <= 0 else f'abierto {restante:.0f}s'}")
-            return "; ".join(partes)
+            return "; ".join(partes) or "todos los modelos operativos"
 
 
 # ======================================================================
@@ -26979,6 +27016,12 @@ class App:
                 self.ui.tenue(f"  {rol}: {resolver_modelo(modelo)}")
             self.ui.tenue(f"  escalada: {resolver_modelo(self.settings.modelo_fuerte)}")
             return
+        # Ω §5.1: solo /modelo <alias> o /modelo <rol> <alias> con rol conocido. Nada más se guarda.
+        if len(partes) == 1:
+            self.settings.modelo = resolver_modelo(partes[0])
+            self.ui.ok(f"Modelo principal: {self.settings.modelo} (NO VERIFICADO; /equipo probar para confirmar)")
+            guardar_settings(self.settings)
+            return
         if len(partes) == 2 and partes[0].lower() in ROLES:
             rol = partes[0].lower()
             if partes[1] in ("-", "default", "ninguno"):
@@ -26986,10 +27029,14 @@ class App:
             else:
                 self.settings.modelos_rol[rol] = resolver_modelo(partes[1])
             self.ui.ok(f"{rol} → {self.settings.modelo_para(rol)}")
+            guardar_settings(self.settings)
+            return
+        # entrada inválida: NO guardar nada (antes guardaba partes[0] como modelo e ignoraba el resto)
+        if len(partes) == 2:
+            self.ui.error(f"Rol desconocido: '{partes[0]}'. Roles válidos: {', '.join(sorted(ROLES))}.")
+            self.ui.tenue("  Uso: /modelo <alias>  ·  /modelo <rol> <alias>  (si el alias lleva espacios, no se admite)")
         else:
-            self.settings.modelo = resolver_modelo(partes[0])
-            self.ui.ok(f"Modelo principal: {self.settings.modelo}")
-        guardar_settings(self.settings)
+            self.ui.error("Uso: /modelo [<alias>] | /modelo <rol> <alias>. Demasiados argumentos; no guardé nada.")
 
     def cmd_modelo_fuerte(self, arg: str) -> None:
         if not arg:
@@ -36301,9 +36348,9 @@ class TestDisyuntorEnCliente(BaseTest):
         return c
 
     def test_modelo_caido_se_abre_y_usa_respaldo(self):
-        c = self.cliente([LLMError("404", probar_otro_modelo=True), "ok",
-                          LLMError("404", probar_otro_modelo=True), "ok",
-                          LLMError("404", probar_otro_modelo=True), "ok"], fallbacks=["qwen"])
+        c = self.cliente([LLMError("503 proveedor caído", probar_otro_modelo=True), "ok",
+                          LLMError("503 proveedor caído", probar_otro_modelo=True), "ok",
+                          LLMError("503 proveedor caído", probar_otro_modelo=True), "ok"], fallbacks=["qwen"])
         principal = resolver_modelo(c.settings.modelo)
         for _ in range(3):
             self.assertEqual(c.chat([{"role": "user", "content": "x"}]).texto, "ok")
@@ -41204,6 +41251,90 @@ class TestProbeCLI(_BaseProbe):
         app = App(self.ajustes(forense=False, escalar=False), MockLLM([]), self.ui(), ws, persistir=False)
         app.mostrar_inicio(animar=False)
         self.assertIn("6 roles", app.ui.texto_registrado())
+
+
+# ======================================================================
+# MÓDULO: autotest_ruteo
+# ======================================================================
+"""Autotests del fix de /modelo (Ω §5.1) y de la exclusión/retiro del disyuntor (Ω §5.2)."""
+
+
+class TestModeloParser(BaseTest):
+    def _app(self):
+        return App(self.ajustes(forense=False, escalar=False), MockLLM([]), self.ui(), self.proyecto(), persistir=False)
+
+    def test_rol_desconocido_no_guarda(self):
+        app = self._app()
+        antes = app.settings.modelo
+        app.comando("/modelo noesunrol venice")          # T01/T03: no debe guardar 'noesunrol' como modelo
+        self.assertEqual(app.settings.modelo, antes)
+        self.assertNotIn("noesunrol", app.settings.modelos_rol)
+        self.assertIn("desconocido", app.ui.texto_registrado().lower())
+
+    def test_demasiados_argumentos_no_guarda(self):
+        app = self._app()
+        antes = app.settings.modelo
+        app.comando("/modelo a b c")
+        self.assertEqual(app.settings.modelo, antes)
+
+    def test_rol_valido_se_guarda(self):
+        app = self._app()
+        app.comando("/modelo revisor qwen")
+        self.assertEqual(app.settings.modelos_rol.get("revisor"), resolver_modelo("qwen"))
+
+    def test_modelo_principal_se_guarda(self):
+        app = self._app()
+        app.comando("/modelo qwen")
+        self.assertEqual(app.settings.modelo, resolver_modelo("qwen"))
+
+
+class TestDisyuntorExcluye(BaseTest):
+    def test_elegibles_excluye_abierto(self):
+        d = DisyuntorModelos(umbral=1)
+        d.fallo("a")                                     # abre 'a'
+        self.assertEqual(d.elegibles(["a", "b"]), ["b"])
+
+    def test_elegibles_vacio_si_todos_abiertos(self):
+        d = DisyuntorModelos(umbral=1)
+        d.fallo("a"); d.fallo("b")
+        self.assertEqual(d.elegibles(["a", "b"]), [])    # a propósito vacío: el cliente da diagnóstico
+
+    def test_retirar_excluye_y_estado(self):
+        d = DisyuntorModelos()
+        d.retirar("groq/llama")
+        self.assertFalse(d.disponible("groq/llama"))
+        self.assertEqual(d.estado("groq/llama"), "retirado")
+        self.assertEqual(d.elegibles(["groq/llama", "otro"]), ["otro"])
+
+    def test_exito_revive_retirado(self):
+        d = DisyuntorModelos()
+        d.retirar("m")
+        d.exito("m")
+        self.assertTrue(d.disponible("m"))
+
+
+class TestChatDisyuntor(BaseTest):
+    def cliente(self, eventos, **ajustes):
+        c = LLMClient("clave", self.ajustes(**ajustes), url="http://falso", transporte=transporte_falso(eventos))
+        c.dormir = lambda _s: None
+        return c
+
+    def test_404_retira_el_modelo_y_no_reintenta(self):
+        c = self.cliente([LLMError("404 model_not_found", probar_otro_modelo=True), "desde respaldo"],
+                         fallbacks=["qwen"])
+        principal = resolver_modelo(c.settings.modelo)
+        self.assertEqual(c.chat([{"role": "user", "content": "hola"}]).texto, "desde respaldo")
+        self.assertEqual(c.disyuntor.estado(principal), "retirado")
+
+    def test_todos_en_enfriamiento_da_diagnostico(self):
+        # un solo modelo: 3 fallos lo abren; el 4º chat no "prueba igual", da diagnóstico claro
+        c = self.cliente([LLMError("503 caído", probar_otro_modelo=True)] * 3)
+        for _ in range(3):
+            with self.assertRaises(LLMError):
+                c.chat([{"role": "user", "content": "x"}])
+        with self.assertRaises(LLMError) as cm:
+            c.chat([{"role": "user", "content": "x"}])        # no consume guion: elegibles vacío
+        self.assertIn("enfriamiento", str(cm.exception).lower())
 
 
 # ======================================================================
