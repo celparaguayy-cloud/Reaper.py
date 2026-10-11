@@ -455,3 +455,87 @@ class TestFlujoConstruirUI(BaseTest):
         self.assertIn("Plan · 2 tareas", texto)
         self.assertIn("Crear a.py", texto)
         self.assertIn("← 1", texto)                      # la tarea 2 depende de la 1
+
+
+class TestConfigValidarDiagnostico(BaseTest):
+    """Tres ideas tomadas de free-claude-code (solo las ideas): validar config, selector y diagnóstico."""
+    _VARS = ("OPENROUTER_API_KEY", "GROQ_API_KEY", "GEMINI_API_KEY", "MISTRAL_API_KEY", "REAPER_CLAVE_PROVEEDOR")
+
+    def setUp(self):
+        super().setUp()
+        self._bak = {k: os.environ.pop(k, None) for k in self._VARS}
+
+    def tearDown(self):
+        for k, v in self._bak.items():
+            os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+        super().tearDown()
+
+    def test_validar_detecta_falta_de_clave(self):
+        s = self.ajustes(modelo="deepseek")        # openrouter, sin clave en el entorno
+        issues = validar_configuracion(s)
+        self.assertTrue(any(n == "error" for n, _ in issues))
+        self.assertTrue(any("credencial" in msg for n, msg in issues if n == "error"))
+        os.environ["OPENROUTER_API_KEY"] = "x"
+        issues2 = validar_configuracion(self.ajustes(modelo="deepseek", escalar=False))
+        self.assertFalse(any(n == "error" for n, _ in issues2))      # con clave, sin errores
+        self.assertTrue(any(n == "ok" for n, _ in issues2))
+
+    def test_validar_marca_proveedor_retirado(self):
+        os.environ["OPENROUTER_API_KEY"] = "x"
+        s = self.ajustes(modelo="github-models:gpt-4o", escalar=False)
+        self.assertTrue(any("retirado" in msg for n, msg in validar_configuracion(s) if n == "error"))
+
+    def test_diagnostico_redacta_y_tiene_lo_esencial(self):
+        os.environ["OPENROUTER_API_KEY"] = "sk-or-v1-0123456789abcdef0123456789"
+        texto = diagnostico_texto(self.ajustes(modelo="deepseek"))
+        self.assertIn("REAPER", texto)
+        self.assertIn(__version__, texto)
+        self.assertIn("Ruteo del equipo", texto)
+        self.assertIn("Validación de configuración", texto)
+        self.assertNotIn("sk-or-v1-0123456789", texto)               # la clave NUNCA aparece
+        self.assertIn("openrouter", texto)
+
+    def test_cmd_validar_y_diagnostico_imprimen(self):
+        app = App(self.ajustes(modelo="deepseek"), MockLLM([]), self.ui(), self.proyecto(), persistir=False)
+        app.cmd_validar("")
+        app.cmd_diagnostico("")
+        texto = app.ui.texto_registrado()
+        self.assertIn("VALIDACIÓN", texto)
+        self.assertIn("diagnóstico", texto)
+
+    def test_validar_dos_modos_no_se_pisan(self):
+        # /validar sin args (o 'config') valida config; /validar archivo.py valida archivos (modo viejo intacto).
+        ws = self.proyecto()
+        ws.escribir("modulo.py", "x = 1\n")
+        app = App(self.ajustes(modelo="deepseek"), MockLLM([]), self.ui(), ws, persistir=False)
+        app.cmd_validar("config")
+        self.assertIn("VALIDACIÓN DE CONFIGURACIÓN", app.ui.texto_registrado())
+        app2 = App(self.ajustes(modelo="deepseek"), MockLLM([]), self.ui(), ws, persistir=False)
+        app2.cmd_validar("modulo.py")                                # modo archivos: NO es el validador de config
+        self.assertNotIn("VALIDACIÓN DE CONFIGURACIÓN", app2.ui.texto_registrado())
+
+    def test_diagnostico_se_guarda_a_archivo(self):
+        ws = self.proyecto()
+        app = App(self.ajustes(), MockLLM([]), self.ui(), ws, persistir=False)
+        app.cmd_diagnostico("reporte.txt")
+        self.assertTrue(ws.existe("reporte.txt"))
+        self.assertIn("REAPER", ws.leer("reporte.txt"))
+
+    def test_modelo_buscar_filtra_el_catalogo(self):
+        app = App(self.ajustes(), MockLLM([]), self.ui(), self.proyecto(), persistir=False)
+        app.cmd_modelo("buscar nemotron")
+        texto = app.ui.texto_registrado()
+        self.assertIn("nemotron", texto.lower())
+        self.assertNotIn("deepseek", texto.lower())                  # filtró de verdad
+
+    def test_modelo_elegir_sin_terminal_no_rompe(self):
+        app = App(self.ajustes(), MockLLM([]), self.ui(), self.proyecto(), persistir=False)
+        app.cmd_modelo("elegir")                                     # UI no interactiva
+        self.assertIn("no disponible sin terminal", app.ui.texto_registrado())
+
+    def test_modelo_elegir_interactivo_setea(self):
+        ui = self.ui(respuestas=["1"])                               # elige la primera opción
+        ui.interactivo = True
+        app = App(self.ajustes(), MockLLM([]), ui, self.proyecto(), persistir=False)
+        app.cmd_modelo("elegir")
+        self.assertNotEqual(app.settings.modelo, "")

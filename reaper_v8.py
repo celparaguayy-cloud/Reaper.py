@@ -28108,7 +28108,7 @@ COMANDOS_AYUDA = [
         ("/nuevo <plantilla> <carpeta>", "crea un proyecto listo y testeado desde una plantilla"),
         ("/plantillas", "lista las plantillas disponibles"),
         ("/auditar-web", "auditoría local de HTML y recursos sin ejecutar código"),
-        ("/scan · /tests · /validar [archivos]", "validadores, suite de tests, validación puntual"),
+        ("/scan · /tests · /validar [cambios|archivo]", "validadores, suite de tests, validación de archivos (sin arg valida config)"),
         ("/correr <archivo> [args]", "ejecuta y ofrece reparar si crashea"),
         ("/vigilar [comando]", "corre los tests cada vez que cambia un archivo (Ctrl+C para salir)"),
         ("/diff · /deshacer [id] · /rehacer", "cambios del último pedido, revertir, volver a aplicar"),
@@ -28141,7 +28141,8 @@ COMANDOS_AYUDA = [
         ("/modelos · /config [clave valor] · /tema [nombre]", "catálogo, configuración, colores"),
         ("/uso · /contexto · /compactar · /estado", "consumo, contexto del agente, estado general"),
         ("/desempeno · /pentest <alcance>", "ranking de modelos por rol; modo seguridad (pentest/CTF/lab) con gate"),
-        ("/doctor · /instalar · /dragon · /evaluar", "diagnóstico, comando `reaper`, el dragón, benchmark"),
+        ("/doctor · /validar [config] · /diagnostico [archivo]", "diagnóstico del entorno · validar config de modelos · reporte sin claves"),
+        ("/instalar · /dragon · /evaluar", "comando `reaper`, el dragón, benchmark"),
         ("/evaluar comportamiento [ids]", "mide si el agente responde directo, no repite herramientas, no miente..."),
         ("/todo · /reset · /salir", "lista de tareas, reiniciar conversación, salir"),
     ]),
@@ -28513,6 +28514,7 @@ class App:
             "/history": "historial", "/status": "estado", "/context": "contexto", "/compact": "compactar",
             "/run": "correr", "/test": "tests", "/project": "proyecto", "/model": "modelo", "/mode": "modo",
             "/strong": "modelo_fuerte", "/privacy": "privacidad", "/providers": "proveedores", "/team": "equipo",
+            "/validate": "validar", "/diagnose": "diagnostico", "/diag": "diagnostico",
         }
         nombre = alias.get(cmd, cmd[1:]).replace("-", "_")
         metodo = getattr(self, "cmd_" + nombre, None)
@@ -28832,14 +28834,38 @@ class App:
             f"tests {'OK' if r.ok else 'FALLARON'} (exit {r.codigo}) · {conteo.texto()} · {formatear_duracion(r.duracion)}")
 
     def cmd_validar(self, arg: str) -> None:
-        rels = shlex.split(arg) if arg else self.ws.checkpoints.archivos_desde(self.ws.checkpoints.inicio_grupo() or 1)
+        # Un solo /validar con dos modos: config de modelos/equipo (lo nuevo) y validación de archivos (lo de antes).
+        sub = arg.strip()
+        low = sub.lower()
+        if low in ("", "config", "configuracion", "configuración", "equipo", "modelos"):
+            self._validar_config()
+            return
+        if low in ("cambios", "changed", "."):
+            rels = self.ws.checkpoints.archivos_desde(self.ws.checkpoints.inicio_grupo() or 1)
+        else:
+            rels = shlex.split(sub)
         if not rels:
-            self.ui.tenue("Uso: /validar archivo.py [otro.js ...]")
+            self.ui.tenue("Uso: /validar [config] · /validar cambios · /validar archivo.py [otro.js ...]")
             return
         for r in validar_archivos(self.ws, rels):
             (self.ui.ok if r.ok else self.ui.error)(r.linea()[2:])
             if not r.ok:
                 self.ui.tenue(recortar(r.stderr or r.stdout, 1500))
+
+    def _validar_config(self) -> None:
+        """Valida la configuración de modelos y equipo (sin tocar la red; la conectividad real la da /equipo probar)."""
+        self.ui.titulo("VALIDACIÓN DE CONFIGURACIÓN")
+        glifos = {"ok": (Tema.ok, "✓"), "aviso": (Tema.aviso, "○"), "error": (Tema.error, "✗")}
+        issues = validar_configuracion(self.settings)
+        for nivel, msg in issues:
+            color, g = glifos.get(nivel, (Tema.tenue, "·"))
+            self.ui.linea(f"  {color}{g}{C.RESET} {msg}")
+        errores = sum(1 for n, _ in issues if n == "error")
+        if errores:
+            self.ui.error(f"{errores} error(es) bloqueante(s): revisá tus claves o el ruteo (/equipo, /modelo).")
+        else:
+            self.ui.ok("Configuración sin errores bloqueantes.")
+        self.ui.tenue("  Conectividad real: /equipo probar · ruteo por rol: /equipo · diagnóstico: /diagnostico")
 
     def cmd_correr(self, arg: str) -> None:
         try:
@@ -29167,13 +29193,63 @@ class App:
         self._guardar_settings()
         self.ui.ok(f"Tema: {nombre}")
 
+    def _catalogo_alias(self) -> list:
+        return sorted(INFO_MODELOS.items(), key=lambda kv: (kv[1].proveedor, kv[0]))
+
+    def _buscar_modelos(self, texto: str) -> None:
+        texto = texto.lower().strip()
+        encontrados = [(a, i) for a, i in self._catalogo_alias()
+                       if not texto or texto in a.lower() or texto in i.id.lower()
+                       or texto in (i.nota or "").lower() or texto in (i.proveedor or "").lower()]
+        if not encontrados:
+            self.ui.tenue(f"Sin modelos que coincidan con '{texto}'. /modelos para el catálogo completo.")
+            return
+        self.ui.info(f"Modelos que coinciden con '{texto}' ({len(encontrados)}):" if texto
+                     else f"Catálogo de modelos ({len(encontrados)}):")
+        for a, i in encontrados[:40]:
+            marca = f"{Tema.ok}●{C.RESET}" if resolver_modelo(a) == self.settings.modelo else " "
+            etiqueta = f"{Tema.acento}free{C.RESET} " if i.free else ""
+            prov = i.proveedor or self.settings.proveedor
+            self.ui.linea(f"  {marca} {Tema.ok}{a:<26}{C.RESET} {Tema.tenue}{prov} · {etiqueta}"
+                          f"{recortar(i.nota or i.id, 46)}{C.RESET}")
+        self.ui.tenue("  Elegí: /modelo <alias> · por rol: /modelo <rol> <alias> · interactivo: /modelo elegir [rol]")
+
+    def _elegir_modelo_interactivo(self, rol: str = "") -> None:
+        catalogo = self._catalogo_alias()
+        if not self.ui.interactivo:
+            self.ui.tenue("Selector interactivo no disponible sin terminal. Usá /modelo buscar <texto> y "
+                          "después /modelo <alias>.")
+            return
+        opciones = [f"{a:<26} {i.proveedor or self.settings.proveedor} · "
+                    f"{'free · ' if i.free else ''}{recortar(i.nota or i.id, 40)}" for a, i in catalogo]
+        actual = self.settings.modelo_para(rol) if rol else self.settings.modelo
+        defecto = next((n for n, (a, _i) in enumerate(catalogo) if resolver_modelo(a) == actual), 0)
+        destino = f"rol {rol}" if rol else "modelo principal"
+        idx = self.ui.elegir(f"Elegí el {destino}", opciones, defecto=defecto)
+        alias = catalogo[idx][0]
+        if rol:
+            self.settings.modelos_rol[rol] = resolver_modelo(alias)
+            self.ui.ok(f"{rol} → {self.settings.modelo_para(rol)} (NO VERIFICADO; /equipo probar)")
+        else:
+            self.settings.modelo = resolver_modelo(alias)
+            self.ui.ok(f"Modelo principal: {self.settings.modelo} (NO VERIFICADO; /equipo probar)")
+        self._guardar_settings()
+
     def cmd_modelo(self, arg: str) -> None:
         partes = arg.split()
+        if partes and partes[0].lower() in ("elegir", "elige", "seleccionar", "picker"):
+            rol = partes[1].lower() if len(partes) > 1 and partes[1].lower() in ROLES else ""
+            self._elegir_modelo_interactivo(rol)
+            return
+        if partes and partes[0].lower() in ("buscar", "search", "find", "filtrar"):
+            self._buscar_modelos(" ".join(partes[1:]))
+            return
         if not partes:
             self.ui.info(f"Modelo principal: {self.settings.modelo}")
             for rol, modelo in self.settings.modelos_rol.items():
                 self.ui.tenue(f"  {rol}: {resolver_modelo(modelo)}")
             self.ui.tenue(f"  escalada: {resolver_modelo(self.settings.modelo_fuerte)}")
+            self.ui.tenue("  Elegir de una lista: /modelo elegir [rol] · buscar: /modelo buscar <texto>")
             return
         # Ω §5.1: solo /modelo <alias> o /modelo <rol> <alias> con rol conocido. Nada más se guarda.
         if len(partes) == 1:
@@ -29768,6 +29844,22 @@ class App:
 
     def cmd_doctor(self, arg: str) -> None:
         diagnostico_sistema(self.ui, self.settings, self.llm)
+        self.ui.tenue("  Validar la config de modelos/equipo: /validar · diagnóstico para reportar bugs: /diagnostico")
+
+    def cmd_diagnostico(self, arg: str) -> None:
+        """Diagnóstico redactado (sin claves) para pegar al reportar un bug. Con un nombre de archivo, lo guarda."""
+        texto = diagnostico_texto(self.settings)
+        self.ui.linea(texto)
+        destino = arg.strip()
+        if destino:
+            try:
+                ruta = self.ws.ruta(destino, escribir=True)
+                escritura_atomica(ruta, texto + "\n")
+                self.ui.ok(f"diagnóstico guardado en {ruta} (sin claves; seguro para compartir)")
+            except (ErrorRuta, OSError) as e:
+                self.ui.error(str(e))
+        else:
+            self.ui.tenue("  Guardalo para compartir: /diagnostico diagnostico.txt (se redactan los secretos)")
 
     def cmd_instalar(self, arg: str) -> None:
         instalar_lanzador(self.ui)
@@ -46158,6 +46250,90 @@ class TestFlujoConstruirUI(BaseTest):
         self.assertIn("← 1", texto)                      # la tarea 2 depende de la 1
 
 
+class TestConfigValidarDiagnostico(BaseTest):
+    """Tres ideas tomadas de free-claude-code (solo las ideas): validar config, selector y diagnóstico."""
+    _VARS = ("OPENROUTER_API_KEY", "GROQ_API_KEY", "GEMINI_API_KEY", "MISTRAL_API_KEY", "REAPER_CLAVE_PROVEEDOR")
+
+    def setUp(self):
+        super().setUp()
+        self._bak = {k: os.environ.pop(k, None) for k in self._VARS}
+
+    def tearDown(self):
+        for k, v in self._bak.items():
+            os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+        super().tearDown()
+
+    def test_validar_detecta_falta_de_clave(self):
+        s = self.ajustes(modelo="deepseek")        # openrouter, sin clave en el entorno
+        issues = validar_configuracion(s)
+        self.assertTrue(any(n == "error" for n, _ in issues))
+        self.assertTrue(any("credencial" in msg for n, msg in issues if n == "error"))
+        os.environ["OPENROUTER_API_KEY"] = "x"
+        issues2 = validar_configuracion(self.ajustes(modelo="deepseek", escalar=False))
+        self.assertFalse(any(n == "error" for n, _ in issues2))      # con clave, sin errores
+        self.assertTrue(any(n == "ok" for n, _ in issues2))
+
+    def test_validar_marca_proveedor_retirado(self):
+        os.environ["OPENROUTER_API_KEY"] = "x"
+        s = self.ajustes(modelo="github-models:gpt-4o", escalar=False)
+        self.assertTrue(any("retirado" in msg for n, msg in validar_configuracion(s) if n == "error"))
+
+    def test_diagnostico_redacta_y_tiene_lo_esencial(self):
+        os.environ["OPENROUTER_API_KEY"] = "sk-or-v1-0123456789abcdef0123456789"
+        texto = diagnostico_texto(self.ajustes(modelo="deepseek"))
+        self.assertIn("REAPER", texto)
+        self.assertIn(__version__, texto)
+        self.assertIn("Ruteo del equipo", texto)
+        self.assertIn("Validación de configuración", texto)
+        self.assertNotIn("sk-or-v1-0123456789", texto)               # la clave NUNCA aparece
+        self.assertIn("openrouter", texto)
+
+    def test_cmd_validar_y_diagnostico_imprimen(self):
+        app = App(self.ajustes(modelo="deepseek"), MockLLM([]), self.ui(), self.proyecto(), persistir=False)
+        app.cmd_validar("")
+        app.cmd_diagnostico("")
+        texto = app.ui.texto_registrado()
+        self.assertIn("VALIDACIÓN", texto)
+        self.assertIn("diagnóstico", texto)
+
+    def test_validar_dos_modos_no_se_pisan(self):
+        # /validar sin args (o 'config') valida config; /validar archivo.py valida archivos (modo viejo intacto).
+        ws = self.proyecto()
+        ws.escribir("modulo.py", "x = 1\n")
+        app = App(self.ajustes(modelo="deepseek"), MockLLM([]), self.ui(), ws, persistir=False)
+        app.cmd_validar("config")
+        self.assertIn("VALIDACIÓN DE CONFIGURACIÓN", app.ui.texto_registrado())
+        app2 = App(self.ajustes(modelo="deepseek"), MockLLM([]), self.ui(), ws, persistir=False)
+        app2.cmd_validar("modulo.py")                                # modo archivos: NO es el validador de config
+        self.assertNotIn("VALIDACIÓN DE CONFIGURACIÓN", app2.ui.texto_registrado())
+
+    def test_diagnostico_se_guarda_a_archivo(self):
+        ws = self.proyecto()
+        app = App(self.ajustes(), MockLLM([]), self.ui(), ws, persistir=False)
+        app.cmd_diagnostico("reporte.txt")
+        self.assertTrue(ws.existe("reporte.txt"))
+        self.assertIn("REAPER", ws.leer("reporte.txt"))
+
+    def test_modelo_buscar_filtra_el_catalogo(self):
+        app = App(self.ajustes(), MockLLM([]), self.ui(), self.proyecto(), persistir=False)
+        app.cmd_modelo("buscar nemotron")
+        texto = app.ui.texto_registrado()
+        self.assertIn("nemotron", texto.lower())
+        self.assertNotIn("deepseek", texto.lower())                  # filtró de verdad
+
+    def test_modelo_elegir_sin_terminal_no_rompe(self):
+        app = App(self.ajustes(), MockLLM([]), self.ui(), self.proyecto(), persistir=False)
+        app.cmd_modelo("elegir")                                     # UI no interactiva
+        self.assertIn("no disponible sin terminal", app.ui.texto_registrado())
+
+    def test_modelo_elegir_interactivo_setea(self):
+        ui = self.ui(respuestas=["1"])                               # elige la primera opción
+        ui.interactivo = True
+        app = App(self.ajustes(), MockLLM([]), ui, self.proyecto(), persistir=False)
+        app.cmd_modelo("elegir")
+        self.assertNotEqual(app.settings.modelo, "")
+
+
 # ======================================================================
 # MÓDULO: autotest_runner
 # ======================================================================
@@ -50996,6 +51172,88 @@ def estado_equipo(settings) -> list:
         salida.append({"rol": etiqueta, "reaper_rol": rol, "modelo": modelo, "modelo_real": destino.modelo,
                        "proveedor": destino.proveedor, "tiene_clave": tiene})
     return salida
+
+
+def validar_configuracion(settings) -> list:
+    """
+    Revisa la config de modelos/equipo SIN tocar la red (la conectividad real la da /equipo probar). Devuelve
+    una lista de (nivel, mensaje) con nivel 'error' (bloqueante), 'aviso' (mejorable) u 'ok' (bien).
+    """
+    retirados = globals().get("PROVEEDORES_RETIRADOS", frozenset())
+
+    def tiene_clave(prov: str) -> bool:
+        try:
+            return bool(clave_de_proveedor(prov, replace(settings, proveedor=prov)))
+        except (TypeError, ValueError):
+            return False
+
+    issues = []
+    principal = destino_modelo(settings.modelo, settings)
+    if principal.proveedor in retirados:
+        issues.append(("error", f"el modelo principal usa un proveedor retirado ({principal.proveedor})"))
+    elif not principal.es_local() and not tiene_clave(principal.proveedor):
+        issues.append(("error", f"falta la credencial del proveedor del modelo principal ({principal.proveedor})"))
+    else:
+        issues.append(("ok", f"modelo principal: {settings.modelo} → {principal.proveedor}"))
+
+    estado = estado_equipo(settings)
+    sin_clave = [e["rol"] for e in estado if not e["tiene_clave"]]
+    if sin_clave:
+        issues.append(("error", f"{len(sin_clave)} rol(es) sin credencial para su proveedor: {', '.join(sin_clave)}"))
+    retirados_rol = sorted({e["proveedor"] for e in estado if e["proveedor"] in retirados})
+    if retirados_rol:
+        issues.append(("error", f"rol(es) con proveedor retirado: {', '.join(retirados_rol)}"))
+
+    provs = {e["proveedor"] for e in estado}
+    if len(estado) > 1 and len(provs) <= 1:
+        issues.append(("aviso", f"independencia REDUCIDA: los {len(estado)} roles usan un solo proveedor "
+                                f"({next(iter(provs))}); si se cae, cae todo el equipo"))
+
+    if settings.escalar:
+        fuerte = destino_modelo(settings.modelo_fuerte, settings)
+        if fuerte.proveedor in retirados:
+            issues.append(("error", f"el modelo de escalada usa un proveedor retirado ({fuerte.proveedor})"))
+        elif not fuerte.es_local() and not tiene_clave(fuerte.proveedor):
+            issues.append(("aviso", f"escalada activada pero falta la credencial de {fuerte.proveedor}: no podrá escalar"))
+
+    if not any(nivel == "error" for nivel, _ in issues):
+        issues.append(("ok", "sin errores bloqueantes en la configuración"))
+    issues.append(("aviso", "la conectividad real NO se valida acá: usá /equipo probar"))
+    return issues
+
+
+def diagnostico_texto(settings, incluir_equipo: bool = True) -> str:
+    """
+    Resumen para reportar bugs: versión, entorno, chequeos, config, qué proveedores tienen clave (solo sí/no) y
+    el ruteo del equipo. Pasa por redactar_secretos: NUNCA incluye una clave, aunque aparezca en algún campo.
+    """
+    entorno = "Termux/Android" if es_termux() else f"{platform.system()} {platform.machine()}"
+    lineas = [f"REAPER {__version__} · diagnóstico", f"python {sys.version.split()[0]} · {entorno}", ""]
+    lineas.append("Chequeos del entorno:")
+    for c in chequeos_sistema(settings):
+        marca = "OK" if c.ok else ("FALTA" if c.critico else "opcional")
+        lineas.append(f"  [{marca}] {c.nombre}: {recortar(c.detalle, 70).replace(chr(10), ' ')}")
+    lineas.append("")
+    lineas.append(f"Config: modo={settings.modo} · candidatos={settings.candidatos} · tests_primero={settings.tests_primero}"
+                  f" · torneo={settings.torneo} · escalar={settings.escalar} · roles_x={settings.roles_x}"
+                  f" · privacidad_estricta={settings.privacidad_estricta} · web={settings.web}")
+    marcas = []
+    for prov in PROVEEDORES:
+        try:
+            tiene = bool(clave_de_proveedor(prov, replace(settings, proveedor=prov)))
+        except (TypeError, ValueError):
+            tiene = False
+        marcas.append(f"{prov}{'✓' if tiene else '·'}")
+    lineas.append("Proveedores (✓=con clave, ·=sin clave): " + " ".join(marcas))
+    if incluir_equipo:
+        lineas += ["", "Ruteo del equipo (rol → modelo @ proveedor · credencial):"]
+        for e in estado_equipo(settings):
+            lineas.append(f"  {e['rol']:<16} {e['modelo_real']} @ {e['proveedor']} · "
+                          f"{'con clave' if e['tiene_clave'] else 'SIN CLAVE'}")
+        lineas += ["", "Validación de configuración:"]
+        for nivel, msg in validar_configuracion(settings):
+            lineas.append(f"  [{nivel}] {msg}")
+    return redactar_secretos("\n".join(lineas))
 
 
 def modelos_potentes_free() -> list:

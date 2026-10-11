@@ -33,6 +33,88 @@ def estado_equipo(settings) -> list:
     return salida
 
 
+def validar_configuracion(settings) -> list:
+    """
+    Revisa la config de modelos/equipo SIN tocar la red (la conectividad real la da /equipo probar). Devuelve
+    una lista de (nivel, mensaje) con nivel 'error' (bloqueante), 'aviso' (mejorable) u 'ok' (bien).
+    """
+    retirados = globals().get("PROVEEDORES_RETIRADOS", frozenset())
+
+    def tiene_clave(prov: str) -> bool:
+        try:
+            return bool(clave_de_proveedor(prov, replace(settings, proveedor=prov)))
+        except (TypeError, ValueError):
+            return False
+
+    issues = []
+    principal = destino_modelo(settings.modelo, settings)
+    if principal.proveedor in retirados:
+        issues.append(("error", f"el modelo principal usa un proveedor retirado ({principal.proveedor})"))
+    elif not principal.es_local() and not tiene_clave(principal.proveedor):
+        issues.append(("error", f"falta la credencial del proveedor del modelo principal ({principal.proveedor})"))
+    else:
+        issues.append(("ok", f"modelo principal: {settings.modelo} → {principal.proveedor}"))
+
+    estado = estado_equipo(settings)
+    sin_clave = [e["rol"] for e in estado if not e["tiene_clave"]]
+    if sin_clave:
+        issues.append(("error", f"{len(sin_clave)} rol(es) sin credencial para su proveedor: {', '.join(sin_clave)}"))
+    retirados_rol = sorted({e["proveedor"] for e in estado if e["proveedor"] in retirados})
+    if retirados_rol:
+        issues.append(("error", f"rol(es) con proveedor retirado: {', '.join(retirados_rol)}"))
+
+    provs = {e["proveedor"] for e in estado}
+    if len(estado) > 1 and len(provs) <= 1:
+        issues.append(("aviso", f"independencia REDUCIDA: los {len(estado)} roles usan un solo proveedor "
+                                f"({next(iter(provs))}); si se cae, cae todo el equipo"))
+
+    if settings.escalar:
+        fuerte = destino_modelo(settings.modelo_fuerte, settings)
+        if fuerte.proveedor in retirados:
+            issues.append(("error", f"el modelo de escalada usa un proveedor retirado ({fuerte.proveedor})"))
+        elif not fuerte.es_local() and not tiene_clave(fuerte.proveedor):
+            issues.append(("aviso", f"escalada activada pero falta la credencial de {fuerte.proveedor}: no podrá escalar"))
+
+    if not any(nivel == "error" for nivel, _ in issues):
+        issues.append(("ok", "sin errores bloqueantes en la configuración"))
+    issues.append(("aviso", "la conectividad real NO se valida acá: usá /equipo probar"))
+    return issues
+
+
+def diagnostico_texto(settings, incluir_equipo: bool = True) -> str:
+    """
+    Resumen para reportar bugs: versión, entorno, chequeos, config, qué proveedores tienen clave (solo sí/no) y
+    el ruteo del equipo. Pasa por redactar_secretos: NUNCA incluye una clave, aunque aparezca en algún campo.
+    """
+    entorno = "Termux/Android" if es_termux() else f"{platform.system()} {platform.machine()}"
+    lineas = [f"REAPER {__version__} · diagnóstico", f"python {sys.version.split()[0]} · {entorno}", ""]
+    lineas.append("Chequeos del entorno:")
+    for c in chequeos_sistema(settings):
+        marca = "OK" if c.ok else ("FALTA" if c.critico else "opcional")
+        lineas.append(f"  [{marca}] {c.nombre}: {recortar(c.detalle, 70).replace(chr(10), ' ')}")
+    lineas.append("")
+    lineas.append(f"Config: modo={settings.modo} · candidatos={settings.candidatos} · tests_primero={settings.tests_primero}"
+                  f" · torneo={settings.torneo} · escalar={settings.escalar} · roles_x={settings.roles_x}"
+                  f" · privacidad_estricta={settings.privacidad_estricta} · web={settings.web}")
+    marcas = []
+    for prov in PROVEEDORES:
+        try:
+            tiene = bool(clave_de_proveedor(prov, replace(settings, proveedor=prov)))
+        except (TypeError, ValueError):
+            tiene = False
+        marcas.append(f"{prov}{'✓' if tiene else '·'}")
+    lineas.append("Proveedores (✓=con clave, ·=sin clave): " + " ".join(marcas))
+    if incluir_equipo:
+        lineas += ["", "Ruteo del equipo (rol → modelo @ proveedor · credencial):"]
+        for e in estado_equipo(settings):
+            lineas.append(f"  {e['rol']:<16} {e['modelo_real']} @ {e['proveedor']} · "
+                          f"{'con clave' if e['tiene_clave'] else 'SIN CLAVE'}")
+        lineas += ["", "Validación de configuración:"]
+        for nivel, msg in validar_configuracion(settings):
+            lineas.append(f"  [{nivel}] {msg}")
+    return redactar_secretos("\n".join(lineas))
+
+
 def modelos_potentes_free() -> list:
     """Alias curados de modelos free POTENTES (del catálogo estático), como (alias, info)."""
     return [(alias, info) for alias, info in INFO_MODELOS.items() if info.free]

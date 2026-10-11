@@ -34,7 +34,7 @@ COMANDOS_AYUDA = [
         ("/nuevo <plantilla> <carpeta>", "crea un proyecto listo y testeado desde una plantilla"),
         ("/plantillas", "lista las plantillas disponibles"),
         ("/auditar-web", "auditoría local de HTML y recursos sin ejecutar código"),
-        ("/scan · /tests · /validar [archivos]", "validadores, suite de tests, validación puntual"),
+        ("/scan · /tests · /validar [cambios|archivo]", "validadores, suite de tests, validación de archivos (sin arg valida config)"),
         ("/correr <archivo> [args]", "ejecuta y ofrece reparar si crashea"),
         ("/vigilar [comando]", "corre los tests cada vez que cambia un archivo (Ctrl+C para salir)"),
         ("/diff · /deshacer [id] · /rehacer", "cambios del último pedido, revertir, volver a aplicar"),
@@ -67,7 +67,8 @@ COMANDOS_AYUDA = [
         ("/modelos · /config [clave valor] · /tema [nombre]", "catálogo, configuración, colores"),
         ("/uso · /contexto · /compactar · /estado", "consumo, contexto del agente, estado general"),
         ("/desempeno · /pentest <alcance>", "ranking de modelos por rol; modo seguridad (pentest/CTF/lab) con gate"),
-        ("/doctor · /instalar · /dragon · /evaluar", "diagnóstico, comando `reaper`, el dragón, benchmark"),
+        ("/doctor · /validar [config] · /diagnostico [archivo]", "diagnóstico del entorno · validar config de modelos · reporte sin claves"),
+        ("/instalar · /dragon · /evaluar", "comando `reaper`, el dragón, benchmark"),
         ("/evaluar comportamiento [ids]", "mide si el agente responde directo, no repite herramientas, no miente..."),
         ("/todo · /reset · /salir", "lista de tareas, reiniciar conversación, salir"),
     ]),
@@ -439,6 +440,7 @@ class App:
             "/history": "historial", "/status": "estado", "/context": "contexto", "/compact": "compactar",
             "/run": "correr", "/test": "tests", "/project": "proyecto", "/model": "modelo", "/mode": "modo",
             "/strong": "modelo_fuerte", "/privacy": "privacidad", "/providers": "proveedores", "/team": "equipo",
+            "/validate": "validar", "/diagnose": "diagnostico", "/diag": "diagnostico",
         }
         nombre = alias.get(cmd, cmd[1:]).replace("-", "_")
         metodo = getattr(self, "cmd_" + nombre, None)
@@ -758,14 +760,38 @@ class App:
             f"tests {'OK' if r.ok else 'FALLARON'} (exit {r.codigo}) · {conteo.texto()} · {formatear_duracion(r.duracion)}")
 
     def cmd_validar(self, arg: str) -> None:
-        rels = shlex.split(arg) if arg else self.ws.checkpoints.archivos_desde(self.ws.checkpoints.inicio_grupo() or 1)
+        # Un solo /validar con dos modos: config de modelos/equipo (lo nuevo) y validación de archivos (lo de antes).
+        sub = arg.strip()
+        low = sub.lower()
+        if low in ("", "config", "configuracion", "configuración", "equipo", "modelos"):
+            self._validar_config()
+            return
+        if low in ("cambios", "changed", "."):
+            rels = self.ws.checkpoints.archivos_desde(self.ws.checkpoints.inicio_grupo() or 1)
+        else:
+            rels = shlex.split(sub)
         if not rels:
-            self.ui.tenue("Uso: /validar archivo.py [otro.js ...]")
+            self.ui.tenue("Uso: /validar [config] · /validar cambios · /validar archivo.py [otro.js ...]")
             return
         for r in validar_archivos(self.ws, rels):
             (self.ui.ok if r.ok else self.ui.error)(r.linea()[2:])
             if not r.ok:
                 self.ui.tenue(recortar(r.stderr or r.stdout, 1500))
+
+    def _validar_config(self) -> None:
+        """Valida la configuración de modelos y equipo (sin tocar la red; la conectividad real la da /equipo probar)."""
+        self.ui.titulo("VALIDACIÓN DE CONFIGURACIÓN")
+        glifos = {"ok": (Tema.ok, "✓"), "aviso": (Tema.aviso, "○"), "error": (Tema.error, "✗")}
+        issues = validar_configuracion(self.settings)
+        for nivel, msg in issues:
+            color, g = glifos.get(nivel, (Tema.tenue, "·"))
+            self.ui.linea(f"  {color}{g}{C.RESET} {msg}")
+        errores = sum(1 for n, _ in issues if n == "error")
+        if errores:
+            self.ui.error(f"{errores} error(es) bloqueante(s): revisá tus claves o el ruteo (/equipo, /modelo).")
+        else:
+            self.ui.ok("Configuración sin errores bloqueantes.")
+        self.ui.tenue("  Conectividad real: /equipo probar · ruteo por rol: /equipo · diagnóstico: /diagnostico")
 
     def cmd_correr(self, arg: str) -> None:
         try:
@@ -1093,13 +1119,63 @@ class App:
         self._guardar_settings()
         self.ui.ok(f"Tema: {nombre}")
 
+    def _catalogo_alias(self) -> list:
+        return sorted(INFO_MODELOS.items(), key=lambda kv: (kv[1].proveedor, kv[0]))
+
+    def _buscar_modelos(self, texto: str) -> None:
+        texto = texto.lower().strip()
+        encontrados = [(a, i) for a, i in self._catalogo_alias()
+                       if not texto or texto in a.lower() or texto in i.id.lower()
+                       or texto in (i.nota or "").lower() or texto in (i.proveedor or "").lower()]
+        if not encontrados:
+            self.ui.tenue(f"Sin modelos que coincidan con '{texto}'. /modelos para el catálogo completo.")
+            return
+        self.ui.info(f"Modelos que coinciden con '{texto}' ({len(encontrados)}):" if texto
+                     else f"Catálogo de modelos ({len(encontrados)}):")
+        for a, i in encontrados[:40]:
+            marca = f"{Tema.ok}●{C.RESET}" if resolver_modelo(a) == self.settings.modelo else " "
+            etiqueta = f"{Tema.acento}free{C.RESET} " if i.free else ""
+            prov = i.proveedor or self.settings.proveedor
+            self.ui.linea(f"  {marca} {Tema.ok}{a:<26}{C.RESET} {Tema.tenue}{prov} · {etiqueta}"
+                          f"{recortar(i.nota or i.id, 46)}{C.RESET}")
+        self.ui.tenue("  Elegí: /modelo <alias> · por rol: /modelo <rol> <alias> · interactivo: /modelo elegir [rol]")
+
+    def _elegir_modelo_interactivo(self, rol: str = "") -> None:
+        catalogo = self._catalogo_alias()
+        if not self.ui.interactivo:
+            self.ui.tenue("Selector interactivo no disponible sin terminal. Usá /modelo buscar <texto> y "
+                          "después /modelo <alias>.")
+            return
+        opciones = [f"{a:<26} {i.proveedor or self.settings.proveedor} · "
+                    f"{'free · ' if i.free else ''}{recortar(i.nota or i.id, 40)}" for a, i in catalogo]
+        actual = self.settings.modelo_para(rol) if rol else self.settings.modelo
+        defecto = next((n for n, (a, _i) in enumerate(catalogo) if resolver_modelo(a) == actual), 0)
+        destino = f"rol {rol}" if rol else "modelo principal"
+        idx = self.ui.elegir(f"Elegí el {destino}", opciones, defecto=defecto)
+        alias = catalogo[idx][0]
+        if rol:
+            self.settings.modelos_rol[rol] = resolver_modelo(alias)
+            self.ui.ok(f"{rol} → {self.settings.modelo_para(rol)} (NO VERIFICADO; /equipo probar)")
+        else:
+            self.settings.modelo = resolver_modelo(alias)
+            self.ui.ok(f"Modelo principal: {self.settings.modelo} (NO VERIFICADO; /equipo probar)")
+        self._guardar_settings()
+
     def cmd_modelo(self, arg: str) -> None:
         partes = arg.split()
+        if partes and partes[0].lower() in ("elegir", "elige", "seleccionar", "picker"):
+            rol = partes[1].lower() if len(partes) > 1 and partes[1].lower() in ROLES else ""
+            self._elegir_modelo_interactivo(rol)
+            return
+        if partes and partes[0].lower() in ("buscar", "search", "find", "filtrar"):
+            self._buscar_modelos(" ".join(partes[1:]))
+            return
         if not partes:
             self.ui.info(f"Modelo principal: {self.settings.modelo}")
             for rol, modelo in self.settings.modelos_rol.items():
                 self.ui.tenue(f"  {rol}: {resolver_modelo(modelo)}")
             self.ui.tenue(f"  escalada: {resolver_modelo(self.settings.modelo_fuerte)}")
+            self.ui.tenue("  Elegir de una lista: /modelo elegir [rol] · buscar: /modelo buscar <texto>")
             return
         # Ω §5.1: solo /modelo <alias> o /modelo <rol> <alias> con rol conocido. Nada más se guarda.
         if len(partes) == 1:
@@ -1694,6 +1770,22 @@ class App:
 
     def cmd_doctor(self, arg: str) -> None:
         diagnostico_sistema(self.ui, self.settings, self.llm)
+        self.ui.tenue("  Validar la config de modelos/equipo: /validar · diagnóstico para reportar bugs: /diagnostico")
+
+    def cmd_diagnostico(self, arg: str) -> None:
+        """Diagnóstico redactado (sin claves) para pegar al reportar un bug. Con un nombre de archivo, lo guarda."""
+        texto = diagnostico_texto(self.settings)
+        self.ui.linea(texto)
+        destino = arg.strip()
+        if destino:
+            try:
+                ruta = self.ws.ruta(destino, escribir=True)
+                escritura_atomica(ruta, texto + "\n")
+                self.ui.ok(f"diagnóstico guardado en {ruta} (sin claves; seguro para compartir)")
+            except (ErrorRuta, OSError) as e:
+                self.ui.error(str(e))
+        else:
+            self.ui.tenue("  Guardalo para compartir: /diagnostico diagnostico.txt (se redactan los secretos)")
 
     def cmd_instalar(self, arg: str) -> None:
         instalar_lanzador(self.ui)
