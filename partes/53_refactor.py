@@ -14,27 +14,84 @@ Después valida todos los archivos tocados; si alguno queda roto, no se aplica n
 import tokenize as _tokenize
 
 _RE_IDENT_VALIDO = re.compile(r"^[A-Za-z_$][\w$]*$")
+_IGNORAR_TOKEN = frozenset({
+    _tokenize.NL, _tokenize.NEWLINE, _tokenize.COMMENT, _tokenize.INDENT, _tokenize.DEDENT, _tokenize.ENCODING,
+})
 
 
-def _renombrar_python(texto: str, viejo: str, nuevo: str) -> tuple[str, int]:
+def _modulos_importados(texto: str) -> set:
+    """Nombres ligados por `import X` / `import X as Y` / `import a.b` (se liga `a`): un `a.viejo` es la función,
+    no un atributo ajeno, así que sí hay que renombrarlo."""
+    nombres: set = set()
+    try:
+        arbol = ast.parse(texto)
+    except (SyntaxError, ValueError):
+        return nombres
+    for nodo in ast.walk(arbol):
+        if isinstance(nodo, ast.Import):
+            for alias in nodo.names:
+                nombres.add((alias.asname or alias.name).split(".")[0])
+    return nombres
+
+
+def _es_metodo_de_clase(texto: str, viejo: str) -> bool:
+    """¿`viejo` está definido como método (def directo en el cuerpo de una clase)? Entonces los accesos por
+    atributo (`obj.viejo`) son sus llamadas y SÍ deben renombrarse; si no, son miembros ajenos del mismo nombre."""
+    try:
+        arbol = ast.parse(texto)
+    except (SyntaxError, ValueError):
+        return False
+    for nodo in ast.walk(arbol):
+        if isinstance(nodo, ast.ClassDef):
+            for hijo in ast.iter_child_nodes(nodo):
+                if isinstance(hijo, (ast.FunctionDef, ast.AsyncFunctionDef)) and hijo.name == viejo:
+                    return True
+    return False
+
+
+def _renombrar_python(texto: str, viejo: str, nuevo: str, incluir_atributos: bool = True) -> tuple[str, int, int]:
+    """
+    Renombra tokens NAME == viejo (nunca strings ni comentarios). Cuando incluir_atributos es False, NO toca los
+    accesos por atributo de instancia (`obj.viejo`, `self.viejo`) —que suelen ser miembros ajenos del mismo
+    nombre— salvo que estén calificados por un módulo importado (`a.viejo`, que sí es la función). Devuelve
+    (texto_nuevo, cambios, atributos_de_instancia_omitidos).
+    """
     lineas = texto.splitlines(keepends=True)
     try:
         tokens = list(_tokenize.generate_tokens(io.StringIO(texto).readline))
     except (_tokenize.TokenError, IndentationError, SyntaxError):
-        return texto, -1
-    cambios = [(t.start, t.end) for t in tokens if t.type == _tokenize.NAME and t.string == viejo]
+        return texto, -1, 0
+    modulos = set() if incluir_atributos else _modulos_importados(texto)
+    cambios: list = []
+    omitidos = 0
+    prev1 = prev2 = None               # tokens significativos previos (prev1 = inmediatamente anterior)
+    for t in tokens:
+        if t.type in _IGNORAR_TOKEN:
+            continue
+        if t.type == _tokenize.NAME and t.string == viejo:
+            es_atributo = prev1 is not None and prev1.type == _tokenize.OP and prev1.string == "."
+            if es_atributo and not incluir_atributos:
+                calificado_por_modulo = (prev2 is not None and prev2.type == _tokenize.NAME
+                                         and prev2.string in modulos)
+                if not calificado_por_modulo:
+                    omitidos += 1
+                    prev2, prev1 = prev1, t
+                    continue
+            cambios.append((t.start, t.end))
+        prev2, prev1 = prev1, t
     if not cambios:
-        return texto, 0
+        return texto, 0, omitidos
     # Se aplica de atrás hacia adelante para no correr las posiciones.
     for (fila, col), (_fila_fin, col_fin) in reversed(cambios):
         linea = lineas[fila - 1]
         lineas[fila - 1] = linea[:col] + nuevo + linea[col_fin:]
-    return "".join(lineas), len(cambios)
+    return "".join(lineas), len(cambios), omitidos
 
 
-def _renombrar_generico(texto: str, viejo: str, nuevo: str, comentario: str = "//") -> tuple[str, int]:
+def _renombrar_generico(texto: str, viejo: str, nuevo: str, comentario: str = "//",
+                        incluir_atributos: bool = True) -> tuple[str, int, int]:
     salida = []
-    i, n, cambios = 0, len(texto), 0
+    i, n, cambios, omitidos = 0, len(texto), 0, 0
     largo = len(viejo)
     while i < n:
         ch = texto[i]
@@ -65,27 +122,33 @@ def _renombrar_generico(texto: str, viejo: str, nuevo: str, comentario: str = "/
             antes = texto[i - 1] if i > 0 else ""
             despues = texto[i + largo] if i + largo < n else ""
             if not (antes.isalnum() or antes in "_$") and not (despues.isalnum() or despues in "_$"):
+                if antes == "." and not incluir_atributos:
+                    omitidos += 1
+                    salida.append(viejo)
+                    i += largo
+                    continue
                 salida.append(nuevo)
                 i += largo
                 cambios += 1
                 continue
         salida.append(ch)
         i += 1
-    return "".join(salida), cambios
+    return "".join(salida), cambios, omitidos
 
 
-def renombrar_en_texto(rel: str, texto: str, viejo: str, nuevo: str) -> tuple[str, int]:
+def renombrar_en_texto(rel: str, texto: str, viejo: str, nuevo: str,
+                       incluir_atributos: bool = True) -> tuple[str, int, int]:
     sufijo = Path(rel).suffix.lower()
     if sufijo == ".py":
-        nuevo_texto, cambios = _renombrar_python(texto, viejo, nuevo)
+        nuevo_texto, cambios, omitidos = _renombrar_python(texto, viejo, nuevo, incluir_atributos)
         if cambios >= 0:
-            return nuevo_texto, cambios
-        return _renombrar_generico(texto, viejo, nuevo, "#")
+            return nuevo_texto, cambios, omitidos
+        return _renombrar_generico(texto, viejo, nuevo, "#", incluir_atributos)
     if sufijo in (".sh", ".bash", ".rb"):
-        return _renombrar_generico(texto, viejo, nuevo, "#")
+        return _renombrar_generico(texto, viejo, nuevo, "#", incluir_atributos)
     if sufijo in LENGUAJES_LLAVES or sufijo in (".html", ".htm", ".vue", ".svelte"):
-        return _renombrar_generico(texto, viejo, nuevo, "//")
-    return texto, 0
+        return _renombrar_generico(texto, viejo, nuevo, "//", incluir_atributos)
+    return texto, 0, 0
 
 
 @dataclass
@@ -94,6 +157,7 @@ class PlanRenombrado:
     nuevo: str
     cambios: dict = field(default_factory=dict)  # rel → (antes, despues, cantidad)
     conflictos: list = field(default_factory=list)
+    atributos_omitidos: int = 0                  # accesos `.viejo` de instancia que se dejaron sin tocar
 
     @property
     def total(self) -> int:
@@ -117,6 +181,10 @@ def planificar_renombrado(ws: Workspace, viejo: str, nuevo: str, archivos: Optio
         raise ValueError(f"'{nuevo}' es una palabra reservada de Python")
     plan = PlanRenombrado(viejo, nuevo)
     candidatos = list(archivos) if archivos else ws.archivos_codigo(limite=3000)
+    # Primero leemos todo y decidimos si `viejo` es un MÉTODO en algún lado del proyecto: si lo es, los accesos
+    # por atributo son sus llamadas y hay que renombrarlos; si no (función/clase/variable libre), un `obj.viejo`
+    # es casi seguro un miembro ajeno del mismo nombre y NO debe tocarse (evita corromper código silenciosamente).
+    textos: dict = {}
     for rel in candidatos:
         try:
             texto = ws.leer(rel)
@@ -124,7 +192,13 @@ def planificar_renombrado(ws: Workspace, viejo: str, nuevo: str, archivos: Optio
             continue
         if viejo not in texto:
             continue
-        nuevo_texto, cantidad = renombrar_en_texto(rel, texto, viejo, nuevo)
+        textos[rel] = texto
+    incluir_atributos = any(
+        rel.lower().endswith(".py") and _es_metodo_de_clase(texto, viejo) for rel, texto in textos.items()
+    ) or not any(rel.lower().endswith(".py") for rel in textos)   # proyecto sin .py: no sé clasificar, comportamiento previo
+    for rel, texto in textos.items():
+        nuevo_texto, cantidad, omitidos = renombrar_en_texto(rel, texto, viejo, nuevo, incluir_atributos)
+        plan.atributos_omitidos += omitidos
         if cantidad > 0:
             if re.search(r"(?<![\w$])" + re.escape(nuevo) + r"(?![\w$])", texto):
                 plan.conflictos.append(f"{rel}: ya existe el nombre '{nuevo}'")
@@ -180,6 +254,10 @@ def rename_symbol(ctx: Contexto, p: dict) -> str:
     texto = plan.resumen()
     if plan.conflictos:
         texto += "\nOjo, el nombre nuevo ya existía en: " + "; ".join(plan.conflictos)
+    if plan.atributos_omitidos:
+        texto += (f"\nDejé sin tocar {plan.atributos_omitidos} acceso(s) por atributo `.{p['old']}` "
+                  f"(parecen miembros ajenos del mismo nombre, no esta función/clase/variable). "
+                  f"Si eran un método o atributo que también querías renombrar, revisalos a mano.")
     return texto + "\nValidación: " + resumen_validacion(resultados)
 
 

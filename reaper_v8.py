@@ -2560,9 +2560,9 @@ class LLMClient:
         payload = self._payload(modelo, mensajes, temperatura, max_tokens, stop, self._destino(modelo).proveedor)
         intentos = max(0, int(self.settings.reintentos))
         vacias = 0
+        cancelado = (lambda: CANCELAR.is_set()) if "CANCELAR" in globals() else None
         for intento in range(intentos + 1):
             try:
-                cancelado = (lambda: CANCELAR.is_set()) if "CANCELAR" in globals() else None
                 self.limitador.adquirir(cancelado)
                 return self._una_vez(modelo, payload, on_progress)
             except _Transitorio as e:
@@ -2583,8 +2583,21 @@ class LLMClient:
                     espera = min(60.0, 2.0 * (2 ** intento)) + random.uniform(0, 1)
                 if self.on_evento:
                     self.on_evento(f"reintento {intento + 1}/{intentos} en {espera:.0f}s: {e}")
-                self.dormir(min(espera, 120.0))
+                self._dormir_cancelable(min(espera, 120.0), cancelado)
         raise LLMError("No se obtuvo respuesta del modelo.")  # pragma: no cover
+
+    def _dormir_cancelable(self, segundos: float, cancelado: Optional[Callable[[], bool]] = None) -> None:
+        """
+        Espera troceada en tramos de ~1 s. Un Retry-After alto (o el backoff) no debe congelar el proceso
+        sin mirar si el usuario canceló: en el teléfono un sleep de 1–2 min sin salida se siente colgado.
+        """
+        restante = max(0.0, segundos)
+        while restante > 0:
+            if cancelado and cancelado():
+                raise LLMError("Cancelado mientras se esperaba para reintentar.")
+            tramo = min(restante, 1.0)
+            self.dormir(tramo)
+            restante -= tramo
 
     def _headers(self, destino: Optional["DestinoModelo"] = None) -> dict:
         proveedor = destino.proveedor if destino is not None else self.settings.proveedor
@@ -37192,6 +37205,45 @@ class TestDisyuntorEnCliente(BaseTest):
         self.assertIn("operativos", c.disyuntor.resumen())
 
 
+class TestEsperaReintentoCancelable(BaseTest):
+    """La espera entre reintentos no debe congelar el proceso (en el teléfono un sleep largo se siente colgado)."""
+
+    def _cliente(self, eventos=(), **ajustes):
+        return LLMClient("clave", self.ajustes(**ajustes), url="http://falso", transporte=transporte_falso(eventos))
+
+    def test_espera_troceada_en_tramos_de_un_segundo(self):
+        c = self._cliente()
+        tramos = []
+        c.dormir = lambda s: tramos.append(s)
+        c._dormir_cancelable(5.0)
+        self.assertTrue(tramos)
+        self.assertLessEqual(max(tramos), 1.0)              # ningún sleep individual supera ~1 s
+        self.assertAlmostEqual(sum(tramos), 5.0, places=6)  # pero se espera el total pedido
+
+    def test_cancelacion_corta_la_espera(self):
+        c = self._cliente()
+        tramos = []
+        c.dormir = lambda s: tramos.append(s)
+        chequeos = {"n": 0}
+
+        def cancelado():
+            chequeos["n"] += 1
+            return chequeos["n"] > 2          # cancela al tercer chequeo
+
+        with self.assertRaises(LLMError):
+            c._dormir_cancelable(300.0, cancelado)
+        self.assertLessEqual(sum(tramos), 3.0)              # no esperó los 300 s
+
+    def test_retry_after_alto_se_acota_y_trocea(self):
+        # un Retry-After de 480 s no debe producir un único sleep gigante: se acota a 120 s y se trocea
+        c = self._cliente([_Transitorio("429 saturado", espera=480.0), "ok"], reintentos=1, rpm=0)
+        tramos = []
+        c.dormir = lambda s: tramos.append(s)
+        self.assertEqual(c.chat([{"role": "user", "content": "x"}]).texto, "ok")
+        self.assertLessEqual(max(tramos), 1.0)
+        self.assertLessEqual(sum(tramos), 121.0)           # acotado a 120 s pese al Retry-After de 480
+
+
 # ======================================================================
 # MÓDULO: autotest_registro
 # ======================================================================
@@ -38689,8 +38741,9 @@ class TestHooks(BaseTest):
 
 class TestRenombrar(BaseTest):
     def test_python_no_toca_strings_ni_comentarios(self):
+        # incluir_atributos=True (por defecto en la función de bajo nivel): renombra NAME tokens, no strings/comentarios
         texto = 'def total(x):\n    return x  # total sin cambiar\n\nprint(total(2), "total")\nobj.total = 1\n'
-        nuevo, n = renombrar_en_texto("a.py", texto, "total", "suma")
+        nuevo, n, _om = renombrar_en_texto("a.py", texto, "total", "suma")
         self.assertEqual(n, 3)
         self.assertIn("def suma(x):", nuevo)
         self.assertIn("# total sin cambiar", nuevo)
@@ -38698,9 +38751,23 @@ class TestRenombrar(BaseTest):
         self.assertIn("obj.suma = 1", nuevo)
         self.assertNotIn("subtotal", renombrar_en_texto("b.py", "subtotal = total\n", "total", "suma")[0].replace("subtotal", "ok"))
 
+    def test_python_modo_seguro_no_toca_atributos_de_instancia(self):
+        # incluir_atributos=False: un acceso por atributo de instancia (miembro ajeno) se deja intacto y se cuenta
+        texto = 'def total(x):\n    return x\n\nprint(total(2))\nobj.total = 1\n'
+        nuevo, n, om = renombrar_en_texto("a.py", texto, "total", "suma", incluir_atributos=False)
+        self.assertEqual(n, 2)                 # def + llamada libre
+        self.assertEqual(om, 1)                # obj.total NO se tocó
+        self.assertIn("def suma(x):", nuevo)
+        self.assertIn("obj.total = 1", nuevo)  # miembro ajeno intacto
+        # pero un acceso calificado por módulo importado SÍ es la función
+        txt2 = "import a\nprint(a.total(1))\n"
+        nuevo2, n2, om2 = renombrar_en_texto("m.py", txt2, "total", "suma", incluir_atributos=False)
+        self.assertEqual((n2, om2), (1, 0))
+        self.assertIn("a.suma(1)", nuevo2)
+
     def test_js(self):
         texto = "const total = 1; // total\nconsole.log(`total ${total}`, 'total', subtotal, total);\n"
-        nuevo, n = renombrar_en_texto("a.js", texto, "total", "suma")
+        nuevo, n, _om = renombrar_en_texto("a.js", texto, "total", "suma")
         self.assertEqual(n, 2)
         self.assertIn("const suma = 1; // total", nuevo)
         self.assertIn("subtotal, suma)", nuevo)
@@ -38727,6 +38794,32 @@ class TestRenombrar(BaseTest):
         self.assertIn("2 cambio(s)", salida)
         self.assertIn("def nueva", ws.leer("m.py"))
         self.assertIn("No encontré", self.herramienta(ctx, "rename_symbol", old="inexistente", new="x"))
+
+    def test_funcion_libre_no_corrompe_atributo_ajeno(self):
+        # renombrar una FUNCIÓN libre no debe reescribir un atributo de instancia ajeno del mismo nombre
+        ws = self.proyecto({
+            "a.py": "def total(xs):\n    return sum(xs)\n",
+            "b.py": "import a\n\nclass W:\n    def __init__(self):\n        self.total = 0\n    def f(self):\n        self.total = a.total([1])\n        return self.total\n"})
+        plan = planificar_renombrado(ws, "total", "suma")
+        ws.checkpoints.iniciar("renombrar")
+        aplicar_renombrado(ws, plan)
+        self.assertIn("def suma(xs)", ws.leer("a.py"))
+        self.assertIn("a.suma([1])", ws.leer("b.py"))     # la llamada calificada por módulo sí se renombra
+        self.assertIn("self.total = 0", ws.leer("b.py"))  # el atributo de instancia ajeno queda intacto
+        self.assertIn("return self.total", ws.leer("b.py"))
+        self.assertGreaterEqual(plan.atributos_omitidos, 1)
+
+    def test_metodo_renombra_sus_llamadas(self):
+        # si `viejo` es un MÉTODO, los accesos por atributo son sus llamadas y SÍ deben renombrarse
+        ws = self.proyecto({
+            "c.py": "class C:\n    def total(self):\n        return 1\n",
+            "u.py": "from c import C\n\nprint(C().total())\n"})
+        plan = planificar_renombrado(ws, "total", "suma")
+        ws.checkpoints.iniciar("renombrar")
+        aplicar_renombrado(ws, plan)
+        self.assertIn("def suma(self)", ws.leer("c.py"))
+        self.assertIn("C().suma()", ws.leer("u.py"))      # la llamada al método se renombró
+        self.assertEqual(plan.atributos_omitidos, 0)
 
 
 class TestIngles(BaseTest):
@@ -44481,27 +44574,84 @@ Después valida todos los archivos tocados; si alguno queda roto, no se aplica n
 import tokenize as _tokenize
 
 _RE_IDENT_VALIDO = re.compile(r"^[A-Za-z_$][\w$]*$")
+_IGNORAR_TOKEN = frozenset({
+    _tokenize.NL, _tokenize.NEWLINE, _tokenize.COMMENT, _tokenize.INDENT, _tokenize.DEDENT, _tokenize.ENCODING,
+})
 
 
-def _renombrar_python(texto: str, viejo: str, nuevo: str) -> tuple[str, int]:
+def _modulos_importados(texto: str) -> set:
+    """Nombres ligados por `import X` / `import X as Y` / `import a.b` (se liga `a`): un `a.viejo` es la función,
+    no un atributo ajeno, así que sí hay que renombrarlo."""
+    nombres: set = set()
+    try:
+        arbol = ast.parse(texto)
+    except (SyntaxError, ValueError):
+        return nombres
+    for nodo in ast.walk(arbol):
+        if isinstance(nodo, ast.Import):
+            for alias in nodo.names:
+                nombres.add((alias.asname or alias.name).split(".")[0])
+    return nombres
+
+
+def _es_metodo_de_clase(texto: str, viejo: str) -> bool:
+    """¿`viejo` está definido como método (def directo en el cuerpo de una clase)? Entonces los accesos por
+    atributo (`obj.viejo`) son sus llamadas y SÍ deben renombrarse; si no, son miembros ajenos del mismo nombre."""
+    try:
+        arbol = ast.parse(texto)
+    except (SyntaxError, ValueError):
+        return False
+    for nodo in ast.walk(arbol):
+        if isinstance(nodo, ast.ClassDef):
+            for hijo in ast.iter_child_nodes(nodo):
+                if isinstance(hijo, (ast.FunctionDef, ast.AsyncFunctionDef)) and hijo.name == viejo:
+                    return True
+    return False
+
+
+def _renombrar_python(texto: str, viejo: str, nuevo: str, incluir_atributos: bool = True) -> tuple[str, int, int]:
+    """
+    Renombra tokens NAME == viejo (nunca strings ni comentarios). Cuando incluir_atributos es False, NO toca los
+    accesos por atributo de instancia (`obj.viejo`, `self.viejo`) —que suelen ser miembros ajenos del mismo
+    nombre— salvo que estén calificados por un módulo importado (`a.viejo`, que sí es la función). Devuelve
+    (texto_nuevo, cambios, atributos_de_instancia_omitidos).
+    """
     lineas = texto.splitlines(keepends=True)
     try:
         tokens = list(_tokenize.generate_tokens(io.StringIO(texto).readline))
     except (_tokenize.TokenError, IndentationError, SyntaxError):
-        return texto, -1
-    cambios = [(t.start, t.end) for t in tokens if t.type == _tokenize.NAME and t.string == viejo]
+        return texto, -1, 0
+    modulos = set() if incluir_atributos else _modulos_importados(texto)
+    cambios: list = []
+    omitidos = 0
+    prev1 = prev2 = None               # tokens significativos previos (prev1 = inmediatamente anterior)
+    for t in tokens:
+        if t.type in _IGNORAR_TOKEN:
+            continue
+        if t.type == _tokenize.NAME and t.string == viejo:
+            es_atributo = prev1 is not None and prev1.type == _tokenize.OP and prev1.string == "."
+            if es_atributo and not incluir_atributos:
+                calificado_por_modulo = (prev2 is not None and prev2.type == _tokenize.NAME
+                                         and prev2.string in modulos)
+                if not calificado_por_modulo:
+                    omitidos += 1
+                    prev2, prev1 = prev1, t
+                    continue
+            cambios.append((t.start, t.end))
+        prev2, prev1 = prev1, t
     if not cambios:
-        return texto, 0
+        return texto, 0, omitidos
     # Se aplica de atrás hacia adelante para no correr las posiciones.
     for (fila, col), (_fila_fin, col_fin) in reversed(cambios):
         linea = lineas[fila - 1]
         lineas[fila - 1] = linea[:col] + nuevo + linea[col_fin:]
-    return "".join(lineas), len(cambios)
+    return "".join(lineas), len(cambios), omitidos
 
 
-def _renombrar_generico(texto: str, viejo: str, nuevo: str, comentario: str = "//") -> tuple[str, int]:
+def _renombrar_generico(texto: str, viejo: str, nuevo: str, comentario: str = "//",
+                        incluir_atributos: bool = True) -> tuple[str, int, int]:
     salida = []
-    i, n, cambios = 0, len(texto), 0
+    i, n, cambios, omitidos = 0, len(texto), 0, 0
     largo = len(viejo)
     while i < n:
         ch = texto[i]
@@ -44532,27 +44682,33 @@ def _renombrar_generico(texto: str, viejo: str, nuevo: str, comentario: str = "/
             antes = texto[i - 1] if i > 0 else ""
             despues = texto[i + largo] if i + largo < n else ""
             if not (antes.isalnum() or antes in "_$") and not (despues.isalnum() or despues in "_$"):
+                if antes == "." and not incluir_atributos:
+                    omitidos += 1
+                    salida.append(viejo)
+                    i += largo
+                    continue
                 salida.append(nuevo)
                 i += largo
                 cambios += 1
                 continue
         salida.append(ch)
         i += 1
-    return "".join(salida), cambios
+    return "".join(salida), cambios, omitidos
 
 
-def renombrar_en_texto(rel: str, texto: str, viejo: str, nuevo: str) -> tuple[str, int]:
+def renombrar_en_texto(rel: str, texto: str, viejo: str, nuevo: str,
+                       incluir_atributos: bool = True) -> tuple[str, int, int]:
     sufijo = Path(rel).suffix.lower()
     if sufijo == ".py":
-        nuevo_texto, cambios = _renombrar_python(texto, viejo, nuevo)
+        nuevo_texto, cambios, omitidos = _renombrar_python(texto, viejo, nuevo, incluir_atributos)
         if cambios >= 0:
-            return nuevo_texto, cambios
-        return _renombrar_generico(texto, viejo, nuevo, "#")
+            return nuevo_texto, cambios, omitidos
+        return _renombrar_generico(texto, viejo, nuevo, "#", incluir_atributos)
     if sufijo in (".sh", ".bash", ".rb"):
-        return _renombrar_generico(texto, viejo, nuevo, "#")
+        return _renombrar_generico(texto, viejo, nuevo, "#", incluir_atributos)
     if sufijo in LENGUAJES_LLAVES or sufijo in (".html", ".htm", ".vue", ".svelte"):
-        return _renombrar_generico(texto, viejo, nuevo, "//")
-    return texto, 0
+        return _renombrar_generico(texto, viejo, nuevo, "//", incluir_atributos)
+    return texto, 0, 0
 
 
 @dataclass
@@ -44561,6 +44717,7 @@ class PlanRenombrado:
     nuevo: str
     cambios: dict = field(default_factory=dict)  # rel → (antes, despues, cantidad)
     conflictos: list = field(default_factory=list)
+    atributos_omitidos: int = 0                  # accesos `.viejo` de instancia que se dejaron sin tocar
 
     @property
     def total(self) -> int:
@@ -44584,6 +44741,10 @@ def planificar_renombrado(ws: Workspace, viejo: str, nuevo: str, archivos: Optio
         raise ValueError(f"'{nuevo}' es una palabra reservada de Python")
     plan = PlanRenombrado(viejo, nuevo)
     candidatos = list(archivos) if archivos else ws.archivos_codigo(limite=3000)
+    # Primero leemos todo y decidimos si `viejo` es un MÉTODO en algún lado del proyecto: si lo es, los accesos
+    # por atributo son sus llamadas y hay que renombrarlos; si no (función/clase/variable libre), un `obj.viejo`
+    # es casi seguro un miembro ajeno del mismo nombre y NO debe tocarse (evita corromper código silenciosamente).
+    textos: dict = {}
     for rel in candidatos:
         try:
             texto = ws.leer(rel)
@@ -44591,7 +44752,13 @@ def planificar_renombrado(ws: Workspace, viejo: str, nuevo: str, archivos: Optio
             continue
         if viejo not in texto:
             continue
-        nuevo_texto, cantidad = renombrar_en_texto(rel, texto, viejo, nuevo)
+        textos[rel] = texto
+    incluir_atributos = any(
+        rel.lower().endswith(".py") and _es_metodo_de_clase(texto, viejo) for rel, texto in textos.items()
+    ) or not any(rel.lower().endswith(".py") for rel in textos)   # proyecto sin .py: no sé clasificar, comportamiento previo
+    for rel, texto in textos.items():
+        nuevo_texto, cantidad, omitidos = renombrar_en_texto(rel, texto, viejo, nuevo, incluir_atributos)
+        plan.atributos_omitidos += omitidos
         if cantidad > 0:
             if re.search(r"(?<![\w$])" + re.escape(nuevo) + r"(?![\w$])", texto):
                 plan.conflictos.append(f"{rel}: ya existe el nombre '{nuevo}'")
@@ -44647,6 +44814,10 @@ def rename_symbol(ctx: Contexto, p: dict) -> str:
     texto = plan.resumen()
     if plan.conflictos:
         texto += "\nOjo, el nombre nuevo ya existía en: " + "; ".join(plan.conflictos)
+    if plan.atributos_omitidos:
+        texto += (f"\nDejé sin tocar {plan.atributos_omitidos} acceso(s) por atributo `.{p['old']}` "
+                  f"(parecen miembros ajenos del mismo nombre, no esta función/clase/variable). "
+                  f"Si eran un método o atributo que también querías renombrar, revisalos a mano.")
     return texto + "\nValidación: " + resumen_validacion(resultados)
 
 

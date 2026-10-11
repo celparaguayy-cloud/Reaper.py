@@ -182,8 +182,9 @@ class TestHooks(BaseTest):
 
 class TestRenombrar(BaseTest):
     def test_python_no_toca_strings_ni_comentarios(self):
+        # incluir_atributos=True (por defecto en la función de bajo nivel): renombra NAME tokens, no strings/comentarios
         texto = 'def total(x):\n    return x  # total sin cambiar\n\nprint(total(2), "total")\nobj.total = 1\n'
-        nuevo, n = renombrar_en_texto("a.py", texto, "total", "suma")
+        nuevo, n, _om = renombrar_en_texto("a.py", texto, "total", "suma")
         self.assertEqual(n, 3)
         self.assertIn("def suma(x):", nuevo)
         self.assertIn("# total sin cambiar", nuevo)
@@ -191,9 +192,23 @@ class TestRenombrar(BaseTest):
         self.assertIn("obj.suma = 1", nuevo)
         self.assertNotIn("subtotal", renombrar_en_texto("b.py", "subtotal = total\n", "total", "suma")[0].replace("subtotal", "ok"))
 
+    def test_python_modo_seguro_no_toca_atributos_de_instancia(self):
+        # incluir_atributos=False: un acceso por atributo de instancia (miembro ajeno) se deja intacto y se cuenta
+        texto = 'def total(x):\n    return x\n\nprint(total(2))\nobj.total = 1\n'
+        nuevo, n, om = renombrar_en_texto("a.py", texto, "total", "suma", incluir_atributos=False)
+        self.assertEqual(n, 2)                 # def + llamada libre
+        self.assertEqual(om, 1)                # obj.total NO se tocó
+        self.assertIn("def suma(x):", nuevo)
+        self.assertIn("obj.total = 1", nuevo)  # miembro ajeno intacto
+        # pero un acceso calificado por módulo importado SÍ es la función
+        txt2 = "import a\nprint(a.total(1))\n"
+        nuevo2, n2, om2 = renombrar_en_texto("m.py", txt2, "total", "suma", incluir_atributos=False)
+        self.assertEqual((n2, om2), (1, 0))
+        self.assertIn("a.suma(1)", nuevo2)
+
     def test_js(self):
         texto = "const total = 1; // total\nconsole.log(`total ${total}`, 'total', subtotal, total);\n"
-        nuevo, n = renombrar_en_texto("a.js", texto, "total", "suma")
+        nuevo, n, _om = renombrar_en_texto("a.js", texto, "total", "suma")
         self.assertEqual(n, 2)
         self.assertIn("const suma = 1; // total", nuevo)
         self.assertIn("subtotal, suma)", nuevo)
@@ -220,6 +235,32 @@ class TestRenombrar(BaseTest):
         self.assertIn("2 cambio(s)", salida)
         self.assertIn("def nueva", ws.leer("m.py"))
         self.assertIn("No encontré", self.herramienta(ctx, "rename_symbol", old="inexistente", new="x"))
+
+    def test_funcion_libre_no_corrompe_atributo_ajeno(self):
+        # renombrar una FUNCIÓN libre no debe reescribir un atributo de instancia ajeno del mismo nombre
+        ws = self.proyecto({
+            "a.py": "def total(xs):\n    return sum(xs)\n",
+            "b.py": "import a\n\nclass W:\n    def __init__(self):\n        self.total = 0\n    def f(self):\n        self.total = a.total([1])\n        return self.total\n"})
+        plan = planificar_renombrado(ws, "total", "suma")
+        ws.checkpoints.iniciar("renombrar")
+        aplicar_renombrado(ws, plan)
+        self.assertIn("def suma(xs)", ws.leer("a.py"))
+        self.assertIn("a.suma([1])", ws.leer("b.py"))     # la llamada calificada por módulo sí se renombra
+        self.assertIn("self.total = 0", ws.leer("b.py"))  # el atributo de instancia ajeno queda intacto
+        self.assertIn("return self.total", ws.leer("b.py"))
+        self.assertGreaterEqual(plan.atributos_omitidos, 1)
+
+    def test_metodo_renombra_sus_llamadas(self):
+        # si `viejo` es un MÉTODO, los accesos por atributo son sus llamadas y SÍ deben renombrarse
+        ws = self.proyecto({
+            "c.py": "class C:\n    def total(self):\n        return 1\n",
+            "u.py": "from c import C\n\nprint(C().total())\n"})
+        plan = planificar_renombrado(ws, "total", "suma")
+        ws.checkpoints.iniciar("renombrar")
+        aplicar_renombrado(ws, plan)
+        self.assertIn("def suma(self)", ws.leer("c.py"))
+        self.assertIn("C().suma()", ws.leer("u.py"))      # la llamada al método se renombró
+        self.assertEqual(plan.atributos_omitidos, 0)
 
 
 class TestIngles(BaseTest):

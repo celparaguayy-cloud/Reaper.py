@@ -87,3 +87,42 @@ class TestDisyuntorEnCliente(BaseTest):
         c = self.cliente(["bien"])
         c.chat([{"role": "user", "content": "x"}])
         self.assertIn("operativos", c.disyuntor.resumen())
+
+
+class TestEsperaReintentoCancelable(BaseTest):
+    """La espera entre reintentos no debe congelar el proceso (en el teléfono un sleep largo se siente colgado)."""
+
+    def _cliente(self, eventos=(), **ajustes):
+        return LLMClient("clave", self.ajustes(**ajustes), url="http://falso", transporte=transporte_falso(eventos))
+
+    def test_espera_troceada_en_tramos_de_un_segundo(self):
+        c = self._cliente()
+        tramos = []
+        c.dormir = lambda s: tramos.append(s)
+        c._dormir_cancelable(5.0)
+        self.assertTrue(tramos)
+        self.assertLessEqual(max(tramos), 1.0)              # ningún sleep individual supera ~1 s
+        self.assertAlmostEqual(sum(tramos), 5.0, places=6)  # pero se espera el total pedido
+
+    def test_cancelacion_corta_la_espera(self):
+        c = self._cliente()
+        tramos = []
+        c.dormir = lambda s: tramos.append(s)
+        chequeos = {"n": 0}
+
+        def cancelado():
+            chequeos["n"] += 1
+            return chequeos["n"] > 2          # cancela al tercer chequeo
+
+        with self.assertRaises(LLMError):
+            c._dormir_cancelable(300.0, cancelado)
+        self.assertLessEqual(sum(tramos), 3.0)              # no esperó los 300 s
+
+    def test_retry_after_alto_se_acota_y_trocea(self):
+        # un Retry-After de 480 s no debe producir un único sleep gigante: se acota a 120 s y se trocea
+        c = self._cliente([_Transitorio("429 saturado", espera=480.0), "ok"], reintentos=1, rpm=0)
+        tramos = []
+        c.dormir = lambda s: tramos.append(s)
+        self.assertEqual(c.chat([{"role": "user", "content": "x"}]).texto, "ok")
+        self.assertLessEqual(max(tramos), 1.0)
+        self.assertLessEqual(sum(tramos), 121.0)           # acotado a 120 s pese al Retry-After de 480

@@ -410,9 +410,9 @@ class LLMClient:
         payload = self._payload(modelo, mensajes, temperatura, max_tokens, stop, self._destino(modelo).proveedor)
         intentos = max(0, int(self.settings.reintentos))
         vacias = 0
+        cancelado = (lambda: CANCELAR.is_set()) if "CANCELAR" in globals() else None
         for intento in range(intentos + 1):
             try:
-                cancelado = (lambda: CANCELAR.is_set()) if "CANCELAR" in globals() else None
                 self.limitador.adquirir(cancelado)
                 return self._una_vez(modelo, payload, on_progress)
             except _Transitorio as e:
@@ -433,8 +433,21 @@ class LLMClient:
                     espera = min(60.0, 2.0 * (2 ** intento)) + random.uniform(0, 1)
                 if self.on_evento:
                     self.on_evento(f"reintento {intento + 1}/{intentos} en {espera:.0f}s: {e}")
-                self.dormir(min(espera, 120.0))
+                self._dormir_cancelable(min(espera, 120.0), cancelado)
         raise LLMError("No se obtuvo respuesta del modelo.")  # pragma: no cover
+
+    def _dormir_cancelable(self, segundos: float, cancelado: Optional[Callable[[], bool]] = None) -> None:
+        """
+        Espera troceada en tramos de ~1 s. Un Retry-After alto (o el backoff) no debe congelar el proceso
+        sin mirar si el usuario canceló: en el teléfono un sleep de 1–2 min sin salida se siente colgado.
+        """
+        restante = max(0.0, segundos)
+        while restante > 0:
+            if cancelado and cancelado():
+                raise LLMError("Cancelado mientras se esperaba para reintentar.")
+            tramo = min(restante, 1.0)
+            self.dormir(tramo)
+            restante -= tramo
 
     def _headers(self, destino: Optional["DestinoModelo"] = None) -> dict:
         proveedor = destino.proveedor if destino is not None else self.settings.proveedor
