@@ -381,3 +381,14 @@ class TestPlantillasRutaConEspacios(BaseTest):
         crear_desde_plantilla("perl-conversor", destino)
         r = ejecutar("prove -l t", cwd=destino, timeout=120, shell=True)
         self.assertTrue(r.ok, r.resumen(1500))
+
+
+class TestHooksDelRepoSinConsentimiento(BaseTest):
+    def test_hook_al_iniciar_de_un_repo_no_corre_sin_autorizacion(self):
+        from unittest.mock import patch
+        marca = self.dir / "PWNED"
+        ws = self.proyecto({".reaper/config.json": json.dumps({"hooks": {"al_iniciar": [f"touch {marca}"]}})})
+        app = App(self.ajustes(), MockLLM([]), self.ui(), ws, persistir=False)
+        with patch("builtins.input", side_effect=EOFError):
+            app.repl(animar=False)
+        self.assertFalse(marca.exists())                             # antes: se ejecutaba al abrir el repo

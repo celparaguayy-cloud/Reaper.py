@@ -229,6 +229,8 @@ _HOOKS_RECHAZADOS: set = set()
 
 
 def hooks_autorizados(ctx) -> bool:
+    """Consentimiento para hooks del repo (una vez por proyecto y sesión). `ctx` puede ser un Contexto o la App:
+    solo se usan .settings, .ws y .ui. Sin terminal interactiva se responde NO (falla cerrado)."""
     if not ctx.settings.hooks:
         return False
     raiz = str(ctx.ws.raiz)

@@ -28352,7 +28352,7 @@ class App:
                 builds=1, builds_ok=int(informe.ok), escaladas=informe.escaladas, lecciones=len(informe.lecciones),
                 torneos=sum(1 for _, modo, _g in informe.torneos if modo == "torneo"), segundos=round(informe.segundos, 1))
             self.estadisticas.registrar_uso(self.llm.uso, self.settings.modelo)
-            if self.settings.hooks:
+            if hooks_autorizados(self):          # hooks del repo: consentimiento una vez, cerrado si no hay TTY
                 for r in ejecutar_hooks(self.ws, "despues_de_build", {"estado": informe.estado, "pedido": pedido[:200]}):
                     (self.ui.tenue if r.ok else self.ui.aviso)(f"  hook: {r.comando} → {'ok' if r.ok else 'falló'}")
         return informe.ok
@@ -29749,7 +29749,7 @@ class App:
     def repl(self, animar: bool = True) -> int:
         self._configurar_readline()
         self.mostrar_inicio(animar)
-        if self.settings.hooks:
+        if hooks_autorizados(self):              # antes corría el hook de un repo clonado sin preguntar
             for r in ejecutar_hooks(self.ws, "al_iniciar", {"proyecto": str(self.ws.raiz)}):
                 (self.ui.tenue if r.ok else self.ui.aviso)(f"  hook al_iniciar: {r.comando} → {'ok' if r.ok else r.salida[-200:]}")
         while True:
@@ -45888,6 +45888,17 @@ class TestPlantillasRutaConEspacios(BaseTest):
         self.assertTrue(r.ok, r.resumen(1500))
 
 
+class TestHooksDelRepoSinConsentimiento(BaseTest):
+    def test_hook_al_iniciar_de_un_repo_no_corre_sin_autorizacion(self):
+        from unittest.mock import patch
+        marca = self.dir / "PWNED"
+        ws = self.proyecto({".reaper/config.json": json.dumps({"hooks": {"al_iniciar": [f"touch {marca}"]}})})
+        app = App(self.ajustes(), MockLLM([]), self.ui(), ws, persistir=False)
+        with patch("builtins.input", side_effect=EOFError):
+            app.repl(animar=False)
+        self.assertFalse(marca.exists())                             # antes: se ejecutaba al abrir el repo
+
+
 # ======================================================================
 # MÓDULO: autotest_runner
 # ======================================================================
@@ -46803,6 +46814,8 @@ _HOOKS_RECHAZADOS: set = set()
 
 
 def hooks_autorizados(ctx) -> bool:
+    """Consentimiento para hooks del repo (una vez por proyecto y sesión). `ctx` puede ser un Contexto o la App:
+    solo se usan .settings, .ws y .ui. Sin terminal interactiva se responde NO (falla cerrado)."""
     if not ctx.settings.hooks:
         return False
     raiz = str(ctx.ws.raiz)
