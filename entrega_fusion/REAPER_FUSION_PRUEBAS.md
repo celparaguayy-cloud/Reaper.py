@@ -266,3 +266,24 @@ hecha; si toca el declarado, pasa). Regresión: 955 tests OK en Python 3.11/3.12
 **Honesto:** esto hace que REAPER **no cuente un desvío ni un no-op como éxito** y que el juez empuje hacia el
 contrato. NO puede hacer que un modelo flojo (o que falla/timeoutea, como en aquella corrida) resuelva una tarea
 que no sabe: ahí la build termina honesta en `parcial`/`fallida` con lo que falta, nunca en un verde falso.
+
+## 13. Actualizaciones que no rompen lo anterior (y el juez lo vigila)
+
+En una corrida real, una "tarea de actualización" tocó archivos que no le correspondían. Ahora, cuando REAPER
+**actualiza** un proyecto que ya tenía trabajo, protege lo que existía ANTES de esa build:
+
+- **Guardia por tarea** (`_verificar_tarea`, determinista, 0 tokens): sobre los archivos que ya existían antes de
+  la build —
+  - borrar uno que la tarea **no declaró** → `BORRÓ TRABAJO PREVIO`;
+  - perder ≥3 líneas y ≥20 % del contenido de uno **no declarado** → `MODIFICÓ TRABAJO PREVIO`;
+  - reescribir casi entero (≥8 líneas y ≥60 %) uno **declarado** → `REESCRITURA DESTRUCTIVA`.
+  La tarea no se da por hecha y va a reparación con el mensaje exacto ("extendé sin perder lo que ya hacía").
+  **Agregar** siempre está bien, las **ediciones chicas** (un import, una línea) pasan, y lo **creado en la misma
+  build** no está protegido (las tareas se construyen unas sobre otras).
+- **El juez lo ve** (`EV-PRESERVA`): en el veredicto final recibe un resumen determinista de qué pasó con lo
+  previo (modificados / BORRADOS / REESCRITOS) y su misión ya dice que en una actualización lo que existía se
+  conserva: si se borró o reescribió trabajo previo que el pedido no pedía cambiar, `cumple=false`.
+
+Se suma a lo que ya protegía: los tests previos no se pueden editar, la regresión de tests frena la tarea y
+`/deshacer` revierte toda la build. Cobertura: `TestPreservarTrabajoPrevio` (9). Regresión: 964 tests OK en
+Python 3.11/3.12/3.13.

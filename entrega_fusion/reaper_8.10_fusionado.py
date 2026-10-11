@@ -10749,8 +10749,10 @@ pantallas, endpoints, comportamientos observables), SIN inventar nada que el usu
 EVIDENCIA dada (cada pieza tiene un id EV-...): estado real de la build, tests, validación, aceptación y el
 resumen del diff. No ejecutás ni leés el repo. Regla dura: NO podés convertir una build roja en verde — si la
 evidencia muestra fallos o tareas sin completar, cumple=false. Si falta algo que se pidió (un archivo, una
-pantalla, un endpoint, un comportamiento), listalo en "faltantes", puntual y accionable. Si la evidencia alcanza
-y el pedido está cubierto, cumple=true. Usá confianza alta solo con evidencia contundente.
+pantalla, un endpoint, un comportamiento), listalo en "faltantes", puntual y accionable. En una ACTUALIZACIÓN lo
+que ya existía se conserva: si EV-PRESERVA muestra que se BORRÓ o se REESCRIBIÓ trabajo previo que el pedido no
+pedía cambiar, cumple=false y decilo en "faltantes". Si la evidencia alcanza y el pedido está cubierto sin romper
+lo anterior, cumple=true. Usá confianza alta solo con evidencia contundente.
 Respondé SOLO: {"cumple": true|false, "faltantes": ["..."], "evidence_ids": ["EV-..."], "confianza": "low|medium|high"}""",
         (),
         0.1,
@@ -14574,6 +14576,50 @@ def _es_testeable(archivos_plan: list, archivos_ws: list) -> bool:
     return not archivos_plan and not archivos_ws
 
 
+def _lineas_borradas(antes: str, ahora: str) -> tuple:
+    """(borradas, total_previas) sobre líneas no vacías: cuántas líneas del contenido previo YA NO están.
+    Agregar no cuenta; cambiar una línea cuenta como una borrada (la versión vieja desapareció)."""
+    previas = [l for l in (antes or "").splitlines() if l.strip()]
+    quedan = collections.Counter(l for l in (ahora or "").splitlines() if l.strip())
+    borradas = 0
+    for linea in previas:
+        if quedan[linea] > 0:
+            quedan[linea] -= 1
+        else:
+            borradas += 1
+    return borradas, len(previas)
+
+
+def resumen_preservacion(ws, cid_build: Optional[int]) -> str:
+    """Determinista: qué pasó con el trabajo que YA EXISTÍA antes de esta actualización (evidencia para el juez)."""
+    if cid_build is None:
+        return "sin datos"
+    modificados, borrados, reescritos = [], [], []
+    for rel in ws.checkpoints.archivos_desde(cid_build):
+        antes = ws.checkpoints.original(rel, cid_build)
+        if antes is None:
+            continue                                   # nació en esta actualización: no es trabajo previo
+        ruta = ws.raiz / rel
+        if not ruta.is_file():
+            borrados.append(rel)
+            continue
+        ahora = ruta.read_text(encoding="utf-8", errors="replace")
+        if ahora == antes:
+            continue
+        modificados.append(rel)
+        borradas, total = _lineas_borradas(antes, ahora)
+        if total and borradas >= 8 and borradas / total >= 0.6:
+            reescritos.append(f"{rel} ({borradas}/{total} líneas previas borradas)")
+    if not (modificados or borrados):
+        return "no se tocó ningún archivo previo: solo se agregó trabajo nuevo"
+    partes = [f"archivos previos modificados: {', '.join(modificados[:8]) or 'ninguno'}"]
+    if borrados:
+        partes.append(f"BORRADOS: {', '.join(borrados[:8])}")
+    if reescritos:
+        partes.append(f"REESCRITOS casi por completo: {'; '.join(reescritos[:5])}")
+    return "; ".join(partes)
+
+
 def _palabras_clave(texto: str) -> set:
     return {p for p in re.findall(r"[a-záéíóúñ0-9/._-]{4,}", (texto or "").lower())}
 
@@ -15769,6 +15815,8 @@ class Orquestador:
             "EV-VALID": resumen_validacion(verif.validaciones, limite=600),
             "EV-ACEPTACION": (verif.aceptacion.resumen(600) if verif.aceptacion is not None else "no configurada"),
             "EV-DIFF": _diffstat(diff) or "(sin cambios)",
+            # Qué pasó con lo que ya existía antes de esta actualización (determinista, 0 tokens extra de cálculo).
+            "EV-PRESERVA": resumen_preservacion(self.ws, informe.cid),
         }
         bloque = "\n".join(f"{k}: {v}" for k, v in evidencia.items())
         prompt = (f"PEDIDO DEL USUARIO:\n{recortar(pedido, 1200)}\n\nOBJETIVO DEL PLAN: {recortar(plan.objetivo, 300)}\n\n"
@@ -15923,6 +15971,35 @@ class Orquestador:
                     "DESVÍO: la tarea declaró trabajar en " + ", ".join(declarados[:6])
                     + " pero no tocó ninguno de esos archivos; cambió " + ", ".join(archivos[:6])
                     + ". Implementá EXACTAMENTE lo pedido en sus archivos, no otra cosa.")
+            # PRESERVAR TRABAJO PREVIO: en una actualización, lo que ya existía ANTES de esta build no se borra ni se
+            # reescribe por accidente. Agregar está bien; borrar un archivo previo que la tarea no declaró, o perder
+            # buena parte de su contenido, no. Los archivos creados en esta misma build no cuentan (se construyen
+            # unos sobre otros). Ediciones chicas (un import, una línea) pasan.
+            if cid_build is not None:
+                for rel in self.ws.checkpoints.archivos_desde(tcid):
+                    if self.ws.checkpoints.original(rel, cid_build) is None:
+                        continue                               # nació en esta actualización
+                    antes_tarea = self.ws.checkpoints.original(rel, tcid)
+                    if antes_tarea is None:
+                        continue
+                    declarado = rel in declarados
+                    ruta = self.ws.raiz / rel
+                    if not ruta.is_file():
+                        if not declarado:
+                            problemas.append(f"BORRÓ TRABAJO PREVIO: eliminó {rel}, que ya existía antes de esta "
+                                             f"actualización y la tarea no lo pedía. Restauralo.")
+                        continue
+                    borradas, total = _lineas_borradas(antes_tarea, ruta.read_text(encoding="utf-8",
+                                                                                    errors="replace"))
+                    if not total:
+                        continue
+                    fraccion = borradas / total
+                    if (not declarado and borradas >= 3 and fraccion >= 0.2) or \
+                            (declarado and borradas >= 8 and fraccion >= 0.6):
+                        tipo = "REESCRITURA DESTRUCTIVA" if declarado else "MODIFICÓ TRABAJO PREVIO"
+                        problemas.append(
+                            f"{tipo}: borró {borradas} de {total} líneas ({fraccion:.0%}) que ya había en {rel} antes "
+                            f"de esta actualización. Extendé el archivo sin perder lo que ya hacía.")
         if tests is not None and not tests.ok and conteo.reconocido:
             # Los tests de la especificación de tareas siguientes fallan a propósito: no son regresión.
             nuevos_fallos = [n for n in conteo.nombres_fallados
@@ -46818,6 +46895,94 @@ class TestJuezCierra(BaseTest):
         self.assertEqual(informe.estado, "parcial")                  # el juez igual bajó a parcial
 
 
+class TestPreservarTrabajoPrevio(BaseTest):
+    """En una ACTUALIZACIÓN, lo que ya existía antes de la build no se borra ni se reescribe por accidente."""
+
+    def _actualizacion(self, archivos):
+        ws = self.proyecto(archivos)
+        orq = Orquestador(MockLLM([]), ws, self.ajustes(), self.ui())
+        orq._protegidos = {}
+        return orq, ws, ws.checkpoints.iniciar("construir: actualización")
+
+    def _verif(self, orq, tcid, declarados, build):
+        return orq._verificar_tarea(tcid, ConteoTests(), set(), verificar_entrega=True,
+                                    archivos_esperados=declarados, cid_build=build)
+
+    def test_lineas_borradas(self):
+        self.assertEqual(_lineas_borradas("a\nb\n", "a\nb\nc\n"), (0, 2))      # agregar no cuenta
+        self.assertEqual(_lineas_borradas("a\nb\n", "a\nB\n"), (1, 2))         # cambiar una línea cuenta
+        self.assertEqual(_lineas_borradas("a\n\nb\n", ""), (2, 2))             # las vacías no cuentan
+
+    def test_borrar_archivo_previo_no_declarado(self):
+        orq, ws, build = self._actualizacion({"viejo.py": "A = 1\n"})
+        t = ws.checkpoints.iniciar("tarea 1", grupo=build)
+        ws.escribir("nuevo.py", "N = 1\n")
+        ws.borrar("viejo.py")                                                   # no le correspondía
+        verif = self._verif(orq, t, ["nuevo.py"], build)
+        self.assertFalse(verif.ok)
+        self.assertIn("BORRÓ TRABAJO PREVIO", verif.diagnostico)
+
+    def test_vaciar_archivo_previo_no_declarado(self):
+        previo = "def a():\n    return 1\n\ndef b():\n    return 2\n\ndef c():\n    return 3\n"
+        orq, ws, build = self._actualizacion({"util.py": previo})
+        t = ws.checkpoints.iniciar("tarea 1", grupo=build)
+        ws.escribir("nuevo.py", "N = 1\n")
+        ws.escribir("util.py", "def a():\n    return 1\n")                     # perdió b() y c()
+        verif = self._verif(orq, t, ["nuevo.py"], build)
+        self.assertFalse(verif.ok)
+        self.assertIn("MODIFICÓ TRABAJO PREVIO", verif.diagnostico)
+
+    def test_edicion_chica_en_archivo_previo_pasa(self):
+        orq, ws, build = self._actualizacion({"main.py": "import os\n\nprint('hola')\n"})
+        t = ws.checkpoints.iniciar("tarea 1", grupo=build)
+        ws.escribir("nuevo.py", "N = 1\n")
+        ws.escribir("main.py", "import os\nimport nuevo\n\nprint('hola')\n")   # solo agrega un import
+        verif = self._verif(orq, t, ["nuevo.py"], build)
+        self.assertTrue(verif.ok, verif.diagnostico)
+
+    def test_reescritura_destructiva_de_archivo_declarado(self):
+        previo = "".join(f"def f{i}():\n    return {i}\n" for i in range(10))
+        orq, ws, build = self._actualizacion({"app.py": previo})
+        t = ws.checkpoints.iniciar("tarea 1", grupo=build)
+        ws.escribir("app.py", "def nueva():\n    return 0\n")                 # lo rehízo de cero
+        verif = self._verif(orq, t, ["app.py"], build)
+        self.assertFalse(verif.ok)
+        self.assertIn("REESCRITURA DESTRUCTIVA", verif.diagnostico)
+
+    def test_extender_archivo_declarado_pasa(self):
+        previo = "".join(f"def f{i}():\n    return {i}\n" for i in range(10))
+        orq, ws, build = self._actualizacion({"app.py": previo})
+        t = ws.checkpoints.iniciar("tarea 1", grupo=build)
+        ws.escribir("app.py", previo + "def nueva():\n    return 0\n")         # agrega sin perder nada
+        verif = self._verif(orq, t, ["app.py"], build)
+        self.assertTrue(verif.ok, verif.diagnostico)
+
+    def test_lo_creado_en_esta_build_no_esta_protegido(self):
+        orq, ws, build = self._actualizacion({"README.md": "# x\n"})
+        ws.checkpoints.iniciar("tarea 1", grupo=build)
+        ws.escribir("modulo.py", "".join(f"L{i} = {i}\n" for i in range(10)))
+        t2 = ws.checkpoints.iniciar("tarea 2", grupo=build)
+        ws.escribir("modulo.py", "X = 1\n")                                   # misma actualización: se puede
+        verif = self._verif(orq, t2, ["modulo.py"], build)
+        self.assertTrue(verif.ok, verif.diagnostico)
+
+    def test_resumen_preservacion_para_el_juez(self):
+        orq, ws, build = self._actualizacion({"viejo.py": "A = 1\n"})
+        self.assertIn("solo se agregó trabajo nuevo", resumen_preservacion(ws, build))
+        ws.checkpoints.iniciar("tarea", grupo=build)
+        ws.escribir("nuevo.py", "N = 1\n")
+        self.assertIn("solo se agregó trabajo nuevo", resumen_preservacion(ws, build))   # lo nuevo no es previo
+        ws.borrar("viejo.py")
+        self.assertIn("BORRADOS: viejo.py", resumen_preservacion(ws, build))
+
+    def test_el_juez_recibe_la_evidencia_de_preservacion(self):
+        llm = MockLLM(lambda m, k: '{"cumple": true, "confianza": "high"}' if k.get("rol") == "juez" else "{}")
+        orq = Orquestador(llm, self.proyecto(), self.ajustes(), self.ui())
+        orq._juicio_de_entrega("pedido", _plan_web(), _verif_ok(), InformeBuild("verificada"))
+        prompt = next(c for c in llm.llamadas if c.get("rol") == "juez")["mensajes"][-1]["content"]
+        self.assertIn("EV-PRESERVA", prompt)
+
+
 class TestTrabajosChicos(BaseTest):
     """Una página estática no debería disparar 'tests primero' y trabarse: eso rompía trabajos chicos."""
     def test_web_estatica_no_fuerza_tests_primero(self):
@@ -48312,8 +48477,10 @@ only the essentials. Reply ONLY: {"criterios": ["concrete, verifiable criterion"
 EVIDENCE given (each piece has an EV-... id): real build state, tests, validation, acceptance and the diff summary.
 You run nothing and do not read the repo. Hard rule: you CANNOT turn a red build green — if the evidence shows
 failures or unfinished tasks, cumple=false. If something the request asked for is missing (a file, a screen, an
-endpoint, a behavior), list it under "faltantes", specific and actionable. If the evidence is enough and the
-request is covered, cumple=true. Use high confidence only when the evidence is conclusive.
+endpoint, a behavior), list it under "faltantes", specific and actionable. In an UPDATE, what already existed must
+be kept: if EV-PRESERVA shows previous work was DELETED or REWRITTEN that the request did not ask to change,
+cumple=false and say so in "faltantes". If the evidence is enough and the request is covered without breaking what
+was there, cumple=true. Use high confidence only when the evidence is conclusive.
 Reply ONLY: {"cumple": true|false, "faltantes": ["..."], "evidence_ids": ["EV-..."], "confianza": "low|medium|high"}""",
 }
 

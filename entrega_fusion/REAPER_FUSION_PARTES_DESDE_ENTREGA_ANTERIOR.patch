@@ -1664,7 +1664,7 @@ index d8102fb..b6ebe29 100644
          'File "<string>"', 'File "<fragmento>"')
      if not r.ok and parece_interactivo(f"{r.stdout}\n{r.stderr}"):
 diff --git a/partes/19_roles.py b/partes/19_roles.py
-index 4e3765c..36c5449 100644
+index 4e3765c..3f9a549 100644
 --- a/partes/19_roles.py
 +++ b/partes/19_roles.py
 @@ -43,7 +43,7 @@ necesario, editar, verificar con herramientas reales y reportar.
@@ -1700,7 +1700,7 @@ index 4e3765c..36c5449 100644
  Sé concreto y breve. No propongas reescribir lo que funciona.""",
          LECTURA + ("attempt_completion",),
          0.1,
-@@ -259,6 +267,80 @@ AFIRMACIÓN → NIVEL (qué evidencia la respalda y qué faltaría para subir de
+@@ -259,6 +267,82 @@ AFIRMACIÓN → NIVEL (qué evidencia la respalda y qué faltaría para subir de
          0.1,
          solo_lectura=True,
      ),
@@ -1771,8 +1771,10 @@ index 4e3765c..36c5449 100644
 +EVIDENCIA dada (cada pieza tiene un id EV-...): estado real de la build, tests, validación, aceptación y el
 +resumen del diff. No ejecutás ni leés el repo. Regla dura: NO podés convertir una build roja en verde — si la
 +evidencia muestra fallos o tareas sin completar, cumple=false. Si falta algo que se pidió (un archivo, una
-+pantalla, un endpoint, un comportamiento), listalo en "faltantes", puntual y accionable. Si la evidencia alcanza
-+y el pedido está cubierto, cumple=true. Usá confianza alta solo con evidencia contundente.
++pantalla, un endpoint, un comportamiento), listalo en "faltantes", puntual y accionable. En una ACTUALIZACIÓN lo
++que ya existía se conserva: si EV-PRESERVA muestra que se BORRÓ o se REESCRIBIÓ trabajo previo que el pedido no
++pedía cambiar, cumple=false y decilo en "faltantes". Si la evidencia alcanza y el pedido está cubierto sin romper
++lo anterior, cumple=true. Usá confianza alta solo con evidencia contundente.
 +Respondé SOLO: {"cumple": true|false, "faltantes": ["..."], "evidence_ids": ["EV-..."], "confianza": "low|medium|high"}""",
 +        (),
 +        0.1,
@@ -1781,7 +1783,7 @@ index 4e3765c..36c5449 100644
  }
  
  ROLES_DELEGABLES = ("explorador", "implementador", "revisor", "qa", "reparador", "arquitecto", "especificador",
-@@ -278,6 +360,12 @@ PRINCIPIOS
+@@ -278,6 +362,12 @@ PRINCIPIOS
     el test. Un test en rojo no implica que el código esté mal (puede ser el test, la ruta, una dependencia,
     un fixture, la entrada o un flaky): decidí QUÉ falla antes de tocar nada.
  7. Seguridad ofensiva solo en sistemas propios, laboratorios, CTF o con autorización explícita.
@@ -1794,7 +1796,7 @@ index 4e3765c..36c5449 100644
  
  CÓMO USAR LAS HERRAMIENTAS
  - Escribí la herramienta como etiquetas XML, igual que en los ejemplos. Podés poner 1-3 frases de
-@@ -351,8 +439,11 @@ def _entorno() -> str:
+@@ -351,8 +441,11 @@ def _entorno() -> str:
      sistema = "Termux en Android" if termux else f"{platform.system()} {platform.release()}"
      herramientas = [n for n in ("node", "npm", "git", "ruff", "go", "cargo", "make", "clang", "php")
                      if shutil.which(n)]
@@ -1806,7 +1808,7 @@ index 4e3765c..36c5449 100644
          f"- Python: {sys.version.split()[0]} ({sys.executable})\n"
          f"- Herramientas disponibles: {', '.join(herramientas) or 'solo python'}"
      )
-@@ -367,6 +458,12 @@ def system_prompt(rol: Rol, ws: Workspace, max_llamadas: int = 4, arbol: bool =
+@@ -367,6 +460,12 @@ def system_prompt(rol: Rol, ws: Workspace, max_llamadas: int = 4, arbol: bool =
          f"\n# TU ROL: {rol.nombre.upper()}\n{rol.mision}",
          "\n# HERRAMIENTAS DISPONIBLES\n" + documentacion(list(rol.herramientas)),
          f"\n# ENTORNO\n- Workspace: {ws.raiz}\n{_entorno()}",
@@ -2227,10 +2229,10 @@ index 4eba772..e986b98 100644
                  (self.ws.raiz / rel).unlink()
                  self.restaurados.append(f"{rel} (creado por los tests, borrado)")
 diff --git a/partes/25_pipeline.py b/partes/25_pipeline.py
-index ad78b6b..52cb121 100644
+index ad78b6b..df8d080 100644
 --- a/partes/25_pipeline.py
 +++ b/partes/25_pipeline.py
-@@ -40,6 +40,39 @@ _RE_VEREDICTO = re.compile(r"VEREDICTO\s*:?\s*\**\s*(APROBADO|CAMBIOS|RECHAZADO)
+@@ -40,6 +40,83 @@ _RE_VEREDICTO = re.compile(r"VEREDICTO\s*:?\s*\**\s*(APROBADO|CAMBIOS|RECHAZADO)
  EXTENSIONES_TESTEABLES = (".py", ".js", ".mjs", ".cjs", ".ts")
  
  
@@ -2244,6 +2246,50 @@ index ad78b6b..52cb121 100644
 +    if any(a.endswith(EXTENSIONES_TESTEABLES) for a in archivos_ws):
 +        return True
 +    return not archivos_plan and not archivos_ws
++
++
++def _lineas_borradas(antes: str, ahora: str) -> tuple:
++    """(borradas, total_previas) sobre líneas no vacías: cuántas líneas del contenido previo YA NO están.
++    Agregar no cuenta; cambiar una línea cuenta como una borrada (la versión vieja desapareció)."""
++    previas = [l for l in (antes or "").splitlines() if l.strip()]
++    quedan = collections.Counter(l for l in (ahora or "").splitlines() if l.strip())
++    borradas = 0
++    for linea in previas:
++        if quedan[linea] > 0:
++            quedan[linea] -= 1
++        else:
++            borradas += 1
++    return borradas, len(previas)
++
++
++def resumen_preservacion(ws, cid_build: Optional[int]) -> str:
++    """Determinista: qué pasó con el trabajo que YA EXISTÍA antes de esta actualización (evidencia para el juez)."""
++    if cid_build is None:
++        return "sin datos"
++    modificados, borrados, reescritos = [], [], []
++    for rel in ws.checkpoints.archivos_desde(cid_build):
++        antes = ws.checkpoints.original(rel, cid_build)
++        if antes is None:
++            continue                                   # nació en esta actualización: no es trabajo previo
++        ruta = ws.raiz / rel
++        if not ruta.is_file():
++            borrados.append(rel)
++            continue
++        ahora = ruta.read_text(encoding="utf-8", errors="replace")
++        if ahora == antes:
++            continue
++        modificados.append(rel)
++        borradas, total = _lineas_borradas(antes, ahora)
++        if total and borradas >= 8 and borradas / total >= 0.6:
++            reescritos.append(f"{rel} ({borradas}/{total} líneas previas borradas)")
++    if not (modificados or borrados):
++        return "no se tocó ningún archivo previo: solo se agregó trabajo nuevo"
++    partes = [f"archivos previos modificados: {', '.join(modificados[:8]) or 'ninguno'}"]
++    if borrados:
++        partes.append(f"BORRADOS: {', '.join(borrados[:8])}")
++    if reescritos:
++        partes.append(f"REESCRITOS casi por completo: {'; '.join(reescritos[:5])}")
++    return "; ".join(partes)
 +
 +
 +def _palabras_clave(texto: str) -> set:
@@ -2270,7 +2316,7 @@ index ad78b6b..52cb121 100644
  @dataclass
  class Tarea:
      id: str
-@@ -178,13 +211,218 @@ def verificacion_peor(despues: "Verificacion", antes: "Verificacion") -> bool:
+@@ -178,13 +255,218 @@ def verificacion_peor(despues: "Verificacion", antes: "Verificacion") -> bool:
  
  
  def veredicto(informe: str) -> tuple[bool, bool]:
@@ -2491,7 +2537,7 @@ index ad78b6b..52cb121 100644
  @dataclass
  class Verificacion:
      ok: bool
-@@ -193,6 +431,7 @@ class Verificacion:
+@@ -193,6 +475,7 @@ class Verificacion:
      diagnostico: str
      archivos: list
      conteo: ConteoTests = field(default_factory=ConteoTests)
@@ -2499,7 +2545,7 @@ index ad78b6b..52cb121 100644
  
  
  @dataclass
-@@ -201,6 +440,7 @@ class InformeBuild:
+@@ -201,6 +484,7 @@ class InformeBuild:
      plan: Optional[Plan] = None
      archivos: list = field(default_factory=list)
      tests: Optional[Resultado] = None
@@ -2507,7 +2553,7 @@ index ad78b6b..52cb121 100644
      diagnostico: str = ""
      cid: Optional[int] = None
      ruta_informe: Optional[Path] = None
-@@ -211,12 +451,27 @@ class InformeBuild:
+@@ -211,12 +495,27 @@ class InformeBuild:
      commit: Optional[str] = None
      spec_tests: list = field(default_factory=list)
      segundos: float = 0.0
@@ -2535,7 +2581,7 @@ index ad78b6b..52cb121 100644
  def _diffstat(diff: str) -> str:
      stats: dict[str, list[int]] = {}
      actual = None
-@@ -231,6 +486,23 @@ def _diffstat(diff: str) -> str:
+@@ -231,6 +530,23 @@ def _diffstat(diff: str) -> str:
      return "\n".join(f"  {a}  +{m} -{n}" for a, (m, n) in stats.items())
  
  
@@ -2559,7 +2605,7 @@ index ad78b6b..52cb121 100644
  def _es_test(rel: str) -> bool:
      return any(fnmatch.fnmatch(rel, p) for p in PATRONES_TESTS)
  
-@@ -246,6 +518,214 @@ def _es_de_especificacion(nombre_test: str, protegidos: dict) -> bool:
+@@ -246,6 +562,214 @@ def _es_de_especificacion(nombre_test: str, protegidos: dict) -> bool:
      return False
  
  
@@ -2774,7 +2820,7 @@ index ad78b6b..52cb121 100644
  class Orquestador:
      def __init__(self, llm, ws: Workspace, settings: Settings, ui: UI):
          self.llm = llm
-@@ -255,6 +735,7 @@ class Orquestador:
+@@ -255,6 +779,7 @@ class Orquestador:
          self.memoria = MemoriaLecciones(ws) if settings.lecciones else None
          self.escalador = Escalador(llm, settings, ui)
          self._protegidos: dict[str, Optional[str]] = {}
@@ -2782,7 +2828,7 @@ index ad78b6b..52cb121 100644
  
      def _sub(self, rol: str, tarea: str, cid: Optional[int], archivos: str = "", titulo: str = "",
               **opciones) -> ResultadoAgente:
-@@ -264,6 +745,20 @@ class Orquestador:
+@@ -264,6 +789,20 @@ class Orquestador:
              profundidad=1, cid_inicio=cid,
          )[0]
  
@@ -2803,7 +2849,7 @@ index ad78b6b..52cb121 100644
      # ------------------------------------------------------------ fases
      def explorar(self, pedido: str) -> str:
          archivos = self.ws.archivos_codigo(limite=500)
-@@ -296,7 +791,13 @@ class Orquestador:
+@@ -296,7 +835,13 @@ class Orquestador:
                  "cómo se ejecuta y se prueba el proyecto",
                  {"memoria": self.memoria},
              ))
@@ -2818,7 +2864,7 @@ index ad78b6b..52cb121 100644
          informe = "\n\n".join(
              f"### Informe explorador {i}\n{r.resumen}" for i, r in enumerate(resultados, start=1)
          )
-@@ -308,7 +809,10 @@ class Orquestador:
+@@ -308,7 +853,10 @@ class Orquestador:
              f"PEDIDO DEL USUARIO:\n{pedido}\n\n"
              f"INFORME DE EXPLORACIÓN (código real):\n{recortar(exploracion, 7000)}\n\n"
              f"Comando de tests detectado: {detectado[0] if detectado else 'ninguno (habrá que crear tests)'}\n"
@@ -2830,7 +2876,7 @@ index ad78b6b..52cb121 100644
          )
          if self.settings.tests_primero:
              tarea += ("\nLos tests se escriben ANTES de implementar a partir de tu <interfaz> y tus <criterios>: "
-@@ -323,6 +827,10 @@ class Orquestador:
+@@ -323,6 +871,10 @@ class Orquestador:
          if not _RE_TAREA.search(texto) and _RE_TAREA.search(res.contexto):
              texto = res.contexto + "\n" + texto
          plan = parsear_plan(texto, pedido, self.settings.max_tareas)
@@ -2841,7 +2887,7 @@ index ad78b6b..52cb121 100644
          if not res.ok:
              self.ui.aviso("El arquitecto no terminó limpio; uso lo que produjo.")
          motivo = plan_degenerado(plan, pedido, texto)
-@@ -431,17 +939,23 @@ class Orquestador:
+@@ -431,17 +983,23 @@ class Orquestador:
              f"Validación automática de los archivos cambiados: {validacion}\n\n"
              "Leé los archivos completos si necesitás contexto. Empezá tu informe con la línea VEREDICTO."
          )
@@ -2868,7 +2914,7 @@ index ad78b6b..52cb121 100644
          detectado = detectar_comando_tests(self.ws)
          criterios = "\n".join(f"- {c}" for c in plan.criterios) or "- (derivalos del pedido)"
          texto = (
-@@ -452,7 +966,7 @@ class Orquestador:
+@@ -452,7 +1010,7 @@ class Orquestador:
              "Escribí (o completá) tests automáticos que verifiquen los criterios y corrélos con run_tests. "
              "Reportá el resultado REAL."
          )
@@ -2877,7 +2923,7 @@ index ad78b6b..52cb121 100644
  
      def verificar(self, cid: int) -> Verificacion:
          archivos = [r for r in self.ws.checkpoints.archivos_desde(cid) if (self.ws.raiz / r).is_file()]
-@@ -462,13 +976,32 @@ class Orquestador:
+@@ -462,13 +1020,32 @@ class Orquestador:
          malos = fallos(validaciones)
          tests_ok = tests is None or tests.ok
          partes = [r.resumen(2500) for r in malos]
@@ -2912,7 +2958,7 @@ index ad78b6b..52cb121 100644
  
      def reparar(self, pedido: str, verif: Verificacion, cid: int, base_fallaba: bool,
                  diagnostico_experto: str = "", contexto: str = "") -> ResultadoAgente:
-@@ -485,7 +1018,8 @@ class Orquestador:
+@@ -485,7 +1062,8 @@ class Orquestador:
          if diagnostico_experto:
              texto = tarea_con_diagnostico(texto, diagnostico_experto)
          protegidos = set(self._protegidos)
@@ -2922,7 +2968,7 @@ index ad78b6b..52cb121 100644
                                                                                      if diagnostico_experto else ""),
                           protegidos=protegidos)
  
-@@ -513,7 +1047,17 @@ class Orquestador:
+@@ -513,7 +1091,17 @@ class Orquestador:
          intentos_txt: list[str] = []
          forense_hecho = False
          informe_forense = ""
@@ -2940,7 +2986,7 @@ index ad78b6b..52cb121 100644
              firma = _firma_error(verif.diagnostico)
              if diagnosticos_vistos.count(firma) >= 3:
                  informe.notas.append(f"{etiqueta}: la reparación no logró avances (mismo diagnóstico repetido).")
-@@ -549,6 +1093,7 @@ class Orquestador:
+@@ -549,6 +1137,7 @@ class Orquestador:
                                       + "\n---\n".join(intentos_txt[-2:]))
              res = self.reparar(pedido, verif, rcid, base_fallaba, experto, contexto_intento.strip())
              intentos_txt.append(recortar(res.resumen, 1200))
@@ -2948,7 +2994,7 @@ index ad78b6b..52cb121 100644
              verif = verificador()
              self._mostrar_verificacion(verif)
              if verif.ok:
-@@ -566,6 +1111,204 @@ class Orquestador:
+@@ -566,6 +1155,206 @@ class Orquestador:
                  verif = antes
          return verif
  
@@ -3088,6 +3134,8 @@ index ad78b6b..52cb121 100644
 +            "EV-VALID": resumen_validacion(verif.validaciones, limite=600),
 +            "EV-ACEPTACION": (verif.aceptacion.resumen(600) if verif.aceptacion is not None else "no configurada"),
 +            "EV-DIFF": _diffstat(diff) or "(sin cambios)",
++            # Qué pasó con lo que ya existía antes de esta actualización (determinista, 0 tokens extra de cálculo).
++            "EV-PRESERVA": resumen_preservacion(self.ws, informe.cid),
 +        }
 +        bloque = "\n".join(f"{k}: {v}" for k, v in evidencia.items())
 +        prompt = (f"PEDIDO DEL USUARIO:\n{recortar(pedido, 1200)}\n\nOBJETIVO DEL PLAN: {recortar(plan.objetivo, 300)}\n\n"
@@ -3153,7 +3201,7 @@ index ad78b6b..52cb121 100644
      # ------------------------------------------------------------ flujos
      def _mostrar_plan(self, plan: Plan) -> None:
          self.ui.titulo("PLAN")
-@@ -575,7 +1318,19 @@ class Orquestador:
+@@ -575,7 +1364,19 @@ class Orquestador:
          self.ui.fase(1, "Exploración")
          exploracion = self.explorar(pedido)
          self.ui.fase(2, "Arquitectura")
@@ -3174,7 +3222,7 @@ index ad78b6b..52cb121 100644
          for _ in range(3):
              self._mostrar_plan(plan)
              if not confirmar or self.ui.confirmar("¿Aprobás el plan y arrancamos?", defecto=True):
-@@ -599,7 +1354,10 @@ class Orquestador:
+@@ -599,7 +1400,10 @@ class Orquestador:
          return ruta
  
      def _verificar_tarea(self, tcid: int, antes: ConteoTests, nombres_antes: set,
@@ -3186,7 +3234,7 @@ index ad78b6b..52cb121 100644
          """
          Una tarea intermedia no necesita que pasen TODOS los tests (los de tareas
          siguientes todavía fallan): alcanza con validadores OK y que no se rompa
-@@ -609,7 +1367,40 @@ class Orquestador:
+@@ -609,7 +1413,69 @@ class Orquestador:
          validaciones = validar_archivos(self.ws, archivos)
          tests = ejecutar_tests(self.ws, timeout=self.settings.tests_timeout, completo=True)
          conteo = conteo_de_resultado(tests)
@@ -3225,10 +3273,39 @@ index ad78b6b..52cb121 100644
 +                    "DESVÍO: la tarea declaró trabajar en " + ", ".join(declarados[:6])
 +                    + " pero no tocó ninguno de esos archivos; cambió " + ", ".join(archivos[:6])
 +                    + ". Implementá EXACTAMENTE lo pedido en sus archivos, no otra cosa.")
++            # PRESERVAR TRABAJO PREVIO: en una actualización, lo que ya existía ANTES de esta build no se borra ni se
++            # reescribe por accidente. Agregar está bien; borrar un archivo previo que la tarea no declaró, o perder
++            # buena parte de su contenido, no. Los archivos creados en esta misma build no cuentan (se construyen
++            # unos sobre otros). Ediciones chicas (un import, una línea) pasan.
++            if cid_build is not None:
++                for rel in self.ws.checkpoints.archivos_desde(tcid):
++                    if self.ws.checkpoints.original(rel, cid_build) is None:
++                        continue                               # nació en esta actualización
++                    antes_tarea = self.ws.checkpoints.original(rel, tcid)
++                    if antes_tarea is None:
++                        continue
++                    declarado = rel in declarados
++                    ruta = self.ws.raiz / rel
++                    if not ruta.is_file():
++                        if not declarado:
++                            problemas.append(f"BORRÓ TRABAJO PREVIO: eliminó {rel}, que ya existía antes de esta "
++                                             f"actualización y la tarea no lo pedía. Restauralo.")
++                        continue
++                    borradas, total = _lineas_borradas(antes_tarea, ruta.read_text(encoding="utf-8",
++                                                                                    errors="replace"))
++                    if not total:
++                        continue
++                    fraccion = borradas / total
++                    if (not declarado and borradas >= 3 and fraccion >= 0.2) or \
++                            (declarado and borradas >= 8 and fraccion >= 0.6):
++                        tipo = "REESCRITURA DESTRUCTIVA" if declarado else "MODIFICÓ TRABAJO PREVIO"
++                        problemas.append(
++                            f"{tipo}: borró {borradas} de {total} líneas ({fraccion:.0%}) que ya había en {rel} antes "
++                            f"de esta actualización. Extendé el archivo sin perder lo que ya hacía.")
          if tests is not None and not tests.ok and conteo.reconocido:
              # Los tests de la especificación de tareas siguientes fallan a propósito: no son regresión.
              nuevos_fallos = [n for n in conteo.nombres_fallados
-@@ -642,30 +1433,185 @@ class Orquestador:
+@@ -642,30 +1508,185 @@ class Orquestador:
              diagnostico = anexar_pistas(diagnostico, 2)
          return Verificacion(not problemas, validaciones, tests, diagnostico, archivos, conteo)
  
@@ -3426,7 +3503,7 @@ index ad78b6b..52cb121 100644
  
          self.ui.fase(numero_fase, "Implementación" + (" · torneo" if self.settings.torneo and self.settings.candidatos > 1 else ""))
          numero_fase += 1
-@@ -676,35 +1622,83 @@ class Orquestador:
+@@ -676,35 +1697,83 @@ class Orquestador:
          if [t.id for t in orden] != [t.id for t in plan.tareas]:
              self.ui.tenue("  Orden por dependencias: " + " → ".join(t.id for t in orden))
              plan.tareas = orden
@@ -3512,7 +3589,7 @@ index ad78b6b..52cb121 100644
                  continue
  
              for ronda in range(self.settings.max_revisiones):
-@@ -722,6 +1716,30 @@ class Orquestador:
+@@ -722,6 +1791,30 @@ class Orquestador:
                      break
                  self.implementar(pedido, plan, i, exploracion, tcid, correcciones=revision,
                                   protegidos=self._protegidos)
@@ -3543,7 +3620,7 @@ index ad78b6b..52cb121 100644
  
          archivos = [r for r in self.ws.checkpoints.archivos_desde(grupo) if (self.ws.raiz / r).is_file()]
          hay_tests_build = any(_es_test(a) for a in archivos)
-@@ -734,21 +1752,40 @@ class Orquestador:
+@@ -734,21 +1827,40 @@ class Orquestador:
          self.ui.fase(numero_fase, "Verificación real")
          verif = self.verificar(grupo)
          self._mostrar_verificacion(verif)
@@ -3588,7 +3665,7 @@ index ad78b6b..52cb121 100644
          informe.ruta_informe = self._guardar_informe(pedido, informe)
          self._mostrar_cierre(informe)
          return informe
-@@ -769,6 +1806,12 @@ class Orquestador:
+@@ -769,6 +1881,12 @@ class Orquestador:
          else:
              self.ui.error(f"tests: fallaron ({verif.conteo.texto() if verif.conteo.reconocido else verif.tests.comando})")
              self.ui.tenue(recortar(fallos_relevantes(verif.tests.stdout + "\n" + verif.tests.stderr, 2, 1500), 1500))
@@ -3601,7 +3678,7 @@ index ad78b6b..52cb121 100644
  
      def _guardar_informe(self, pedido: str, informe: InformeBuild) -> Optional[Path]:
          try:
-@@ -781,7 +1824,14 @@ class Orquestador:
+@@ -781,7 +1899,14 @@ class Orquestador:
                  f"## Plan\n```\n{informe.plan.como_texto() if informe.plan else '-'}\n```\n\n"
                  f"## Archivos\n```\n{_diffstat(diff) or '-'}\n```\n\n"
                  f"## Tests\n```\n{tests}\n```\n\n"
@@ -3617,7 +3694,7 @@ index ad78b6b..52cb121 100644
                     if informe.spec_tests else "")
                  + (f"## Escaladas al modelo fuerte\n{informe.escaladas}\n\n" if informe.escaladas else "")
                  + ("## Lecciones aprendidas\n" + "\n".join(f"- {l}" for l in informe.lecciones) + "\n\n" if informe.lecciones else "")
-@@ -790,40 +1840,69 @@ class Orquestador:
+@@ -790,40 +1915,69 @@ class Orquestador:
                  + ("## Notas\n" + "\n".join(f"- {n}" for n in informe.notas) + "\n" if informe.notas else "")
              )
              ruta = self.ws.raiz / ".reaper" / "informes" / f"build_{datetime.now():%Y%m%d_%H%M%S}.md"
@@ -7322,10 +7399,10 @@ index 0000000..43841a9
 +        self.assertNotEqual(app.settings.modelo, "")
 diff --git a/partes/48ze_autotest_juez.py b/partes/48ze_autotest_juez.py
 new file mode 100644
-index 0000000..3eb1692
+index 0000000..0a9ad90
 --- /dev/null
 +++ b/partes/48ze_autotest_juez.py
-@@ -0,0 +1,247 @@
+@@ -0,0 +1,335 @@
 +"""
 +Autotests del 8.º agente: el JUEZ DE ENTREGA. Al cerrar /construir compara lo entregado contra el PEDIDO y
 +SOLO endurece el estado (verde → parcial); nunca convierte una build roja en verde. Entrada compacta + veredicto
@@ -7548,6 +7625,94 @@ index 0000000..3eb1692
 +        self.assertEqual(informe.intervenciones_juez, 0)              # cupo 0: solo avisa
 +        self.assertFalse(ws.existe("extra.py"))
 +        self.assertEqual(informe.estado, "parcial")                  # el juez igual bajó a parcial
++
++
++class TestPreservarTrabajoPrevio(BaseTest):
++    """En una ACTUALIZACIÓN, lo que ya existía antes de la build no se borra ni se reescribe por accidente."""
++
++    def _actualizacion(self, archivos):
++        ws = self.proyecto(archivos)
++        orq = Orquestador(MockLLM([]), ws, self.ajustes(), self.ui())
++        orq._protegidos = {}
++        return orq, ws, ws.checkpoints.iniciar("construir: actualización")
++
++    def _verif(self, orq, tcid, declarados, build):
++        return orq._verificar_tarea(tcid, ConteoTests(), set(), verificar_entrega=True,
++                                    archivos_esperados=declarados, cid_build=build)
++
++    def test_lineas_borradas(self):
++        self.assertEqual(_lineas_borradas("a\nb\n", "a\nb\nc\n"), (0, 2))      # agregar no cuenta
++        self.assertEqual(_lineas_borradas("a\nb\n", "a\nB\n"), (1, 2))         # cambiar una línea cuenta
++        self.assertEqual(_lineas_borradas("a\n\nb\n", ""), (2, 2))             # las vacías no cuentan
++
++    def test_borrar_archivo_previo_no_declarado(self):
++        orq, ws, build = self._actualizacion({"viejo.py": "A = 1\n"})
++        t = ws.checkpoints.iniciar("tarea 1", grupo=build)
++        ws.escribir("nuevo.py", "N = 1\n")
++        ws.borrar("viejo.py")                                                   # no le correspondía
++        verif = self._verif(orq, t, ["nuevo.py"], build)
++        self.assertFalse(verif.ok)
++        self.assertIn("BORRÓ TRABAJO PREVIO", verif.diagnostico)
++
++    def test_vaciar_archivo_previo_no_declarado(self):
++        previo = "def a():\n    return 1\n\ndef b():\n    return 2\n\ndef c():\n    return 3\n"
++        orq, ws, build = self._actualizacion({"util.py": previo})
++        t = ws.checkpoints.iniciar("tarea 1", grupo=build)
++        ws.escribir("nuevo.py", "N = 1\n")
++        ws.escribir("util.py", "def a():\n    return 1\n")                     # perdió b() y c()
++        verif = self._verif(orq, t, ["nuevo.py"], build)
++        self.assertFalse(verif.ok)
++        self.assertIn("MODIFICÓ TRABAJO PREVIO", verif.diagnostico)
++
++    def test_edicion_chica_en_archivo_previo_pasa(self):
++        orq, ws, build = self._actualizacion({"main.py": "import os\n\nprint('hola')\n"})
++        t = ws.checkpoints.iniciar("tarea 1", grupo=build)
++        ws.escribir("nuevo.py", "N = 1\n")
++        ws.escribir("main.py", "import os\nimport nuevo\n\nprint('hola')\n")   # solo agrega un import
++        verif = self._verif(orq, t, ["nuevo.py"], build)
++        self.assertTrue(verif.ok, verif.diagnostico)
++
++    def test_reescritura_destructiva_de_archivo_declarado(self):
++        previo = "".join(f"def f{i}():\n    return {i}\n" for i in range(10))
++        orq, ws, build = self._actualizacion({"app.py": previo})
++        t = ws.checkpoints.iniciar("tarea 1", grupo=build)
++        ws.escribir("app.py", "def nueva():\n    return 0\n")                 # lo rehízo de cero
++        verif = self._verif(orq, t, ["app.py"], build)
++        self.assertFalse(verif.ok)
++        self.assertIn("REESCRITURA DESTRUCTIVA", verif.diagnostico)
++
++    def test_extender_archivo_declarado_pasa(self):
++        previo = "".join(f"def f{i}():\n    return {i}\n" for i in range(10))
++        orq, ws, build = self._actualizacion({"app.py": previo})
++        t = ws.checkpoints.iniciar("tarea 1", grupo=build)
++        ws.escribir("app.py", previo + "def nueva():\n    return 0\n")         # agrega sin perder nada
++        verif = self._verif(orq, t, ["app.py"], build)
++        self.assertTrue(verif.ok, verif.diagnostico)
++
++    def test_lo_creado_en_esta_build_no_esta_protegido(self):
++        orq, ws, build = self._actualizacion({"README.md": "# x\n"})
++        ws.checkpoints.iniciar("tarea 1", grupo=build)
++        ws.escribir("modulo.py", "".join(f"L{i} = {i}\n" for i in range(10)))
++        t2 = ws.checkpoints.iniciar("tarea 2", grupo=build)
++        ws.escribir("modulo.py", "X = 1\n")                                   # misma actualización: se puede
++        verif = self._verif(orq, t2, ["modulo.py"], build)
++        self.assertTrue(verif.ok, verif.diagnostico)
++
++    def test_resumen_preservacion_para_el_juez(self):
++        orq, ws, build = self._actualizacion({"viejo.py": "A = 1\n"})
++        self.assertIn("solo se agregó trabajo nuevo", resumen_preservacion(ws, build))
++        ws.checkpoints.iniciar("tarea", grupo=build)
++        ws.escribir("nuevo.py", "N = 1\n")
++        self.assertIn("solo se agregó trabajo nuevo", resumen_preservacion(ws, build))   # lo nuevo no es previo
++        ws.borrar("viejo.py")
++        self.assertIn("BORRADOS: viejo.py", resumen_preservacion(ws, build))
++
++    def test_el_juez_recibe_la_evidencia_de_preservacion(self):
++        llm = MockLLM(lambda m, k: '{"cumple": true, "confianza": "high"}' if k.get("rol") == "juez" else "{}")
++        orq = Orquestador(llm, self.proyecto(), self.ajustes(), self.ui())
++        orq._juicio_de_entrega("pedido", _plan_web(), _verif_ok(), InformeBuild("verificada"))
++        prompt = next(c for c in llm.llamadas if c.get("rol") == "juez")["mensajes"][-1]["content"]
++        self.assertIn("EV-PRESERVA", prompt)
 +
 +
 +class TestTrabajosChicos(BaseTest):
@@ -8153,7 +8318,7 @@ index 04beb5e..4fdfd45 100644
  
  
 diff --git a/partes/54_ingles.py b/partes/54_ingles.py
-index 8456a11..3c027dd 100644
+index 8456a11..3fb511f 100644
 --- a/partes/54_ingles.py
 +++ b/partes/54_ingles.py
 @@ -19,6 +19,11 @@ PRINCIPLES
@@ -8168,7 +8333,7 @@ index 8456a11..3c027dd 100644
  
  HOW TO USE TOOLS
  - Write tool calls as XML tags exactly like the examples. You may write 1-3 sentences of reasoning first.
-@@ -177,6 +182,45 @@ TEST_SUITE_GREEN (tests pass), BEHAVIOR_VERIFIED (the program was also run and g
+@@ -177,6 +182,47 @@ TEST_SUITE_GREEN (tests pass), BEHAVIOR_VERIFIED (the program was also run and g
  CONTRADICTED (evidence says otherwise). Remember: 'tests pass' does NOT imply 'no bugs' (that exceeds the
  evidence), and green tests that don't discriminate (inspect_tests) don't rise above TEST_SUITE_GREEN.
  attempt_completion with one line per claim: CLAIM → LEVEL (what evidence backs it and what's missing to raise it).""",
@@ -8208,13 +8373,15 @@ index 8456a11..3c027dd 100644
 +EVIDENCE given (each piece has an EV-... id): real build state, tests, validation, acceptance and the diff summary.
 +You run nothing and do not read the repo. Hard rule: you CANNOT turn a red build green — if the evidence shows
 +failures or unfinished tasks, cumple=false. If something the request asked for is missing (a file, a screen, an
-+endpoint, a behavior), list it under "faltantes", specific and actionable. If the evidence is enough and the
-+request is covered, cumple=true. Use high confidence only when the evidence is conclusive.
++endpoint, a behavior), list it under "faltantes", specific and actionable. In an UPDATE, what already existed must
++be kept: if EV-PRESERVA shows previous work was DELETED or REWRITTEN that the request did not ask to change,
++cumple=false and say so in "faltantes". If the evidence is enough and the request is covered without breaking what
++was there, cumple=true. Use high confidence only when the evidence is conclusive.
 +Reply ONLY: {"cumple": true|false, "faltantes": ["..."], "evidence_ids": ["EV-..."], "confianza": "low|medium|high"}""",
  }
  
  DOCS_EN = {
-@@ -259,6 +303,9 @@ DOCS_EN = {
+@@ -259,6 +305,9 @@ DOCS_EN = {
      "fetch_url": ("Reads a web page (official docs, README, an answer to an error) and returns its clean text. With "
                    "'buscar' only paragraphs with those words are returned. GET only; never sends project data.",
                    {"url": "full http(s) URL", "buscar": "keywords to keep only the relevant part (optional)"}),
@@ -8224,7 +8391,7 @@ index 8456a11..3c027dd 100644
      "rename_symbol": ("Renames a function, class, variable or method across the WHOLE project safely: never touches "
                        "strings or comments and validates everything at the end.",
                        {"old": "current name", "new": "new name", "paths": "comma-separated files (optional)"}),
-@@ -296,6 +343,10 @@ def system_prompt_en(rol: "Rol", ws: Workspace, max_llamadas: int = 4, arbol: bo
+@@ -296,6 +345,10 @@ def system_prompt_en(rol: "Rol", ws: Workspace, max_llamadas: int = 4, arbol: bo
          f"\n# YOUR ROLE: {rol.nombre.upper()}\n{MISIONES_EN.get(rol.nombre, rol.mision)}",
          "\n# AVAILABLE TOOLS\n" + documentacion_en(list(rol.herramientas)),
          f"\n# ENVIRONMENT\n- Workspace: {ws.raiz}\n{_entorno()}",
