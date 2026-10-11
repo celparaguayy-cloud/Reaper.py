@@ -206,7 +206,7 @@ index 4210bef..782455c 100644
      except (OSError, ValueError):
          return False
 diff --git a/partes/03_config.py b/partes/03_config.py
-index 9f76627..6e899ee 100644
+index 9f76627..88b4744 100644
 --- a/partes/03_config.py
 +++ b/partes/03_config.py
 @@ -69,10 +69,14 @@ PROVEEDORES = {
@@ -313,7 +313,7 @@ index 9f76627..6e899ee 100644
  
  
  @dataclass
-@@ -146,6 +208,17 @@ class Settings:
+@@ -146,6 +208,20 @@ class Settings:
      modelos_rol: dict = field(default_factory=dict)
      # Modelos de respaldo si el principal falla (404, 402, caídas persistentes).
      fallbacks: list = field(default_factory=list)
@@ -328,10 +328,13 @@ index 9f76627..6e899ee 100644
 +    # de reparación hacia los faltantes y vuelve a juzgar. 0 = solo avisa, no interviene. Acotado para no entrar en
 +    # bucle: insiste "hasta que se haga" pero con tope (y corta si una pasada no logra avances).
 +    juez_max_intervenciones: int = 2
++    # Al verificar, correr el punto de entrada (python -m paquete / script CLI) con --help: si se cae al CARGAR
++    # (ModuleNotFoundError, SyntaxError...) la build no queda verificada aunque los tests pasen.
++    verificar_arranque: bool = True
      proveedor: str = "openrouter"
      api_url: str = ""
  
-@@ -169,7 +242,14 @@ class Settings:
+@@ -169,7 +245,14 @@ class Settings:
      max_llamadas_turno: int = 4
      max_reparaciones: int = 3
      max_revisiones: int = 2
@@ -347,7 +350,7 @@ index 9f76627..6e899ee 100644
      paralelo: int = 2
      qa: bool = True
  
-@@ -274,8 +354,10 @@ class Settings:
+@@ -274,8 +357,10 @@ class Settings:
          acotar("max_profundidad", 0, 3)
          acotar("max_llamadas_turno", 1, 10)
          acotar("max_reparaciones", 0, 10)
@@ -359,7 +362,7 @@ index 9f76627..6e899ee 100644
          acotar("paralelo", 1, 8)
          acotar("candidatos", 1, 6)
          acotar("paralelo_torneo", 1, 6)
-@@ -322,9 +404,11 @@ class Settings:
+@@ -322,9 +407,11 @@ class Settings:
  
  PERFILES = {
      "gratis": {
@@ -373,7 +376,7 @@ index 9f76627..6e899ee 100644
      },
      "rapido": {
          "descripcion": "sin torneo ni tests previos: un intento por tarea (barato y veloz)",
-@@ -370,6 +454,11 @@ def cargar_settings(ruta: Optional[Path] = None) -> Settings:
+@@ -370,6 +457,11 @@ def cargar_settings(ruta: Optional[Path] = None) -> Settings:
          except (OSError, ValueError, TypeError):
              settings = Settings()
  
@@ -385,7 +388,7 @@ index 9f76627..6e899ee 100644
      if os.getenv("MODEL_NAME"):
          settings.modelo = resolver_modelo(os.environ["MODEL_NAME"])
      if os.getenv("REAPER_MODO") in MODOS:
-@@ -381,6 +470,27 @@ def cargar_settings(ruta: Optional[Path] = None) -> Settings:
+@@ -381,6 +473,27 @@ def cargar_settings(ruta: Optional[Path] = None) -> Settings:
      return settings.validar()
  
  
@@ -413,7 +416,7 @@ index 9f76627..6e899ee 100644
  def guardar_settings(settings: Settings, ruta: Optional[Path] = None) -> None:
      ruta = ruta or CONFIG_FILE
      ruta.parent.mkdir(parents=True, exist_ok=True)
-@@ -389,16 +499,47 @@ def guardar_settings(settings: Settings, ruta: Optional[Path] = None) -> None:
+@@ -389,16 +502,47 @@ def guardar_settings(settings: Settings, ruta: Optional[Path] = None) -> None:
      os.replace(tmp, ruta)
  
  
@@ -2229,10 +2232,10 @@ index 4eba772..e986b98 100644
                  (self.ws.raiz / rel).unlink()
                  self.restaurados.append(f"{rel} (creado por los tests, borrado)")
 diff --git a/partes/25_pipeline.py b/partes/25_pipeline.py
-index ad78b6b..df8d080 100644
+index ad78b6b..02a0057 100644
 --- a/partes/25_pipeline.py
 +++ b/partes/25_pipeline.py
-@@ -40,6 +40,83 @@ _RE_VEREDICTO = re.compile(r"VEREDICTO\s*:?\s*\**\s*(APROBADO|CAMBIOS|RECHAZADO)
+@@ -40,6 +40,133 @@ _RE_VEREDICTO = re.compile(r"VEREDICTO\s*:?\s*\**\s*(APROBADO|CAMBIOS|RECHAZADO)
  EXTENSIONES_TESTEABLES = (".py", ".js", ".mjs", ".cjs", ".ts")
  
  
@@ -2292,6 +2295,56 @@ index ad78b6b..df8d080 100644
 +    return "; ".join(partes)
 +
 +
++_RE_MAIN_SCRIPT = re.compile(r"""__name__\s*==\s*['"]__main__['"]""")
++_RE_CLI_SCRIPT = re.compile(r"\b(argparse|ArgumentParser|click|typer|sys\.argv|fire\.Fire)\b")
++# Solo cuentan fallas de CARGA: el código ni siquiera se pudo importar. Un ValueError por recibir '--help'
++# como dato, un EOFError de un programa interactivo o un "opción no reconocida" NO son "proyecto roto".
++_FIRMAS_NO_ARRANCA = ("ModuleNotFoundError", "ImportError", "No module named", "SyntaxError",
++                      "IndentationError", "TabError")
++
++
++def puntos_de_entrada(ws, limite: int = 3) -> list:
++    """Cómo se arranca el proyecto: paquetes con __main__.py (python -m paquete, también en src/) y scripts de la
++    raíz que son una CLI (if __name__ == '__main__' + argparse/click/sys.argv). [(etiqueta, cmd, cwd, env)]."""
++    raiz = ws.raiz
++    candidatos = []
++    for base, env in ((raiz, None), (raiz / "src", {"PYTHONPATH": str(raiz / "src")})):
++        if not base.is_dir():
++            continue
++        for d in sorted(base.iterdir()):
++            if (d.is_dir() and not d.name.startswith((".", "_")) and (d / "__init__.py").is_file()
++                    and (d / "__main__.py").is_file()):
++                candidatos.append((f"python -m {d.name}", [sys.executable, "-m", d.name, "--help"], raiz, env))
++    for archivo in sorted(raiz.glob("*.py")):
++        nombre = archivo.name
++        if nombre.startswith("test_") or nombre.endswith("_test.py") or nombre in ("setup.py", "conftest.py"):
++            continue
++        try:
++            texto = archivo.read_text(encoding="utf-8", errors="replace")[:200_000]
++        except OSError:
++            continue
++        if _RE_MAIN_SCRIPT.search(texto) and _RE_CLI_SCRIPT.search(texto):
++            candidatos.append((f"python {nombre}", [sys.executable, nombre, "--help"], raiz, None))
++    return candidatos[:limite]
++
++
++def verificar_arranque(ws, timeout: int = 12) -> list:
++    """¿El proyecto ARRANCA de verdad? Corre cada punto de entrada con --help (stdin vacío, plazo corto) y marca
++    como roto solo una falla de CARGA (ModuleNotFoundError, SyntaxError, ...). Un timeout (servidor o programa
++    interactivo) no cuenta. Caso real: los tests pasaban y `python -m paquete` ni siquiera importaba."""
++    problemas = []
++    for etiqueta, cmd, cwd, env in puntos_de_entrada(ws):
++        r = ejecutar(cmd, cwd=cwd, timeout=timeout, entrada="", env_extra=env)
++        if r.ok or r.timeout:
++            continue
++        salida = f"{r.stdout}\n{r.stderr}"
++        if any(firma in salida for firma in _FIRMAS_NO_ARRANCA):
++            problemas.append(f"ARRANQUE: `{etiqueta}` no arranca: falla al cargar el código (exit {r.codigo}). "
++                             f"Los tests pueden pasar y la app igual estar rota.\n"
++                             + fallos_relevantes(salida, maximo=2, limite=2500))
++    return problemas
++
++
 +def _palabras_clave(texto: str) -> set:
 +    return {p for p in re.findall(r"[a-záéíóúñ0-9/._-]{4,}", (texto or "").lower())}
 +
@@ -2316,7 +2369,7 @@ index ad78b6b..df8d080 100644
  @dataclass
  class Tarea:
      id: str
-@@ -178,13 +255,218 @@ def verificacion_peor(despues: "Verificacion", antes: "Verificacion") -> bool:
+@@ -178,13 +305,218 @@ def verificacion_peor(despues: "Verificacion", antes: "Verificacion") -> bool:
  
  
  def veredicto(informe: str) -> tuple[bool, bool]:
@@ -2537,7 +2590,7 @@ index ad78b6b..df8d080 100644
  @dataclass
  class Verificacion:
      ok: bool
-@@ -193,6 +475,7 @@ class Verificacion:
+@@ -193,6 +525,7 @@ class Verificacion:
      diagnostico: str
      archivos: list
      conteo: ConteoTests = field(default_factory=ConteoTests)
@@ -2545,7 +2598,7 @@ index ad78b6b..df8d080 100644
  
  
  @dataclass
-@@ -201,6 +484,7 @@ class InformeBuild:
+@@ -201,6 +534,7 @@ class InformeBuild:
      plan: Optional[Plan] = None
      archivos: list = field(default_factory=list)
      tests: Optional[Resultado] = None
@@ -2553,7 +2606,7 @@ index ad78b6b..df8d080 100644
      diagnostico: str = ""
      cid: Optional[int] = None
      ruta_informe: Optional[Path] = None
-@@ -211,12 +495,27 @@ class InformeBuild:
+@@ -211,12 +545,27 @@ class InformeBuild:
      commit: Optional[str] = None
      spec_tests: list = field(default_factory=list)
      segundos: float = 0.0
@@ -2581,7 +2634,7 @@ index ad78b6b..df8d080 100644
  def _diffstat(diff: str) -> str:
      stats: dict[str, list[int]] = {}
      actual = None
-@@ -231,6 +530,23 @@ def _diffstat(diff: str) -> str:
+@@ -231,6 +580,23 @@ def _diffstat(diff: str) -> str:
      return "\n".join(f"  {a}  +{m} -{n}" for a, (m, n) in stats.items())
  
  
@@ -2605,7 +2658,7 @@ index ad78b6b..df8d080 100644
  def _es_test(rel: str) -> bool:
      return any(fnmatch.fnmatch(rel, p) for p in PATRONES_TESTS)
  
-@@ -246,6 +562,214 @@ def _es_de_especificacion(nombre_test: str, protegidos: dict) -> bool:
+@@ -246,6 +612,214 @@ def _es_de_especificacion(nombre_test: str, protegidos: dict) -> bool:
      return False
  
  
@@ -2820,7 +2873,7 @@ index ad78b6b..df8d080 100644
  class Orquestador:
      def __init__(self, llm, ws: Workspace, settings: Settings, ui: UI):
          self.llm = llm
-@@ -255,6 +779,7 @@ class Orquestador:
+@@ -255,6 +829,7 @@ class Orquestador:
          self.memoria = MemoriaLecciones(ws) if settings.lecciones else None
          self.escalador = Escalador(llm, settings, ui)
          self._protegidos: dict[str, Optional[str]] = {}
@@ -2828,7 +2881,7 @@ index ad78b6b..df8d080 100644
  
      def _sub(self, rol: str, tarea: str, cid: Optional[int], archivos: str = "", titulo: str = "",
               **opciones) -> ResultadoAgente:
-@@ -264,6 +789,20 @@ class Orquestador:
+@@ -264,6 +839,20 @@ class Orquestador:
              profundidad=1, cid_inicio=cid,
          )[0]
  
@@ -2849,7 +2902,7 @@ index ad78b6b..df8d080 100644
      # ------------------------------------------------------------ fases
      def explorar(self, pedido: str) -> str:
          archivos = self.ws.archivos_codigo(limite=500)
-@@ -296,7 +835,13 @@ class Orquestador:
+@@ -296,7 +885,13 @@ class Orquestador:
                  "cómo se ejecuta y se prueba el proyecto",
                  {"memoria": self.memoria},
              ))
@@ -2864,7 +2917,7 @@ index ad78b6b..df8d080 100644
          informe = "\n\n".join(
              f"### Informe explorador {i}\n{r.resumen}" for i, r in enumerate(resultados, start=1)
          )
-@@ -308,7 +853,10 @@ class Orquestador:
+@@ -308,7 +903,10 @@ class Orquestador:
              f"PEDIDO DEL USUARIO:\n{pedido}\n\n"
              f"INFORME DE EXPLORACIÓN (código real):\n{recortar(exploracion, 7000)}\n\n"
              f"Comando de tests detectado: {detectado[0] if detectado else 'ninguno (habrá que crear tests)'}\n"
@@ -2876,7 +2929,7 @@ index ad78b6b..df8d080 100644
          )
          if self.settings.tests_primero:
              tarea += ("\nLos tests se escriben ANTES de implementar a partir de tu <interfaz> y tus <criterios>: "
-@@ -323,6 +871,10 @@ class Orquestador:
+@@ -323,6 +921,10 @@ class Orquestador:
          if not _RE_TAREA.search(texto) and _RE_TAREA.search(res.contexto):
              texto = res.contexto + "\n" + texto
          plan = parsear_plan(texto, pedido, self.settings.max_tareas)
@@ -2887,7 +2940,7 @@ index ad78b6b..df8d080 100644
          if not res.ok:
              self.ui.aviso("El arquitecto no terminó limpio; uso lo que produjo.")
          motivo = plan_degenerado(plan, pedido, texto)
-@@ -431,17 +983,23 @@ class Orquestador:
+@@ -431,17 +1033,23 @@ class Orquestador:
              f"Validación automática de los archivos cambiados: {validacion}\n\n"
              "Leé los archivos completos si necesitás contexto. Empezá tu informe con la línea VEREDICTO."
          )
@@ -2914,7 +2967,7 @@ index ad78b6b..df8d080 100644
          detectado = detectar_comando_tests(self.ws)
          criterios = "\n".join(f"- {c}" for c in plan.criterios) or "- (derivalos del pedido)"
          texto = (
-@@ -452,7 +1010,7 @@ class Orquestador:
+@@ -452,7 +1060,7 @@ class Orquestador:
              "Escribí (o completá) tests automáticos que verifiquen los criterios y corrélos con run_tests. "
              "Reportá el resultado REAL."
          )
@@ -2923,7 +2976,7 @@ index ad78b6b..df8d080 100644
  
      def verificar(self, cid: int) -> Verificacion:
          archivos = [r for r in self.ws.checkpoints.archivos_desde(cid) if (self.ws.raiz / r).is_file()]
-@@ -462,13 +1020,32 @@ class Orquestador:
+@@ -462,13 +1070,35 @@ class Orquestador:
          malos = fallos(validaciones)
          tests_ok = tests is None or tests.ok
          partes = [r.resumen(2500) for r in malos]
@@ -2949,16 +3002,19 @@ index ad78b6b..df8d080 100644
 +        if not aceptacion_ok:
 +            partes.append('PRUEBAS DE ACEPTACIÓN INDEPENDIENTES:\n'
 +                          + aceptacion.resumen(4500))
++        # ¿Arranca? Que los tests pasen no prueba que `python -m paquete` cargue: si se cae al importar, está roto.
++        arranque = verificar_arranque(self.ws) if getattr(self.settings, "verificar_arranque", True) else []
++        partes.extend(arranque)
          diagnostico = "\n\n".join(partes)
          if diagnostico and self.settings.pistas_errores:
              diagnostico = anexar_pistas(diagnostico, 3)
 -        return Verificacion(not malos and tests_ok, validaciones, tests, diagnostico, archivos, conteo)
-+        return Verificacion(not malos and tests_ok and aceptacion_ok, validaciones,
++        return Verificacion(not malos and tests_ok and aceptacion_ok and not arranque, validaciones,
 +                            tests, diagnostico, archivos, conteo, aceptacion)
  
      def reparar(self, pedido: str, verif: Verificacion, cid: int, base_fallaba: bool,
                  diagnostico_experto: str = "", contexto: str = "") -> ResultadoAgente:
-@@ -485,7 +1062,8 @@ class Orquestador:
+@@ -485,7 +1115,8 @@ class Orquestador:
          if diagnostico_experto:
              texto = tarea_con_diagnostico(texto, diagnostico_experto)
          protegidos = set(self._protegidos)
@@ -2968,7 +3024,7 @@ index ad78b6b..df8d080 100644
                                                                                      if diagnostico_experto else ""),
                           protegidos=protegidos)
  
-@@ -513,7 +1091,17 @@ class Orquestador:
+@@ -513,7 +1144,17 @@ class Orquestador:
          intentos_txt: list[str] = []
          forense_hecho = False
          informe_forense = ""
@@ -2986,7 +3042,7 @@ index ad78b6b..df8d080 100644
              firma = _firma_error(verif.diagnostico)
              if diagnosticos_vistos.count(firma) >= 3:
                  informe.notas.append(f"{etiqueta}: la reparación no logró avances (mismo diagnóstico repetido).")
-@@ -549,6 +1137,7 @@ class Orquestador:
+@@ -549,6 +1190,7 @@ class Orquestador:
                                       + "\n---\n".join(intentos_txt[-2:]))
              res = self.reparar(pedido, verif, rcid, base_fallaba, experto, contexto_intento.strip())
              intentos_txt.append(recortar(res.resumen, 1200))
@@ -2994,7 +3050,7 @@ index ad78b6b..df8d080 100644
              verif = verificador()
              self._mostrar_verificacion(verif)
              if verif.ok:
-@@ -566,6 +1155,206 @@ class Orquestador:
+@@ -566,6 +1208,206 @@ class Orquestador:
                  verif = antes
          return verif
  
@@ -3201,7 +3257,7 @@ index ad78b6b..df8d080 100644
      # ------------------------------------------------------------ flujos
      def _mostrar_plan(self, plan: Plan) -> None:
          self.ui.titulo("PLAN")
-@@ -575,7 +1364,19 @@ class Orquestador:
+@@ -575,7 +1417,19 @@ class Orquestador:
          self.ui.fase(1, "Exploración")
          exploracion = self.explorar(pedido)
          self.ui.fase(2, "Arquitectura")
@@ -3222,7 +3278,7 @@ index ad78b6b..df8d080 100644
          for _ in range(3):
              self._mostrar_plan(plan)
              if not confirmar or self.ui.confirmar("¿Aprobás el plan y arrancamos?", defecto=True):
-@@ -599,7 +1400,10 @@ class Orquestador:
+@@ -599,7 +1453,10 @@ class Orquestador:
          return ruta
  
      def _verificar_tarea(self, tcid: int, antes: ConteoTests, nombres_antes: set,
@@ -3234,7 +3290,7 @@ index ad78b6b..df8d080 100644
          """
          Una tarea intermedia no necesita que pasen TODOS los tests (los de tareas
          siguientes todavía fallan): alcanza con validadores OK y que no se rompa
-@@ -609,7 +1413,69 @@ class Orquestador:
+@@ -609,7 +1466,69 @@ class Orquestador:
          validaciones = validar_archivos(self.ws, archivos)
          tests = ejecutar_tests(self.ws, timeout=self.settings.tests_timeout, completo=True)
          conteo = conteo_de_resultado(tests)
@@ -3305,20 +3361,47 @@ index ad78b6b..df8d080 100644
          if tests is not None and not tests.ok and conteo.reconocido:
              # Los tests de la especificación de tareas siguientes fallan a propósito: no son regresión.
              nuevos_fallos = [n for n in conteo.nombres_fallados
-@@ -642,30 +1508,185 @@ class Orquestador:
+@@ -642,30 +1561,212 @@ class Orquestador:
              diagnostico = anexar_pistas(diagnostico, 2)
          return Verificacion(not problemas, validaciones, tests, diagnostico, archivos, conteo)
  
 -    def construir(self, pedido: str, confirmar: bool = True) -> InformeBuild:
 +    def construir(self, pedido: str, confirmar: bool = True, reanudar: bool = False) -> InformeBuild:
-+        with PLAZO.limitar(self.settings.tiempo_max_build, "la build"):
-+            pila = list(PLAZO._pila)
-+            try:
-+                return self._construir(pedido, confirmar, reanudar)
-+            finally:
-+                # Si una excepción cortó una tarea, su plazo no debe sobrevivir a la build.
-+                with PLAZO._lock:
-+                    PLAZO._pila = [e for e in PLAZO._pila if e in pila]
++        restaurar_equipo = self._equipo_del_juez()
++        try:
++            with PLAZO.limitar(self.settings.tiempo_max_build, "la build"):
++                pila = list(PLAZO._pila)
++                try:
++                    return self._construir(pedido, confirmar, reanudar)
++                finally:
++                    # Si una excepción cortó una tarea, su plazo no debe sobrevivir a la build.
++                    with PLAZO._lock:
++                        PLAZO._pila = [e for e in PLAZO._pila if e in pila]
++        finally:
++            restaurar_equipo()            # la asignación del juez vale para ESTA build; tu config queda intacta
++
++    def _equipo_del_juez(self) -> Callable[[], None]:
++        """Motor central: antes de construir, el juez arma el equipo según la necesidad (salud de cada modelo,
++        historial por rol y peso del rol). Sin tokens. Devuelve cómo volver a la configuración del usuario."""
++        if not getattr(self.settings, "juez", True):
++            return lambda: None
++        try:
++            desempeno = MemoriaDesempeno() if getattr(self.settings, "router_aprendido", True) else None
++            cambios, motivos = asignar_equipo_juez(self.settings, desempeno, getattr(self.llm, "disyuntor", None))
++        except (OSError, ValueError, TypeError, AttributeError):
++            return lambda: None
++        if not cambios:
++            return lambda: None
++        original = dict(self.settings.modelos_rol)
++        self.settings.modelos_rol.update(cambios)
++        self.ui.tenue("  Juez · arma el equipo según la necesidad:")
++        for motivo in motivos:
++            self.ui.tenue(f"    • {motivo}")
++
++        def restaurar() -> None:
++            self.settings.modelos_rol.clear()
++            self.settings.modelos_rol.update(original)
++        return restaurar
 +
 +    def _construir(self, pedido: str, confirmar: bool = True, reanudar: bool = False) -> InformeBuild:
          inicio = time.monotonic()
@@ -3503,7 +3586,7 @@ index ad78b6b..df8d080 100644
  
          self.ui.fase(numero_fase, "Implementación" + (" · torneo" if self.settings.torneo and self.settings.candidatos > 1 else ""))
          numero_fase += 1
-@@ -676,35 +1697,83 @@ class Orquestador:
+@@ -676,35 +1777,83 @@ class Orquestador:
          if [t.id for t in orden] != [t.id for t in plan.tareas]:
              self.ui.tenue("  Orden por dependencias: " + " → ".join(t.id for t in orden))
              plan.tareas = orden
@@ -3589,7 +3672,7 @@ index ad78b6b..df8d080 100644
                  continue
  
              for ronda in range(self.settings.max_revisiones):
-@@ -722,6 +1791,30 @@ class Orquestador:
+@@ -722,6 +1871,30 @@ class Orquestador:
                      break
                  self.implementar(pedido, plan, i, exploracion, tcid, correcciones=revision,
                                   protegidos=self._protegidos)
@@ -3620,7 +3703,7 @@ index ad78b6b..df8d080 100644
  
          archivos = [r for r in self.ws.checkpoints.archivos_desde(grupo) if (self.ws.raiz / r).is_file()]
          hay_tests_build = any(_es_test(a) for a in archivos)
-@@ -734,21 +1827,40 @@ class Orquestador:
+@@ -734,21 +1907,40 @@ class Orquestador:
          self.ui.fase(numero_fase, "Verificación real")
          verif = self.verificar(grupo)
          self._mostrar_verificacion(verif)
@@ -3665,7 +3748,7 @@ index ad78b6b..df8d080 100644
          informe.ruta_informe = self._guardar_informe(pedido, informe)
          self._mostrar_cierre(informe)
          return informe
-@@ -769,6 +1881,12 @@ class Orquestador:
+@@ -769,6 +1961,12 @@ class Orquestador:
          else:
              self.ui.error(f"tests: fallaron ({verif.conteo.texto() if verif.conteo.reconocido else verif.tests.comando})")
              self.ui.tenue(recortar(fallos_relevantes(verif.tests.stdout + "\n" + verif.tests.stderr, 2, 1500), 1500))
@@ -3678,7 +3761,7 @@ index ad78b6b..df8d080 100644
  
      def _guardar_informe(self, pedido: str, informe: InformeBuild) -> Optional[Path]:
          try:
-@@ -781,7 +1899,14 @@ class Orquestador:
+@@ -781,7 +1979,14 @@ class Orquestador:
                  f"## Plan\n```\n{informe.plan.como_texto() if informe.plan else '-'}\n```\n\n"
                  f"## Archivos\n```\n{_diffstat(diff) or '-'}\n```\n\n"
                  f"## Tests\n```\n{tests}\n```\n\n"
@@ -3694,7 +3777,7 @@ index ad78b6b..df8d080 100644
                     if informe.spec_tests else "")
                  + (f"## Escaladas al modelo fuerte\n{informe.escaladas}\n\n" if informe.escaladas else "")
                  + ("## Lecciones aprendidas\n" + "\n".join(f"- {l}" for l in informe.lecciones) + "\n\n" if informe.lecciones else "")
-@@ -790,40 +1915,69 @@ class Orquestador:
+@@ -790,40 +1995,69 @@ class Orquestador:
                  + ("## Notas\n" + "\n".join(f"- {n}" for n in informe.notas) + "\n" if informe.notas else "")
              )
              ruta = self.ws.raiz / ".reaper" / "informes" / f"build_{datetime.now():%Y%m%d_%H%M%S}.md"
@@ -3993,7 +4076,7 @@ index 390095e..919a836 100644
  """
  
 diff --git a/partes/35_cli.py b/partes/35_cli.py
-index 9e5d20f..962d94f 100644
+index 9e5d20f..7d2ec2b 100644
 --- a/partes/35_cli.py
 +++ b/partes/35_cli.py
 @@ -20,6 +20,7 @@ COMANDOS_AYUDA = [
@@ -4633,7 +4716,7 @@ index 9e5d20f..962d94f 100644
              self.ui.ok(f"Privacidad estricta: {'ON' if valor else 'OFF'}.")
              if valor:
                  self.ui.tenue("  Los modelos externos quedan BLOQUEADOS: solo saldrá tráfico a un proveedor local (ollama).")
-@@ -991,8 +1316,42 @@ class App:
+@@ -991,8 +1316,55 @@ class App:
          self.ui.linea(texto_reporte_privacidad(reporte_privacidad(self.llm, self.settings)))
  
      def cmd_equipo(self, arg: str) -> None:
@@ -4672,12 +4755,25 @@ index 9e5d20f..962d94f 100644
 +            self.ui.info(f"  juez → {ej['proveedor']}/{ej.get('modelo_real') or ej['modelo']}   {marca}")
 +            self.ui.tenue("  Al cerrar /construir compara lo entregado contra tu pedido y SOLO puede bajar de verde a "
 +                          "parcial (nunca sube un rojo a verde). Bajo costo: entrada compacta + veredicto JSON corto.")
++            if ej["activo"]:
++                # Qué roles reasignaría el juez en la próxima build (salud de cada modelo, historial, peso del rol).
++                try:
++                    _cambios, motivos = asignar_equipo_juez(self.settings, self.desempeno,
++                                                            getattr(self.llm, "disyuntor", None))
++                except (OSError, ValueError, TypeError, AttributeError):
++                    motivos = []
++                if motivos:
++                    self.ui.info("  En la próxima /construir el juez arma el equipo así:")
++                    for motivo in motivos:
++                        self.ui.info(f"    • {motivo}")
++                else:
++                    self.ui.tenue("  Equipo: el juez mantiene tu asignación (todos los roles están en modelos sanos).")
 +            self.ui.tenue("  Asignarle modelo: /modelo juez <alias> · apagarlo: /equipo juez off")
 +            return
          estado = estado_equipo(self.settings)
          ind = independencia_equipo(estado)
          if sub in ("independencia", "independence"):
-@@ -1008,33 +1367,43 @@ class App:
+@@ -1008,33 +1380,43 @@ class App:
                  self.ui.tenue("  Configurá un proveedor free: export GROQ_API_KEY=... (o NVIDIA/GEMINI/OpenRouter).")
              else:
                  self.settings.modelos_rol.update(asignacion)
@@ -4727,7 +4823,7 @@ index 9e5d20f..962d94f 100644
  
      def cmd_proveedores(self, arg: str) -> None:
          """Estado de proveedores SIN exponer secretos. Las claves salen de env o .clave_<proveedor>."""
-@@ -1077,12 +1446,28 @@ class App:
+@@ -1077,12 +1459,28 @@ class App:
                            f"{c['providers_chat_operational']} · free confirmado: {c['providers_free_confirmed']}")
              self.ui.tenue("  Un gateway (OpenRouter) es 1 proveedor, no cientos. Credencial presente ≠ autenticado.")
              return
@@ -4761,7 +4857,7 @@ index 9e5d20f..962d94f 100644
              return
          self.ui.error("Uso: /proveedores [estado|configurar|estadisticas|probar|sincronizar|diagnostico]")
  
-@@ -1170,7 +1555,11 @@ class App:
+@@ -1170,7 +1568,11 @@ class App:
              self.ui.error("Uso: /muestra <archivo>  (análisis estático; la muestra NUNCA se ejecuta)")
              return
          try:
@@ -4774,7 +4870,7 @@ index 9e5d20f..962d94f 100644
          except (OSError, ValueError, ErrorRuta) as e:
              self.ui.error(f"No pude leer {ruta}: {e}")
              return
-@@ -1333,7 +1722,7 @@ class App:
+@@ -1333,7 +1735,7 @@ class App:
              aplicar_tema(self.settings.tema)
          if clave in ("rpm", "modelo") and hasattr(self.llm, "limitador"):
              self.llm.limitador = LimitadorTasa(self.settings.rpm_efectivo())
@@ -4783,7 +4879,7 @@ index 9e5d20f..962d94f 100644
          self.ui.ok(f"{clave} = {getattr(self.settings, clave)!r}")
  
      def cmd_uso(self, arg: str) -> None:
-@@ -1374,6 +1763,7 @@ class App:
+@@ -1374,6 +1776,7 @@ class App:
  
      def cmd_reset(self, arg: str) -> None:
          self.principal = self._nuevo_principal()
@@ -4791,7 +4887,7 @@ index 9e5d20f..962d94f 100644
          try:
              self._ruta_sesion().unlink()
          except OSError:
-@@ -1399,6 +1789,22 @@ class App:
+@@ -1399,6 +1802,22 @@ class App:
  
      def cmd_doctor(self, arg: str) -> None:
          diagnostico_sistema(self.ui, self.settings, self.llm)
@@ -4814,7 +4910,7 @@ index 9e5d20f..962d94f 100644
  
      def cmd_instalar(self, arg: str) -> None:
          instalar_lanzador(self.ui)
-@@ -1471,15 +1877,24 @@ class App:
+@@ -1471,15 +1890,24 @@ class App:
  
      def _leer_entrada(self) -> str:
          marca = f"{Tema.aviso}[plan] {C.RESET}" if self.modo_plan else ""
@@ -4846,7 +4942,7 @@ index 9e5d20f..962d94f 100644
  
      def mostrar_inicio(self, animar: bool = True) -> None:
          if not (animar and self.settings.animacion and animar_intro()):
-@@ -1494,24 +1909,44 @@ class App:
+@@ -1494,24 +1922,44 @@ class App:
              funciones.append(f"escalada→{self.settings.modelo_fuerte}")
          if self.settings.lecciones:
              funciones.append("lecciones")
@@ -7399,10 +7495,10 @@ index 0000000..43841a9
 +        self.assertNotEqual(app.settings.modelo, "")
 diff --git a/partes/48ze_autotest_juez.py b/partes/48ze_autotest_juez.py
 new file mode 100644
-index 0000000..0a9ad90
+index 0000000..2a2468a
 --- /dev/null
 +++ b/partes/48ze_autotest_juez.py
-@@ -0,0 +1,335 @@
+@@ -0,0 +1,448 @@
 +"""
 +Autotests del 8.º agente: el JUEZ DE ENTREGA. Al cerrar /construir compara lo entregado contra el PEDIDO y
 +SOLO endurece el estado (verde → parcial); nunca convierte una build roja en verde. Entrada compacta + veredicto
@@ -7713,6 +7809,119 @@ index 0000000..0a9ad90
 +        orq._juicio_de_entrega("pedido", _plan_web(), _verif_ok(), InformeBuild("verificada"))
 +        prompt = next(c for c in llm.llamadas if c.get("rol") == "juez")["mensajes"][-1]["content"]
 +        self.assertIn("EV-PRESERVA", prompt)
++
++
++class TestJuezArmaEquipo(BaseTest):
++    """El juez elige qué modelo hace cada rol según la necesidad (salud, historial, peso del rol). Sin tokens."""
++    _VARS = ("OPENROUTER_API_KEY", "GROQ_API_KEY", "GEMINI_API_KEY", "NVIDIA_API_KEY", "REAPER_CLAVE_PROVEEDOR")
++
++    def setUp(self):
++        super().setUp()
++        self._bak = {k: os.environ.pop(k, None) for k in self._VARS}
++        os.environ["OPENROUTER_API_KEY"] = "x"          # solo OpenRouter tiene clave
++
++    def tearDown(self):
++        for k, v in self._bak.items():
++            os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
++        super().tearDown()
++
++    def test_ningun_rol_queda_en_un_modelo_sin_clave(self):
++        s = self.ajustes(modelo="venice", modelos_rol={"implementador": "groq-llama70", "revisor": "deepseek"})
++        cambios, motivos = asignar_equipo_juez(s)
++        self.assertEqual(cambios.get("implementador"), resolver_modelo("deepseek"))   # groq sin clave → sano y fuerte
++        self.assertTrue(any("no está disponible" in m and "groq" in m for m in motivos))
++
++    def test_roles_criticos_prefieren_un_modelo_fuerte(self):
++        s = self.ajustes(modelo="venice", modelos_rol={"revisor": "deepseek"})
++        cambios, _ = asignar_equipo_juez(s)
++        self.assertEqual(cambios.get("implementador"), resolver_modelo("deepseek"))   # crítico: base → fuerte
++        self.assertNotIn("qa", cambios)                                              # liviano: se queda
++
++    def test_el_historial_le_gana_al_nivel(self):
++        mem = MemoriaDesempeno()
++        for _ in range(8):
++            mem.registrar("implementador", "venice", True, verificado=True)
++        s = self.ajustes(modelo="venice", modelos_rol={"revisor": "deepseek"})
++        cambios, _ = asignar_equipo_juez(s, mem)
++        self.assertNotIn("implementador", cambios)              # venice demostró rendir: no se cambia por nivel
++
++    def test_disyuntor_abierto_saca_al_modelo(self):
++        class Disyuntor:
++            def disponible(self, m):
++                return m != resolver_modelo("venice")
++        s = self.ajustes(modelo="venice", modelos_rol={"revisor": "deepseek"})
++        cambios, motivos = asignar_equipo_juez(s, None, Disyuntor())
++        self.assertEqual(cambios.get("qa"), resolver_modelo("deepseek"))             # venice viene fallando
++        self.assertTrue(any("fallando" in m for m in motivos))
++
++    def test_sin_modelos_sanos_no_inventa(self):
++        os.environ.pop("OPENROUTER_API_KEY", None)
++        cambios, motivos = asignar_equipo_juez(self.ajustes(modelo="venice"))
++        self.assertEqual((cambios, motivos), ({}, []))
++
++    def test_la_asignacion_vale_solo_para_la_build(self):
++        s = self.ajustes(modelo="venice", modelos_rol={"revisor": "deepseek"})
++        orq = Orquestador(MockLLM([]), self.proyecto(), s, self.ui())
++        original = dict(s.modelos_rol)
++        restaurar = orq._equipo_del_juez()
++        self.assertEqual(s.modelo_para("implementador"), resolver_modelo("deepseek"))  # durante la build
++        restaurar()
++        self.assertEqual(s.modelos_rol, original)               # después: la config del usuario intacta
++
++    def test_equipo_juez_muestra_como_armaria_el_equipo(self):
++        s = self.ajustes(modelo="venice", modelos_rol={"implementador": "groq-llama70", "revisor": "deepseek"})
++        app = App(s, MockLLM([]), self.ui(), self.proyecto(), persistir=False)
++        app.cmd_equipo("juez")
++        texto = app.ui.texto_registrado()
++        self.assertIn("el juez arma el equipo", texto)
++        self.assertIn("implementador", texto)
++        self.assertEqual(s.modelo_para("implementador"), resolver_modelo("groq-llama70"))   # solo muestra, no cambia
++
++
++class TestArranqueReal(BaseTest):
++    """Que los tests pasen no alcanza: el proyecto tiene que ARRANCAR (caso real: python -m paquete no importaba)."""
++    _CLI_OK = "import argparse\n\ndef main():\n    argparse.ArgumentParser(prog='app').parse_args()\n"
++
++    def test_paquete_que_no_importa_esta_roto(self):
++        ws = self.proyecto({"app/__init__.py": "", "app/__main__.py": "from app.cli import main\nmain()\n"})
++        problemas = verificar_arranque(ws)                      # app/cli.py no existe → ModuleNotFoundError
++        self.assertEqual(len(problemas), 1)
++        self.assertIn("ARRANQUE", problemas[0])
++        self.assertIn("python -m app", problemas[0])
++
++    def test_paquete_sano_arranca(self):
++        ws = self.proyecto({"app/__init__.py": "", "app/cli.py": self._CLI_OK,
++                            "app/__main__.py": "from app.cli import main\nmain()\n"})
++        self.assertEqual(verificar_arranque(ws), [])
++
++    def test_script_con_error_de_sintaxis(self):
++        ws = self.proyecto({"main.py": "import sys\nif __name__ == '__main__':\n    print(sys.argv\n"})
++        self.assertTrue(verificar_arranque(ws))                 # SyntaxError al cargar
++
++    def test_no_es_roto_si_solo_rechaza_el_help(self):
++        # Usa sys.argv como dato: '--help' le da ValueError. Eso NO es "no arranca" (cargó bien).
++        ws = self.proyecto({"main.py": "import sys\nif __name__ == '__main__':\n    print(int(sys.argv[1]))\n"})
++        self.assertEqual(verificar_arranque(ws), [])
++
++    def test_programa_interactivo_no_es_roto(self):
++        ws = self.proyecto({"juego.py": "import sys\nif __name__ == '__main__':\n    print(sys.argv)\n"
++                                        "    input('tu jugada: ')\n"})
++        self.assertEqual(verificar_arranque(ws), [])            # stdin vacío → EOFError: no es falla de carga
++
++    def test_una_libreria_sin_punto_de_entrada_no_se_corre(self):
++        ws = self.proyecto({"calc.py": "def suma(a, b):\n    return a + b\n"})
++        self.assertEqual(puntos_de_entrada(ws), [])
++
++    def test_la_verificacion_final_no_aprueba_un_proyecto_que_no_arranca(self):
++        ws = self.proyecto({"app/__init__.py": "", "app/__main__.py": "from app.cli import main\nmain()\n"})
++        orq = Orquestador(MockLLM([]), ws, self.ajustes(), self.ui())
++        orq._huella_aceptacion = None
++        grupo = ws.checkpoints.iniciar("construir")
++        verif = orq.verificar(grupo)
++        self.assertFalse(verif.ok)
++        self.assertIn("ARRANQUE", verif.diagnostico)
++        orq.settings.verificar_arranque = False                 # se puede apagar
++        self.assertTrue(orq.verificar(grupo).ok)
 +
 +
 +class TestTrabajosChicos(BaseTest):
@@ -8416,10 +8625,10 @@ index c9c292f..eb8455e 100644
  
      ## Primer uso
 diff --git a/partes/70_equipo.py b/partes/70_equipo.py
-index bde977a..208b0eb 100644
+index bde977a..99a9d15 100644
 --- a/partes/70_equipo.py
 +++ b/partes/70_equipo.py
-@@ -21,18 +21,112 @@ ROLES_EQUIPO_SEIS = (
+@@ -21,18 +21,192 @@ ROLES_EQUIPO_SEIS = (
  def estado_equipo(settings) -> list:
      """Para cada rol: modelo asignado, proveedor de destino y si hay credencial para ese proveedor."""
      salida = []
@@ -8447,6 +8656,86 @@ index bde977a..208b0eb 100644
 +        tiene = False
 +    return {"rol": "juez", "activo": bool(getattr(settings, "juez", True)), "modelo": modelo,
 +            "modelo_real": destino.modelo, "proveedor": destino.proveedor, "tiene_clave": tiene}
++
++
++# Roles donde un modelo más capaz cambia el resultado (planificar, implementar, reparar, integrar).
++ROLES_CRITICOS = frozenset({"principal", "director", "arquitecto", "implementador", "reparador", "integrador"})
++
++
++def modelo_sano(settings, modelo: str, disyuntor=None) -> tuple:
++    """(sano, motivo). Sano = proveedor con credencial (o local), no retirado y sin el disyuntor abierto."""
++    retirados = globals().get("PROVEEDORES_RETIRADOS", frozenset())
++    try:
++        destino = destino_modelo(modelo, settings)
++    except (TypeError, ValueError):
++        return False, "modelo inválido"
++    if destino.proveedor in retirados:
++        return False, f"proveedor retirado ({destino.proveedor})"
++    if not destino.es_local():
++        try:
++            if not clave_de_proveedor(destino.proveedor, replace(settings, proveedor=destino.proveedor)):
++                return False, f"sin clave para {destino.proveedor}"
++        except (TypeError, ValueError):
++            return False, f"sin clave para {destino.proveedor}"
++    if disyuntor is not None:
++        try:
++            if not disyuntor.disponible(modelo):
++                return False, "viene fallando seguido (disyuntor abierto)"
++        except (AttributeError, TypeError, ValueError):
++            pass
++    return True, ""
++
++
++def asignar_equipo_juez(settings, desempeno=None, disyuntor=None) -> tuple:
++    """
++    El JUEZ reparte los roles según la NECESIDAD, sin gastar tokens (todo con evidencia local):
++    - ningún rol queda en un modelo caído: descarta los que no tienen clave, están retirados o vienen fallando;
++    - para cada rol elige, entre los modelos SANOS del equipo, el de mejor historial en ESE rol;
++    - en los roles críticos (planificar, implementar, reparar) prefiere un modelo 'fuerte' si no hay
++      historial que diga lo contrario;
++    - si el configurado está sano y nadie es claramente mejor, lo respeta (no cambia por cambiar).
++    El modelo de ESCALADA queda reservado para cuando una tarea se traba (no se gasta en todo el build).
++    Devuelve (cambios {rol: modelo}, motivos [str]).
++    """
++    roles = [r for _etiqueta, r in roles_equipo(settings)] + ["juez"]
++    pool = []
++    for rol in roles:
++        modelo = settings.modelo_para(rol)
++        if modelo and modelo not in pool:
++            pool.append(modelo)
++    for respaldo in list(getattr(settings, "fallbacks", None) or []):
++        modelo = resolver_modelo(respaldo)
++        if modelo and modelo not in pool:
++            pool.append(modelo)
++    salud = {m: modelo_sano(settings, m, disyuntor) for m in pool}
++    sanos = [m for m in pool if salud[m][0]]
++    if not sanos:
++        return {}, []
++
++    def puntaje(rol: str, modelo: str, actual: str) -> float:
++        base = desempeno.puntaje(rol, modelo) if desempeno is not None else 0.6
++        if rol in ROLES_CRITICOS and info_modelo(modelo).nivel == "fuerte":
++            base += 0.1
++        if modelo == actual:
++            base += 0.02            # estabilidad: ante empate se queda el configurado
++        return base
++
++    cambios, motivos = {}, []
++    for rol in roles:
++        actual = settings.modelo_para(rol)
++        mejor = max(sanos, key=lambda m: puntaje(rol, m, actual))
++        if mejor == actual:
++            continue
++        sano_actual, motivo_actual = salud.get(actual) or modelo_sano(settings, actual, disyuntor)
++        if not sano_actual:
++            cambios[rol] = mejor
++            motivos.append(f"{rol} → {mejor} (el asignado no está disponible: {motivo_actual})")
++        elif puntaje(rol, mejor, actual) - puntaje(rol, actual, actual) >= 0.05:
++            cambios[rol] = mejor
++            razon = "es más capaz para este rol" if desempeno is None or not desempeno._fila(
++                desempeno._cargar(), rol, mejor) else "rinde mejor en este rol según su historial"
++            motivos.append(f"{rol} → {mejor} ({razon})")
++    return cambios, motivos
 +
 +
 +def validar_configuracion(settings) -> list:
@@ -8534,7 +8823,7 @@ index bde977a..208b0eb 100644
  def modelos_potentes_free() -> list:
      """Alias curados de modelos free POTENTES (del catálogo estático), como (alias, info)."""
      return [(alias, info) for alias, info in INFO_MODELOS.items() if info.free]
-@@ -62,7 +156,7 @@ def autoasignar_equipo_free(settings) -> tuple:
+@@ -62,7 +236,7 @@ def autoasignar_equipo_free(settings) -> tuple:
              if cola:
                  candidatos.append(cola.pop(0))
      asignacion = {}
@@ -8543,7 +8832,7 @@ index bde977a..208b0eb 100644
          asignacion[rol] = candidatos[i % len(candidatos)]
      return asignacion, ""
  
-@@ -71,11 +165,19 @@ def _probar_modelo(llm, modelo: str) -> dict:
+@@ -71,11 +245,19 @@ def _probar_modelo(llm, modelo: str) -> dict:
      """Petición mínima REAL a un modelo concreto (sin fallback): dice si responde de verdad."""
      t0 = time.monotonic()
      try:
@@ -8565,7 +8854,7 @@ index bde977a..208b0eb 100644
          return {"estado": "FALLA", "detalle": recortar(str(e), 120)}
      except (OSError, ValueError, RuntimeError) as e:
          return {"estado": "FALLA", "detalle": f"{type(e).__name__}: {e}"[:120]}
-@@ -108,7 +210,8 @@ def resumen_arranque_equipo(settings) -> str:
+@@ -108,7 +290,8 @@ def resumen_arranque_equipo(settings) -> str:
      ind = independencia_equipo(estado)
      con_clave = sum(1 for e in estado if e["tiene_clave"])
      aviso = "" if con_clave == len(estado) else f" · {len(estado) - con_clave} sin clave"

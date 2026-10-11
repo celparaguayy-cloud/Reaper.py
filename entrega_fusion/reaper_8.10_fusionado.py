@@ -1723,6 +1723,9 @@ class Settings:
     # de reparación hacia los faltantes y vuelve a juzgar. 0 = solo avisa, no interviene. Acotado para no entrar en
     # bucle: insiste "hasta que se haga" pero con tope (y corta si una pasada no logra avances).
     juez_max_intervenciones: int = 2
+    # Al verificar, correr el punto de entrada (python -m paquete / script CLI) con --help: si se cae al CARGAR
+    # (ModuleNotFoundError, SyntaxError...) la build no queda verificada aunque los tests pasen.
+    verificar_arranque: bool = True
     proveedor: str = "openrouter"
     api_url: str = ""
 
@@ -14620,6 +14623,56 @@ def resumen_preservacion(ws, cid_build: Optional[int]) -> str:
     return "; ".join(partes)
 
 
+_RE_MAIN_SCRIPT = re.compile(r"""__name__\s*==\s*['"]__main__['"]""")
+_RE_CLI_SCRIPT = re.compile(r"\b(argparse|ArgumentParser|click|typer|sys\.argv|fire\.Fire)\b")
+# Solo cuentan fallas de CARGA: el código ni siquiera se pudo importar. Un ValueError por recibir '--help'
+# como dato, un EOFError de un programa interactivo o un "opción no reconocida" NO son "proyecto roto".
+_FIRMAS_NO_ARRANCA = ("ModuleNotFoundError", "ImportError", "No module named", "SyntaxError",
+                      "IndentationError", "TabError")
+
+
+def puntos_de_entrada(ws, limite: int = 3) -> list:
+    """Cómo se arranca el proyecto: paquetes con __main__.py (python -m paquete, también en src/) y scripts de la
+    raíz que son una CLI (if __name__ == '__main__' + argparse/click/sys.argv). [(etiqueta, cmd, cwd, env)]."""
+    raiz = ws.raiz
+    candidatos = []
+    for base, env in ((raiz, None), (raiz / "src", {"PYTHONPATH": str(raiz / "src")})):
+        if not base.is_dir():
+            continue
+        for d in sorted(base.iterdir()):
+            if (d.is_dir() and not d.name.startswith((".", "_")) and (d / "__init__.py").is_file()
+                    and (d / "__main__.py").is_file()):
+                candidatos.append((f"python -m {d.name}", [sys.executable, "-m", d.name, "--help"], raiz, env))
+    for archivo in sorted(raiz.glob("*.py")):
+        nombre = archivo.name
+        if nombre.startswith("test_") or nombre.endswith("_test.py") or nombre in ("setup.py", "conftest.py"):
+            continue
+        try:
+            texto = archivo.read_text(encoding="utf-8", errors="replace")[:200_000]
+        except OSError:
+            continue
+        if _RE_MAIN_SCRIPT.search(texto) and _RE_CLI_SCRIPT.search(texto):
+            candidatos.append((f"python {nombre}", [sys.executable, nombre, "--help"], raiz, None))
+    return candidatos[:limite]
+
+
+def verificar_arranque(ws, timeout: int = 12) -> list:
+    """¿El proyecto ARRANCA de verdad? Corre cada punto de entrada con --help (stdin vacío, plazo corto) y marca
+    como roto solo una falla de CARGA (ModuleNotFoundError, SyntaxError, ...). Un timeout (servidor o programa
+    interactivo) no cuenta. Caso real: los tests pasaban y `python -m paquete` ni siquiera importaba."""
+    problemas = []
+    for etiqueta, cmd, cwd, env in puntos_de_entrada(ws):
+        r = ejecutar(cmd, cwd=cwd, timeout=timeout, entrada="", env_extra=env)
+        if r.ok or r.timeout:
+            continue
+        salida = f"{r.stdout}\n{r.stderr}"
+        if any(firma in salida for firma in _FIRMAS_NO_ARRANCA):
+            problemas.append(f"ARRANQUE: `{etiqueta}` no arranca: falla al cargar el código (exit {r.codigo}). "
+                             f"Los tests pueden pasar y la app igual estar rota.\n"
+                             + fallos_relevantes(salida, maximo=2, limite=2500))
+    return problemas
+
+
 def _palabras_clave(texto: str) -> set:
     return {p for p in re.findall(r"[a-záéíóúñ0-9/._-]{4,}", (texto or "").lower())}
 
@@ -15565,10 +15618,13 @@ class Orquestador:
         if not aceptacion_ok:
             partes.append('PRUEBAS DE ACEPTACIÓN INDEPENDIENTES:\n'
                           + aceptacion.resumen(4500))
+        # ¿Arranca? Que los tests pasen no prueba que `python -m paquete` cargue: si se cae al importar, está roto.
+        arranque = verificar_arranque(self.ws) if getattr(self.settings, "verificar_arranque", True) else []
+        partes.extend(arranque)
         diagnostico = "\n\n".join(partes)
         if diagnostico and self.settings.pistas_errores:
             diagnostico = anexar_pistas(diagnostico, 3)
-        return Verificacion(not malos and tests_ok and aceptacion_ok, validaciones,
+        return Verificacion(not malos and tests_ok and aceptacion_ok and not arranque, validaciones,
                             tests, diagnostico, archivos, conteo, aceptacion)
 
     def reparar(self, pedido: str, verif: Verificacion, cid: int, base_fallaba: bool,
@@ -16033,14 +16089,41 @@ class Orquestador:
         return Verificacion(not problemas, validaciones, tests, diagnostico, archivos, conteo)
 
     def construir(self, pedido: str, confirmar: bool = True, reanudar: bool = False) -> InformeBuild:
-        with PLAZO.limitar(self.settings.tiempo_max_build, "la build"):
-            pila = list(PLAZO._pila)
-            try:
-                return self._construir(pedido, confirmar, reanudar)
-            finally:
-                # Si una excepción cortó una tarea, su plazo no debe sobrevivir a la build.
-                with PLAZO._lock:
-                    PLAZO._pila = [e for e in PLAZO._pila if e in pila]
+        restaurar_equipo = self._equipo_del_juez()
+        try:
+            with PLAZO.limitar(self.settings.tiempo_max_build, "la build"):
+                pila = list(PLAZO._pila)
+                try:
+                    return self._construir(pedido, confirmar, reanudar)
+                finally:
+                    # Si una excepción cortó una tarea, su plazo no debe sobrevivir a la build.
+                    with PLAZO._lock:
+                        PLAZO._pila = [e for e in PLAZO._pila if e in pila]
+        finally:
+            restaurar_equipo()            # la asignación del juez vale para ESTA build; tu config queda intacta
+
+    def _equipo_del_juez(self) -> Callable[[], None]:
+        """Motor central: antes de construir, el juez arma el equipo según la necesidad (salud de cada modelo,
+        historial por rol y peso del rol). Sin tokens. Devuelve cómo volver a la configuración del usuario."""
+        if not getattr(self.settings, "juez", True):
+            return lambda: None
+        try:
+            desempeno = MemoriaDesempeno() if getattr(self.settings, "router_aprendido", True) else None
+            cambios, motivos = asignar_equipo_juez(self.settings, desempeno, getattr(self.llm, "disyuntor", None))
+        except (OSError, ValueError, TypeError, AttributeError):
+            return lambda: None
+        if not cambios:
+            return lambda: None
+        original = dict(self.settings.modelos_rol)
+        self.settings.modelos_rol.update(cambios)
+        self.ui.tenue("  Juez · arma el equipo según la necesidad:")
+        for motivo in motivos:
+            self.ui.tenue(f"    • {motivo}")
+
+        def restaurar() -> None:
+            self.settings.modelos_rol.clear()
+            self.settings.modelos_rol.update(original)
+        return restaurar
 
     def _construir(self, pedido: str, confirmar: bool = True, reanudar: bool = False) -> InformeBuild:
         inicio = time.monotonic()
@@ -29721,6 +29804,19 @@ class App:
             self.ui.info(f"  juez → {ej['proveedor']}/{ej.get('modelo_real') or ej['modelo']}   {marca}")
             self.ui.tenue("  Al cerrar /construir compara lo entregado contra tu pedido y SOLO puede bajar de verde a "
                           "parcial (nunca sube un rojo a verde). Bajo costo: entrada compacta + veredicto JSON corto.")
+            if ej["activo"]:
+                # Qué roles reasignaría el juez en la próxima build (salud de cada modelo, historial, peso del rol).
+                try:
+                    _cambios, motivos = asignar_equipo_juez(self.settings, self.desempeno,
+                                                            getattr(self.llm, "disyuntor", None))
+                except (OSError, ValueError, TypeError, AttributeError):
+                    motivos = []
+                if motivos:
+                    self.ui.info("  En la próxima /construir el juez arma el equipo así:")
+                    for motivo in motivos:
+                        self.ui.info(f"    • {motivo}")
+                else:
+                    self.ui.tenue("  Equipo: el juez mantiene tu asignación (todos los roles están en modelos sanos).")
             self.ui.tenue("  Asignarle modelo: /modelo juez <alias> · apagarlo: /equipo juez off")
             return
         estado = estado_equipo(self.settings)
@@ -46983,6 +47079,119 @@ class TestPreservarTrabajoPrevio(BaseTest):
         self.assertIn("EV-PRESERVA", prompt)
 
 
+class TestJuezArmaEquipo(BaseTest):
+    """El juez elige qué modelo hace cada rol según la necesidad (salud, historial, peso del rol). Sin tokens."""
+    _VARS = ("OPENROUTER_API_KEY", "GROQ_API_KEY", "GEMINI_API_KEY", "NVIDIA_API_KEY", "REAPER_CLAVE_PROVEEDOR")
+
+    def setUp(self):
+        super().setUp()
+        self._bak = {k: os.environ.pop(k, None) for k in self._VARS}
+        os.environ["OPENROUTER_API_KEY"] = "x"          # solo OpenRouter tiene clave
+
+    def tearDown(self):
+        for k, v in self._bak.items():
+            os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+        super().tearDown()
+
+    def test_ningun_rol_queda_en_un_modelo_sin_clave(self):
+        s = self.ajustes(modelo="venice", modelos_rol={"implementador": "groq-llama70", "revisor": "deepseek"})
+        cambios, motivos = asignar_equipo_juez(s)
+        self.assertEqual(cambios.get("implementador"), resolver_modelo("deepseek"))   # groq sin clave → sano y fuerte
+        self.assertTrue(any("no está disponible" in m and "groq" in m for m in motivos))
+
+    def test_roles_criticos_prefieren_un_modelo_fuerte(self):
+        s = self.ajustes(modelo="venice", modelos_rol={"revisor": "deepseek"})
+        cambios, _ = asignar_equipo_juez(s)
+        self.assertEqual(cambios.get("implementador"), resolver_modelo("deepseek"))   # crítico: base → fuerte
+        self.assertNotIn("qa", cambios)                                              # liviano: se queda
+
+    def test_el_historial_le_gana_al_nivel(self):
+        mem = MemoriaDesempeno()
+        for _ in range(8):
+            mem.registrar("implementador", "venice", True, verificado=True)
+        s = self.ajustes(modelo="venice", modelos_rol={"revisor": "deepseek"})
+        cambios, _ = asignar_equipo_juez(s, mem)
+        self.assertNotIn("implementador", cambios)              # venice demostró rendir: no se cambia por nivel
+
+    def test_disyuntor_abierto_saca_al_modelo(self):
+        class Disyuntor:
+            def disponible(self, m):
+                return m != resolver_modelo("venice")
+        s = self.ajustes(modelo="venice", modelos_rol={"revisor": "deepseek"})
+        cambios, motivos = asignar_equipo_juez(s, None, Disyuntor())
+        self.assertEqual(cambios.get("qa"), resolver_modelo("deepseek"))             # venice viene fallando
+        self.assertTrue(any("fallando" in m for m in motivos))
+
+    def test_sin_modelos_sanos_no_inventa(self):
+        os.environ.pop("OPENROUTER_API_KEY", None)
+        cambios, motivos = asignar_equipo_juez(self.ajustes(modelo="venice"))
+        self.assertEqual((cambios, motivos), ({}, []))
+
+    def test_la_asignacion_vale_solo_para_la_build(self):
+        s = self.ajustes(modelo="venice", modelos_rol={"revisor": "deepseek"})
+        orq = Orquestador(MockLLM([]), self.proyecto(), s, self.ui())
+        original = dict(s.modelos_rol)
+        restaurar = orq._equipo_del_juez()
+        self.assertEqual(s.modelo_para("implementador"), resolver_modelo("deepseek"))  # durante la build
+        restaurar()
+        self.assertEqual(s.modelos_rol, original)               # después: la config del usuario intacta
+
+    def test_equipo_juez_muestra_como_armaria_el_equipo(self):
+        s = self.ajustes(modelo="venice", modelos_rol={"implementador": "groq-llama70", "revisor": "deepseek"})
+        app = App(s, MockLLM([]), self.ui(), self.proyecto(), persistir=False)
+        app.cmd_equipo("juez")
+        texto = app.ui.texto_registrado()
+        self.assertIn("el juez arma el equipo", texto)
+        self.assertIn("implementador", texto)
+        self.assertEqual(s.modelo_para("implementador"), resolver_modelo("groq-llama70"))   # solo muestra, no cambia
+
+
+class TestArranqueReal(BaseTest):
+    """Que los tests pasen no alcanza: el proyecto tiene que ARRANCAR (caso real: python -m paquete no importaba)."""
+    _CLI_OK = "import argparse\n\ndef main():\n    argparse.ArgumentParser(prog='app').parse_args()\n"
+
+    def test_paquete_que_no_importa_esta_roto(self):
+        ws = self.proyecto({"app/__init__.py": "", "app/__main__.py": "from app.cli import main\nmain()\n"})
+        problemas = verificar_arranque(ws)                      # app/cli.py no existe → ModuleNotFoundError
+        self.assertEqual(len(problemas), 1)
+        self.assertIn("ARRANQUE", problemas[0])
+        self.assertIn("python -m app", problemas[0])
+
+    def test_paquete_sano_arranca(self):
+        ws = self.proyecto({"app/__init__.py": "", "app/cli.py": self._CLI_OK,
+                            "app/__main__.py": "from app.cli import main\nmain()\n"})
+        self.assertEqual(verificar_arranque(ws), [])
+
+    def test_script_con_error_de_sintaxis(self):
+        ws = self.proyecto({"main.py": "import sys\nif __name__ == '__main__':\n    print(sys.argv\n"})
+        self.assertTrue(verificar_arranque(ws))                 # SyntaxError al cargar
+
+    def test_no_es_roto_si_solo_rechaza_el_help(self):
+        # Usa sys.argv como dato: '--help' le da ValueError. Eso NO es "no arranca" (cargó bien).
+        ws = self.proyecto({"main.py": "import sys\nif __name__ == '__main__':\n    print(int(sys.argv[1]))\n"})
+        self.assertEqual(verificar_arranque(ws), [])
+
+    def test_programa_interactivo_no_es_roto(self):
+        ws = self.proyecto({"juego.py": "import sys\nif __name__ == '__main__':\n    print(sys.argv)\n"
+                                        "    input('tu jugada: ')\n"})
+        self.assertEqual(verificar_arranque(ws), [])            # stdin vacío → EOFError: no es falla de carga
+
+    def test_una_libreria_sin_punto_de_entrada_no_se_corre(self):
+        ws = self.proyecto({"calc.py": "def suma(a, b):\n    return a + b\n"})
+        self.assertEqual(puntos_de_entrada(ws), [])
+
+    def test_la_verificacion_final_no_aprueba_un_proyecto_que_no_arranca(self):
+        ws = self.proyecto({"app/__init__.py": "", "app/__main__.py": "from app.cli import main\nmain()\n"})
+        orq = Orquestador(MockLLM([]), ws, self.ajustes(), self.ui())
+        orq._huella_aceptacion = None
+        grupo = ws.checkpoints.iniciar("construir")
+        verif = orq.verificar(grupo)
+        self.assertFalse(verif.ok)
+        self.assertIn("ARRANQUE", verif.diagnostico)
+        orq.settings.verificar_arranque = False                 # se puede apagar
+        self.assertTrue(orq.verificar(grupo).ok)
+
+
 class TestTrabajosChicos(BaseTest):
     """Una página estática no debería disparar 'tests primero' y trabarse: eso rompía trabajos chicos."""
     def test_web_estatica_no_fuerza_tests_primero(self):
@@ -51875,6 +52084,86 @@ def estado_juez(settings) -> dict:
         tiene = False
     return {"rol": "juez", "activo": bool(getattr(settings, "juez", True)), "modelo": modelo,
             "modelo_real": destino.modelo, "proveedor": destino.proveedor, "tiene_clave": tiene}
+
+
+# Roles donde un modelo más capaz cambia el resultado (planificar, implementar, reparar, integrar).
+ROLES_CRITICOS = frozenset({"principal", "director", "arquitecto", "implementador", "reparador", "integrador"})
+
+
+def modelo_sano(settings, modelo: str, disyuntor=None) -> tuple:
+    """(sano, motivo). Sano = proveedor con credencial (o local), no retirado y sin el disyuntor abierto."""
+    retirados = globals().get("PROVEEDORES_RETIRADOS", frozenset())
+    try:
+        destino = destino_modelo(modelo, settings)
+    except (TypeError, ValueError):
+        return False, "modelo inválido"
+    if destino.proveedor in retirados:
+        return False, f"proveedor retirado ({destino.proveedor})"
+    if not destino.es_local():
+        try:
+            if not clave_de_proveedor(destino.proveedor, replace(settings, proveedor=destino.proveedor)):
+                return False, f"sin clave para {destino.proveedor}"
+        except (TypeError, ValueError):
+            return False, f"sin clave para {destino.proveedor}"
+    if disyuntor is not None:
+        try:
+            if not disyuntor.disponible(modelo):
+                return False, "viene fallando seguido (disyuntor abierto)"
+        except (AttributeError, TypeError, ValueError):
+            pass
+    return True, ""
+
+
+def asignar_equipo_juez(settings, desempeno=None, disyuntor=None) -> tuple:
+    """
+    El JUEZ reparte los roles según la NECESIDAD, sin gastar tokens (todo con evidencia local):
+    - ningún rol queda en un modelo caído: descarta los que no tienen clave, están retirados o vienen fallando;
+    - para cada rol elige, entre los modelos SANOS del equipo, el de mejor historial en ESE rol;
+    - en los roles críticos (planificar, implementar, reparar) prefiere un modelo 'fuerte' si no hay
+      historial que diga lo contrario;
+    - si el configurado está sano y nadie es claramente mejor, lo respeta (no cambia por cambiar).
+    El modelo de ESCALADA queda reservado para cuando una tarea se traba (no se gasta en todo el build).
+    Devuelve (cambios {rol: modelo}, motivos [str]).
+    """
+    roles = [r for _etiqueta, r in roles_equipo(settings)] + ["juez"]
+    pool = []
+    for rol in roles:
+        modelo = settings.modelo_para(rol)
+        if modelo and modelo not in pool:
+            pool.append(modelo)
+    for respaldo in list(getattr(settings, "fallbacks", None) or []):
+        modelo = resolver_modelo(respaldo)
+        if modelo and modelo not in pool:
+            pool.append(modelo)
+    salud = {m: modelo_sano(settings, m, disyuntor) for m in pool}
+    sanos = [m for m in pool if salud[m][0]]
+    if not sanos:
+        return {}, []
+
+    def puntaje(rol: str, modelo: str, actual: str) -> float:
+        base = desempeno.puntaje(rol, modelo) if desempeno is not None else 0.6
+        if rol in ROLES_CRITICOS and info_modelo(modelo).nivel == "fuerte":
+            base += 0.1
+        if modelo == actual:
+            base += 0.02            # estabilidad: ante empate se queda el configurado
+        return base
+
+    cambios, motivos = {}, []
+    for rol in roles:
+        actual = settings.modelo_para(rol)
+        mejor = max(sanos, key=lambda m: puntaje(rol, m, actual))
+        if mejor == actual:
+            continue
+        sano_actual, motivo_actual = salud.get(actual) or modelo_sano(settings, actual, disyuntor)
+        if not sano_actual:
+            cambios[rol] = mejor
+            motivos.append(f"{rol} → {mejor} (el asignado no está disponible: {motivo_actual})")
+        elif puntaje(rol, mejor, actual) - puntaje(rol, actual, actual) >= 0.05:
+            cambios[rol] = mejor
+            razon = "es más capaz para este rol" if desempeno is None or not desempeno._fila(
+                desempeno._cargar(), rol, mejor) else "rinde mejor en este rol según su historial"
+            motivos.append(f"{rol} → {mejor} ({razon})")
+    return cambios, motivos
 
 
 def validar_configuracion(settings) -> list:

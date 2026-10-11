@@ -287,3 +287,27 @@ En una corrida real, una "tarea de actualización" tocó archivos que no le corr
 Se suma a lo que ya protegía: los tests previos no se pueden editar, la regresión de tests frena la tarea y
 `/deshacer` revierte toda la build. Cobertura: `TestPreservarTrabajoPrevio` (9). Regresión: 964 tests OK en
 Python 3.11/3.12/3.13.
+
+## 14. El juez arma el equipo según la necesidad, y el proyecto tiene que ARRANCAR
+
+**El juez elige quién hace cada rol** (`asignar_equipo_juez`, determinista, 0 tokens). Antes de cada `/construir`:
+- **ningún rol queda en un modelo caído**: descarta los que no tienen clave, están retirados o vienen fallando
+  (disyuntor abierto) y los reemplaza por el mejor modelo **sano** del equipo — justo lo que tiró abajo la corrida
+  de `mi_script` (modelos que daban error/timeout o no eran compatibles con el endpoint);
+- para cada rol elige el de **mejor historial en ese rol** (memoria de desempeño);
+- en los roles **críticos** (planificar, implementar, reparar, integrar) prefiere un modelo `fuerte` si el
+  historial no dice lo contrario; los livianos (QA, explorador) no gastan de más;
+- si el configurado está sano y nadie es claramente mejor, **lo respeta**;
+- el modelo de **escalada** queda reservado para cuando una tarea se traba.
+La asignación vale **solo para esa build**: tu configuración queda intacta. `/equipo juez` muestra de antemano cómo
+armaría el equipo y por qué.
+
+**Verificación de arranque** (`verificar_arranque`): que los tests pasen no prueba que la app arranque. En la
+verificación final REAPER detecta el punto de entrada (`python -m paquete`, también en `src/`, o un script CLI con
+argparse/click/sys.argv) y lo corre con `--help`, stdin vacío y plazo corto. Si se cae al **cargar**
+(ModuleNotFoundError, ImportError, SyntaxError…) la build **no queda verificada** y el reparador recibe el
+traceback real. Un timeout (servidor, programa interactivo) o un "no reconozco --help" **no** cuentan como roto.
+Caso real: en `mi_script` los tests pasaban y `python -m mi_script` daba `No module named mi_script.__main__`.
+Se apaga con `verificar_arranque=false`.
+
+Cobertura: `TestJuezArmaEquipo` (7) y `TestArranqueReal` (7).
