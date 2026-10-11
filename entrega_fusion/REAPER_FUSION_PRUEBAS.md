@@ -243,3 +243,26 @@ Cambios (el modelo lo elige el usuario; esto es lo que NO depende del modelo):
 
 Cobertura: `TestTrabajosChicos.test_plan_grande_no_se_trunca_con_el_tope_por_defecto`. Honesto: esto sube el TECHO
 de escala; que un proyecto grande salga BIEN sigue dependiendo del modelo que se elija.
+
+## 12. Construcción fiel al pedido (el juez gobierna, no hay simulación)
+
+Partiendo de una corrida real donde REAPER **se desvió** (bumpeó la versión en vez de implementar el módulo
+pedido) y dio "tests pasan" sin trabajo funcional, se cerraron los agujeros que dejaban pasar eso:
+
+- **DESVÍO por tarea** (`_verificar_tarea`): si una tarea cambia archivos pero **ninguno de los que declaró**
+  (p. ej. toca `__init__.py` cuando debía implementar `whatsapp.py`, que ya existía como esqueleto), la
+  verificación falla y va a reparación con el error exacto. Que los declarados existan y que los tests pasen ya
+  no alcanza: el trabajo tiene que estar en SUS archivos. Se suma a los gates que ya había (SIN CAMBIOS, ENTREGA
+  INCOMPLETA, regresión, ✓ solo con tests reales).
+- **El contrato del juez gobierna todo el build**: los criterios que el juez deriva del pedido pasan a ser los
+  criterios de aceptación de TODO el build (los usan tests-primero, el checklist y la verificación), no solo el
+  gate final. El equipo construye hacia lo que se pidió, no hacia lo que un rol interpretó.
+- **El juez insiste "hasta que se haga"**: `juez_max_intervenciones` 1 → 2 (acotado; corta si una pasada no logra
+  avances, para no quemar tokens ni entrar en bucle).
+
+Cobertura: `test_desvio_tarea_toca_el_archivo_equivocado` (una tarea que toca el archivo equivocado no se da por
+hecha; si toca el declarado, pasa). Regresión: 955 tests OK en Python 3.11/3.12/3.13.
+
+**Honesto:** esto hace que REAPER **no cuente un desvío ni un no-op como éxito** y que el juez empuje hacia el
+contrato. NO puede hacer que un modelo flojo (o que falla/timeoutea, como en aquella corrida) resuelva una tarea
+que no sabe: ahí la build termina honesta en `parcial`/`fallida` con lo que falta, nunca en un verde falso.

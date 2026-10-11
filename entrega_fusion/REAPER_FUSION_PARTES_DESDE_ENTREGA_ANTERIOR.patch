@@ -206,7 +206,7 @@ index 4210bef..782455c 100644
      except (OSError, ValueError):
          return False
 diff --git a/partes/03_config.py b/partes/03_config.py
-index 9f76627..010b644 100644
+index 9f76627..6e899ee 100644
 --- a/partes/03_config.py
 +++ b/partes/03_config.py
 @@ -69,10 +69,14 @@ PROVEEDORES = {
@@ -313,7 +313,7 @@ index 9f76627..010b644 100644
  
  
  @dataclass
-@@ -146,6 +208,16 @@ class Settings:
+@@ -146,6 +208,17 @@ class Settings:
      modelos_rol: dict = field(default_factory=dict)
      # Modelos de respaldo si el principal falla (404, 402, caídas persistentes).
      fallbacks: list = field(default_factory=list)
@@ -325,12 +325,13 @@ index 9f76627..010b644 100644
 +    # ENDURECER el estado (verificada/validada → parcial si falta algo); nunca convierte una build roja en verde.
 +    juez: bool = True
 +    # Cuántas veces el juez puede INTERVENIR para cerrar: si al final falta algo del pedido, dispara una pasada
-+    # de reparación hacia los faltantes y vuelve a juzgar. 0 = solo avisa, no interviene. Acotado para no entrar en bucle.
-+    juez_max_intervenciones: int = 1
++    # de reparación hacia los faltantes y vuelve a juzgar. 0 = solo avisa, no interviene. Acotado para no entrar en
++    # bucle: insiste "hasta que se haga" pero con tope (y corta si una pasada no logra avances).
++    juez_max_intervenciones: int = 2
      proveedor: str = "openrouter"
      api_url: str = ""
  
-@@ -169,7 +241,14 @@ class Settings:
+@@ -169,7 +242,14 @@ class Settings:
      max_llamadas_turno: int = 4
      max_reparaciones: int = 3
      max_revisiones: int = 2
@@ -346,7 +347,7 @@ index 9f76627..010b644 100644
      paralelo: int = 2
      qa: bool = True
  
-@@ -274,8 +353,10 @@ class Settings:
+@@ -274,8 +354,10 @@ class Settings:
          acotar("max_profundidad", 0, 3)
          acotar("max_llamadas_turno", 1, 10)
          acotar("max_reparaciones", 0, 10)
@@ -358,7 +359,7 @@ index 9f76627..010b644 100644
          acotar("paralelo", 1, 8)
          acotar("candidatos", 1, 6)
          acotar("paralelo_torneo", 1, 6)
-@@ -322,9 +403,11 @@ class Settings:
+@@ -322,9 +404,11 @@ class Settings:
  
  PERFILES = {
      "gratis": {
@@ -372,7 +373,7 @@ index 9f76627..010b644 100644
      },
      "rapido": {
          "descripcion": "sin torneo ni tests previos: un intento por tarea (barato y veloz)",
-@@ -370,6 +453,11 @@ def cargar_settings(ruta: Optional[Path] = None) -> Settings:
+@@ -370,6 +454,11 @@ def cargar_settings(ruta: Optional[Path] = None) -> Settings:
          except (OSError, ValueError, TypeError):
              settings = Settings()
  
@@ -384,7 +385,7 @@ index 9f76627..010b644 100644
      if os.getenv("MODEL_NAME"):
          settings.modelo = resolver_modelo(os.environ["MODEL_NAME"])
      if os.getenv("REAPER_MODO") in MODOS:
-@@ -381,6 +469,27 @@ def cargar_settings(ruta: Optional[Path] = None) -> Settings:
+@@ -381,6 +470,27 @@ def cargar_settings(ruta: Optional[Path] = None) -> Settings:
      return settings.validar()
  
  
@@ -412,7 +413,7 @@ index 9f76627..010b644 100644
  def guardar_settings(settings: Settings, ruta: Optional[Path] = None) -> None:
      ruta = ruta or CONFIG_FILE
      ruta.parent.mkdir(parents=True, exist_ok=True)
-@@ -389,16 +498,47 @@ def guardar_settings(settings: Settings, ruta: Optional[Path] = None) -> None:
+@@ -389,16 +499,47 @@ def guardar_settings(settings: Settings, ruta: Optional[Path] = None) -> None:
      os.replace(tmp, ruta)
  
  
@@ -2226,7 +2227,7 @@ index 4eba772..e986b98 100644
                  (self.ws.raiz / rel).unlink()
                  self.restaurados.append(f"{rel} (creado por los tests, borrado)")
 diff --git a/partes/25_pipeline.py b/partes/25_pipeline.py
-index ad78b6b..e807ee2 100644
+index ad78b6b..52cb121 100644
 --- a/partes/25_pipeline.py
 +++ b/partes/25_pipeline.py
 @@ -40,6 +40,39 @@ _RE_VEREDICTO = re.compile(r"VEREDICTO\s*:?\s*\**\s*(APROBADO|CAMBIOS|RECHAZADO)
@@ -3185,7 +3186,7 @@ index ad78b6b..e807ee2 100644
          """
          Una tarea intermedia no necesita que pasen TODOS los tests (los de tareas
          siguientes todavía fallan): alcanza con validadores OK y que no se rompa
-@@ -609,7 +1367,31 @@ class Orquestador:
+@@ -609,7 +1367,40 @@ class Orquestador:
          validaciones = validar_archivos(self.ws, archivos)
          tests = ejecutar_tests(self.ws, timeout=self.settings.tests_timeout, completo=True)
          conteo = conteo_de_resultado(tests)
@@ -3215,10 +3216,19 @@ index ad78b6b..e807ee2 100644
 +            if not archivos and not creados_en_build:
 +                problemas.append("SIN CAMBIOS: la tarea no modificó archivos del proyecto. "
 +                                 "No se puede verificar una implementación solo por el texto del modelo.")
++            # DESVÍO: cambió archivos pero NINGUNO de los que la tarea declaró (p. ej. bumpeó la versión en vez de
++            # implementar el módulo pedido). Que existan los declarados y que los tests pasen no alcanza: el trabajo
++            # tiene que estar en SUS archivos, no en otra cosa. No aplica si los declarados ya se crearon en la build.
++            tocados_declarados = [rel for rel in declarados if rel in archivos]
++            if declarados and archivos and not tocados_declarados and not creados_en_build:
++                problemas.append(
++                    "DESVÍO: la tarea declaró trabajar en " + ", ".join(declarados[:6])
++                    + " pero no tocó ninguno de esos archivos; cambió " + ", ".join(archivos[:6])
++                    + ". Implementá EXACTAMENTE lo pedido en sus archivos, no otra cosa.")
          if tests is not None and not tests.ok and conteo.reconocido:
              # Los tests de la especificación de tareas siguientes fallan a propósito: no son regresión.
              nuevos_fallos = [n for n in conteo.nombres_fallados
-@@ -642,30 +1424,177 @@ class Orquestador:
+@@ -642,30 +1433,185 @@ class Orquestador:
              diagnostico = anexar_pistas(diagnostico, 2)
          return Verificacion(not problemas, validaciones, tests, diagnostico, archivos, conteo)
  
@@ -3364,6 +3374,14 @@ index ad78b6b..e807ee2 100644
 +            informe.criterios_entrega = self._contrato_de_entrega(pedido)
 +            if informe.criterios_entrega:
 +                previo["criterios_entrega"] = informe.criterios_entrega
++                # El juez MANDA: su contrato pasa a ser el criterio de aceptación de TODO el build (lo usan los
++                # tests primero, el checklist y la verificación), no solo el gate final. Así el equipo construye
++                # hacia lo que se pidió, no hacia lo que un rol interpretó.
++                fusion = list(informe.criterios_entrega) + [c for c in plan.criterios
++                                                            if c not in informe.criterios_entrega]
++                plan.criterios = fusion[:10]
++                informe.plan = plan
++                previo["plan"] = asdict(plan)
 +                registro_build.guardar(previo)
 +                self._mostrar_contrato(informe.criterios_entrega, plan)
 +        else:
@@ -3408,7 +3426,7 @@ index ad78b6b..e807ee2 100644
  
          self.ui.fase(numero_fase, "Implementación" + (" · torneo" if self.settings.torneo and self.settings.candidatos > 1 else ""))
          numero_fase += 1
-@@ -676,35 +1605,83 @@ class Orquestador:
+@@ -676,35 +1622,83 @@ class Orquestador:
          if [t.id for t in orden] != [t.id for t in plan.tareas]:
              self.ui.tenue("  Orden por dependencias: " + " → ".join(t.id for t in orden))
              plan.tareas = orden
@@ -3494,7 +3512,7 @@ index ad78b6b..e807ee2 100644
                  continue
  
              for ronda in range(self.settings.max_revisiones):
-@@ -722,6 +1699,30 @@ class Orquestador:
+@@ -722,6 +1716,30 @@ class Orquestador:
                      break
                  self.implementar(pedido, plan, i, exploracion, tcid, correcciones=revision,
                                   protegidos=self._protegidos)
@@ -3525,7 +3543,7 @@ index ad78b6b..e807ee2 100644
  
          archivos = [r for r in self.ws.checkpoints.archivos_desde(grupo) if (self.ws.raiz / r).is_file()]
          hay_tests_build = any(_es_test(a) for a in archivos)
-@@ -734,21 +1735,40 @@ class Orquestador:
+@@ -734,21 +1752,40 @@ class Orquestador:
          self.ui.fase(numero_fase, "Verificación real")
          verif = self.verificar(grupo)
          self._mostrar_verificacion(verif)
@@ -3570,7 +3588,7 @@ index ad78b6b..e807ee2 100644
          informe.ruta_informe = self._guardar_informe(pedido, informe)
          self._mostrar_cierre(informe)
          return informe
-@@ -769,6 +1789,12 @@ class Orquestador:
+@@ -769,6 +1806,12 @@ class Orquestador:
          else:
              self.ui.error(f"tests: fallaron ({verif.conteo.texto() if verif.conteo.reconocido else verif.tests.comando})")
              self.ui.tenue(recortar(fallos_relevantes(verif.tests.stdout + "\n" + verif.tests.stderr, 2, 1500), 1500))
@@ -3583,7 +3601,7 @@ index ad78b6b..e807ee2 100644
  
      def _guardar_informe(self, pedido: str, informe: InformeBuild) -> Optional[Path]:
          try:
-@@ -781,7 +1807,14 @@ class Orquestador:
+@@ -781,7 +1824,14 @@ class Orquestador:
                  f"## Plan\n```\n{informe.plan.como_texto() if informe.plan else '-'}\n```\n\n"
                  f"## Archivos\n```\n{_diffstat(diff) or '-'}\n```\n\n"
                  f"## Tests\n```\n{tests}\n```\n\n"
@@ -3599,7 +3617,7 @@ index ad78b6b..e807ee2 100644
                     if informe.spec_tests else "")
                  + (f"## Escaladas al modelo fuerte\n{informe.escaladas}\n\n" if informe.escaladas else "")
                  + ("## Lecciones aprendidas\n" + "\n".join(f"- {l}" for l in informe.lecciones) + "\n\n" if informe.lecciones else "")
-@@ -790,40 +1823,69 @@ class Orquestador:
+@@ -790,40 +1840,69 @@ class Orquestador:
                  + ("## Notas\n" + "\n".join(f"- {n}" for n in informe.notas) + "\n" if informe.notas else "")
              )
              ruta = self.ws.raiz / ".reaper" / "informes" / f"build_{datetime.now():%Y%m%d_%H%M%S}.md"
@@ -5252,6 +5270,35 @@ index 46cb9a4..abb5421 100644
  
  class TestIngles(BaseTest):
      def test_prompt_en(self):
+diff --git a/partes/46_autotest_bucles.py b/partes/46_autotest_bucles.py
+index a6e481a..b3348d9 100644
+--- a/partes/46_autotest_bucles.py
++++ b/partes/46_autotest_bucles.py
+@@ -492,6 +492,24 @@ class TestPipelinePlanYRevision(BaseTest):
+         self.assertIn("SIN PROGRESO", verif.diagnostico)
+         self.assertTrue(orq._verificar_tarea(tcid, ConteoTests(), set()).ok)
+ 
++    def test_desvio_tarea_toca_el_archivo_equivocado(self):
++        # La tarea declara b.py pero el agente cambió a.py (los dos ya existían): es un DESVÍO, no se da por hecha.
++        ws = self.proyecto({"a.py": "X = 1\n", "b.py": "Y = 1\n"})
++        orq = Orquestador(MockLLM([]), ws, self.ajustes(), self.ui())
++        orq._protegidos = {}
++        tcid = ws.checkpoints.iniciar("tarea 1")
++        ws.escribir("a.py", "X = 2\n")                       # cambió a.py, NO el declarado b.py
++        verif = orq._verificar_tarea(tcid, ConteoTests(), set(), verificar_entrega=True,
++                                     archivos_esperados=["b.py"], cid_build=tcid)
++        self.assertFalse(verif.ok)
++        self.assertIn("DESVÍO", verif.diagnostico)
++        # Si toca el archivo que declaró, la verificación pasa.
++        tcid2 = ws.checkpoints.iniciar("tarea 2")
++        ws.escribir("b.py", "Y = 2\n")
++        verif2 = orq._verificar_tarea(tcid2, ConteoTests(), set(), verificar_entrega=True,
++                                      archivos_esperados=["b.py"], cid_build=tcid2)
++        self.assertTrue(verif2.ok, verif2.diagnostico)
++
+     def test_revisor_no_aprueba_una_tarea_que_rompe_tests(self):
+         ws = self.proyecto({
+             "calc.py": "def suma(a, b):\n    return a + b\n",
 diff --git a/partes/46c_autotest_robustez.py b/partes/46c_autotest_robustez.py
 index 89c664d..e8d4ead 100644
 --- a/partes/46c_autotest_robustez.py
