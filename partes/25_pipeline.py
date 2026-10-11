@@ -96,6 +96,56 @@ def resumen_preservacion(ws, cid_build: Optional[int]) -> str:
     return "; ".join(partes)
 
 
+_RE_MAIN_SCRIPT = re.compile(r"""__name__\s*==\s*['"]__main__['"]""")
+_RE_CLI_SCRIPT = re.compile(r"\b(argparse|ArgumentParser|click|typer|sys\.argv|fire\.Fire)\b")
+# Solo cuentan fallas de CARGA: el código ni siquiera se pudo importar. Un ValueError por recibir '--help'
+# como dato, un EOFError de un programa interactivo o un "opción no reconocida" NO son "proyecto roto".
+_FIRMAS_NO_ARRANCA = ("ModuleNotFoundError", "ImportError", "No module named", "SyntaxError",
+                      "IndentationError", "TabError")
+
+
+def puntos_de_entrada(ws, limite: int = 3) -> list:
+    """Cómo se arranca el proyecto: paquetes con __main__.py (python -m paquete, también en src/) y scripts de la
+    raíz que son una CLI (if __name__ == '__main__' + argparse/click/sys.argv). [(etiqueta, cmd, cwd, env)]."""
+    raiz = ws.raiz
+    candidatos = []
+    for base, env in ((raiz, None), (raiz / "src", {"PYTHONPATH": str(raiz / "src")})):
+        if not base.is_dir():
+            continue
+        for d in sorted(base.iterdir()):
+            if (d.is_dir() and not d.name.startswith((".", "_")) and (d / "__init__.py").is_file()
+                    and (d / "__main__.py").is_file()):
+                candidatos.append((f"python -m {d.name}", [sys.executable, "-m", d.name, "--help"], raiz, env))
+    for archivo in sorted(raiz.glob("*.py")):
+        nombre = archivo.name
+        if nombre.startswith("test_") or nombre.endswith("_test.py") or nombre in ("setup.py", "conftest.py"):
+            continue
+        try:
+            texto = archivo.read_text(encoding="utf-8", errors="replace")[:200_000]
+        except OSError:
+            continue
+        if _RE_MAIN_SCRIPT.search(texto) and _RE_CLI_SCRIPT.search(texto):
+            candidatos.append((f"python {nombre}", [sys.executable, nombre, "--help"], raiz, None))
+    return candidatos[:limite]
+
+
+def verificar_arranque(ws, timeout: int = 12) -> list:
+    """¿El proyecto ARRANCA de verdad? Corre cada punto de entrada con --help (stdin vacío, plazo corto) y marca
+    como roto solo una falla de CARGA (ModuleNotFoundError, SyntaxError, ...). Un timeout (servidor o programa
+    interactivo) no cuenta. Caso real: los tests pasaban y `python -m paquete` ni siquiera importaba."""
+    problemas = []
+    for etiqueta, cmd, cwd, env in puntos_de_entrada(ws):
+        r = ejecutar(cmd, cwd=cwd, timeout=timeout, entrada="", env_extra=env)
+        if r.ok or r.timeout:
+            continue
+        salida = f"{r.stdout}\n{r.stderr}"
+        if any(firma in salida for firma in _FIRMAS_NO_ARRANCA):
+            problemas.append(f"ARRANQUE: `{etiqueta}` no arranca: falla al cargar el código (exit {r.codigo}). "
+                             f"Los tests pueden pasar y la app igual estar rota.\n"
+                             + fallos_relevantes(salida, maximo=2, limite=2500))
+    return problemas
+
+
 def _palabras_clave(texto: str) -> set:
     return {p for p in re.findall(r"[a-záéíóúñ0-9/._-]{4,}", (texto or "").lower())}
 
@@ -1041,10 +1091,13 @@ class Orquestador:
         if not aceptacion_ok:
             partes.append('PRUEBAS DE ACEPTACIÓN INDEPENDIENTES:\n'
                           + aceptacion.resumen(4500))
+        # ¿Arranca? Que los tests pasen no prueba que `python -m paquete` cargue: si se cae al importar, está roto.
+        arranque = verificar_arranque(self.ws) if getattr(self.settings, "verificar_arranque", True) else []
+        partes.extend(arranque)
         diagnostico = "\n\n".join(partes)
         if diagnostico and self.settings.pistas_errores:
             diagnostico = anexar_pistas(diagnostico, 3)
-        return Verificacion(not malos and tests_ok and aceptacion_ok, validaciones,
+        return Verificacion(not malos and tests_ok and aceptacion_ok and not arranque, validaciones,
                             tests, diagnostico, archivos, conteo, aceptacion)
 
     def reparar(self, pedido: str, verif: Verificacion, cid: int, base_fallaba: bool,
@@ -1509,14 +1562,41 @@ class Orquestador:
         return Verificacion(not problemas, validaciones, tests, diagnostico, archivos, conteo)
 
     def construir(self, pedido: str, confirmar: bool = True, reanudar: bool = False) -> InformeBuild:
-        with PLAZO.limitar(self.settings.tiempo_max_build, "la build"):
-            pila = list(PLAZO._pila)
-            try:
-                return self._construir(pedido, confirmar, reanudar)
-            finally:
-                # Si una excepción cortó una tarea, su plazo no debe sobrevivir a la build.
-                with PLAZO._lock:
-                    PLAZO._pila = [e for e in PLAZO._pila if e in pila]
+        restaurar_equipo = self._equipo_del_juez()
+        try:
+            with PLAZO.limitar(self.settings.tiempo_max_build, "la build"):
+                pila = list(PLAZO._pila)
+                try:
+                    return self._construir(pedido, confirmar, reanudar)
+                finally:
+                    # Si una excepción cortó una tarea, su plazo no debe sobrevivir a la build.
+                    with PLAZO._lock:
+                        PLAZO._pila = [e for e in PLAZO._pila if e in pila]
+        finally:
+            restaurar_equipo()            # la asignación del juez vale para ESTA build; tu config queda intacta
+
+    def _equipo_del_juez(self) -> Callable[[], None]:
+        """Motor central: antes de construir, el juez arma el equipo según la necesidad (salud de cada modelo,
+        historial por rol y peso del rol). Sin tokens. Devuelve cómo volver a la configuración del usuario."""
+        if not getattr(self.settings, "juez", True):
+            return lambda: None
+        try:
+            desempeno = MemoriaDesempeno() if getattr(self.settings, "router_aprendido", True) else None
+            cambios, motivos = asignar_equipo_juez(self.settings, desempeno, getattr(self.llm, "disyuntor", None))
+        except (OSError, ValueError, TypeError, AttributeError):
+            return lambda: None
+        if not cambios:
+            return lambda: None
+        original = dict(self.settings.modelos_rol)
+        self.settings.modelos_rol.update(cambios)
+        self.ui.tenue("  Juez · arma el equipo según la necesidad:")
+        for motivo in motivos:
+            self.ui.tenue(f"    • {motivo}")
+
+        def restaurar() -> None:
+            self.settings.modelos_rol.clear()
+            self.settings.modelos_rol.update(original)
+        return restaurar
 
     def _construir(self, pedido: str, confirmar: bool = True, reanudar: bool = False) -> InformeBuild:
         inicio = time.monotonic()

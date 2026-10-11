@@ -1350,6 +1350,19 @@ class App:
             self.ui.info(f"  juez → {ej['proveedor']}/{ej.get('modelo_real') or ej['modelo']}   {marca}")
             self.ui.tenue("  Al cerrar /construir compara lo entregado contra tu pedido y SOLO puede bajar de verde a "
                           "parcial (nunca sube un rojo a verde). Bajo costo: entrada compacta + veredicto JSON corto.")
+            if ej["activo"]:
+                # Qué roles reasignaría el juez en la próxima build (salud de cada modelo, historial, peso del rol).
+                try:
+                    _cambios, motivos = asignar_equipo_juez(self.settings, self.desempeno,
+                                                            getattr(self.llm, "disyuntor", None))
+                except (OSError, ValueError, TypeError, AttributeError):
+                    motivos = []
+                if motivos:
+                    self.ui.info("  En la próxima /construir el juez arma el equipo así:")
+                    for motivo in motivos:
+                        self.ui.info(f"    • {motivo}")
+                else:
+                    self.ui.tenue("  Equipo: el juez mantiene tu asignación (todos los roles están en modelos sanos).")
             self.ui.tenue("  Asignarle modelo: /modelo juez <alias> · apagarlo: /equipo juez off")
             return
         estado = estado_equipo(self.settings)

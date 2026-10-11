@@ -45,6 +45,86 @@ def estado_juez(settings) -> dict:
             "modelo_real": destino.modelo, "proveedor": destino.proveedor, "tiene_clave": tiene}
 
 
+# Roles donde un modelo más capaz cambia el resultado (planificar, implementar, reparar, integrar).
+ROLES_CRITICOS = frozenset({"principal", "director", "arquitecto", "implementador", "reparador", "integrador"})
+
+
+def modelo_sano(settings, modelo: str, disyuntor=None) -> tuple:
+    """(sano, motivo). Sano = proveedor con credencial (o local), no retirado y sin el disyuntor abierto."""
+    retirados = globals().get("PROVEEDORES_RETIRADOS", frozenset())
+    try:
+        destino = destino_modelo(modelo, settings)
+    except (TypeError, ValueError):
+        return False, "modelo inválido"
+    if destino.proveedor in retirados:
+        return False, f"proveedor retirado ({destino.proveedor})"
+    if not destino.es_local():
+        try:
+            if not clave_de_proveedor(destino.proveedor, replace(settings, proveedor=destino.proveedor)):
+                return False, f"sin clave para {destino.proveedor}"
+        except (TypeError, ValueError):
+            return False, f"sin clave para {destino.proveedor}"
+    if disyuntor is not None:
+        try:
+            if not disyuntor.disponible(modelo):
+                return False, "viene fallando seguido (disyuntor abierto)"
+        except (AttributeError, TypeError, ValueError):
+            pass
+    return True, ""
+
+
+def asignar_equipo_juez(settings, desempeno=None, disyuntor=None) -> tuple:
+    """
+    El JUEZ reparte los roles según la NECESIDAD, sin gastar tokens (todo con evidencia local):
+    - ningún rol queda en un modelo caído: descarta los que no tienen clave, están retirados o vienen fallando;
+    - para cada rol elige, entre los modelos SANOS del equipo, el de mejor historial en ESE rol;
+    - en los roles críticos (planificar, implementar, reparar) prefiere un modelo 'fuerte' si no hay
+      historial que diga lo contrario;
+    - si el configurado está sano y nadie es claramente mejor, lo respeta (no cambia por cambiar).
+    El modelo de ESCALADA queda reservado para cuando una tarea se traba (no se gasta en todo el build).
+    Devuelve (cambios {rol: modelo}, motivos [str]).
+    """
+    roles = [r for _etiqueta, r in roles_equipo(settings)] + ["juez"]
+    pool = []
+    for rol in roles:
+        modelo = settings.modelo_para(rol)
+        if modelo and modelo not in pool:
+            pool.append(modelo)
+    for respaldo in list(getattr(settings, "fallbacks", None) or []):
+        modelo = resolver_modelo(respaldo)
+        if modelo and modelo not in pool:
+            pool.append(modelo)
+    salud = {m: modelo_sano(settings, m, disyuntor) for m in pool}
+    sanos = [m for m in pool if salud[m][0]]
+    if not sanos:
+        return {}, []
+
+    def puntaje(rol: str, modelo: str, actual: str) -> float:
+        base = desempeno.puntaje(rol, modelo) if desempeno is not None else 0.6
+        if rol in ROLES_CRITICOS and info_modelo(modelo).nivel == "fuerte":
+            base += 0.1
+        if modelo == actual:
+            base += 0.02            # estabilidad: ante empate se queda el configurado
+        return base
+
+    cambios, motivos = {}, []
+    for rol in roles:
+        actual = settings.modelo_para(rol)
+        mejor = max(sanos, key=lambda m: puntaje(rol, m, actual))
+        if mejor == actual:
+            continue
+        sano_actual, motivo_actual = salud.get(actual) or modelo_sano(settings, actual, disyuntor)
+        if not sano_actual:
+            cambios[rol] = mejor
+            motivos.append(f"{rol} → {mejor} (el asignado no está disponible: {motivo_actual})")
+        elif puntaje(rol, mejor, actual) - puntaje(rol, actual, actual) >= 0.05:
+            cambios[rol] = mejor
+            razon = "es más capaz para este rol" if desempeno is None or not desempeno._fila(
+                desempeno._cargar(), rol, mejor) else "rinde mejor en este rol según su historial"
+            motivos.append(f"{rol} → {mejor} ({razon})")
+    return cambios, motivos
+
+
 def validar_configuracion(settings) -> list:
     """
     Revisa la config de modelos/equipo SIN tocar la red (la conectividad real la da /equipo probar). Devuelve

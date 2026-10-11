@@ -310,6 +310,119 @@ class TestPreservarTrabajoPrevio(BaseTest):
         self.assertIn("EV-PRESERVA", prompt)
 
 
+class TestJuezArmaEquipo(BaseTest):
+    """El juez elige qué modelo hace cada rol según la necesidad (salud, historial, peso del rol). Sin tokens."""
+    _VARS = ("OPENROUTER_API_KEY", "GROQ_API_KEY", "GEMINI_API_KEY", "NVIDIA_API_KEY", "REAPER_CLAVE_PROVEEDOR")
+
+    def setUp(self):
+        super().setUp()
+        self._bak = {k: os.environ.pop(k, None) for k in self._VARS}
+        os.environ["OPENROUTER_API_KEY"] = "x"          # solo OpenRouter tiene clave
+
+    def tearDown(self):
+        for k, v in self._bak.items():
+            os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+        super().tearDown()
+
+    def test_ningun_rol_queda_en_un_modelo_sin_clave(self):
+        s = self.ajustes(modelo="venice", modelos_rol={"implementador": "groq-llama70", "revisor": "deepseek"})
+        cambios, motivos = asignar_equipo_juez(s)
+        self.assertEqual(cambios.get("implementador"), resolver_modelo("deepseek"))   # groq sin clave → sano y fuerte
+        self.assertTrue(any("no está disponible" in m and "groq" in m for m in motivos))
+
+    def test_roles_criticos_prefieren_un_modelo_fuerte(self):
+        s = self.ajustes(modelo="venice", modelos_rol={"revisor": "deepseek"})
+        cambios, _ = asignar_equipo_juez(s)
+        self.assertEqual(cambios.get("implementador"), resolver_modelo("deepseek"))   # crítico: base → fuerte
+        self.assertNotIn("qa", cambios)                                              # liviano: se queda
+
+    def test_el_historial_le_gana_al_nivel(self):
+        mem = MemoriaDesempeno()
+        for _ in range(8):
+            mem.registrar("implementador", "venice", True, verificado=True)
+        s = self.ajustes(modelo="venice", modelos_rol={"revisor": "deepseek"})
+        cambios, _ = asignar_equipo_juez(s, mem)
+        self.assertNotIn("implementador", cambios)              # venice demostró rendir: no se cambia por nivel
+
+    def test_disyuntor_abierto_saca_al_modelo(self):
+        class Disyuntor:
+            def disponible(self, m):
+                return m != resolver_modelo("venice")
+        s = self.ajustes(modelo="venice", modelos_rol={"revisor": "deepseek"})
+        cambios, motivos = asignar_equipo_juez(s, None, Disyuntor())
+        self.assertEqual(cambios.get("qa"), resolver_modelo("deepseek"))             # venice viene fallando
+        self.assertTrue(any("fallando" in m for m in motivos))
+
+    def test_sin_modelos_sanos_no_inventa(self):
+        os.environ.pop("OPENROUTER_API_KEY", None)
+        cambios, motivos = asignar_equipo_juez(self.ajustes(modelo="venice"))
+        self.assertEqual((cambios, motivos), ({}, []))
+
+    def test_la_asignacion_vale_solo_para_la_build(self):
+        s = self.ajustes(modelo="venice", modelos_rol={"revisor": "deepseek"})
+        orq = Orquestador(MockLLM([]), self.proyecto(), s, self.ui())
+        original = dict(s.modelos_rol)
+        restaurar = orq._equipo_del_juez()
+        self.assertEqual(s.modelo_para("implementador"), resolver_modelo("deepseek"))  # durante la build
+        restaurar()
+        self.assertEqual(s.modelos_rol, original)               # después: la config del usuario intacta
+
+    def test_equipo_juez_muestra_como_armaria_el_equipo(self):
+        s = self.ajustes(modelo="venice", modelos_rol={"implementador": "groq-llama70", "revisor": "deepseek"})
+        app = App(s, MockLLM([]), self.ui(), self.proyecto(), persistir=False)
+        app.cmd_equipo("juez")
+        texto = app.ui.texto_registrado()
+        self.assertIn("el juez arma el equipo", texto)
+        self.assertIn("implementador", texto)
+        self.assertEqual(s.modelo_para("implementador"), resolver_modelo("groq-llama70"))   # solo muestra, no cambia
+
+
+class TestArranqueReal(BaseTest):
+    """Que los tests pasen no alcanza: el proyecto tiene que ARRANCAR (caso real: python -m paquete no importaba)."""
+    _CLI_OK = "import argparse\n\ndef main():\n    argparse.ArgumentParser(prog='app').parse_args()\n"
+
+    def test_paquete_que_no_importa_esta_roto(self):
+        ws = self.proyecto({"app/__init__.py": "", "app/__main__.py": "from app.cli import main\nmain()\n"})
+        problemas = verificar_arranque(ws)                      # app/cli.py no existe → ModuleNotFoundError
+        self.assertEqual(len(problemas), 1)
+        self.assertIn("ARRANQUE", problemas[0])
+        self.assertIn("python -m app", problemas[0])
+
+    def test_paquete_sano_arranca(self):
+        ws = self.proyecto({"app/__init__.py": "", "app/cli.py": self._CLI_OK,
+                            "app/__main__.py": "from app.cli import main\nmain()\n"})
+        self.assertEqual(verificar_arranque(ws), [])
+
+    def test_script_con_error_de_sintaxis(self):
+        ws = self.proyecto({"main.py": "import sys\nif __name__ == '__main__':\n    print(sys.argv\n"})
+        self.assertTrue(verificar_arranque(ws))                 # SyntaxError al cargar
+
+    def test_no_es_roto_si_solo_rechaza_el_help(self):
+        # Usa sys.argv como dato: '--help' le da ValueError. Eso NO es "no arranca" (cargó bien).
+        ws = self.proyecto({"main.py": "import sys\nif __name__ == '__main__':\n    print(int(sys.argv[1]))\n"})
+        self.assertEqual(verificar_arranque(ws), [])
+
+    def test_programa_interactivo_no_es_roto(self):
+        ws = self.proyecto({"juego.py": "import sys\nif __name__ == '__main__':\n    print(sys.argv)\n"
+                                        "    input('tu jugada: ')\n"})
+        self.assertEqual(verificar_arranque(ws), [])            # stdin vacío → EOFError: no es falla de carga
+
+    def test_una_libreria_sin_punto_de_entrada_no_se_corre(self):
+        ws = self.proyecto({"calc.py": "def suma(a, b):\n    return a + b\n"})
+        self.assertEqual(puntos_de_entrada(ws), [])
+
+    def test_la_verificacion_final_no_aprueba_un_proyecto_que_no_arranca(self):
+        ws = self.proyecto({"app/__init__.py": "", "app/__main__.py": "from app.cli import main\nmain()\n"})
+        orq = Orquestador(MockLLM([]), ws, self.ajustes(), self.ui())
+        orq._huella_aceptacion = None
+        grupo = ws.checkpoints.iniciar("construir")
+        verif = orq.verificar(grupo)
+        self.assertFalse(verif.ok)
+        self.assertIn("ARRANQUE", verif.diagnostico)
+        orq.settings.verificar_arranque = False                 # se puede apagar
+        self.assertTrue(orq.verificar(grupo).ok)
+
+
 class TestTrabajosChicos(BaseTest):
     """Una página estática no debería disparar 'tests primero' y trabarse: eso rompía trabajos chicos."""
     def test_web_estatica_no_fuerza_tests_primero(self):

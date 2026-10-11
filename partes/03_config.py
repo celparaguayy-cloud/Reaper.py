@@ -219,6 +219,9 @@ class Settings:
     # de reparación hacia los faltantes y vuelve a juzgar. 0 = solo avisa, no interviene. Acotado para no entrar en
     # bucle: insiste "hasta que se haga" pero con tope (y corta si una pasada no logra avances).
     juez_max_intervenciones: int = 2
+    # Al verificar, correr el punto de entrada (python -m paquete / script CLI) con --help: si se cae al CARGAR
+    # (ModuleNotFoundError, SyntaxError...) la build no queda verificada aunque los tests pasen.
+    verificar_arranque: bool = True
     proveedor: str = "openrouter"
     api_url: str = ""
 
