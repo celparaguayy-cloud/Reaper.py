@@ -1,6 +1,6 @@
-REAPER: /home/user/Reaper.py/reaper_v8.py
+REAPER: /home/user/Reaper.py/entrega_fusion/reaper_8.10_fusionado.py
 Python: 3.11.15
-Fecha: 2026-10-11 03:07:04
+Fecha: 2026-10-11 07:07:35
 
 === vacio: exit 2 (esperado 2) OK · 1.3s
   setUpClass (test_mercadocontrol.TestApi) ... ERROR

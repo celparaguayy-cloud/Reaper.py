@@ -1,0 +1,20 @@
+🐉 REAPER 8.10 · autotest (910 tests, sin API)
+..............................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................No hay tests que coincidan con el filtro 'reaper810_no_existe_987'. Clases: TestAdvertenciasDeTests, TestAgente, TestAislamientoCredenciales, TestAnalizarDependencias, TestAnalizarMuestra, TestArchivoSensible, TestAuditorCLI, TestAuditorConfig, TestAutofix, TestAutonomiaV8, TestAvisoAlEscribirTests, TestBloqueSeguridad…
+......................................................................$ aceptación independiente: unittest /tmp/reaper_autotest_atrsxzl8/evaluador_independiente
+exit code: 0
+STDERR:
+test_ok (test_calidad.TestX.test_ok) ... ok
+
+----------------------------------------------------------------------
+Ran 1 test in 0.000s
+
+OK
+
+ACEPTACIÓN: 1 corridos, 1 efectivos, 0 fallos, 0 errores, 0 omitidos (mínimo 1).
+..........................................................................................................................................................................................................................
+----------------------------------------------------------------------
+Ran 910 tests in 75.862s
+
+OK
+Tests más lentos: TestPlantillas.test_todas_las_plantillas_pasan_sus_tests 12.9s; TestValidacionProyecto.test_go_build_detecta_error_entre_archivos 4.3s; TestReaper810Round9.test_android_java_offline 3.7s; TestCtrlCNoCuelga.test_sigint_real_sale_en_plazo_acotado 3.3s; TestProcesosFondo.test_limites_y_seguridad 3.2s; TestRecetasLenguajes.test_recetas_ejecutables_funcionan 2.8s; TestEvalsConSolucion.test_tests_ocultos_pasan_con_la_solucion_de_referencia 1.9s; TestDoctor.test_instalar_lanzador 1.9s
+✓ 910 tests OK en 1m15s

@@ -1,21 +1,21 @@
-REAPER: /home/user/Reaper.py/reaper_v8.py
+REAPER: /home/user/Reaper.py/entrega_fusion/reaper_8.10_fusionado.py
 Python: 3.11.15
-HOME temporal: /tmp/reaper smoke home lxj6qkvw
+HOME temporal: /tmp/reaper smoke home j2mdgh4i
 
 OK  --version                              exit=0 (esperado 0)   0.6s
 OK  --help                                 exit=0 (esperado 0)   0.6s
 OK  --plantillas                           exit=0 (esperado 0)   0.6s
     plantillas listadas: 68
 OK  --autotest-filtro inexistente → 2      exit=2 (esperado 2)   0.6s
-OK  --autotest-filtro testcli              exit=0 (esperado 0)   1.5s
+OK  --autotest-filtro testcli              exit=0 (esperado 0)   1.6s
 OK  --aceptacion sin manifiesto → 2        exit=2 (esperado 2)   0.6s
-OK  --doctor sin clave → 1 (crítico)       exit=1 (esperado 1)   0.7s
-OK  -p sin clave → error claro, sin colgarse exit=1 (esperado 1)   0.9s
+OK  --doctor sin clave → 1 (crítico)       exit=1 (esperado 1)   0.6s
+OK  -p sin clave → error claro, sin colgarse exit=1 (esperado 1)   1.0s
 OK  --nuevo 2048                           exit=0 (esperado 0)   0.6s
 OK    tests de la plantilla 2048                 exit=0  [python3 -m unittest discover -s tests -t .]
-OK  --nuevo agenda                         exit=0 (esperado 0)   0.6s
+OK  --nuevo agenda                         exit=0 (esperado 0)   0.7s
 OK    tests de la plantilla agenda               exit=0  [python3 -m unittest discover -s tests -t .]
-OK  --nuevo ahorcado                       exit=0 (esperado 0)   0.7s
+OK  --nuevo ahorcado                       exit=0 (esperado 0)   0.6s
 OK    tests de la plantilla ahorcado             exit=0  [python3 -m unittest discover -s tests -t .]
 OK  --nuevo android-java                   exit=0 (esperado 0)   0.6s
 OK    tests de la plantilla android-java         exit=0  [bash tests/test_counter.sh]
@@ -31,15 +31,15 @@ OK  --nuevo blackjack                      exit=0 (esperado 0)   0.6s
 OK    tests de la plantilla blackjack            exit=0  [python3 -m unittest discover -s tests -t .]
 OK  --nuevo bot-telegram                   exit=0 (esperado 0)   0.6s
 OK    tests de la plantilla bot-telegram         exit=0  [python3 -m unittest discover -s tests -t .]
-OK  --nuevo buscaminas                     exit=0 (esperado 0)   0.6s
+OK  --nuevo buscaminas                     exit=0 (esperado 0)   0.7s
 OK    tests de la plantilla buscaminas           exit=0  [python3 -m unittest discover -s tests -t .]
-OK  --nuevo c-rpn                          exit=0 (esperado 0)   0.7s
+OK  --nuevo c-rpn                          exit=0 (esperado 0)   0.6s
 OK    tests de la plantilla c-rpn                exit=0  [make test]
-OK  --nuevo calculadora-web                exit=0 (esperado 0)   0.6s
+OK  --nuevo calculadora-web                exit=0 (esperado 0)   0.7s
 OK    tests de la plantilla calculadora-web      exit=0  [node --test]
 OK  --nuevo chat                           exit=0 (esperado 0)   0.7s
 OK    tests de la plantilla chat                 exit=0  [python3 -m unittest discover -s tests -t .]
-OK  --nuevo chat-sse                       exit=0 (esperado 0)   0.7s
+OK  --nuevo chat-sse                       exit=0 (esperado 0)   0.8s
 OK    tests de la plantilla chat-sse             exit=0  [node --test]
 OK  --nuevo chatbot                        exit=0 (esperado 0)   0.6s
 OK    tests de la plantilla chatbot              exit=0  [python3 -m unittest discover -s tests]
@@ -47,7 +47,7 @@ OK  --nuevo claves                         exit=0 (esperado 0)   0.6s
 OK    tests de la plantilla claves               exit=0  [python3 -m unittest discover -s tests -t .]
 OK  --nuevo conecta4                       exit=0 (esperado 0)   0.6s
 OK    tests de la plantilla conecta4             exit=0  [python3 -m unittest discover -s tests -t .]
-OK  --nuevo conversor                      exit=0 (esperado 0)   0.7s
+OK  --nuevo conversor                      exit=0 (esperado 0)   0.6s
 OK    tests de la plantilla conversor            exit=0  [python3 -m unittest discover -s tests -t .]
 OK  --nuevo cron                           exit=0 (esperado 0)   0.6s
 OK    tests de la plantilla cron                 exit=0  [python3 -m unittest discover -s tests -t .]
@@ -59,23 +59,23 @@ OK  --nuevo editor-markdown                exit=0 (esperado 0)   0.6s
 OK    tests de la plantilla editor-markdown      exit=0  [node --test]
 OK  --nuevo flashcards                     exit=0 (esperado 0)   0.6s
 OK    tests de la plantilla flashcards           exit=0  [python3 -m unittest discover -s tests]
-OK  --nuevo gastos                         exit=0 (esperado 0)   0.6s
+OK  --nuevo gastos                         exit=0 (esperado 0)   0.7s
 OK    tests de la plantilla gastos               exit=0  [python3 -m unittest discover -s tests -t .]
 OK  --nuevo gastos-web                     exit=0 (esperado 0)   0.6s
 OK    tests de la plantilla gastos-web           exit=0  [node --test]
 OK  --nuevo go-api                         exit=0 (esperado 0)   0.6s
 OK    tests de la plantilla go-api               exit=0  [go test ./...]
-OK  --nuevo go-tareas                      exit=0 (esperado 0)   0.6s
+OK  --nuevo go-tareas                      exit=0 (esperado 0)   0.7s
 OK    tests de la plantilla go-tareas            exit=0  [go test ./...]
 OK  --nuevo habitos                        exit=0 (esperado 0)   0.6s
 OK    tests de la plantilla habitos              exit=0  [python3 -m unittest discover -s tests]
-OK  --nuevo horario                        exit=0 (esperado 0)   0.6s
+OK  --nuevo horario                        exit=0 (esperado 0)   0.7s
 OK    tests de la plantilla horario              exit=0  [python3 -m unittest discover -s tests]
 OK  --nuevo inventario                     exit=0 (esperado 0)   0.6s
 OK    tests de la plantilla inventario           exit=0  [python3 -m unittest discover -s tests -t .]
-OK  --nuevo java-banco                     exit=0 (esperado 0)   0.6s
+OK  --nuevo java-banco                     exit=0 (esperado 0)   0.7s
 OK    tests de la plantilla java-banco           exit=0  [sh tests/run_tests.sh]
-OK  --nuevo juego-canvas                   exit=0 (esperado 0)   0.7s
+OK  --nuevo juego-canvas                   exit=0 (esperado 0)   0.6s
 OK    tests de la plantilla juego-canvas         exit=0  [node --test]
 OK  --nuevo kanban-web                     exit=0 (esperado 0)   0.6s
 OK    tests de la plantilla kanban-web           exit=0  [node --test]
@@ -83,7 +83,7 @@ OK  --nuevo kv-store                       exit=0 (esperado 0)   0.6s
 OK    tests de la plantilla kv-store             exit=0  [python3 -m unittest discover -s tests -t .]
 OK  --nuevo logs                           exit=0 (esperado 0)   0.7s
 OK    tests de la plantilla logs                 exit=0  [python3 -m unittest discover -s tests -t .]
-OK  --nuevo markdown                       exit=0 (esperado 0)   0.7s
+OK  --nuevo markdown                       exit=0 (esperado 0)   0.6s
 OK    tests de la plantilla markdown             exit=0  [python3 -m unittest discover -s tests]
 OK  --nuevo memoria                        exit=0 (esperado 0)   0.6s
 OK    tests de la plantilla memoria              exit=0  [python3 -m unittest discover -s tests -t .]
@@ -100,27 +100,12 @@ OK    tests de la plantilla organizador          exit=0  [python3 -m unittest di
 OK  --nuevo paquete                        exit=0 (esperado 0)   0.6s
 OK    tests de la plantilla paquete              exit=0  [python3 -m unittest discover -s tests -t .]
 OK  --nuevo perl-conversor                 exit=0 (esperado 0)   0.6s
-MAL   tests de la plantilla perl-conversor       exit=1  [prove -l t]
-     Tests=16,  0 wallclock secs ( 0.02 usr  0.00 sys +  0.05 cusr  0.00 csys =  0.07 CPU)
-    Result: FAIL
-    Can't open perl script "/tmp/reaper": No such file or directory
-    
-    #   Failed test 'REPL por stdin convierte'
-    #   at t/conversor.t line 29.
-    #                   ''
-    #     doesn't match '(?^:100 c = 212 f)'
-    
-    #   Failed test 'REPL por stdin informa errores'
-    #   at t/conversor.t line 30.
-    #                   ''
-    #     doesn't match '(?^:error: no se puede convertir)'
-    # Looks like you failed 2 tests of 16.
-    
+OK    tests de la plantilla perl-conversor       exit=0  [prove -l t]
 OK  --nuevo php-carrito                    exit=0 (esperado 0)   0.6s
 OK    tests de la plantilla php-carrito          exit=0  [php tests/run.php]
 OK  --nuevo pomodoro                       exit=0 (esperado 0)   0.6s
 OK    tests de la plantilla pomodoro             exit=0  [python3 -m unittest discover -s tests -t .]
-OK  --nuevo pong-canvas                    exit=0 (esperado 0)   0.7s
+OK  --nuevo pong-canvas                    exit=0 (esperado 0)   0.6s
 OK    tests de la plantilla pong-canvas          exit=0  [node --test]
 OK  --nuevo presupuesto                    exit=0 (esperado 0)   0.6s
 OK    tests de la plantilla presupuesto          exit=0  [python3 -m unittest discover -s tests]
@@ -130,29 +115,29 @@ OK  --nuevo pwa-offline                    exit=0 (esperado 0)   0.6s
 OK    tests de la plantilla pwa-offline          exit=0  [node --test tests/*.test.mjs]
 OK  --nuevo python-cli                     exit=0 (esperado 0)   0.6s
 OK    tests de la plantilla python-cli           exit=0  [python3 -m unittest discover -s tests -t .]
-OK  --nuevo quiz                           exit=0 (esperado 0)   0.6s
+OK  --nuevo quiz                           exit=0 (esperado 0)   0.7s
 OK    tests de la plantilla quiz                 exit=0  [python3 -m unittest discover -s tests -t .]
-OK  --nuevo react-vite                     exit=0 (esperado 0)   0.7s
+OK  --nuevo react-vite                     exit=0 (esperado 0)   0.6s
 OK    tests de la plantilla react-vite           exit=0  [node --test tests/*.test.mjs]
 OK  --nuevo respaldo                       exit=0 (esperado 0)   0.6s
 OK    tests de la plantilla respaldo             exit=0  [python3 -m unittest discover -s tests -t .]
-OK  --nuevo rss                            exit=0 (esperado 0)   0.6s
+OK  --nuevo rss                            exit=0 (esperado 0)   0.7s
 OK    tests de la plantilla rss                  exit=0  [python3 -m unittest discover -s tests]
-OK  --nuevo ruby-biblioteca                exit=0 (esperado 0)   0.7s
+OK  --nuevo ruby-biblioteca                exit=0 (esperado 0)   0.6s
 OK    tests de la plantilla ruby-biblioteca      exit=0  [ruby -Ilib -Itest test/test_biblioteca.rb]
-OK  --nuevo rust-inventario                exit=0 (esperado 0)   0.6s
+OK  --nuevo rust-inventario                exit=0 (esperado 0)   0.7s
 OK    tests de la plantilla rust-inventario      exit=0  [cargo test --offline -q]
-OK  --nuevo scraper                        exit=0 (esperado 0)   1.0s
+OK  --nuevo scraper                        exit=0 (esperado 0)   0.8s
 OK    tests de la plantilla scraper              exit=0  [python3 -m unittest discover -s tests -t .]
 OK  --nuevo sitio-estatico                 exit=0 (esperado 0)   0.6s
 OK    tests de la plantilla sitio-estatico       exit=0  [python3 -m unittest discover -s tests -t .]
-OK  --nuevo snake                          exit=0 (esperado 0)   0.6s
+OK  --nuevo snake                          exit=0 (esperado 0)   0.7s
 OK    tests de la plantilla snake                exit=0  [python3 -m unittest discover -s tests -t .]
 OK  --nuevo sudoku                         exit=0 (esperado 0)   0.6s
 OK    tests de la plantilla sudoku               exit=0  [python3 -m unittest discover -s tests -t .]
-OK  --nuevo tareas                         exit=0 (esperado 0)   0.6s
+OK  --nuevo tareas                         exit=0 (esperado 0)   0.7s
 OK    tests de la plantilla tareas               exit=0  [python3 -m unittest discover -s tests -t .]
-OK  --nuevo tateti                         exit=0 (esperado 0)   0.6s
+OK  --nuevo tateti                         exit=0 (esperado 0)   0.7s
 OK    tests de la plantilla tateti               exit=0  [python3 -m unittest discover -s tests -t .]
 OK  --nuevo termux-api                     exit=0 (esperado 0)   0.6s
 OK    tests de la plantilla termux-api           exit=0  [python3 -m unittest discover -s tests -t .]
@@ -160,8 +145,8 @@ OK  --nuevo web-auth                       exit=0 (esperado 0)   0.6s
 OK    tests de la plantilla web-auth             exit=0  [python3 -m unittest discover -s tests -v]
 OK  --nuevo web-fullstack                  exit=0 (esperado 0)   0.6s
 OK    tests de la plantilla web-fullstack        exit=0  [python3 -m unittest discover -s tests -v]
-OK  --nuevo web-tareas                     exit=0 (esperado 0)   0.7s
+OK  --nuevo web-tareas                     exit=0 (esperado 0)   0.6s
 OK    tests de la plantilla web-tareas           exit=0  [node --test]
-OK  --auditar-web web-fullstack            exit=0 (esperado 0)   0.6s
+OK  --auditar-web web-fullstack            exit=0 (esperado 0)   0.7s
 
-RESULTADO: 1 fallas: tests perl-conversor
+RESULTADO: 0 fallas

@@ -1,0 +1,28 @@
+Python 3.11.15
+[0] reaper_8.10_chatgpt_r12.py
+[1] reaper_8.10_fusionado.py
+
+== P0-3 XML mal cerrado se escribe en el archivo
+  [0] 'body { color: red; }\n</replace_line>\nh1 { margin: 0; }\n'
+  [1] 'body { color: black; }\nh1 { margin: 0; }\n'
+== P0-4 Ctrl+C con modelo lento
+  [0] salió en 28.1 s
+  [1] salió en 2.1 s
+== P0-4b hijos huérfanos tras Ctrl+C
+  [0] hijos vivos tras Ctrl+C: 2
+  [1] hijos vivos tras Ctrl+C: 0
+== P0-5a gate suplantado por unittest.py
+  [0] SIN sombra  -> ok = False | CON sombra  -> ok = True
+  [1] SIN sombra  -> ok = False | CON sombra  -> ok = False
+== P0-5c agente edita/borra acceptance.json
+  [0] write_to_file -> {"suite_dir": "/tmp/x", "min_tests": 1} |  | delete_file -> BORRADO
+  [1] write_to_file -> {"suite_dir": "/tmp/x", "min_tests": 10} | delete_file -> {"suite_dir": "/tmp/x", "min_tests": 10}
+== P0-5d tests todos omitidos
+  [0] verif.ok: True | estado final: verificada
+  [1] verif.ok: False | estado final: fallida
+== P2 proyecto afloja modo/hooks
+  [0] modo: auto | hooks: True | max_reparaciones: 10
+  [1] modo: confirmar | hooks: True | max_reparaciones: 10
+== P2 hook al_iniciar sin consentimiento
+  [0] hook de inicio ejecutado SIN consentimiento: True
+  [1] hook de inicio ejecutado SIN consentimiento: False
