@@ -815,7 +815,10 @@ class UI:
         self.linea(f"{Tema.ok}✓ {texto}{C.RESET}")
 
     def aviso(self, texto: str) -> None:
-        self.linea(f"{Tema.aviso}{texto}{C.RESET}")
+        # Glifo de advertencia respetando la sangría existente (no rompe mensajes ya indentados).
+        pelado = texto.lstrip(" ")
+        sangria = texto[: len(texto) - len(pelado)]
+        self.linea(f"{sangria}{Tema.aviso}⚠ {pelado}{C.RESET}")
 
     def error(self, texto: str) -> None:
         self.linea(f"{Tema.error}✗ {texto}{C.RESET}")
@@ -824,14 +827,16 @@ class UI:
         self.linea(f"{Tema.tenue}{texto}{C.RESET}")
 
     def titulo(self, texto: str) -> None:
-        self.linea(f"\n{Tema.titulo}{C.BOLD}══ {texto} ══{C.RESET}")
+        # Barra de acento a la izquierda: más limpio que el marco simétrico y el texto resalta.
+        self.linea(f"\n{Tema.acento}▌{Tema.titulo}{C.BOLD} {texto}{C.RESET}")
 
     def fase(self, numero: Union[int, str], texto: str) -> None:
         ancho = min(ancho_terminal(), 72)
-        etiqueta = f" FASE {numero} · {texto} "
-        relleno = max(2, ancho - ancho_visible(etiqueta) - 4)
+        etiqueta = f"FASE {numero} · {texto}"
+        relleno = max(3, ancho - ancho_visible(etiqueta) - 4)
         self.linea("")
-        self.linea(f"{Tema.titulo}{C.BOLD}━━{etiqueta}{'━' * relleno}{C.RESET}")
+        # Diamante de acento + etiqueta resaltada + regla tenue que se desvanece (en vez de una barra pesada).
+        self.linea(f"{Tema.acento}◆{C.RESET} {Tema.titulo}{C.BOLD}{etiqueta}{C.RESET} {Tema.tenue}{'─' * relleno}{C.RESET}")
 
     def separador(self, caracter: str = "─") -> None:
         self.linea(f"{Tema.tenue}{caracter * min(ancho_terminal(), 72)}{C.RESET}")
