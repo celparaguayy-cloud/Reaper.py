@@ -63,8 +63,8 @@ NOMBRES_TEXTO = {
 _RE_ASIGNA_SECRETO = re.compile(
     r"(?i)([\"']?[A-Za-z0-9_.\-]*"
     r"(?:api[_-]?key|access[_-]?key|private[_-]?key|secret|password|passwd|pwd|auth[_-]?token|token|"
-    r"contrase\w*|clave\w*)"
-    r"[\"']?\s*[:=]\s*)[\"']?([^\s\"',}]{5,})")
+    r"credential|contrase\w*|clave\w*)[A-Za-z0-9_]*"
+    r"[\"']?\s*[:=]\s*[\"']?)([^\s\"',}]{5,})")
 _RE_URL_CRED = re.compile(r"(?i)\b([a-z][a-z0-9+.\-]*://[^\s:@/]+):([^\s:@/]{3,})@")
 PATRONES_SECRETOS = [  # se reemplazan por [REDACTADO] enteros
     re.compile(r"\bsk-(?:proj-|ant-|or-)?[A-Za-z0-9_-]{16,}"),      # OpenAI / OpenRouter / Anthropic
@@ -76,6 +76,12 @@ PATRONES_SECRETOS = [  # se reemplazan por [REDACTADO] enteros
     re.compile(r"\bAKIA[0-9A-Z]{16}\b"),                           # AWS access key id
     re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._\-]{12,}"),            # Authorization: Bearer …
 ]
+
+# Complementa el filtro clave=valor con claves entrecomilladas de JSON.
+# No deja valores de API en informes ni sesiones persistentes.
+_PATRON_JSON_SECRETO = re.compile(
+    r"(?i)([\"'](?:[\w-]*)(?:api[_-]?key|token|secret|password|passwd|private_key|credential)[\"']\s*:\s*[\"'])([^\"'\r\n]+)"
+)
 
 MAX_BYTES_LECTURA = 1_000_000
 
@@ -91,6 +97,7 @@ def redactar_secretos(texto: str) -> str:
     limpio = _RE_URL_CRED.sub(lambda m: f"{m.group(1)}:[REDACTADO]@", limpio)       # user:pass@host
     for patron in PATRONES_SECRETOS:
         limpio = patron.sub("[REDACTADO]", limpio)
+    limpio = _PATRON_JSON_SECRETO.sub(lambda m: m.group(1) + "[REDACTADO]", limpio)
     return limpio
 
 
@@ -253,17 +260,24 @@ class Workspace:
         return self.raiz / ".reaper"
 
     def notas(self, limite: int = 2500) -> str:
-        """Notas persistentes que dejaron los agentes (save_note) en .reaper/notas.md."""
+        """Notas internas: jamás seguir symlinks ni exponer secretos al modelo."""
         ruta = self.carpeta_reaper() / "notas.md"
+        if ruta.is_symlink():
+            return ""
         try:
-            return ruta.read_text(encoding="utf-8", errors="replace")[-limite:]
-        except OSError:
+            texto = self.leer(".reaper/notas.md")
+            return redactar_secretos(texto[-max(0, limite):])
+        except (OSError, ErrorRuta, ValueError):
             return ""
 
     # ------------------------------------------------------------ listado
     def _patrones_gitignore(self) -> list[str]:
         """Se recarga si .gitignore cambia (el agente o el usuario pueden editarlo en la sesión)."""
         archivo = self.raiz / ".gitignore"
+        if archivo.is_symlink():
+            # No incorporar reglas desde un archivo externo al proyecto.
+            self._ignorar, self._gitignore_mtime = [], None
+            return self._ignorar
         try:
             mtime = archivo.stat().st_mtime
         except OSError:
@@ -308,13 +322,18 @@ class Workspace:
             rel_actual = "" if rel_actual == "." else rel_actual
             dirs[:] = sorted(
                 d for d in dirs
-                if not self.ignorado(f"{rel_actual}/{d}".lstrip("/"), True)
+                if not (Path(actual) / d).is_symlink()
+                and not self.ignorado(f"{rel_actual}/{d}".lstrip("/"), True)
             )
             for nombre in sorted(archivos):
                 rel = f"{rel_actual}/{nombre}".lstrip("/")
-                if self.ignorado(rel, False):
+                ruta = Path(actual) / nombre
+                # Un enlace simbólico puede apuntar a secretos fuera del workspace.
+                # Nunca mostrar ni indexar su contenido (la resolución de rutas ya
+                # protege lecturas explícitas, pero el iterador debe hacer lo mismo).
+                if ruta.is_symlink() or self.ignorado(rel, False):
                     continue
-                yield Path(actual) / nombre
+                yield ruta
                 contador += 1
                 if contador >= limite:
                     return
@@ -357,20 +376,26 @@ class Workspace:
     def memoria(self, limite: int = 4000) -> str:
         for nombre in ("REAPER.md", "CLAUDE.md", "AGENTS.md"):
             ruta = self.raiz / nombre
-            if ruta.is_file():
-                try:
-                    texto = ruta.read_text(encoding="utf-8", errors="replace")
-                except OSError:
-                    continue
-                return f"({nombre})\n" + texto[:limite]
+            if ruta.is_symlink():
+                continue   # No permitir instrucciones indirectas fuera del workspace.
+            try:
+                texto = self.leer(nombre)
+            except (OSError, ErrorRuta, ValueError):
+                continue
+            return f"({nombre})\n" + redactar_secretos(texto[:max(0, limite)])
         return ""
 
     def config_local(self) -> dict:
         ruta = self.raiz / ".reaper" / "config.json"
+        if ruta.is_symlink() or (self.raiz / ".reaper").is_symlink():
+            return {}
         try:
-            data = json.loads(ruta.read_text(encoding="utf-8"))
+            segura = self.ruta(".reaper/config.json")
+            if segura.stat().st_size > MAX_BYTES_LECTURA:
+                return {}
+            data = json.loads(segura.read_text(encoding="utf-8"))
             return data if isinstance(data, dict) else {}
-        except (OSError, ValueError):
+        except (OSError, ValueError, ErrorRuta):
             return {}
 
 

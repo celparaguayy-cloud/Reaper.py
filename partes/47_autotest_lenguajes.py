@@ -158,7 +158,7 @@ class TestRecetasLenguajes(BaseTest):
                 continue
             with self.subTest(receta=r.titulo):
                 if not receta_disponible(r):
-                    continue
+                    self.skipTest(f"Dependencia no instalada para {r.titulo}: intérprete o extensión PDO SQLite")
                 if r.lenguaje in compilados and not os.getenv("REAPER_AUTOTEST_COMPLETO"):
                     continue  # compilar tarda: solo con REAPER_AUTOTEST_COMPLETO=1
                 resultado = self._correr(r)

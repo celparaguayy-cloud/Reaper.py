@@ -410,7 +410,7 @@ def banner_dragon(columnas: Optional[int] = None, subtitulo: str = "") -> str:
     margen_logo = max(0, (columnas - ancho_logo) // 2)
     lineas.append("")
     lineas.extend(" " * margen_logo + l for l in logo)
-    texto = subtitulo or f"agente autónomo de programación · v{__version__} «{__codename__}»"
+    texto = subtitulo or f"agente autónomo de programación · {__version__}"
     margen_sub = max(0, (columnas - ancho_visible(texto)) // 2)
     lineas.append(" " * margen_sub + f"{C.ESCAMA}{texto}{C.RESET}")
     return "\n".join(lineas)
@@ -456,7 +456,7 @@ def animar_intro(columnas: Optional[int] = None, salida=None, cuadros: int = 7, 
             salida.write(" " * margen_logo + l + "\n")
             salida.flush()
             time.sleep(pausa / 2)
-        texto = f"agente autónomo de programación · v{__version__} «{__codename__}»"
+        texto = f"agente autónomo de programación · {__version__}"
         salida.write(" " * max(0, (columnas - ancho_visible(texto)) // 2) + f"{C.ESCAMA}{texto}{C.RESET}\n")
     except (OSError, ValueError):
         return False

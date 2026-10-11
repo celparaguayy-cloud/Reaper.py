@@ -153,12 +153,22 @@ DIRECTOR_POR_DEFECTO = "or-dolphin-jefe-free"
 
 MODELOS = {alias: info.id for alias, info in INFO_MODELOS.items()}
 
+# Compatibilidad con alias antiguos que se enviaban como IDs literales y daban HTTP 400 (ronda 8.10 de
+# ChatGPT). Hoy esos alias están definidos en INFO_MODELOS con su proveedor real, que tiene prioridad; acá solo
+# van alias viejos que ya NO existan en INFO_MODELOS. No mapear un alias a un modelo de OTRO proveedor/familia
+# (antes groq-gptoss120 terminaba en un Nemotron de OpenRouter). Estado real del modelo: /equipo probar.
+ALIAS_MODELOS_HEREDADOS: dict = {}
+
 MODOS = ("confirmar", "auto-edicion", "auto")
 
 
 def resolver_modelo(nombre: str) -> str:
     nombre = (nombre or "").strip()
-    return MODELOS.get(nombre.lower(), nombre)
+    proveedor, sep, identificador = nombre.partition(":")
+    if sep and proveedor.lower() in PROVEEDORES and identificador:
+        corregido = MODELOS.get(identificador.lower(), ALIAS_MODELOS_HEREDADOS.get(identificador.lower(), identificador))
+        return f"{proveedor.lower()}:{corregido}"
+    return MODELOS.get(nombre.lower(), ALIAS_MODELOS_HEREDADOS.get(nombre.lower(), nombre))
 
 
 def separar_proveedor(nombre: str) -> tuple:

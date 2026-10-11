@@ -1327,7 +1327,12 @@ def ejecutar_tests(ws: Workspace, timeout: int = 300, completo: bool = False) ->
     comando, _nombre = detectado
     r = ejecutar(comando, cwd=ws.raiz, timeout=timeout, shell=True)
     combinado = r.stdout + r.stderr
-    if r.codigo == 5 or "NO TESTS RAN" in combinado or re.search(r"\bRan 0 tests?\b", combinado):
+    # Un exit 5 genérico NO significa "no hay tests". pytest y unittest (Python ≥ 3.12) usan
+    # ese código para indicar recolección vacía. La evidencia
+    # textual es necesaria y nunca se convierte un timeout en éxito.
+    sin_tests = bool(re.search(r"\b(?:no tests ran|collected 0 items|Ran 0 tests?)\b",
+                               combinado, re.IGNORECASE))
+    if sin_tests and not r.timeout and (r.codigo == 0 or (r.codigo == 5 and _nombre in ("pytest", "unittest"))):
         r.ok, r.omitido = True, True
         r.stdout = "No se encontraron tests para ejecutar. " + r.stdout
     return r

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-REAPER v8.0.0 «Dragón» — agente de programación autónomo para Termux vía OpenRouter
+REAPER 8.10 — agente de programación autónomo para Termux con proveedores de IA
 (estilo Claude Code / Codex / Antigravity, pensado para sacarle el máximo a un modelo de 24B).
 
 Archivo único generado desde partes/ con empaquetar.py.
@@ -61,18 +61,18 @@ Clave:
     export OPENROUTER_API_KEY="tu_key"
 
 Ejecutar:
-    python3 reaper_v8.py                                  modo interactivo (/ayuda)
-    python3 reaper_v8.py --proyecto ~/mi_app              abre un workspace
-    python3 reaper_v8.py -p "agregá tests a utils.py"     un pedido y sale
-    python3 reaper_v8.py --construir "API de notas" --auto
-    python3 reaper_v8.py --autotest                       verifica REAPER sin gastar API
-    python3 reaper_v8.py --instalar                       crea el comando `reaper`
+    python3 reaper_8.10.py                                  modo interactivo (/ayuda)
+    python3 reaper_8.10.py --proyecto ~/mi_app              abre un workspace
+    python3 reaper_8.10.py -p "agregá tests a utils.py"     un pedido y sale
+    python3 reaper_8.10.py --construir "API de notas" --auto
+    python3 reaper_8.10.py --autotest                       verifica REAPER sin gastar API
+    python3 reaper_8.10.py --instalar                       crea el comando `reaper`
 """
 
 from __future__ import annotations
 
-__version__ = "8.0.0"
-__codename__ = "Dragón"
+__version__ = "8.10"
+__codename__ = ""  # Nombre del producto: REAPER
 
 import argparse
 import atexit

@@ -149,7 +149,7 @@ class TestCLI(BaseTest):
         app.mostrar_inicio(animar=False)
         texto = self.salida(app)
         self.assertIn("proyecto", texto)
-        self.assertIn("v" + __version__, texto)
+        self.assertIn(__version__, texto)
 
     def test_sesion_persistente(self):
         ws = self.proyecto()
@@ -246,8 +246,13 @@ class TestDoctor(BaseTest):
             if es_termux():
                 self.skipTest("en Termux el lanzador va a $PREFIX/bin")
             self.assertTrue(lanzador and lanzador.exists())
-            self.assertIn("import reaper_v8", lanzador.read_text())
-            self.assertTrue((BASE_DIR / "app" / "reaper_v8.py").exists())
+            self.assertIn("import reaper\n", lanzador.read_text())
+            self.assertTrue((BASE_DIR / "app" / "reaper.py").exists())
+            # Prueba real del lanzador, no solamente del texto generado.
+            ejecucion = subprocess.run([sys.executable, str(lanzador), "--version"],
+                                       capture_output=True, text=True, timeout=15)
+            self.assertEqual(ejecucion.returncode, 0, ejecucion.stderr)
+            self.assertIn("REAPER 8.10", ejecucion.stdout)
         finally:
             for k, v in anteriores.items():
                 if v is None:

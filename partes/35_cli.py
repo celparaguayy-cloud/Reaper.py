@@ -20,6 +20,7 @@ COMANDOS_AYUDA = [
     ]),
     ("EQUIPO", [
         ("/construir <pedido>", "exploradores → arquitecto → tests primero → torneo por tarea → verificación → reparador"),
+        ("/pendiente · /continuar", "revisar y reanudar con control tareas que agotaron pasos"),
         ("/plan <pedido>", "solo exploración + plan (se guarda en .reaper/planes)"),
         ("/modo plan", "modo plan: propone un plan en solo lectura y lo ejecuta cuando lo aprobás"),
         ("/torneo <tarea>", "N implementadores compiten en copias aisladas; gana el que pasa más tests"),
@@ -32,6 +33,7 @@ COMANDOS_AYUDA = [
         ("/proyecto [ruta]", "cambia de workspace"),
         ("/nuevo <plantilla> <carpeta>", "crea un proyecto listo y testeado desde una plantilla"),
         ("/plantillas", "lista las plantillas disponibles"),
+        ("/auditar-web", "auditoría local de HTML y recursos sin ejecutar código"),
         ("/scan · /tests · /validar [archivos]", "validadores, suite de tests, validación puntual"),
         ("/correr <archivo> [args]", "ejecuta y ofrece reparar si crashea"),
         ("/vigilar [comando]", "corre los tests cada vez que cambia un archivo (Ctrl+C para salir)"),
@@ -110,6 +112,29 @@ def resolver_workspace(texto: str) -> Path:
 _RE_MENCION = re.compile(r"(?<![\w/])@([\w./-]+\.[\w]+|[\w./-]+/)")
 
 
+def detectar_workspace_mezclado(ws: Workspace, pedido: str) -> str:
+    """Detecta la colisión observada NovaDB/OFICIORADAR sin inspeccionar datos privados.
+
+    Solo bloquea nuevas construcciones explícitas de NovaDB cuando ya hay tests
+    de ofertas/postulaciones incompatibles; no afecta tareas de mantenimiento.
+    """
+    t = (pedido or "").lower()
+    if "novadb" not in t or not re.search(r"\b(constru|crea|desde cero|implement|desarroll)", t):
+        return ""
+    for nombre in ("tests/test_db.py", "tests/test_api.py", "tests/test_match.py"):
+        ruta = ws.raiz / nombre
+        try:
+            if ruta.is_file():
+                contenido = ruta.read_text(encoding="utf-8", errors="replace")[:35000].lower()
+                if any(palabra in contenido for palabra in ("postulacion", "trabajador", "oferta", "empresa")):
+                    return ("CONFLICTO DE WORKSPACE: se pidió NovaDB, pero " + nombre +
+                            " contiene pruebas de un sistema de empleos/ofertas. "
+                            "No se deben mezclar ni borrar pruebas para ocultar errores.")
+        except OSError:
+            continue
+    return ""
+
+
 class App:
     def __init__(self, settings: Settings, llm, ui: UI, ws: Workspace, persistir: bool = True):
         self.settings = settings
@@ -124,6 +149,8 @@ class App:
         self.historial: list[tuple[str, str, bool]] = []
         self._rehacer: Optional[dict] = None
         self._pedido_actual = ""
+        # El trabajo inconcluso se mantiene por proyecto; nunca se reejecuta sin /continuar.
+        self.pendiente: Optional[dict] = None
         self.modo_plan = False
         self.escalador = Escalador(llm, settings, ui)
         self.memoria = self._nueva_memoria()
@@ -169,8 +196,10 @@ class App:
             mensajes = [{**m, "content": redactar_secretos(m["content"])} if isinstance(m.get("content"), str)
                         else m for m in mensajes]
             datos = {"mensajes": mensajes, "todo": self.principal.ctx.todo,
-                     "historial": self.historial[-50:], "guardado": datetime.now().isoformat(timespec="seconds")}
-            escritura_atomica(self._ruta_sesion(), json.dumps(datos, ensure_ascii=False))
+                     "historial": self.historial[-50:], "pendiente": self.pendiente,
+                     "guardado": datetime.now().isoformat(timespec="seconds")}
+            serializado = json.dumps(datos, ensure_ascii=False)
+            escritura_atomica(self._ruta_sesion(), redactar_secretos(serializado))
         except OSError as e:
             self.ui.aviso(f"No pude guardar la sesión: {e}")
 
@@ -179,18 +208,41 @@ class App:
             datos = json.loads(self._ruta_sesion().read_text(encoding="utf-8"))
         except (OSError, ValueError):
             return
-        mensajes = [m for m in datos.get("mensajes", [])
+        # Sesiones truncadas / modificadas a mano no pueden bloquear el inicio de REAPER.
+        if not isinstance(datos, dict):
+            return
+        raw_mensajes = datos.get("mensajes")
+        raw_historial = datos.get("historial")
+        raw_todo = datos.get("todo")
+        mensajes = [m for m in (raw_mensajes if isinstance(raw_mensajes, list) else [])
                     if isinstance(m, dict) and m.get("role") in ("user", "assistant") and isinstance(m.get("content"), str)]
-        self.historial = [tuple(h) for h in datos.get("historial", []) if isinstance(h, list) and len(h) == 3]
+        self.historial = [tuple(h) for h in (raw_historial if isinstance(raw_historial, list) else [])
+                          if isinstance(h, list) and len(h) == 3]
+        anterior = datos.get("pendiente")
+        if (isinstance(anterior, dict) and isinstance(anterior.get("pedido"), str)
+                and isinstance(anterior.get("intentos"), int)
+                and 0 <= anterior["intentos"] <= 3 and len(anterior["pedido"]) <= 6000):
+            # No confiar en tipos internos de un JSON local manipulado o truncado.
+            cambios = anterior.get("cambios")
+            self.pendiente = {
+                "pedido": anterior["pedido"], "intentos": anterior["intentos"],
+                "resumen": str(anterior.get("resumen", ""))[:1200],
+                "cambios": [c for c in (cambios if isinstance(cambios, list) else [])
+                            if isinstance(c, str)][:40],
+                "motivo": str(anterior.get("motivo", "max_pasos"))[:40],
+                "fecha": str(anterior.get("fecha", ""))[:40],
+            }
         if mensajes:
             self.principal.mensajes = [{"role": "system", "content": ""}] + mensajes
-            self.principal.ctx.todo[:] = [tuple(t) for t in datos.get("todo", []) if len(t) == 2]
+            self.principal.ctx.todo[:] = [tuple(t) for t in (raw_todo if isinstance(raw_todo, list) else [])
+                                          if isinstance(t, (list, tuple)) and len(t) == 2]
             self.aviso_sesion = (f"retomé la sesión anterior de este proyecto ({len(mensajes)} mensajes) · "
                                  "/reset para empezar de cero")
 
     def cambiar_workspace(self, ruta: Path) -> None:
         self._guardar_sesion()
         self.ws = Workspace(ruta)
+        self.pendiente = None  # nunca transportar pendientes a otro proyecto
         self.memoria = self._nueva_memoria()
         self.principal = self._nuevo_principal()
         self.historial = []
@@ -214,12 +266,21 @@ class App:
             if ruta.is_dir():
                 listado = [self.ws.rel(p) for p in self.ws.iterar(rel, limite=60)]
                 adjuntos.append(f"### Carpeta {self.ws.rel(ruta)}\n" + "\n".join(listado))
-            elif ruta.is_file() and self.ws.es_texto(ruta) and not es_binario(ruta):
+            elif ruta.is_file():
+                # Las menciones no deben saltarse la protección de Workspace.leer.
+                if es_archivo_sensible(ruta.name):
+                    adjuntos.append(f"### {self.ws.rel(ruta)}: archivo sensible protegido; no se adjunta")
+                    continue
+                if not self.ws.es_texto(ruta) or es_binario(ruta):
+                    continue
                 try:
+                    if ruta.stat().st_size > MAX_BYTES_LECTURA:
+                        adjuntos.append(f"### {self.ws.rel(ruta)}: demasiado grande; usá read_file por tramos")
+                        continue
                     lineas = ruta.read_text(encoding="utf-8", errors="replace").splitlines()
                 except OSError:
                     continue
-                cuerpo = "\n".join(f"{i:>5}| {l}" for i, l in enumerate(lineas[:300], start=1))
+                cuerpo = redactar_secretos("\n".join(f"{i:>5}| {l}" for i, l in enumerate(lineas[:300], start=1)))
                 extra = f"\n(... {len(lineas) - 300} líneas más: usá read_file)" if len(lineas) > 300 else ""
                 adjuntos.append(f"### {self.ws.rel(ruta)} ({len(lineas)} líneas)\n{cuerpo}{extra}")
         if not adjuntos:
@@ -261,19 +322,52 @@ class App:
             f"adaptalo y decilo en el informe):\n{res.resumen}"
         )
 
-    def turno(self, texto: str) -> bool:
+    def turno(self, texto: str, *, _continuacion_de: Optional[dict] = None) -> bool:
         if self.modo_plan:
             return self.turno_plan(texto)
+        conflicto = detectar_workspace_mezclado(self.ws, texto)
+        if conflicto:
+            self.ui.aviso(conflicto)
+            self.ui.aviso("Abrí un workspace nuevo con /proyecto o aclaralo en un pedido específico; no borraré tests existentes.")
+            return False
         self._pedido_actual = texto
         cid = self.ws.checkpoints.iniciar(f"pedido: {texto[:80]}")
         inicio = time.monotonic()
         res = None
         try:
             res = self.principal.ejecutar(self.expandir_menciones(texto), cid_inicio=cid)
+        except (KeyboardInterrupt, Cancelado):
+            # Guardar la tarea y el diff para poder retomarlos al reabrir Termux.
+            anterior = _continuacion_de or {}
+            self.pendiente = {
+                "pedido": str(anterior.get("pedido", texto))[:6000],
+                "resumen": "Ejecución interrumpida; hay que revisar archivos y tests.",
+                "cambios": list(self.ws.checkpoints.archivos_desde(cid))[:40],
+                "motivo": "interrumpido",
+                "intentos": int(anterior.get("intentos", 0)) + (1 if _continuacion_de else 0),
+                "fecha": datetime.now().isoformat(timespec="seconds"),
+            }
+            raise
         finally:
             self.historial.append((datetime.now().strftime("%H:%M"), texto[:200], bool(res and res.ok)))
-            self._guardar_sesion()
             self.ws.checkpoints.descartar_si_vacio(cid)
+            if res is None:
+                # También conservar el historial si el proveedor falla durante el turno.
+                self._guardar_sesion()
+        if res is not None:
+            if not res.ok and res.motivo in ("max_pasos", "bucle"):
+                base = _continuacion_de or {}
+                original = base.get("pedido", texto)
+                intentos = int(base.get("intentos", 0)) + (1 if _continuacion_de else 0)
+                self.pendiente = {
+                    "pedido": str(original)[:6000], "resumen": redactar_secretos(res.resumen[:1200]),
+                    "cambios": list(res.cambios[:40]), "motivo": res.motivo, "intentos": intentos,
+                    "fecha": datetime.now().isoformat(timespec="seconds"),
+                }
+                self.ui.aviso("  Trabajo incompleto guardado. /pendiente para revisarlo · /continuar para retomarlo.")
+            elif res.ok:
+                self.pendiente = None
+        self._guardar_sesion()
         self.ui.linea("")
         self.ui.linea(f"{Tema.agente}{C.BOLD}reaper »{C.RESET}")
         mostrar_markdown(self.ui, res.resumen)
@@ -298,9 +392,24 @@ class App:
         self.ui.linea("")
         return res.ok
 
-    def construir(self, pedido: str, confirmar: bool = True) -> bool:
+    def construir(self, pedido: str, confirmar: bool = True, reanudar: bool = False) -> bool:
+        if reanudar:
+            try:
+                previo = RegistroBuild(self.ws).leer()
+            except ValueError as e:
+                self.ui.error(str(e))
+                return False
+            if not previo:
+                self.ui.aviso("No hay ninguna construcción pendiente.")
+                return False
+            pedido = previo["pedido"]
+        conflicto = detectar_workspace_mezclado(self.ws, pedido)
+        if conflicto:
+            self.ui.aviso(conflicto)
+            self.ui.aviso("Usá /proyecto para abrir una carpeta nueva; no tocaré ni borraré tests ajenos.")
+            return False
         self._pedido_actual = pedido
-        informe = Orquestador(self.llm, self.ws, self.settings, self.ui).construir(pedido, confirmar)
+        informe = Orquestador(self.llm, self.ws, self.settings, self.ui).construir(pedido, confirmar, reanudar=reanudar)
         self.historial.append((datetime.now().strftime("%H:%M"), f"/construir {pedido[:180]}", informe.ok))
         if informe.estado != "cancelada":
             self.estadisticas.registrar(
@@ -358,6 +467,71 @@ class App:
     def cmd_ayuda(self, arg: str) -> None:
         self.ui.linea(texto_ayuda())
 
+    def cmd_buscar(self, arg: str) -> None:
+        """Búsqueda pública por Internet: /buscar consulta. No gasta tokens de IA."""
+        if not arg.strip():
+            self.ui.tenue("Uso: /buscar <consulta pública> · también disponible web_search para agentes")
+            return
+        ctx = Contexto(self.ws, self.settings, self.ui, "búsqueda")
+        try:
+            self.ui.linea(web_search(ctx, {"query": arg.strip(), "max_results": "6"}))
+        except ErrorHerramienta as e:
+            self.ui.error(str(e))
+
+    def cmd_auditar_web(self, arg: str) -> None:
+        """Analiza estructura web; no ejecuta scripts del usuario."""
+        try:
+            carpeta = self.ws.ruta(arg.strip()) if arg.strip() else self.ws.raiz
+        except ErrorRuta as exc:
+            self.ui.error(str(exc))
+            return
+        if not carpeta.is_dir():
+            self.ui.error("Se necesita una carpeta para auditar.")
+            return
+        r = auditar_web_proyecto(carpeta)
+        self.ui.info(f"Auditoría web offline: {r['paginas']} entrada(s) HTML")
+        for linea in r['hallazgos']:
+            (self.ui.error if linea.startswith(('ERROR:', 'RIESGO:')) else self.ui.aviso)(linea)
+        (self.ui.ok if r['ok'] else self.ui.error)(r['estado'])
+
+    def cmd_pendiente(self, arg: str) -> None:
+        """Muestra el trabajo interrumpido sin ejecutar ni modificar archivos."""
+        p = self.pendiente
+        if not p:
+            self.ui.tenue("No hay trabajo pendiente por límite de pasos o bucle.")
+            return
+        self.ui.info("Trabajo pendiente: " + recortar(redactar_secretos(p.get("pedido", "")), 320))
+        self.ui.tenue("  motivo: " + str(p.get("motivo", "?"))
+                      + " · reanudaciones: " + str(p.get("intentos", 0)))
+        archivos = p.get("cambios", [])
+        if archivos:
+            self.ui.tenue("  archivos tocados: " + ", ".join(archivos[:12]))
+        self.ui.tenue("  /continuar retoma el trabajo; /reset descarta el pendiente sin borrar archivos.")
+
+    def cmd_continuar(self, arg: str) -> None:
+        """Reanuda una sola vez por invocación, con información del trabajo previo."""
+        p = self.pendiente
+        if not p:
+            self.ui.aviso("No hay trabajo pendiente. Creá una tarea con /construir o escribí un pedido.")
+            return
+        if p.get("intentos", 0) >= 3:
+            self.ui.aviso("Ya se reanudó 3 veces sin completar. Revisá /tests, /diff y dividí la tarea.")
+            return
+        if arg.strip():
+            self.ui.tenue("Uso: /continuar (sin parámetros; no necesita repetir el pedido)")
+            return
+        base = copy.deepcopy(p)
+        self.ui.info("Retomo la tarea pendiente conservando los archivos ya escritos.")
+        # No se fía del resumen del modelo: obliga a inspeccionar el proyecto y ejecutar tests reales.
+        solicitud = ("CONTINUACIÓN DE TRABAJO INCOMPLETO, NO UN NUEVO PROYECTO.\n"
+                     "Objetivo original:\n" + base["pedido"] + "\n\n"
+                     "Resumen provisional NO VERIFICADO:\n" + str(base.get("resumen", "")) + "\n\n"
+                     "Archivos tocados anteriormente: " + ", ".join(base.get("cambios", [])) + "\n"
+                     "Revisá el workspace y tests actuales ANTES de editar. No repitas trabajo ya hecho, "
+                     "no borres tests ni afirmes éxito sin evidencia. Concentrate en lo que falta y "
+                     "cerrá con un informe de pruebas reales.")
+        self.turno(solicitud, _continuacion_de=base)
+
     def cmd_salir(self, arg: str) -> str:
         self._guardar_sesion()
         u = self.llm.uso
@@ -368,8 +542,35 @@ class App:
 
     # ---------------------------------------------------------------- equipo
     def cmd_construir(self, arg: str) -> None:
+        modo = arg.strip().lower()
+        if modo == "estado":
+            try:
+                p = RegistroBuild(self.ws).leer()
+            except ValueError as e:
+                self.ui.error(str(e))
+                return
+            if not p:
+                self.ui.tenue("No hay ninguna build pendiente en este proyecto.")
+                return
+            self.ui.info("Build pendiente: " + recortar(redactar_secretos(p["pedido"]), 160))
+            self.ui.tenue("  estado: " + p.get("estado", "en_curso"))
+            for t in p["plan"]["tareas"]:
+                self.ui.tenue(f"  [{p['estados'].get(t['id'], 'pendiente')}] {t['id']}: "
+                              + recortar(str(t.get("descripcion", "")), 100))
+            return
+        if modo == "descartar":
+            if self.ui.confirmar("¿Descartar el REGISTRO pendiente? Los archivos del proyecto no se borran."):
+                RegistroBuild(self.ws).borrar()
+                self.ui.ok("Registro descartado; los archivos siguen intactos.")
+            return
+        if modo == "continuar":
+            try:
+                self.construir("", confirmar=False, reanudar=True)
+            except ValueError as e:
+                self.ui.error(str(e))
+            return
         if not arg:
-            self.ui.tenue("Uso: /construir <qué querés construir>")
+            self.ui.tenue("Uso: /construir <pedido> | estado | continuar | descartar")
             return
         self.construir(arg)
 
@@ -1154,7 +1355,7 @@ class App:
             if not candidatos:
                 self.ui.aviso("Ningún proveedor tiene credencial configurada. Configurá con /proveedores configurar.")
                 return
-            self.ui.info(f"Probando (petición mínima 'ping', sin tu código) a: {', '.join(candidatos)}")
+            self.ui.info(f"Probando (respuesta verificable REAPER_OK, sin tu código) a: {', '.join(candidatos)}")
             iconos = {"OK": "✓", "SIN_CLAVE": "—"}
             for r in probar_proveedores(self.llm, self.settings, candidatos):
                 marca = iconos.get(r["estado"], "✗")
@@ -1464,6 +1665,7 @@ class App:
 
     def cmd_reset(self, arg: str) -> None:
         self.principal = self._nuevo_principal()
+        self.pendiente = None
         try:
             self._ruta_sesion().unlink()
         except OSError:
@@ -1562,14 +1764,23 @@ class App:
     def _leer_entrada(self) -> str:
         marca = f"{Tema.aviso}[plan] {C.RESET}" if self.modo_plan else ""
         entrada = input(f"{marca}{Tema.prompt}{C.BOLD}vos ›{C.RESET} ")
-        if entrada.strip() != '"""':
+        if entrada.strip().lower() not in ('"""', '/pegar'):
             return entrada.strip()
         lineas = []
-        while True:
-            linea = input(f"{Tema.herramienta}│ {C.RESET}")
-            if linea.strip() == '"""':
-                return "\n".join(lineas).strip()
-            lineas.append(linea)
+        caracteres = 0
+        try:
+            while True:
+                linea = input(f"{Tema.herramienta}│ {C.RESET}")
+                if linea.strip() == '"""':
+                    return "\n".join(lineas).strip()
+                caracteres += len(linea) + 1
+                if caracteres > 120_000:
+                    self.ui.aviso("Pedido demasiado extenso (máximo 120.000 caracteres); no se ejecutó.")
+                    return ""
+                lineas.append(linea)
+        except EOFError:
+            self.ui.aviso("Pegado incompleto (faltó cerrar con triple comilla); no se ejecutó.")
+            return ""
 
     def mostrar_inicio(self, animar: bool = True) -> None:
         if not (animar and self.settings.animacion and animar_intro()):
@@ -1596,7 +1807,8 @@ class App:
             lineas.append(f"{Tema.tenue}sesión{C.RESET}    {self.aviso_sesion}")
         self.ui.linea("")
         self.ui.caja(lineas, color=C.VIOLETA)
-        self.ui.tenue("  escribí lo que necesitás · /ayuda · /construir <pedido> · @archivo para adjuntar\n")
+        self.ui.tenue('  Para instrucciones de varias líneas: escribí /pegar, pegá TODO y cerrá con """.')
+        self.ui.tenue("  /ayuda · /buscar <consulta> · /construir <pedido> · @archivo para adjuntar\n")
 
     def repl(self, animar: bool = True) -> int:
         self._configurar_readline()

@@ -13,7 +13,7 @@ Salen de los bugs vistos en Termux:
   persistente      tests que fallan por estado que persiste entre corridas → arreglo que pasa SIEMPRE (v8)
   no_empeorar      un fallo cuya solución "obvia" rompe 12 tests → arreglar sin empeorar (v8)
 
-    python3 reaper_v8.py --comportamiento        todas
+    python3 reaper_8.10.py --comportamiento        todas
     /evaluar comportamiento [id ...]              desde el REPL
 """
 

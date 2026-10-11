@@ -22,7 +22,7 @@ class _BaseProbe(BaseTest):
 class TestProbarEquipo(_BaseProbe):
     def test_todos_responden_con_clave(self):
         os.environ["OPENROUTER_API_KEY"] = "ok"      # default = openrouter para los seis roles
-        c = self.cliente(["pong"] * 6)               # dedup por modelo: con 1 modelo basta 1 evento
+        c = self.cliente(["REAPER_OK"] * 6)               # dedup por modelo: con 1 modelo basta 1 evento
         res = probar_equipo(c, c.settings)
         self.assertEqual(len(res), 6)
         responden = [r for r in res if r["estado"] == "RESPONDE"]
@@ -46,7 +46,7 @@ class TestProbarEquipo(_BaseProbe):
 
     def test_dedup_por_modelo_una_sola_llamada(self):
         os.environ["OPENROUTER_API_KEY"] = "ok"
-        c = self.cliente(["pong"])                   # un solo evento: los 6 roles comparten modelo → 1 llamada
+        c = self.cliente(["REAPER_OK"])                   # un solo evento: los 6 roles comparten modelo → 1 llamada
         probar_equipo(c, c.settings)
         self.assertEqual(c.uso.llamadas, 1)
 
@@ -60,7 +60,7 @@ class TestProbeCLI(_BaseProbe):
     def test_equipo_probar_cli(self):
         os.environ["OPENROUTER_API_KEY"] = "ok"
         ws = self.proyecto()
-        llm = self.cliente(["pong"])
+        llm = self.cliente(["REAPER_OK"])
         app = App(self.ajustes(forense=False, escalar=False), llm, self.ui(), ws, persistir=False)
         app.comando("/equipo probar")
         texto = app.ui.texto_registrado()

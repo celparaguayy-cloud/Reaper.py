@@ -32,25 +32,27 @@ def roles_equipo(settings) -> tuple:
 
 
 def extraer_json_x(texto: str) -> Optional[dict]:
-    """Primer objeto JSON del texto (acepta ```json ...```). None si no hay un objeto válido. Nunca evalúa código."""
-    if not texto:
+    """Extrae un objeto JSON sin confundir llaves dentro de cadenas o JSON anidado.
+
+    Acepta un objeto directo o incluido en un bloque Markdown; no usa eval,
+    ignora ejemplos inválidos previos y limita la cantidad de intentos para
+    que la salida de un modelo no provoque un análisis cuadrático ilimitado.
+    """
+    if not isinstance(texto, str) or not texto.strip():
         return None
-    candidatos = re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", texto, re.S)
-    inicio = texto.find("{")
-    if inicio >= 0:
-        profundidad = 0
-        for i in range(inicio, len(texto)):
-            if texto[i] == "{":
-                profundidad += 1
-            elif texto[i] == "}":
-                profundidad -= 1
-                if profundidad == 0:
-                    candidatos.append(texto[inicio:i + 1])
-                    break
-    for c in candidatos:
+    # Los dictámenes operativos no necesitan megabytes de texto del modelo.
+    texto = texto[:262144]
+    decoder = json.JSONDecoder()
+    intentos = 0
+    for indice, caracter in enumerate(texto):
+        if caracter != "{":
+            continue
+        intentos += 1
+        if intentos > 64:
+            break
         try:
-            datos = json.loads(c)
-        except ValueError:
+            datos, _fin = decoder.raw_decode(texto, indice)
+        except (ValueError, RecursionError):
             continue
         if isinstance(datos, dict):
             return datos
@@ -117,6 +119,9 @@ def parsear_dictamen(texto: str, rol: str, evidencia: Optional[dict] = None, *, 
     if decision == "APPROVE" and not base.evidence_ids:
         base.problema = "APPROVE sin evidence_ids"
         return base
+    if decision == "APPROVE" and evidencia is None:
+        base.problema = "APPROVE sin inventario de evidencia verificable"
+        return base
     if decision in ("REJECT", "REWORK") and not base.reasons:
         base.problema = f"{decision} sin razones verificables"
         return base
@@ -157,11 +162,52 @@ def parsear_hallazgos_seguridad(texto: str) -> Optional[list]:
     return salida
 
 
+def _evidencia_positiva_entrega(identificador: str, contenido: Any) -> bool:
+    """Una evidencia presente no equivale automáticamente a una prueba favorable.
+
+    Los planes, la ausencia de cambios y los resultados de tests fallidos no
+    demuestran la entrega. Este filtro es conservador; verificar el significado
+    específico de cada criterio sigue siendo responsabilidad del auditor.
+    """
+    id_norm = str(identificador).upper()
+    valor = str(contenido or "").strip().lower()
+    if not valor:
+        return False
+    if id_norm in ("EV-PLAN", "EV-PEDIDO"):
+        return False
+    if id_norm == "EV-DIFF":
+        return valor not in ("(sin cambios)", "sin cambios", "-", "no changes")
+    if id_norm == "EV-ESTADO":
+        return ("estado por verificación real: verificada" in valor or
+                "estado por verificación real: validada" in valor)
+    if id_norm == "EV-TESTS":
+        if ("sin suite" in valor or "sin tests" in valor or
+                re.search(r"\bexit\s+[1-9]\d*\b", valor) or
+                re.search(r"\b(?:fallaron|failed|error|errores)\b", valor)):
+            return False
+        return True
+    if id_norm == "EV-VALID":
+        return not ("fallaron" in valor or "failed" in valor or "error" in valor)
+    return valor not in ("ninguna", "desconocido", "sin evidencia")
+
+
 def parsear_auditoria(texto: str, evidencia: dict) -> Optional[list]:
-    """[{criterion, status, evidence_ids}]; un MET sin evidencia existente baja a UNKNOWN. None si es inválido."""
+    """[{criterion, status, evidence_ids}]; MET requiere evidencia existente y positiva."""
     datos = extraer_json_x(texto)
     if datos is None or not isinstance(datos.get("criteria"), list):
         return None
+    if not isinstance(evidencia, dict):
+        return None
+    # Un resultado fallido global contradice una declaración de entrega completa,
+    # incluso si el auditor cita solo el diff y omite deliberadamente EV-TESTS.
+    estado_global = str(evidencia.get("EV-ESTADO", "")).lower()
+    tests_globales = str(evidencia.get("EV-TESTS", "")).lower()
+    validacion_global = str(evidencia.get("EV-VALID", "")).lower()
+    entrega_roja = bool(
+        re.search(r"estado por verificación real: (?:fallida|parcial|cancelada)", estado_global)
+        or ("EV-TESTS" in evidencia and not _evidencia_positiva_entrega("EV-TESTS", tests_globales))
+        or ("EV-VALID" in evidencia and not _evidencia_positiva_entrega("EV-VALID", validacion_global))
+    )
     salida = []
     for c in datos["criteria"]:
         if not isinstance(c, dict) or not str(c.get("criterion", "")).strip():
@@ -170,7 +216,7 @@ def parsear_auditoria(texto: str, evidencia: dict) -> Optional[list]:
         ids = [e for e in _lista_str(c.get("evidence_ids")) if e in evidencia]
         if status not in ("MET", "NOT_MET", "UNKNOWN"):
             status = "UNKNOWN"
-        if status == "MET" and not ids:
+        if status == "MET" and (entrega_roja or not any(_evidencia_positiva_entrega(e, evidencia[e]) for e in ids)):
             status = "UNKNOWN"
         salida.append({"criterion": str(c["criterion"]).strip()[:200], "status": status, "evidence_ids": ids})
     return salida

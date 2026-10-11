@@ -214,7 +214,11 @@ _RE_COMANDO_TESTS = re.compile(r"\b(?:pytest|unittest|npm\s+(?:run\s+)?test|node
 def limpiar_texto_visible(texto: str) -> str:
     """Quita los ```xml``` vacíos que quedan cuando el modelo envuelve herramientas en bloques de código."""
     texto = _RE_FENCE_VACIO.sub("", texto or "")
-    return re.sub(r"\n{3,}", "\n\n", texto).strip()
+    # Los modelos pequeños a veces imprimen miles de cierres XML inventados.
+    texto = re.sub(r"(?:\s*</tool_calls>\s*){2,}", "\n[etiquetas XML repetidas descartadas]\n", texto, flags=re.I)
+    texto = re.sub(r"(?:\s*</tool_c>\s*){2,}", "\n[etiquetas XML repetidas descartadas]\n", texto, flags=re.I)
+    texto = re.sub(r"\n{3,}", "\n\n", texto).strip()
+    return recortar(texto, 10000)
 
 
 def pide_cambios(tarea: str) -> bool:
@@ -284,6 +288,30 @@ def codigo_pegado(texto: str) -> bool:
         if len([l for l in m.group(1).splitlines() if l.strip()]) >= 3:
             return True
     return False
+
+
+def requiere_busqueda_actual(tarea: str) -> bool:
+    """Heurística conservadora: solo preguntas públicas claramente sensibles al tiempo.
+
+    Evita enviar archivos de proyecto, rutas, prompts extensos o credenciales al buscador.
+    """
+    texto = (tarea or "").strip()
+    if not texto or len(texto) > 190 or "\n" in texto:
+        return False
+    if _consulta_web_tiene_secretos(texto) or re.search(
+        r"(?i)\b(?:api[_-]?key|token|password|secret|bearer)\b|\b[\w.+-]+@[\w.-]+\.\w{2,}\b", texto
+    ):
+        return False
+    if re.search(r"(?i)\b(crea|construye|implementa|modifica|borra|edita|instala|ejecuta)\b", texto):
+        return False
+    patrones = (
+        r"\b(?:hoy|actualmente|ahora mismo|en este momento|últimas noticias|ultima noticia)\b",
+        r"\b(?:ultima|última|ultimo|último|más reciente|version actual|versión actual|actualización)\b",
+        r"\b(?:se retir[oó]|cuándo se retira|cuando se retira|fecha se retir[oó])\b",
+        r"\b(?:precio hoy|cotización|precio actual|fichaje|resultados de hoy)\b",
+    )
+    return any(re.search(p, texto.lower(), re.I) for p in patrones)
+
 
 
 class Agente:
@@ -394,7 +422,19 @@ class Agente:
             self.mensajes[0] = {"role": "system", "content": prompt}
         else:
             self.mensajes = [{"role": "system", "content": prompt}]
-        self._agregar_usuario(self._preparar_tarea(tarea))
+        pedido_contextual = self._preparar_tarea(tarea)
+        if (principal and requiere_busqueda_actual(tarea) and self.settings.web
+                and not self.settings.privacidad_estricta and not self._prohibido):
+            try:
+                fuentes = web_search(self.ctx, {"query": tarea[:190], "max_results": "5"})
+                pedido_contextual += ("\n\nBÚSQUEDA EN VIVO REALIZADA POR REAPER:\n" + fuentes
+                                      + "\nAbrí con fetch_url las fuentes que vayas a citar. "
+                                      "No afirmes haber leído una fuente que solo aparece en los resultados.")
+            except ErrorHerramienta as e:
+                self.ui.aviso("  Búsqueda actual fallida: " + recortar(str(e), 180))
+                pedido_contextual += ("\n\nAVISO: REAPER intentó consultar Internet pero falló. "
+                                      "Respondé indicando que NO se verificaron datos actuales en vivo.")
+        self._agregar_usuario(pedido_contextual)
         self._indice_tarea = len(self.mensajes) - 1
         self.ctx.cambios = set()
         self.ctx.parciales = {}
@@ -538,7 +578,9 @@ class Agente:
             self._agregar_usuario("\n\n".join(observaciones))
 
         return self._cerrar(
-            "Se alcanzó el límite de pasos sin terminar. Último razonamiento: " + recortar(self._ultimo_texto, 800),
+            "Se alcanzó el límite de pasos sin terminar. Trabajo parcial: "
+            + recortar(limpiar_texto_visible(self._ultimo_texto), 400)
+            + "\nRevisá /diff y /tests. No se confirmó la finalización. Retomá con una tarea más pequeña.",
             self.max_pasos,
             "max_pasos",
             ok=False,

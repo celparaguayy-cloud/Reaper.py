@@ -521,7 +521,7 @@ class TestPipeline(BaseTest):
         muchas = parsear_plan("".join(f'<tarea id="{i}">tarea número {i}</tarea>' for i in range(12)), "p", max_tareas=4)
         self.assertEqual(len(muchas.tareas), 4)
         self.assertEqual(veredicto("VEREDICTO: CAMBIOS\n1. x"), (False, True))
-        self.assertEqual(veredicto("sin formato"), (True, False))
+        self.assertEqual(veredicto("sin formato"), (False, False))
 
     def test_especificacion_reconoce_tests(self):
         self.assertTrue(_es_de_especificacion("test_calc.TestCalc.test_resta", {"tests/test_calc.py": ""}))

@@ -549,12 +549,12 @@ _BLOQUEADOS = [
 ]
 
 _SEGUROS = (
-    "ls", "pwd", "cat ", "head ", "tail ", "wc ", "tree", "file ", "stat ", "du ",
-    "grep ", "rg ", "which ", "echo ", "python -m py_compile", "python3 -m py_compile",
-    "python -m pytest", "python3 -m pytest", "python -m unittest", "python3 -m unittest",
-    "pytest", "node --check", "node --test", "npm test", "ruff check", "git status",
-    "git diff", "git log", "git show", "pip list", "pip show", "python --version",
-    "python3 --version", "node --version",
+    "ls", "pwd", "head", "tail", "wc", "tree", "file", "stat", "du",
+    "grep", "rg", "which", "git status", "git diff", "git log", "git show",
+    "git rev-parse", "git ls-files", "git grep", "git branch --show-current",
+    "npm --version", "python --version", "python3 --version", "node --version",
+    "python -m py_compile", "python3 -m py_compile", "node --check",
+    "find",  # solo consultas; abajo se excluyen -exec/-delete y expresiones peligrosas
 )
 
 
@@ -566,10 +566,35 @@ def comando_bloqueado(comando: str) -> Optional[str]:
 
 
 def comando_seguro(comando: str) -> bool:
+    """Permite sin preguntar comandos de consulta/verificación expresamente conocidos.
+
+    No aceptar un prefijo de palabra (lsfalso), saltos de línea ni operadores
+    de shell: una orden aparentemente inocente podría incluir otra distinta.
+    """
     c = comando.strip()
-    if any(s in c for s in (";", "&&", "||", "|", ">", "<", "`", "$(")):
+    if not c or any(s in c for s in ("\n", "\r", ";", "&&", "||", "|", ">", "<", "`", "$(", "${", "\\")):
         return False
-    return any(c == s.strip() or c.startswith(s) for s in _SEGUROS)
+    if re.search(r"(?:^|\s)(?:-delete|-exec|-execdir|-ok|-okdir|-print0|--files-from)(?:\s|$)", c):
+        return False
+    if re.search(r"(?:^|\s)(?:/|~|\.\./|\$HOME|/sdcard)(?:/|\s|$)", c):
+        return False
+    if re.search(r"(?:^|\s)(?:-name|-iname)\s+[^\s]*\.(?:env|pem|key)(?:\s|$)", c, re.I):
+        return False
+    # Los comandos de lectura pueden revelar secretos del workspace sin ejecutar código.
+    # Requieren confirmación al apuntar a credenciales (incluye git show HEAD:.env).
+    if re.search(r"(?i)(?:^|[\s/'\":])(?:\.env(?:\.[\w-]+)?|\.npmrc|\.pypirc|"
+                 r"\.netrc|credentials(?:\.json)?|id_(?:rsa|ed25519)|[^\s/]+\.(?:pem|p12|pfx|key))"
+                 r"(?=$|[\s/'\"])", c):
+        return False
+    # Las búsquedas recursivas pueden terminar mostrando credenciales sin pedir permiso.
+    if re.match(r"^(?:grep|rg)\s", c) and (
+        re.search(r"(?i)(?:^|\s)(?:-r|-R|--recursive|--hidden|-uu|-uuu)(?:\s|$)", c)
+        or re.search(r"\s(?:\.|\./|/)\s*$", c)
+    ):
+        return False
+    if any(token in c for token in ("*", "?", "[", "]")) and not c.startswith("find "):
+        return False
+    return any(c == permitido or c.startswith(permitido + " ") for permitido in _SEGUROS)
 
 
 PISTA_INTERACTIVO = (
@@ -613,6 +638,8 @@ def execute_command(ctx: Contexto, p: dict) -> str:
     comando = p["command"].strip()
     if not comando:
         raise ErrorHerramienta("Comando vacío.")
+    if re.match(r"^(?:read_file|list_files|search_files|code_outline|read_symbol|run_tests)\s+", comando):
+        raise ErrorHerramienta("Es una herramienta REAPER, no un comando de shell. Invocala con etiquetas XML directamente.")
     patron = comando_bloqueado(comando)
     if patron:
         raise ErrorHerramienta(f"Comando bloqueado por seguridad (coincide con {patron}).")
@@ -622,8 +649,9 @@ def execute_command(ctx: Contexto, p: dict) -> str:
     if ctx.settings.modo != "auto" and not comando_seguro(comando):
         if not pedir_permiso_comando(ctx, comando):
             raise ErrorHerramienta(
-                "El usuario no aprobó el comando (o no hay usuario para aprobarlo). "
-                "Seguí sin él o usá run_tests / validate."
+                "NEEDS_APPROVAL: comando sin permiso. No supongas que el usuario lo rechazó. "
+                "Continuá con las herramientas disponibles, o pedí autorización explícita "
+                "cuando vuelva a haber una entrada interactiva."
             )
     timeout = min(600, _entero(p.get("timeout"), ctx.settings.exec_timeout) or ctx.settings.exec_timeout)
     entrada = _entrada_estandar(p)

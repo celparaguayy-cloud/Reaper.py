@@ -255,12 +255,13 @@ def _web_abrir(decision: DecisionEgress, url: str, timeout: int, maximo: int) ->
     if partes.query:
         ruta += "?" + partes.query
     raw = socket.create_connection((ip, decision.puerto), timeout=timeout)
+    sock = raw
+    conn = None
     try:
         if scheme == "https":
             sock = _web_ssl.create_default_context().wrap_socket(raw, server_hostname=decision.host)
             conn = _web_httpc.HTTPSConnection(decision.host, decision.puerto, timeout=timeout)
         else:
-            sock = raw
             conn = _web_httpc.HTTPConnection(decision.host, decision.puerto, timeout=timeout)
         conn.sock = sock
         conn.request("GET", ruta, headers={
@@ -275,26 +276,51 @@ def _web_abrir(decision: DecisionEgress, url: str, timeout: int, maximo: int) ->
         return {"status": r.status, "location": r.getheader("Location"),
                 "ctype": (r.getheader("Content-Type") or "").lower(), "body": body}
     finally:
+        # Si TLS falla antes de crear conn, el socket original también debe cerrarse.
+        if conn is not None:
+            try:
+                conn.close()
+            except OSError:
+                pass
         try:
-            conn.close()
-        except Exception:
+            sock.close()
+        except OSError:
             pass
+        if sock is not raw:
+            try:
+                raw.close()
+            except OSError:
+                pass
 
 
 def descargar_texto(url: str, timeout: int = 20, maximo: int = 2_000_000, usar_cache: bool = True, *,
                     permitir_http: bool = False, permitir_local: bool = False, permitidos: Sequence[str] = (),
                     resolver=None, abrir=None) -> dict:
     """Descarga y convierte. Valida el destino (SSRF) en CADA salto y conecta pinneado. Lanza ValueError/OSError."""
-    cache = _ruta_cache(url)
-    if usar_cache:
+    actual = (url or "").strip().strip("<>\"'")
+    cache = _ruta_cache(actual)
+    if usar_cache and cache.is_file():
+        # Una respuesta cacheada no debe omitir el gate de egreso. El destino
+        # original Y el final deben seguir siendo admisibles, sin hacer GET.
+        destino = validar_destino(actual, permitir_http=permitir_http, permitir_local=permitir_local,
+                                  permitidos=permitidos, resolver=resolver)
+        if not destino.permitido:
+            raise ValueError(destino.razon)
         try:
             datos = json.loads(cache.read_text(encoding="utf-8"))
-            if time.time() - datos.get("guardado", 0) < 3600:
+            if not isinstance(datos, dict) or not isinstance(datos.get("texto"), str):
+                raise ValueError("entrada de caché web inválida")
+            final_cache = datos.get("url") or actual
+            final_decision = validar_destino(final_cache, permitir_http=permitir_http,
+                                             permitir_local=permitir_local, permitidos=permitidos,
+                                             resolver=resolver)
+            if not final_decision.permitido:
+                raise ValueError(final_decision.razon)
+            if time.time() - float(datos.get("guardado", 0)) < 3600:
                 return datos
-        except (OSError, ValueError):
+        except (OSError, ValueError, TypeError):
             pass
     abrir = abrir or _web_abrir
-    actual = (url or "").strip().strip("<>\"'")
     saltos = 0
     while True:
         d = validar_destino(actual, permitir_http=permitir_http, permitir_local=permitir_local,
@@ -318,7 +344,10 @@ def descargar_texto(url: str, timeout: int = 20, maximo: int = 2_000_000, usar_c
     tipo = resp["ctype"]
     codificacion = _web_charset(tipo)
     final = actual
-    texto = crudo.decode(codificacion, errors="replace")
+    try:
+        texto = crudo.decode(codificacion, errors="replace")
+    except LookupError:  # Algunos servidores declaran charsets inválidos.
+        texto = crudo.decode("utf-8", errors="replace")
     titulo = ""
     if "json" in tipo or texto.lstrip()[:1] in "[{" and "html" not in tipo:
         try:
@@ -389,5 +418,156 @@ def fetch_url(ctx: Contexto, p: dict) -> str:
     return redactar_secretos(f"{cabecera}\n\n{texto}")
 
 
+from html.parser import HTMLParser as _ReaperHTMLParser
+from html import unescape as _reaper_html_unescape
+
+
+class _ExtractorResultadosBusqueda(_ReaperHTMLParser):
+    """Parser pequeño de enlaces HTML públicos; no ejecuta JavaScript ni enlaces."""
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.resultados = []
+        self._href = ""
+        self._partes = []
+        self._capturando = False
+
+    def handle_starttag(self, tag, attrs):
+        if tag != "a":
+            return
+        atributos = dict(attrs)
+        clases = atributos.get("class", "").lower()
+        if "result__a" in clases or "result-link" in clases:
+            self._href = atributos.get("href", "")
+            self._partes = []
+            self._capturando = True
+
+    def handle_data(self, data):
+        if self._capturando:
+            self._partes.append(data)
+
+    def handle_endtag(self, tag):
+        if tag == "a" and self._capturando:
+            nombre = " ".join(" ".join(self._partes).split())
+            if nombre and self._href:
+                self.resultados.append((nombre, self._href))
+            self._capturando = False
+
+
+def extraer_resultados_busqueda(html: str, limite: int = 5) -> list[tuple[str, str]]:
+    extractor = _ExtractorResultadosBusqueda()
+    extractor.feed(html)
+    vistos, salida = set(), []
+    for titulo, href in extractor.resultados:
+        enlace = urllib.parse.urljoin("https://html.duckduckgo.com/", _reaper_html_unescape(href))
+        destino = urllib.parse.urlparse(enlace)
+        if destino.hostname and (destino.hostname == "duckduckgo.com" or
+                                 destino.hostname.endswith(".duckduckgo.com")):
+            redirigido = urllib.parse.parse_qs(destino.query).get("uddg", [])
+            if redirigido:
+                enlace = redirigido[0]
+        try:
+            url, _ = validar_url(enlace)
+        except ValueError:
+            continue
+        if url not in vistos:
+            vistos.add(url)
+            salida.append((titulo[:180], url))
+        if len(salida) >= limite:
+            break
+    return salida
+
+
+def _consulta_web_tiene_secretos(consulta: str) -> bool:
+    """Evita filtrar credenciales o fragmentos de datos personales al buscador."""
+    return bool(
+        _RE_URL_SOSPECHOSA.search(consulta)
+        or re.search(r"(?i)\b(?:api[_ -]?key|secret|token|password|contrase(?:n|ñ)a|bearer)\s*[:=]\s*\S+", consulta)
+        or re.search(r"(?i)\b(?:gh[pousr]_[a-z0-9]{12,}|sk-[a-z0-9_-]{12,}|AIza[a-z0-9_-]{20,})\b", consulta)
+        or re.search(r"(?i)(?:/data/data/|/sdcard/|~?/storage/|~?/\.ssh/|-----BEGIN .*PRIVATE KEY)", consulta)
+    )
+
+
+@herramienta(
+    "web_search",
+    "Busca documentación pública, errores de programación o datos recientes y devuelve títulos con URL. "
+    "Después abrí las fuentes con fetch_url. No ejecuta scripts ni instala paquetes.",
+    [Param("query", "consulta de búsqueda, sin claves ni datos privados"),
+     Param("max_results", "máximo de resultados, 1 a 8", requerido=False)],
+    "<web_search>\n<query>Python sqlite3 documentación transacciones</query>\n</web_search>",
+)
+def web_search(ctx: Contexto, p: dict) -> str:
+    if not ctx.settings.web or ctx.settings.privacidad_estricta:
+        raise ErrorHerramienta("Búsqueda web desactivada (web=false o privacidad_estricta=true).")
+    consulta = str(p.get("query") or "").strip()
+    if not consulta or len(consulta) > 250:
+        raise ErrorHerramienta("La consulta debe tener entre 1 y 250 caracteres.")
+    if _consulta_web_tiene_secretos(consulta):
+        raise ErrorHerramienta("La consulta parece contener credenciales o rutas privadas; eliminá esos datos.")
+    limite = max(1, min(8, _entero(p.get("max_results"), 5)))
+    url = "https://html.duckduckgo.com/html/?" + urllib.parse.urlencode({"q": consulta})
+    error_primario = ""
+    try:
+        datos = descargar_texto(url, usar_cache=True, maximo=850_000, timeout=15,
+                                permitidos=("duckduckgo.com",))
+        texto = str(datos.get("texto") or "")
+    except (urllib.error.URLError, urllib.error.HTTPError, OSError, ValueError) as e:
+        texto = ""
+        error_primario = f"{type(e).__name__}: {e}"
+    # descargar_texto transforma HTML en texto. HTMLaTexto conserva URLs en paréntesis.
+    resultados = extraer_resultados_busqueda(texto, limite)
+    if not resultados:
+        # descargar_texto convierte HTML en texto: HTMLaTexto conserva el enlace como
+        # 'Título (URL)' y no como Markdown. El motor puede responder con enlaces
+        # de redirección de DuckDuckGo; se extrae uddg cuando está presente.
+        enlaces = re.findall(r"([^\n()]{5,180}?)\s*\((https?://[^)\s]+)\)", texto)
+        vistos = set()
+        for titulo, enlace in enlaces:
+            titulo = titulo.strip().split("  ")[-1][-180:].strip()
+            p_url = urllib.parse.urlparse(enlace)
+            if p_url.hostname and (p_url.hostname == "duckduckgo.com" or
+                                   p_url.hostname.endswith(".duckduckgo.com")):
+                destino = urllib.parse.parse_qs(p_url.query).get("uddg", [])
+                if destino:
+                    enlace = destino[0]
+            try:
+                validar_url(enlace)
+            except ValueError:
+                continue
+            if not titulo or enlace in vistos:
+                continue
+            vistos.add(enlace)
+            resultados.append((titulo, enlace))
+            if len(resultados) >= limite:
+                break
+    if not resultados:
+        # Respaldo independiente: XML RSS público de Bing, sin claves API.
+        try:
+            import xml.etree.ElementTree as _web_et
+            rss_url = "https://www.bing.com/search?" + urllib.parse.urlencode({"q": consulta, "format": "rss"})
+            rss = descargar_texto(rss_url, usar_cache=True, maximo=500_000, timeout=15,
+                                  permitidos=("bing.com",))
+            raiz_xml = _web_et.fromstring(str(rss.get("texto") or ""))
+            for item in raiz_xml.findall(".//channel/item"):
+                titulo = (item.findtext("title") or "").strip()
+                enlace = (item.findtext("link") or "").strip()
+                try:
+                    validar_url(enlace)
+                except ValueError:
+                    continue
+                if titulo and enlace and (titulo, enlace) not in resultados:
+                    resultados.append((titulo[:180], enlace))
+                if len(resultados) >= limite:
+                    break
+        except (urllib.error.URLError, urllib.error.HTTPError, OSError, ValueError, _web_et.ParseError):
+            pass
+    if not resultados:
+        raise ErrorHerramienta("No se pudo recuperar ningún resultado fiable de los motores web. "
+                               + (error_primario[:160] + ". " if error_primario else "")
+                               + "No inventes enlaces ni afirmes búsqueda exitosa.")
+    return "Resultados web (no verificados; abrí los enlaces con fetch_url):\n" + "\n".join(
+        f"{i}. {titulo} — {enlace}" for i, (titulo, enlace) in enumerate(resultados, 1))
+
+
 ALIAS_HERRAMIENTAS.update({"web": "fetch_url", "leer_web": "fetch_url", "browse": "fetch_url",
-                           "open_url": "fetch_url", "web_fetch": "fetch_url", "curl": "fetch_url"})
+                           "open_url": "fetch_url", "web_fetch": "fetch_url", "curl": "fetch_url",
+                           "buscar_web": "web_search", "search_web": "web_search"})

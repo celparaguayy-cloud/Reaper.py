@@ -20,12 +20,11 @@ def correr_autotest(filtro: Optional[str] = None, verbosidad: Optional[int] = No
         suite.addTests(cargador.loadTestsFromTestCase(clase))
     total = suite.countTestCases()
     if total == 0:
-        # Un filtro que no matchea nada NO es "todo verde": sería un falso éxito (A20).
+        # Un filtro que no coincide con nada NO es "todo verde": sería un falso éxito (A20).
         disponibles = ", ".join(c.__name__ for c in clases_de_test()[:12])
-        print(f"{Tema.error}✗ 0 tests seleccionados"
-              + (f" con el filtro '{filtro}'" if filtro else "") + f". Clases: {disponibles}…{C.RESET}")
+        print(f"No hay tests que coincidan con el filtro {filtro!r}. Clases: {disponibles}…", file=sys.stderr)
         return 2
-    print(f"{Tema.titulo}{C.BOLD}🐉 REAPER v{__version__} · autotest{C.RESET} {Tema.tenue}"
+    print(f"{Tema.titulo}{C.BOLD}🐉 REAPER {__version__} · autotest{C.RESET} {Tema.tenue}"
           f"({total} tests, sin API){C.RESET}")
     inicio = time.monotonic()
     resultado = unittest.TextTestRunner(verbosity=verbosidad, stream=sys.stdout).run(suite)

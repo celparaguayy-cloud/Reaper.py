@@ -1,9 +1,9 @@
 """
-Autotest interno: `python3 reaper_v8.py --autotest` verifica REAPER sin gastar API.
+Autotest interno: `python3 reaper_8.10.py --autotest` verifica REAPER sin gastar API.
 
 Todo corre en un entorno aislado (REAPER_HOME temporal), con UI silenciosa y
 MockLLM. Los tests que necesitan node, git o go se saltean si no están.
-Filtrar: REAPER_AUTOTEST=parser python3 reaper_v8.py --autotest
+Filtrar: REAPER_AUTOTEST=parser python3 reaper_8.10.py --autotest
 """
 
 _RUTAS_GLOBALES = ("BASE_DIR", "PROJECTS_DIR", "CHECKPOINTS_DIR", "SESIONES_DIR", "LOGS_DIR", "CACHE_DIR",
@@ -200,7 +200,7 @@ class TestDragon(BaseTest):
 
     def test_banner_y_logo(self):
         texto = sin_ansi(banner_dragon(60))
-        self.assertIn("v" + __version__, texto)
+        self.assertIn(__version__, texto)
         self.assertEqual(len(logo_texto("REAPER")), 3)
 
     def test_animacion_sin_tty_no_anima(self):

@@ -71,14 +71,19 @@ def _probar_modelo(llm, modelo: str) -> dict:
     """Petición mínima REAL a un modelo concreto (sin fallback): dice si responde de verdad."""
     t0 = time.monotonic()
     try:
-        resp = llm.chat([{"role": "user", "content": "ping"}], modelo=modelo, max_tokens=1,
+        resp = llm.chat([{"role": "user", "content": "Responde únicamente la palabra REAPER_OK."}],
+                        modelo=modelo, max_tokens=64,
                         temperatura=0, sin_respaldo=True, rol="probe")
         ms = round((time.monotonic() - t0) * 1000)
-        return {"estado": "RESPONDE", "detalle": f"{ms}ms", "modelo_servido": getattr(resp, "modelo", "")}
+        visible = str(getattr(resp, "texto", "") or "").strip()
+        if "REAPER_OK" not in visible.upper():
+            return {"estado": "FALLA", "detalle": f"{ms}ms; respuesta de prueba no verificable"}
+        return {"estado": "RESPONDE", "detalle": f"{ms}ms (texto verificado)",
+                "modelo_servido": getattr(resp, "modelo", "")}
     except LLMError as e:
-        if getattr(e, "solo_razonamiento", False):        # respondió (pensando) aunque sin texto visible
+        if getattr(e, "solo_razonamiento", False):
             ms = round((time.monotonic() - t0) * 1000)
-            return {"estado": "RESPONDE", "detalle": f"{ms}ms (razonamiento)"}
+            return {"estado": "FALLA", "detalle": f"{ms}ms (solo razonamiento, sin texto verificable)"}
         return {"estado": "FALLA", "detalle": recortar(str(e), 120)}
     except (OSError, ValueError, RuntimeError) as e:
         return {"estado": "FALLA", "detalle": f"{type(e).__name__}: {e}"[:120]}

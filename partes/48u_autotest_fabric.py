@@ -186,7 +186,7 @@ class TestPruebaProveedor(BaseTest):
 
     def test_ok_cuando_responde(self):
         os.environ["OPENROUTER_API_KEY"] = "ok"
-        c = self._cliente(["pong"], proveedor="openrouter")
+        c = self._cliente(["REAPER_OK"], proveedor="openrouter")
         r = probar_proveedor(c, "openrouter", c.settings)
         self.assertEqual(r["estado"], "OK")
         self.assertTrue(r["modelo"])

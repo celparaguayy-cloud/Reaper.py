@@ -169,15 +169,28 @@ def instalar_lanzador(ui: UI) -> Optional[Path]:
         return None
     carpeta_app = BASE_DIR / "app"
     carpeta_app.mkdir(parents=True, exist_ok=True)
-    destino = carpeta_app / "reaper_v8.py"
+    destino = carpeta_app / "reaper.py"
     import py_compile
+    temporal = None
     try:
         if origen.resolve() != destino.resolve():
-            shutil.copy2(origen, destino)
-        py_compile.compile(str(destino), doraise=True)
+            # Validar primero y reemplazar después: una actualización defectuosa
+            # nunca debe sobreescribir la instalación que ya funciona.
+            fd, nombre = tempfile.mkstemp(prefix=".reaper-8_10-", suffix=".py", dir=carpeta_app)
+            os.close(fd)
+            temporal = Path(nombre)
+            shutil.copy2(origen, temporal)
+            py_compile.compile(str(temporal), doraise=True)
+            os.replace(temporal, destino)
+            temporal = None
+        else:
+            py_compile.compile(str(destino), doraise=True)
     except (OSError, py_compile.PyCompileError) as e:
         ui.error(f"No pude copiar/compilar REAPER: {e}")
         return None
+    finally:
+        if temporal is not None:
+            temporal.unlink(missing_ok=True)
     prefijo = os.getenv("PREFIX")
     bin_dir = Path(prefijo) / "bin" if prefijo and es_termux() else Path.home() / ".local" / "bin"
     bin_dir.mkdir(parents=True, exist_ok=True)
@@ -187,8 +200,8 @@ def instalar_lanzador(ui: UI) -> Optional[Path]:
         "# Lanzador de REAPER (generado por --instalar). Importa el módulo para usar el bytecode cacheado.\n"
         "import sys\n"
         f"sys.path.insert(0, {str(carpeta_app)!r})\n"
-        "import reaper_v8\n"
-        "sys.exit(reaper_v8.main())\n"
+        "import reaper\n"
+        "sys.exit(reaper.main())\n"
     )
     try:
         lanzador.write_text(contenido, encoding="utf-8")

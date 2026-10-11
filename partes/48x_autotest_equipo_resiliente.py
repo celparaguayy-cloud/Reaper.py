@@ -114,12 +114,12 @@ class TestRespaldoEquipo(_BaseEquipo):
         self.assertEqual(len(enviados), 2)
         self.assertIn("groq.com", enviados[1][0])                  # no reintentó el modelo que solo "piensa"
 
-    def test_probe_cuenta_razonamiento_como_responde(self):
+    def test_probe_no_cuenta_razonamiento_como_responde(self):
         os.environ["OPENROUTER_API_KEY"] = "ok"
         pensando = {"choices": [{"delta": {"reasoning": "hmm"}, "finish_reason": "length"}]}
         c, _ = self.cliente_espia([pensando])
         res = probar_equipo(c, c.settings)
-        self.assertTrue(all(r["estado"] == "RESPONDE" for r in res), res)
+        self.assertTrue(all(r["estado"] == "FALLA" for r in res), res)
 
 
 class TestPipelineNoAbortaPorUnRol(_BaseEquipo):

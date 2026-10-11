@@ -52,7 +52,10 @@ class Escalador:
             texto += f"Archivos involucrados: {', '.join(archivos[:12])}\n\n"
         if intentos:
             texto += f"LO QUE YA SE INTENTÓ (sin éxito):\n{recortar(intentos, 2500)}\n\n"
-        texto += ("Leé el código necesario y escribí el diagnóstico con el arreglo exacto "
+        texto += ("Leé el código necesario y escribí el diagnóstico con evidencia: "
+                  "traceback, archivo/función, hipótesis comprobable y test para confirmar; "
+                  "no pidas herramientas de escritura, no borres tests ni mezcles proyectos. "
+                  "Si no hay suficiente evidencia, decí NECESITA EVIDENCIA. "
                   "(DIAGNÓSTICO / ARREGLO / VERIFICACIÓN).")
         self.ui.linea(f"{Tema.acento}⇪ escalada:{C.RESET} {Tema.tenue}consulto a {self.modelo} "
                       f"(la verificación falló {self.settings.umbral_escalada} veces){C.RESET}")

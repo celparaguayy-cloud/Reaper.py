@@ -128,11 +128,26 @@ def crear_desde_plantilla(nombre: str, destino: Path, variables: Optional[dict] 
     if destino.exists() and any(destino.iterdir()) and not sobrescribir:
         raise FileExistsError(f"{destino} ya existe y no está vacía.")
     variables = {**variables_para(destino), **(variables or {})}
-    creados = []
+    # Validar TODO el manifiesto antes de escribir el primer archivo: una
+    # plantilla externa manipulada no puede usar ../ ni escribir por symlinks.
+    raiz_segura = destino.resolve()
+    objetivos = []
+    vistos = set()
     for rel, contenido in sorted(p.archivos.items()):
         rel_final = renderizar_plantilla(rel, variables)
-        ruta = destino / rel_final
-        texto = renderizar_plantilla(contenido, variables)
+        parte = Path(rel_final)
+        if (parte.is_absolute() or not rel_final or any(x in ("..", "") for x in parte.parts)
+                or rel_final in vistos or "\\" in rel_final):
+            raise ValueError(f"Ruta inválida o repetida en la plantilla: {rel_final!r}")
+        ruta = destino / parte
+        if raiz_segura not in ruta.resolve().parents:
+            raise ValueError(f"La plantilla intenta escribir fuera de la carpeta: {rel_final!r}")
+        vistos.add(rel_final)
+        objetivos.append((rel_final, ruta, renderizar_plantilla(contenido, variables)))
+    if "REAPER.md" not in vistos and raiz_segura not in (destino / "REAPER.md").resolve().parents:
+        raise ValueError("REAPER.md apunta fuera del proyecto")
+    creados = []
+    for rel_final, ruta, texto in objetivos:
         escritura_atomica(ruta, texto)
         if rel_final.endswith(".sh") or texto.startswith("#!"):
             try:

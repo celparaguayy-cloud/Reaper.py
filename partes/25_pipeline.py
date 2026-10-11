@@ -178,11 +178,109 @@ def verificacion_peor(despues: "Verificacion", antes: "Verificacion") -> bool:
 
 
 def veredicto(informe: str) -> tuple[bool, bool]:
-    """(aprobado, claro). Si el revisor no respeta el formato se aprueba para no entrar en bucles."""
+    """(aprobado, claro). Un dictamen malformado NO equivale a una aprobación."""
     m = _RE_VEREDICTO.search(informe or "")
     if not m:
-        return True, False
+        return False, False
     return m.group(1).upper() == "APROBADO", True
+
+
+# ======================================================================
+# REAPER 8.10 — RONDA 12: PRUEBAS DE ACEPTACIÓN INDEPENDIENTES
+# ======================================================================
+# Contrato administrado por el propietario, separado del workspace.
+# No usa shell, no descarga código ni aprueba si se recogieron 0 tests.
+# El manifiesto .reaper/acceptance.json es opcional para proyectos antiguos.
+
+def _aceptacion_error(mensaje: str) -> Resultado:
+    return Resultado(False, 'aceptacion_independiente', 1, stderr=str(mensaje))
+
+
+def huella_aceptacion(ws: Workspace) -> str:
+    """Fija el manifiesto y la suite externa; cambios durante build => fallo cerrado."""
+    cfg = ws.raiz / '.reaper' / 'acceptance.json'
+    if not cfg.exists() and not cfg.is_symlink():
+        return 'sin-evaluador'
+    if cfg.is_symlink() or not cfg.is_file():
+        raise ValueError('El manifiesto de aceptación no puede ser un enlace simbólico.')
+    if cfg.stat().st_size > 16_384:
+        raise ValueError('El manifiesto de aceptación supera 16 KiB.')
+    raw = cfg.read_bytes()
+    try:
+        spec = json.loads(raw)
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise ValueError(f'Manifiesto de aceptación inválido: {exc}') from exc
+    if not isinstance(spec, dict) or set(spec) - {'suite_dir', 'min_tests', 'timeout'}:
+        raise ValueError('El manifiesto acepta solo suite_dir, min_tests y timeout.')
+    suite_str = spec.get('suite_dir')
+    if not isinstance(suite_str, str) or not suite_str.startswith('/'):
+        raise ValueError('suite_dir debe ser una carpeta ABSOLUTA fuera del proyecto.')
+    suite = Path(suite_str).resolve(strict=False)
+    raiz = ws.raiz.resolve()
+    if os.path.commonpath((str(suite), str(raiz))) == str(raiz):
+        raise ValueError('La suite independiente debe estar FUERA del proyecto editado por REAPER.')
+    if not suite.is_dir():
+        raise ValueError(f'No existe la suite independiente: {suite}')
+    minimo = spec.get('min_tests', 1)
+    tiempo = spec.get('timeout', 60)
+    if isinstance(minimo, bool) or not isinstance(minimo, int) or not 1 <= minimo <= 10000:
+        raise ValueError('min_tests debe ser un entero entre 1 y 10000.')
+    if isinstance(tiempo, bool) or not isinstance(tiempo, int) or not 1 <= tiempo <= 180:
+        raise ValueError('timeout debe ser un entero entre 1 y 180.')
+    tests = sorted(suite.rglob('test_*.py'))
+    if not tests or len(tests) > 500:
+        raise ValueError('La suite externa debe incluir 1 a 500 archivos test_*.py.')
+    h = hashlib.sha256(b'REAPER-810-ACCEPTANCE-V1\0' + raw)
+    for p in tests:
+        if p.is_symlink() or not p.is_file():
+            raise ValueError('Los tests independientes no admiten enlaces simbólicos.')
+        if p.stat().st_size > 1_000_000:
+            raise ValueError(f'Test externo demasiado grande: {p.name}')
+        h.update(str(p.relative_to(suite)).encode('utf-8') + b'\0')
+        h.update(p.read_bytes())
+        h.update(b'\0')
+    return h.hexdigest()
+
+
+def ejecutar_aceptacion_independiente(ws: Workspace, *,
+                                        huella_fijada: Optional[str] = None) -> Optional[Resultado]:
+    """Devuelve None solo si NO se configuró un evaluador al inicio de la build.
+
+    Ejecuta unittest con argv real (shell=False) y muestra fallos auténticos.
+    No acepta cambiar/quitar los tests, ni resultados vacíos o con saltos completos.
+    """
+    try:
+        huella_actual = huella_aceptacion(ws)
+        if huella_fijada is not None and huella_fijada != huella_actual:
+            return _aceptacion_error('Evaluador independiente cambiado o eliminado durante la build.')
+        if huella_actual == 'sin-evaluador':
+            return None
+        spec = json.loads((ws.raiz / '.reaper' / 'acceptance.json').read_text(encoding='utf-8'))
+        carpeta = str(Path(spec['suite_dir']).resolve())
+        resultado = ejecutar([sys.executable, '-m', 'unittest', 'discover',
+                             '-s', carpeta, '-p', 'test_*.py', '-v'],
+                            cwd=ws.raiz, timeout=int(spec.get('timeout', 60)), shell=False)
+        combinado = resultado.stdout + '\n' + resultado.stderr
+        m = re.search(r'\bRan\s+(\d+)\s+tests?\b', combinado)
+        minimo = spec.get('min_tests', 1)
+        if not m:
+            resultado.ok = False
+            resultado.stderr += '\nACEPTACIÓN: falta conteo verificable de unittest.'
+        else:
+            skipped = re.search(r'\bskipped\s*=\s*(\d+)', combinado)
+            xfailed = re.search(r'\bexpected failures\s*=\s*(\d+)', combinado)
+            no_ejecutados = (int(skipped.group(1)) if skipped else 0) + (int(xfailed.group(1)) if xfailed else 0)
+            efectivos = max(0, int(m.group(1)) - no_ejecutados)
+            if efectivos < minimo:
+                resultado.ok = False
+                resultado.stderr += (f'\nACEPTACIÓN: solo {efectivos}/{minimo} pruebas ejecutadas '
+                                     'sin omisiones o fallos esperados.')
+        if huella_aceptacion(ws) != huella_actual:
+            resultado.ok = False
+            resultado.stderr += '\nACEPTACIÓN: los tests/manifiesto se modificaron al ejecutarse.'
+        return resultado
+    except (ValueError, OSError, UnicodeError) as exc:
+        return _aceptacion_error(f'ACEPTACIÓN inválida: {exc}')
 
 
 @dataclass
@@ -193,6 +291,7 @@ class Verificacion:
     diagnostico: str
     archivos: list
     conteo: ConteoTests = field(default_factory=ConteoTests)
+    aceptacion: Optional[Resultado] = None
 
 
 @dataclass
@@ -201,6 +300,7 @@ class InformeBuild:
     plan: Optional[Plan] = None
     archivos: list = field(default_factory=list)
     tests: Optional[Resultado] = None
+    aceptacion: Optional[Resultado] = None
     diagnostico: str = ""
     cid: Optional[int] = None
     ruta_informe: Optional[Path] = None
@@ -217,6 +317,16 @@ class InformeBuild:
     @property
     def ok(self) -> bool:
         return self.estado in ("verificada", "validada")
+
+
+def estado_final_build(verif: Verificacion, informe: InformeBuild) -> str:
+    """Nunca declarar terminada una build con tareas omitidas, aunque la suite actual esté verde."""
+    if not verif.ok:
+        return "fallida"
+    if informe.tareas_bloqueadas or informe.tareas_fallidas:
+        return "parcial"
+    hay_tests = verif.tests is not None and not verif.tests.omitido
+    return "verificada" if hay_tests or (verif.aceptacion is not None and verif.aceptacion.ok) else "validada"
 
 
 def _diffstat(diff: str) -> str:
@@ -248,6 +358,214 @@ def _es_de_especificacion(nombre_test: str, protegidos: dict) -> bool:
     return False
 
 
+# Registro persistente y prudente de /construir. No es una fuente de verdad
+# sobre los tests: conserva solo estados observados y permite un resume explícito.
+class RegistroBuild:
+    ESQUEMA = 1
+
+    def __init__(self, ws: Workspace):
+        self.ws = ws
+        self.ruta = ws.carpeta_reaper() / "build_pendiente.json"
+
+    def huellas(self) -> dict[str, str]:
+        """Inventario para reanudar: incluye binarios, permisos y symlinks sin leer secretos.
+
+        El inventario anterior solo incluía archivos de texto conocidos, y
+        permitía pasar por alto cambios externos en datos SQLite, imágenes o
+        enlaces simbólicos. Para archivos grandes se usa metadata y no contenido.
+        """
+        salidas: dict[str, str] = {}
+        maximo = 2000
+        for actual, carpetas, archivos in os.walk(self.ws.raiz, followlinks=False):
+            base = Path(actual)
+            rel_base = base.relative_to(self.ws.raiz).as_posix()
+            rel_base = "" if rel_base == "." else rel_base
+            permitidas = []
+            for nombre in sorted(carpetas):
+                rel = f"{rel_base}/{nombre}".lstrip("/")
+                if self.ws.ignorado(rel, True):
+                    continue
+                ruta = base / nombre
+                if ruta.is_symlink():
+                    # Registrar su existencia y destino, sin seguirlo ni abrirlo.
+                    salidas[rel + "/"] = "link:" + hashlib.sha256(os.fsencode(os.readlink(ruta))).hexdigest()
+                else:
+                    permitidas.append(nombre)
+                if len(salidas) > maximo:
+                    raise ValueError("Más de 2000 archivos/enlaces: no puedo verificar la reanudación")
+            carpetas[:] = permitidas
+            for nombre in sorted(archivos):
+                rel = f"{rel_base}/{nombre}".lstrip("/")
+                if self.ws.ignorado(rel, False):
+                    continue
+                ruta = base / nombre
+                try:
+                    st = ruta.lstat()
+                    if ruta.is_symlink():
+                        digest = "link:" + hashlib.sha256(os.fsencode(os.readlink(ruta))).hexdigest()
+                    elif not ruta.is_file():
+                        continue
+                    elif es_archivo_sensible(nombre) or st.st_size > 16_000_000:
+                        # No abrir claves privadas; sin cargar archivos enormes en RAM.
+                        detalle = f"meta:{st.st_size}:{st.st_mtime_ns}:{st.st_ctime_ns}:{st.st_mode}"
+                        digest = hashlib.sha256(detalle.encode()).hexdigest()
+                    else:
+                        h = hashlib.sha256()
+                        with ruta.open("rb") as f:
+                            for bloque in iter(lambda: f.read(65536), b""):
+                                h.update(bloque)
+                        digest = h.hexdigest()
+                    salidas[rel] = digest
+                except OSError as e:
+                    raise ValueError(f"No pude verificar {rel}: {e}") from e
+                if len(salidas) > maximo:
+                    raise ValueError("Más de 2000 archivos/enlaces: no puedo verificar la reanudación")
+        return salidas
+
+    def huella(self) -> str:
+        h = hashlib.sha256()
+        for rel, digest in sorted(self.huellas().items()):
+            h.update(f"{rel}\0{digest}\n".encode("utf-8"))
+        return h.hexdigest()
+
+    def huella_legada(self) -> str:
+        """Solo para validar la huella de diarios anteriores a la ronda 6.
+
+        El inventario antiguo omitía binarios y enlaces. Por ese motivo,
+        incluso si coincide, NO conserva tareas verificadas: vuelve a probarlas.
+        """
+        salidas = {}
+        archivos = list(self.ws.iterar(limite=2001))
+        if len(archivos) > 2000:
+            raise ValueError("Más de 2000 archivos en el diario antiguo")
+        for ruta in archivos:
+            if not self.ws.es_texto(ruta) or not ruta.is_file() or ruta.is_symlink():
+                continue
+            try:
+                if ruta.stat().st_size > 2_000_000:
+                    raise ValueError("El archivo grande requiere iniciar una construcción nueva")
+                h = hashlib.sha256()
+                with ruta.open("rb") as f:
+                    for bloque in iter(lambda: f.read(65536), b""):
+                        h.update(bloque)
+                salidas[self.ws.rel(ruta)] = h.hexdigest()
+            except OSError as e:
+                raise ValueError(f"Inventario legado ilegible: {e}") from e
+        h = hashlib.sha256()
+        for rel, digest in sorted(salidas.items()):
+            h.update(f"{rel}\0{digest}\n".encode("utf-8"))
+        return h.hexdigest()
+
+    def recuperable(self, previo: dict) -> bool:
+        """Acepta modificaciones de la tarea interrumpida SOLO si están en su checkpoint.
+
+        Si cambió un archivo fuera de ese checkpoint, puede tratarse de una
+        edición externa: no saltamos tareas con evidencia antigua.
+        """
+        if previo["huella"] == self.huella():
+            return True
+        activo = previo.get("tarea_activa")
+        tcid = previo.get("tcid")
+        inicio = previo.get("huellas_inicio")
+        if not isinstance(activo, str) or not isinstance(tcid, int) or not isinstance(inicio, dict):
+            return False
+        if tcid not in self.ws.checkpoints.ids():
+            return False
+        antes = inicio
+        ahora = self.huellas()
+        cambiados = {p for p in set(antes) | set(ahora) if antes.get(p) != ahora.get(p)}
+        registrados = set(self.ws.checkpoints.archivos_desde(tcid))
+        if not cambiados or not cambiados.issubset(registrados):
+            return False
+        # Una tarea a medio hacer no debe invalidar en silencio otra ya validada.
+        verificados = previo.get("archivos_verificados", {})
+        if any(antes.get(p) != ahora.get(p) for p in verificados):
+            return False
+        return True
+
+    def leer(self) -> Optional[dict]:
+        if not self.ruta.is_file():
+            return None
+        try:
+            if self.ruta.stat().st_size > 250_000:
+                raise ValueError("registro demasiado grande")
+            registro = json.loads(self.ruta.read_text(encoding="utf-8"))
+            if not isinstance(registro, dict) or registro.get("esquema") != self.ESQUEMA:
+                raise ValueError("versión de registro incompatible")
+            if registro.get("proyecto") != str(self.ws.raiz):
+                raise ValueError("el registro es de otro proyecto")
+            if not isinstance(registro.get("pedido"), str) or not isinstance(registro.get("plan"), dict):
+                raise ValueError("pedido/plan no válidos")
+            tareas = registro["plan"].get("tareas")
+            if not isinstance(tareas, list) or not tareas or len(tareas) > 60:
+                raise ValueError("grafo de tareas inválido")
+            ids = [t.get("id") for t in tareas if isinstance(t, dict)]
+            if len(ids) != len(tareas) or len(set(ids)) != len(ids) or any(not isinstance(i, str) for i in ids):
+                raise ValueError("ids de tareas inválidos")
+            if not isinstance(registro.get("estados"), dict) or not isinstance(registro.get("huella"), str):
+                raise ValueError("estados o huella inválidos")
+            if not isinstance(registro.get("grupo"), int) or registro["grupo"] < 1:
+                raise ValueError("checkpoint inválido")
+            if not isinstance(registro.get("archivos_verificados", {}), dict) or not isinstance(registro.get("tests_protegidos", {}), dict):
+                raise ValueError("huellas de verificación inválidas")
+            try:
+                plan = _plan_de_registro(registro["plan"])
+                if errores_grafo_build(plan):
+                    raise ValueError("plan guardado con dependencias inválidas")
+            except (KeyError, TypeError, AttributeError, ValueError) as e:
+                raise ValueError(f"plan guardado no válido: {e}") from e
+            return registro
+        except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as e:
+            raise ValueError(f"Registro de build dañado: {e}") from e
+
+    def guardar(self, registro: dict) -> None:
+        registro["huella"] = self.huella()
+        registro["huellas_version"] = 2
+        registro["actualizado"] = datetime.now().isoformat(timespec="seconds")
+        # Nunca guardar prompts de conversación con claves sin redactar.
+        contenido = redactar_secretos(json.dumps(registro, ensure_ascii=False, indent=2))
+        if len(contenido) > 250_000:
+            raise ValueError("Registro de build demasiado grande")
+        escritura_atomica(self.ruta, contenido)
+
+    def borrar(self) -> None:
+        if self.ruta.is_file():
+            self.ruta.unlink()
+
+
+def _plan_de_registro(datos: dict) -> Plan:
+    for item in datos["tareas"]:
+        if not isinstance(item, dict) or not isinstance(item.get("descripcion"), str) \
+                or not isinstance(item.get("archivos", []), list) or not isinstance(item.get("deps", []), list):
+            raise ValueError("Plan inválido")
+        if any(not isinstance(x, str) for x in item.get("archivos", []) + item.get("deps", [])):
+            raise ValueError("Plan inválido: nombres de archivos o dependencias")
+    tareas = [Tarea(t["id"], t["descripcion"], t.get("archivos", []), t.get("deps", []))
+              for t in datos["tareas"]]
+    return Plan(str(datos.get("objetivo", "")), tareas, list(datos.get("criterios", [])),
+                str(datos.get("texto", "")), str(datos.get("interfaz", "")))
+
+
+def errores_grafo_build(plan: Plan) -> list[str]:
+    """No ejecutar un plan con dependencias ambiguas o tareas duplicadas."""
+    if not plan.tareas:
+        return ["el plan no contiene tareas"]
+    ids = [t.id for t in plan.tareas]
+    errores = []
+    if any(not isinstance(i, str) or not i.strip() for i in ids):
+        errores.append("hay identificadores de tarea vacíos o inválidos")
+    elif len(ids) != len(set(ids)):
+        errores.append("hay identificadores de tarea duplicados")
+    if errores:
+        return errores
+    grafo = GrafoTareas(plan.tareas)
+    grafo.orden()  # registra ciclos y dependencias inexistentes
+    errores.extend(grafo.problemas)
+    if any(t.id in (t.deps or []) for t in plan.tareas):
+        errores.append("hay tareas que dependen de sí mismas")
+    return errores
+
+
 class Orquestador:
     def __init__(self, llm, ws: Workspace, settings: Settings, ui: UI):
         self.llm = llm
@@ -257,6 +575,7 @@ class Orquestador:
         self.memoria = MemoriaLecciones(ws) if settings.lecciones else None
         self.escalador = Escalador(llm, settings, ui)
         self._protegidos: dict[str, Optional[str]] = {}
+        self._huella_aceptacion: Optional[str] = None
 
     def _sub(self, rol: str, tarea: str, cid: Optional[int], archivos: str = "", titulo: str = "",
              **opciones) -> ResultadoAgente:
@@ -461,7 +780,8 @@ class Orquestador:
             return True, "(revisión omitida: el revisor no respondió; la validación real pasa)"
         aprobado, claro = veredicto(res.resumen)
         if not claro:
-            self.ui.tenue("  (el revisor no usó el formato VEREDICTO: se toma como aprobado)")
+            self.ui.aviso("  Revisión SIN VEREDICTO: no se considera aprobada; la verificación real decidirá el resultado.")
+            return False, "VEREDICTO: CAMBIOS\nLa revisión no entregó un dictamen verificable (APROBADO o CAMBIOS)."
         if aprobado and validacion and not validacion.startswith(("OK", "sin validadores")):
             self.ui.aviso("  El revisor aprobó, pero la validación real falla: lo tomo como CAMBIOS.")
             return False, ("VEREDICTO: CAMBIOS\n1. La validación automática falla (corregilo antes que nada):\n"
@@ -497,10 +817,19 @@ class Orquestador:
         elif tests is not None and not tests.ok:
             partes.append("TESTS: " + conteo.texto() + "\n" + fallos_relevantes(f"{tests.stdout}\n{tests.stderr}",
                                                                                 maximo=3, limite=5000))
+        # Evaluador externo, colocado FUERA del directorio editable del proyecto.
+        # Si falla, no se puede declarar la build verificada aunque el LLM diga que terminó.
+        aceptacion = ejecutar_aceptacion_independiente(
+            self.ws, huella_fijada=self._huella_aceptacion)
+        aceptacion_ok = aceptacion is None or aceptacion.ok
+        if not aceptacion_ok:
+            partes.append('PRUEBAS DE ACEPTACIÓN INDEPENDIENTES:\n'
+                          + aceptacion.resumen(4500))
         diagnostico = "\n\n".join(partes)
         if diagnostico and self.settings.pistas_errores:
             diagnostico = anexar_pistas(diagnostico, 3)
-        return Verificacion(not malos and tests_ok, validaciones, tests, diagnostico, archivos, conteo)
+        return Verificacion(not malos and tests_ok and aceptacion_ok, validaciones,
+                            tests, diagnostico, archivos, conteo, aceptacion)
 
     def reparar(self, pedido: str, verif: Verificacion, cid: int, base_fallaba: bool,
                 diagnostico_experto: str = "", contexto: str = "") -> ResultadoAgente:
@@ -659,6 +988,8 @@ class Orquestador:
             "EV-TESTS": (verif.conteo.texto() if verif.conteo.reconocido else
                          ("sin suite de tests" if verif.tests is None else f"exit {verif.tests.codigo}")),
             "EV-VALID": resumen_validacion(verif.validaciones, limite=1500),
+            "EV-ACEPTACION": (verif.aceptacion.resumen(1600) if verif.aceptacion is not None
+                               else 'no configurada'),
             "EV-DIFF": _diffstat(diff) or "(sin cambios)",
         }
         bloque = "\n".join(f"{k}: {v}" for k, v in evidencia.items())
@@ -733,7 +1064,8 @@ class Orquestador:
         return ruta
 
     def _verificar_tarea(self, tcid: int, antes: ConteoTests, nombres_antes: set,
-                         exigir_progreso: bool = False) -> Verificacion:
+                         exigir_progreso: bool = False, verificar_entrega: bool = False,
+                         archivos_esperados: Sequence[str] = ()) -> Verificacion:
         """
         Una tarea intermedia no necesita que pasen TODOS los tests (los de tareas
         siguientes todavía fallan): alcanza con validadores OK y que no se rompa
@@ -744,6 +1076,19 @@ class Orquestador:
         tests = ejecutar_tests(self.ws, timeout=self.settings.tests_timeout, completo=True)
         conteo = conteo_de_resultado(tests)
         problemas = [r.resumen(2500) for r in fallos(validaciones)]
+        if verificar_entrega:
+            # La palabra "listo" del modelo NO es evidencia. Cada tarea debe
+            # materializar sus objetivos declarados y producir cambios reales.
+            # No se exige que toda la suite esté verde antes de tareas futuras.
+            faltantes = [rel for rel in archivos_esperados
+                         if not isinstance(rel, str) or not rel.strip()
+                         or not self.ws.existe(rel)]
+            if faltantes:
+                problemas.append("ENTREGA INCOMPLETA: faltan archivos declarados por la tarea: "
+                                 + ", ".join(map(str, faltantes[:10])))
+            if not archivos:
+                problemas.append("SIN CAMBIOS: la tarea no modificó archivos del proyecto. "
+                                 "No se puede verificar una implementación solo por el texto del modelo.")
         if tests is not None and not tests.ok and conteo.reconocido:
             # Los tests de la especificación de tareas siguientes fallan a propósito: no son regresión.
             nuevos_fallos = [n for n in conteo.nombres_fallados
@@ -776,40 +1121,151 @@ class Orquestador:
             diagnostico = anexar_pistas(diagnostico, 2)
         return Verificacion(not problemas, validaciones, tests, diagnostico, archivos, conteo)
 
-    def construir(self, pedido: str, confirmar: bool = True) -> InformeBuild:
+    def construir(self, pedido: str, confirmar: bool = True, reanudar: bool = False) -> InformeBuild:
         inicio = time.monotonic()
         self._protegidos: dict[str, Optional[str]] = {}
+        registro_build = RegistroBuild(self.ws)
+        try:
+            previo = registro_build.leer()
+        except ValueError as e:
+            self.ui.error(str(e) + ". Usá /construir estado y revisá el registro antes de descartarlo.")
+            return InformeBuild("cancelada")
         base = ejecutar_tests(self.ws, timeout=self.settings.tests_timeout, completo=True)
         base_fallaba = base is not None and not base.ok
         if base_fallaba:
             self.ui.aviso("Atención: la suite de tests YA falla antes de empezar; se tendrá en cuenta.")
+        # La huella original es ajena al LLM: si sus tests cambian durante la
+        # construcción, el verificador fallará sin conceder un falso verde.
+        try:
+            huella_actual = huella_aceptacion(self.ws)
+        except (ValueError, OSError) as exc:
+            self.ui.error(f'No puedo iniciar: evaluador independiente inválido: {exc}')
+            return InformeBuild('cancelada')
+        if reanudar:
+            if not previo:
+                self.ui.aviso("No hay /construir pendiente en este proyecto.")
+                return InformeBuild("cancelada")
+            if previo.get("huellas_version", 1) != 2:
+                # La huella anterior ignoraba binarios y enlaces simbólicos.
+                # No podemos heredar sus resultados "verificados" como evidencia.
+                try:
+                    igual_legado = previo["huella"] == registro_build.huella_legada()
+                except (OSError, ValueError) as e:
+                    self.ui.error(f"Inventario antiguo no verificable: {e}")
+                    return InformeBuild("cancelada")
+                if not igual_legado:
+                    self.ui.error("El proyecto cambió desde el diario antiguo. No reanudo ni "
+                                  "sobrescribo archivos; revisá el proyecto manualmente.")
+                    return InformeBuild("cancelada")
+                previo["estados"] = {tid: "pendiente" for tid in previo["estados"]}
+                previo["archivos_verificados"] = {}
+                previo.pop("tarea_activa", None)
+                previo.pop("tcid", None)
+                previo.pop("huellas_inicio", None)
+                registro_build.guardar(previo)
+                self.ui.aviso("Diario antiguo migrado: ninguna tarea se omite; "
+                              "se repiten las verificaciones reales.")
+            if not registro_build.recuperable(previo):
+                self.ui.error("Cambios externos o tareas ya verificadas alteradas; "
+                              "no puedo omitir trabajo con evidencia antigua. Revisá /diff.")
+                return InformeBuild("cancelada")
+            # Actualizar la huella después de una tarea que quedó a mitad.
+            # Sus cambios siguen pendientes de verificación, no se marcan como OK.
+            if previo["huella"] != registro_build.huella():
+                previo["huella"] = registro_build.huella()
+                registro_build.guardar(previo)
+            if previo["grupo"] not in self.ws.checkpoints.ids():
+                self.ui.error("El checkpoint original ya no existe; no puedo reanudar con evidencia.")
+                return InformeBuild("cancelada")
+            huella_guardada = previo.get('huella_aceptacion')
+            if huella_guardada is not None and huella_actual != huella_guardada:
+                self.ui.error('Cambió el evaluador independiente desde el checkpoint; no reanudo.')
+                return InformeBuild('cancelada')
+            self._huella_aceptacion = huella_guardada if huella_guardada is not None else huella_actual
+            if huella_guardada is None:
+                previo['huella_aceptacion'] = huella_actual
+                registro_build.guardar(previo)
+            pedido = previo["pedido"]
+            # Migración tolerante de registros antiguos: el campo se introdujo
+            # después de la primera versión del diario de construcciones.
+            # Los campos ausentes NO significan que una tarea esté verificada.
+            previo.setdefault("archivos_verificados", {})
+            previo.setdefault("tests_protegidos", {})
+            plan = _plan_de_registro(previo["plan"])
+            problemas_grafo = errores_grafo_build(plan)
+            if problemas_grafo:
+                self.ui.error("Plan guardado inválido; no retomo la construcción: " + "; ".join(problemas_grafo))
+                return InformeBuild("cancelada")
+            exploracion = str(previo.get("exploracion", ""))
+            grupo = previo["grupo"]
+            # Restaurar tests protegidos. No desprotegerlos silenciosamente si desaparecieron.
+            for rel, digest in previo.get("tests_protegidos", {}).items():
+                if not self.ws.existe(rel) or self.ws.hash(rel) != digest:
+                    self.ui.error("Los tests de especificación cambiaron: " + rel)
+                    return InformeBuild("cancelada")
+                self._protegidos[rel] = self.ws.leer(rel)
+            self.ui.info("Retomo la build desde el checkpoint guardado, sin replanificar.")
+        else:
+            if previo and previo.get("estado") not in ("verificada", "validada"):
+                self.ui.error("Ya hay una build incompleta. Usá /construir continuar o "
+                              "/construir descartar para comenzar otra (sin borrar archivos).")
+                return InformeBuild("cancelada")
+            plan, exploracion = self.obtener_plan(pedido, confirmar)
+            if plan is None:
+                self.ui.tenue("Construcción cancelada; no se tocó ningún archivo.")
+                return InformeBuild("cancelada")
+            problemas_grafo = errores_grafo_build(plan)
+            if problemas_grafo:
+                self.ui.error("El plan no es ejecutable: " + "; ".join(problemas_grafo)
+                              + ". Corregí sus dependencias antes de empezar.")
+                return InformeBuild("cancelada")
+            grupo = self.ws.checkpoints.iniciar(f"construir: {pedido[:80]}")
+            previo = {"esquema": RegistroBuild.ESQUEMA, "proyecto": str(self.ws.raiz),
+                      "pedido": pedido, "plan": asdict(plan), "grupo": grupo,
+                      "exploracion": recortar(exploracion, 3000), "estados": {},
+                      "tests_protegidos": {}, "archivos_verificados": {}, "estado": "en_curso",
+                      "especificacion_completa": False,
+                      "tests_primero": bool(self.settings.tests_primero),
+                      "huella_aceptacion": huella_actual}
+            self._huella_aceptacion = huella_actual
+            registro_build.guardar(previo)
 
-        plan, exploracion = self.obtener_plan(pedido, confirmar)
-        if plan is None:
-            self.ui.tenue("Construcción cancelada; no se tocó ningún archivo.")
-            return InformeBuild("cancelada")
-
-        grupo = self.ws.checkpoints.iniciar(f"construir: {pedido[:80]}")
         informe = InformeBuild("fallida", plan=plan, cid=grupo)
 
         testeable = any(a.endswith(EXTENSIONES_TESTEABLES) for a in plan.archivos()) or any(
             a.endswith(EXTENSIONES_TESTEABLES) for a in self.ws.archivos_codigo(limite=200)) or not self.ws.archivos_codigo(limite=5)
         numero_fase = 3
-        # Proteger los tests que YA existían en el proyecto: ni el implementador ni un candidato del torneo
-        # pueden editarlos para que un bug "pase" (test gaming). Se fijan a su contenido actual y la
-        # verificación corre contra el test real, así un código roto termina FALLIDA y no "verificada".
-        for rel in self.ws.archivos_codigo(limite=800):
-            if _es_test(rel):
-                try:
-                    self._protegidos[rel] = self.ws.leer(rel)
-                except (OSError, ValueError, ErrorRuta):
-                    pass
-        if self.settings.tests_primero and testeable:
+        if not reanudar:
+            # Proteger los tests que YA existían en el proyecto: ni el implementador ni un candidato del torneo
+            # pueden editarlos para que un bug "pase" (test gaming). Se fijan a su contenido actual y sus hashes
+            # quedan en el diario, así una reanudación los vuelve a exigir intactos en vez de congelar lo que haya.
+            for rel in self.ws.archivos_codigo(limite=800):
+                if _es_test(rel):
+                    try:
+                        self._protegidos[rel] = self.ws.leer(rel)
+                    except (OSError, ValueError, ErrorRuta):
+                        pass
+            if self._protegidos:
+                previo["tests_protegidos"] = {p: self.ws.hash(p) for p in self._protegidos}
+                registro_build.guardar(previo)
+        # Si se interrumpió la etapa de especificación, reanudarla (no
+        # saltarla silenciosamente). Para registros antiguos, los hashes de
+        # los tests permiten reconocer la etapa como completada.
+        tests_primero_build = bool(previo.get("tests_primero", self.settings.tests_primero))
+        spec_completa = bool(previo.get("especificacion_completa",
+                                         bool(previo.get("tests_protegidos"))))
+        if tests_primero_build and testeable and not spec_completa:
             self.ui.fase(numero_fase, "Tests primero (especificación ejecutable)")
             numero_fase += 1
             espec = self.especificar(pedido, plan, grupo)
             self._protegidos.update(espec)
             informe.spec_tests = list(espec)
+            previo["spec_tests"] = list(espec)
+            previo["tests_protegidos"] = {p: self.ws.hash(p) for p in self._protegidos}
+            previo["especificacion_completa"] = True
+            registro_build.guardar(previo)
+        elif reanudar:
+            informe.spec_tests = list(previo.get("spec_tests", self._protegidos))
 
         self.ui.fase(numero_fase, "Implementación" + (" · torneo" if self.settings.torneo and self.settings.candidatos > 1 else ""))
         numero_fase += 1
@@ -820,8 +1276,13 @@ class Orquestador:
         if [t.id for t in orden] != [t.id for t in plan.tareas]:
             self.ui.tenue("  Orden por dependencias: " + " → ".join(t.id for t in orden))
             plan.tareas = orden
+        # Si hay tareas verificadas, la huella del proyecto se confirmó ANTES de
+        # retomarlas. No se repiten implementaciones exitosas ni sus solicitudes a IA.
         for i, tarea in enumerate(plan.tareas):
             self.ui.info(f"\n▸ Tarea {i + 1}/{len(plan.tareas)}: {recortar(tarea.descripcion.splitlines()[0], 120)}")
+            if reanudar and previo["estados"].get(tarea.id) == "verificada":
+                self.ui.ok(f"Tarea {tarea.id}: conservada (verificada antes de la interrupción)")
+                continue
             rotas = [d for d in grafo.dependencias(tarea.id)
                      if d in informe.tareas_fallidas or d in informe.tareas_bloqueadas]
             if rotas:
@@ -829,24 +1290,36 @@ class Orquestador:
                 self.ui.aviso(f"  Tarea {tarea.id} BLOQUEADA: depende de {', '.join(rotas)}, que no pasó su verificación.")
                 informe.tareas_bloqueadas.append(tarea.id)
                 informe.notas.append(f"Tarea {tarea.id}: bloqueada (depende de {', '.join(rotas)}).")
+                previo["estados"][tarea.id] = "bloqueada"
+                registro_build.guardar(previo)
                 continue
+            previo["estados"][tarea.id] = "en_curso"
+            previo["tarea_activa"] = tarea.id
+            previo["huellas_inicio"] = registro_build.huellas()
+            registro_build.guardar(previo)
             antes_tests = ejecutar_tests(self.ws, timeout=self.settings.tests_timeout, completo=True)
             conteo_antes = conteo_de_resultado(antes_tests)
             nombres_antes = set(conteo_antes.nombres_fallados)
             tcid = self.ws.checkpoints.iniciar(f"tarea {tarea.id}", grupo=grupo)
+            previo["tcid"] = tcid
+            registro_build.guardar(previo)
             resultado = self.implementar(pedido, plan, i, exploracion, tcid, protegidos=self._protegidos)
             informe.torneos.append((tarea.id, resultado.modo, resultado.ganador.indice if resultado.ganador else None))
             if not resultado.ok:
                 informe.notas.append(f"Tarea {tarea.id}: la implementación no terminó limpia.")
 
             exigir = not resultado.ok
-            verif_tarea = self._verificar_tarea(tcid, conteo_antes, nombres_antes, exigir_progreso=exigir)
+            verif_tarea = self._verificar_tarea(tcid, conteo_antes, nombres_antes,
+                                                 exigir_progreso=exigir, verificar_entrega=True,
+                                                 archivos_esperados=tarea.archivos)
             if not verif_tarea.ok:
                 self.ui.aviso(f"  La tarea {tarea.id} no pasó su verificación: la reparo con el error real.")
                 verif_tarea = self._reparar_con_escalada(
                     pedido, verif_tarea, grupo, base_fallaba, informe, f"tarea {tarea.id}",
                     max(1, self.settings.umbral_escalada + 1),
-                    lambda: self._verificar_tarea(tcid, conteo_antes, nombres_antes, exigir_progreso=exigir),
+                    lambda: self._verificar_tarea(tcid, conteo_antes, nombres_antes,
+                                                 exigir_progreso=exigir, verificar_entrega=True,
+                                                 archivos_esperados=tarea.archivos),
                     contexto=f"TAREA EN CURSO (#{tarea.id}): {tarea.descripcion}",
                 )
                 if not verif_tarea.ok:
@@ -858,6 +1331,11 @@ class Orquestador:
                 # terminaba "aprobando" igual): el problema ya está diagnosticado por los tests.
                 self.ui.aviso(f"  No paso la tarea {tarea.id} al revisor: su verificación real falla.")
                 informe.notas.append(f"Tarea {tarea.id}: sin revisión porque la verificación real falla.")
+                previo["estados"][tarea.id] = "fallida"
+                previo.pop("tarea_activa", None)
+                previo.pop("tcid", None)
+                previo.pop("huellas_inicio", None)
+                registro_build.guardar(previo)
                 continue
 
             for ronda in range(self.settings.max_revisiones):
@@ -875,6 +1353,28 @@ class Orquestador:
                     break
                 self.implementar(pedido, plan, i, exploracion, tcid, correcciones=revision,
                                  protegidos=self._protegidos)
+            # La revisión puede editar código. Verificar de nuevo antes de
+            # registrar la tarea como hecha: tests verdes previos no bastan.
+            verif_post = self._verificar_tarea(tcid, conteo_antes, nombres_antes,
+                                              exigir_progreso=exigir, verificar_entrega=True,
+                                              archivos_esperados=tarea.archivos)
+            if verif_post.ok:
+                previo["estados"][tarea.id] = "verificada"
+                # Archivo verificado por primera vez: no permitir que una tarea
+                # interrumpida lo altere y sea saltado al reanudar.
+                for rel in self.ws.checkpoints.archivos_desde(tcid):
+                    previo["archivos_verificados"][rel] = self.ws.hash(rel)
+                for rel in list(previo["archivos_verificados"]):
+                    previo["archivos_verificados"][rel] = self.ws.hash(rel)
+            else:
+                previo["estados"][tarea.id] = "fallida"
+                if tarea.id not in informe.tareas_fallidas:
+                    informe.tareas_fallidas.append(tarea.id)
+                informe.notas.append(f"Tarea {tarea.id}: falla tras revisión; verificación final pendiente.")
+            previo.pop("tarea_activa", None)
+            previo.pop("tcid", None)
+            previo.pop("huellas_inicio", None)
+            registro_build.guardar(previo)
 
         archivos = [r for r in self.ws.checkpoints.archivos_desde(grupo) if (self.ws.raiz / r).is_file()]
         hay_tests_build = any(_es_test(a) for a in archivos)
@@ -896,12 +1396,12 @@ class Orquestador:
 
         informe.archivos = verif.archivos
         informe.tests = verif.tests
+        informe.aceptacion = verif.aceptacion
         informe.diagnostico = verif.diagnostico
-        if verif.ok and informe.tareas_bloqueadas:
-            # Lo construido pasa, pero hay tareas del plan que nunca se hicieron: entrega INCOMPLETA.
-            informe.estado = "parcial"
-        elif verif.ok:
-            informe.estado = "verificada" if verif.tests is not None and not verif.tests.omitido else "validada"
+        informe.estado = estado_final_build(verif, informe)
+        if informe.estado == "parcial":
+            informe.notas.append("Verificación final verde, pero hay tareas fallidas/bloqueadas sin completar.")
+        elif informe.ok:
             if self.settings.git_snapshots and es_repo_git(self.ws):
                 try:
                     informe.commit = snapshot_build(self.ws, self.settings.rama_git,
@@ -912,6 +1412,10 @@ class Orquestador:
             self.ui.fase(numero_fase + 1, "Auditoría REAPER X (seguridad defensiva · entrega · supervisor)")
             self._auditoria_x(pedido, plan, verif, informe)
         informe.segundos = time.monotonic() - inicio
+        previo["estado"] = informe.estado
+        registro_build.guardar(previo)
+        if informe.ok:
+            registro_build.borrar()
         informe.ruta_informe = self._guardar_informe(pedido, informe)
         self._mostrar_cierre(informe)
         return informe
@@ -932,6 +1436,12 @@ class Orquestador:
         else:
             self.ui.error(f"tests: fallaron ({verif.conteo.texto() if verif.conteo.reconocido else verif.tests.comando})")
             self.ui.tenue(recortar(fallos_relevantes(verif.tests.stdout + "\n" + verif.tests.stderr, 2, 1500), 1500))
+        if verif.aceptacion is not None:
+            if verif.aceptacion.ok:
+                self.ui.ok('aceptación independiente: pruebas externas superadas')
+            else:
+                self.ui.error('aceptación independiente: FALLIDA')
+                self.ui.tenue(recortar(verif.aceptacion.resumen(1500), 1500))
 
     def _guardar_informe(self, pedido: str, informe: InformeBuild) -> Optional[Path]:
         try:
@@ -944,6 +1454,13 @@ class Orquestador:
                 f"## Plan\n```\n{informe.plan.como_texto() if informe.plan else '-'}\n```\n\n"
                 f"## Archivos\n```\n{_diffstat(diff) or '-'}\n```\n\n"
                 f"## Tests\n```\n{tests}\n```\n\n"
+                + (f"## Aceptación independiente\n```\n{informe.aceptacion.resumen(4500)}\n```\n\n"
+                   if informe.aceptacion is not None else '')
+                + ("## Tareas pendientes de la build\n"
+                   + "\n".join(f"- Fallida: {t}" for t in informe.tareas_fallidas)
+                   + ("\n" if informe.tareas_fallidas and informe.tareas_bloqueadas else "")
+                   + "\n".join(f"- Bloqueada: {t}" for t in informe.tareas_bloqueadas)
+                   + "\n\n" if (informe.tareas_fallidas or informe.tareas_bloqueadas) else "")
                 + ("## Especificación (tests escritos antes de implementar)\n" + "\n".join(f"- {t}" for t in informe.spec_tests) + "\n\n"
                    if informe.spec_tests else "")
                 + (f"## Escaladas al modelo fuerte\n{informe.escaladas}\n\n" if informe.escaladas else "")
@@ -953,7 +1470,9 @@ class Orquestador:
                 + ("## Notas\n" + "\n".join(f"- {n}" for n in informe.notas) + "\n" if informe.notas else "")
             )
             ruta = self.ws.raiz / ".reaper" / "informes" / f"build_{datetime.now():%Y%m%d_%H%M%S}.md"
-            escritura_atomica(ruta, contenido)
+            # Los informes persisten fuera de la conversación y no deben
+            # filtrar tokens mencionados en el pedido ni en los diagnósticos.
+            escritura_atomica(ruta, redactar_secretos(contenido))
             return ruta
         except OSError as e:
             self.ui.aviso(f"No pude guardar el informe: {e}")
@@ -967,7 +1486,8 @@ class Orquestador:
         elif informe.estado == "parcial":
             self.ui.titulo("◐ BUILD PARCIAL (lo hecho pasa, pero faltan tareas del plan)")
             self.ui.aviso(f"  fallidas: {', '.join(informe.tareas_fallidas) or '—'} · "
-                          f"bloqueadas: {', '.join(informe.tareas_bloqueadas)}  → /construir de nuevo retoma")
+                          f"bloqueadas: {', '.join(informe.tareas_bloqueadas)}. "
+                          "Una nueva /construir requerirá verificar lo ya hecho.")
         else:
             self.ui.titulo("✗ BUILD FALLIDA")
         diff = self.ws.checkpoints.diff_desde(informe.cid) if informe.cid else ""

@@ -27,8 +27,26 @@ def comando_receta(r: Receta, ruta: str) -> str:
     }[r.lenguaje]
 
 
+@functools.lru_cache(maxsize=1)
+def _pdo_sqlite_disponible() -> bool:
+    """PHP puede existir sin la extensión pdo_sqlite; comprobarla realmente."""
+    php = shutil.which("php")
+    if not php:
+        return False
+    try:
+        r = subprocess.run([php, "-r", "echo in_array('sqlite', PDO::getAvailableDrivers(), true) ? 'SI' : 'NO';"],
+                           capture_output=True, text=True, timeout=5, check=False)
+        return r.returncode == 0 and r.stdout.strip() == "SI"
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
 def receta_disponible(r: Receta) -> bool:
-    return shutil.which(_REQUIERE_RECETA.get(r.lenguaje, r.lenguaje)) is not None
+    if shutil.which(_REQUIERE_RECETA.get(r.lenguaje, r.lenguaje)) is None:
+        return False
+    if r.lenguaje == "php" and "PDO" in r.titulo and "SQLite" in r.titulo:
+        return _pdo_sqlite_disponible()
+    return True
 
 
 # ======================================================================== GO
@@ -653,7 +671,7 @@ function validarRegistro(array $datos): array
     $errores = [];
     $limpio = [];
     $nombre = trim((string) ($datos['nombre'] ?? ''));
-    if ($nombre === '' || mb_strlen($nombre) > 60) {
+    if ($nombre === '' || (function_exists('mb_strlen') ? mb_strlen($nombre) : preg_match_all('/./us', $nombre)) > 60) {
         $errores['nombre'] = 'El nombre es obligatorio (máx. 60 caracteres).';
     }
     $limpio['nombre'] = $nombre;

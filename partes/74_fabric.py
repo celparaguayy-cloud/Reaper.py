@@ -188,7 +188,7 @@ def _modelo_representativo(proveedor: str, settings, modelo: Optional[str] = Non
 
 def probar_proveedor(llm, proveedor: str, settings, *, modelo: Optional[str] = None) -> dict:
     """
-    Prueba REAL de un proveedor: petición mínima ('ping', max_tokens=1), SIN código del proyecto, un solo
+    Prueba REAL de un proveedor: respuesta verificable (REAPER_OK, max_tokens=64), SIN código del proyecto, un solo
     intento, y clasifica el resultado por causa. Registra checked_at. Requiere consentimiento y claves
     válidas; hasta ejecutarse con red real el resultado es NO VERIFICADO.
     """
@@ -209,12 +209,15 @@ def probar_proveedor(llm, proveedor: str, settings, *, modelo: Optional[str] = N
     reg["modelo"] = modelo
     t0 = time.monotonic()
     try:
-        llm.chat([{"role": "user", "content": "ping"}], modelo=modelo, max_tokens=1, temperatura=0,
-                 sin_respaldo=True, rol="probe")
-        reg["estado"], reg["detalle"] = "OK", "responde"
+        respuesta = llm.chat([{"role": "user", "content": "Responde solo REAPER_OK."}],
+                             modelo=modelo, max_tokens=64, temperatura=0,
+                             sin_respaldo=True, rol="probe")
+        visible = str(getattr(respuesta, "texto", "") or "").strip()
+        reg["estado"], reg["detalle"] = (("OK", "texto verificado") if "REAPER_OK" in visible.upper()
+                                             else ("ERROR", "respuesta vacía o no verificable"))
     except LLMError as e:
         if getattr(e, "solo_razonamiento", False):
-            reg["estado"], reg["detalle"] = "OK", "responde (solo razonamiento con max_tokens mínimo)"
+            reg["estado"], reg["detalle"] = "ERROR", "solo razonamiento, no verificable"
         else:
             reg["estado"], reg["detalle"] = clasificar_prueba_proveedor(e)
     except (OSError, ValueError, RuntimeError) as e:
