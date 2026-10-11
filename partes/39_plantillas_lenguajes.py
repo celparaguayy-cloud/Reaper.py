@@ -3138,7 +3138,7 @@ like($@, qr/cero absoluto/, 'bajo el cero absoluto');
 eval { convertir(-1, 'm', 'cm') };
 like($@, qr/negativo/, 'longitud negativa');
 
-my $salida = `printf '100 c f\\n1 kg m\\nsalir\\n' | $^X $FindBin::Bin/../bin/conversor.pl`;
+my $salida = `printf '100 c f\\n1 kg m\\nsalir\\n' | "$^X" "$FindBin::Bin/../bin/conversor.pl"`;
 like($salida, qr/100 c = 212 f/, 'REPL por stdin convierte');
 like($salida, qr/error: no se puede convertir/, 'REPL por stdin informa errores');
 

@@ -123,7 +123,9 @@ INFO_MODELOS = {
     # ":free" de OpenRouter no prueba coste cero: free=False hasta verificarlo con la cuenta.
     "or-dolphin-jefe-free": InfoModelo("cognitivecomputations/dolphin-mistral-24b-venice-edition:free", 32768,
                                        "base", "Dolphin Mistral 24B Venice Edition (uncensored): DIRECTOR, solo "
-                                       "texto/JSON (sin tool calls nativos)", "openrouter", False),
+                                       "texto/JSON (sin tool calls nativos). Ojo: el catálogo público de OpenRouter "
+                                       "(consultado 2026-10-11) lista solo la versión PAGA; si :free da 404 REAPER la "
+                                       "retira y usa el respaldo del equipo", "openrouter", False),
     "or-nemotron3-ultra-free": InfoModelo("nvidia/nemotron-3-ultra-550b-a55b:free", 32768, "fuerte",
                                           "Nemotron 3 Ultra: SUPERVISOR (razonamiento; puede tardar)", "openrouter", False),
     "groq-gptoss120": InfoModelo("openai/gpt-oss-120b", 131072, "fuerte",

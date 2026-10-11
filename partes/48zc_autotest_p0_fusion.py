@@ -370,3 +370,14 @@ class TestGateWebDePuntaAPunta(BaseTest):
         informe = self._build(rota=False)
         self.assertEqual(informe.estado, "verificada", informe.diagnostico)
         self.assertTrue(informe.aceptacion.ok)
+
+
+class TestPlantillasRutaConEspacios(BaseTest):
+    @unittest.skipUnless(shutil.which("prove") and shutil.which("perl"), "perl/prove no instalados")
+    def test_perl_conversor_en_carpeta_con_espacios(self):
+        # Termux: "/storage/emulated/0/Mis proyectos" es habitual. El test de la plantilla invocaba el script por
+        # shell sin comillas y fallaba con "Can't open perl script".
+        destino = self.dir / "mis proyectos" / "demo perl"
+        crear_desde_plantilla("perl-conversor", destino)
+        r = ejecutar("prove -l t", cwd=destino, timeout=120, shell=True)
+        self.assertTrue(r.ok, r.resumen(1500))

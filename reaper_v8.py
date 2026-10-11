@@ -1566,7 +1566,9 @@ INFO_MODELOS = {
     # ":free" de OpenRouter no prueba coste cero: free=False hasta verificarlo con la cuenta.
     "or-dolphin-jefe-free": InfoModelo("cognitivecomputations/dolphin-mistral-24b-venice-edition:free", 32768,
                                        "base", "Dolphin Mistral 24B Venice Edition (uncensored): DIRECTOR, solo "
-                                       "texto/JSON (sin tool calls nativos)", "openrouter", False),
+                                       "texto/JSON (sin tool calls nativos). Ojo: el catálogo público de OpenRouter "
+                                       "(consultado 2026-10-11) lista solo la versión PAGA; si :free da 404 REAPER la "
+                                       "retira y usa el respaldo del equipo", "openrouter", False),
     "or-nemotron3-ultra-free": InfoModelo("nvidia/nemotron-3-ultra-550b-a55b:free", 32768, "fuerte",
                                           "Nemotron 3 Ultra: SUPERVISOR (razonamiento; puede tardar)", "openrouter", False),
     "groq-gptoss120": InfoModelo("openai/gpt-oss-120b", 131072, "fuerte",
@@ -34348,7 +34350,7 @@ like($@, qr/cero absoluto/, 'bajo el cero absoluto');
 eval { convertir(-1, 'm', 'cm') };
 like($@, qr/negativo/, 'longitud negativa');
 
-my $salida = `printf '100 c f\\n1 kg m\\nsalir\\n' | $^X $FindBin::Bin/../bin/conversor.pl`;
+my $salida = `printf '100 c f\\n1 kg m\\nsalir\\n' | "$^X" "$FindBin::Bin/../bin/conversor.pl"`;
 like($salida, qr/100 c = 212 f/, 'REPL por stdin convierte');
 like($salida, qr/error: no se puede convertir/, 'REPL por stdin informa errores');
 
@@ -45875,6 +45877,17 @@ class TestGateWebDePuntaAPunta(BaseTest):
         self.assertTrue(informe.aceptacion.ok)
 
 
+class TestPlantillasRutaConEspacios(BaseTest):
+    @unittest.skipUnless(shutil.which("prove") and shutil.which("perl"), "perl/prove no instalados")
+    def test_perl_conversor_en_carpeta_con_espacios(self):
+        # Termux: "/storage/emulated/0/Mis proyectos" es habitual. El test de la plantilla invocaba el script por
+        # shell sin comillas y fallaba con "Can't open perl script".
+        destino = self.dir / "mis proyectos" / "demo perl"
+        crear_desde_plantilla("perl-conversor", destino)
+        r = ejecutar("prove -l t", cwd=destino, timeout=120, shell=True)
+        self.assertTrue(r.ok, r.resumen(1500))
+
+
 # ======================================================================
 # MÓDULO: autotest_runner
 # ======================================================================
@@ -45887,6 +45900,43 @@ def clases_de_test() -> list:
          if isinstance(obj, type) and issubclass(obj, unittest.TestCase) and nombre.startswith("Test")),
         key=lambda c: c.__name__,
     )
+
+
+class _ResultadoCronometrado(unittest.TextTestResult):
+    """Mide cada test y deja ver cuál está corriendo (para el vigía de tests colgados)."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.tiempos: list = []
+        self.actual: Optional[str] = None
+        self.inicio_actual = 0.0
+
+    def startTest(self, test):
+        self.actual, self.inicio_actual = test.id(), time.monotonic()
+        super().startTest(test)
+
+    def stopTest(self, test):
+        self.tiempos.append((time.monotonic() - self.inicio_actual, test.id()))
+        self.actual = None
+        super().stopTest(test)
+
+
+def _vigia_tests(resultado: "_ResultadoCronometrado", alerta: float, fin: threading.Event) -> None:
+    """
+    Si un test pasa de `alerta` segundos, dice CUÁL es y vuelca la pila de todos los hilos (dónde está trabado:
+    socket, subprocess, join...). Solo diagnostica: no mata el test ni cambia timeouts (batería atascada en Termux).
+    """
+    import faulthandler
+    avisado = None
+    while not fin.wait(1.0):
+        actual = resultado.actual
+        if actual and actual != avisado and time.monotonic() - resultado.inicio_actual > alerta:
+            avisado = actual
+            print(f"\n⏱ VIGÍA: {actual} lleva más de {alerta:.0f}s. Pila de los hilos:", file=sys.stderr, flush=True)
+            try:
+                faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
+            except (OSError, ValueError, RuntimeError):
+                pass
 
 
 def correr_autotest(filtro: Optional[str] = None, verbosidad: Optional[int] = None) -> int:
@@ -45907,8 +45957,31 @@ def correr_autotest(filtro: Optional[str] = None, verbosidad: Optional[int] = No
     print(f"{Tema.titulo}{C.BOLD}🐉 REAPER {__version__} · autotest{C.RESET} {Tema.tenue}"
           f"({total} tests, sin API){C.RESET}")
     inicio = time.monotonic()
-    resultado = unittest.TextTestRunner(verbosity=verbosidad, stream=sys.stdout).run(suite)
+    runner = unittest.TextTestRunner(verbosity=verbosidad, stream=sys.stdout, resultclass=_ResultadoCronometrado)
+    fin_vigia = threading.Event()
+    try:
+        alerta = float(os.getenv("REAPER_AUTOTEST_ALERTA", "60"))
+    except ValueError:
+        alerta = 60.0
+    original_crear = runner._makeResult
+
+    def _crear():
+        r = original_crear()
+        if alerta > 0:
+            threading.Thread(target=_vigia_tests, args=(r, alerta, fin_vigia), name="vigia-autotest",
+                             daemon=True).start()
+        return r
+
+    runner._makeResult = _crear
+    try:
+        resultado = runner.run(suite)
+    finally:
+        fin_vigia.set()
     duracion = formatear_duracion(time.monotonic() - inicio)
+    lentos = sorted(getattr(resultado, "tiempos", []), reverse=True)[:8]
+    if lentos and lentos[0][0] >= 2.0:
+        print(f"{Tema.tenue}Tests más lentos: " + "; ".join(f"{n.split('.', 1)[-1]} {s:.1f}s" for s, n in lentos
+                                                            if s >= 1.0) + C.RESET)
     if resultado.wasSuccessful():
         print(f"{Tema.ok}✓ {resultado.testsRun} tests OK en {duracion}"
               f"{f' ({len(resultado.skipped)} salteados)' if resultado.skipped else ''}{C.RESET}")
