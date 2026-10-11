@@ -392,3 +392,31 @@ class TestHooksDelRepoSinConsentimiento(BaseTest):
         with patch("builtins.input", side_effect=EOFError):
             app.repl(animar=False)
         self.assertFalse(marca.exists())                             # antes: se ejecutaba al abrir el repo
+
+
+class TestHallazgosTermux(BaseTest):
+    """Fallos vistos al correr el autotest en el Termux real del usuario (Python 3.14, pytest instalado)."""
+
+    def test_pytest_con_todo_salteado_se_reconoce(self):
+        for salida, omitidos in (("s                                  [100%]\n1 skipped in 0.01s", 1),
+                                 ("3 deselected in 0.02s", 3), ("xx\n2 xfailed in 0.10s", 2)):
+            with self.subTest(salida=salida):
+                c = contar_tests(salida, 0)
+                self.assertTrue(c.reconocido)
+                self.assertEqual((c.ejecutados, c.omitidos), (0, omitidos))   # antes: "1 pasó" por exit 0
+
+    def test_suite_pytest_toda_salteada_no_verifica(self):
+        from unittest.mock import patch
+        ws = self.proyecto({"app.py": "x = 1\n", "tests/test_app.py": "import pytest\n"})
+        falso = Resultado(True, "python -m pytest -q", 0, "s    [100%]\n1 skipped in 0.01s")
+        orq = Orquestador(MockLLM([]), ws, self.ajustes(forense=False, lecciones=False), self.ui())
+        with patch.dict(Orquestador.verificar.__globals__, {"ejecutar_tests": lambda *a, **k: falso}):
+            verif = orq.verificar(ws.checkpoints.iniciar("x"))
+        self.assertFalse(verif.ok)
+        self.assertIn("OMITIDOS", verif.diagnostico)
+
+    def test_requisito_de_libreria_se_comprueba_de_verdad(self):
+        self.assertFalse(requisito_disponible("herramienta_que_no_existe_xyz"))
+        self.assertFalse(requisito_disponible("python3:modulo_que_no_existe_xyz"))
+        self.assertTrue(requisito_disponible("python3:json"))
+        self.assertIn("gem install minitest", instruccion_requisito("ruby:minitest"))

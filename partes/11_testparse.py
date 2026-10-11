@@ -71,7 +71,10 @@ _RE_CARGO_FALLO = re.compile(r"^test (\S+) \.\.\. FAILED", re.M)
 
 
 def _pytest(salida: str) -> Optional[ConteoTests]:
-    lineas = [l for l in salida.splitlines() if re.search(r"\b(passed|failed|errors?)\b", l)
+    # Un resumen con SOLO skipped/xfailed/deselected ("1 skipped in 0.01s") también cuenta: antes se ignoraba,
+    # se caía a "exit 0 = 1 pasó" y una suite toda salteada terminaba "verificada" (visto en Termux con pytest).
+    lineas = [l for l in salida.splitlines()
+              if re.search(r"\b(passed|failed|errors?|skipped|xfailed|xpassed|deselected)\b", l)
               and re.search(r"\bin\s+[\d.]+s", l) and not l.lstrip().startswith("test result:")]  # cargo
     if not lineas:
         if "no tests ran" in salida.lower():

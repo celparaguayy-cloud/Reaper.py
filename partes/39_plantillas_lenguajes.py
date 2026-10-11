@@ -2993,7 +2993,7 @@ En Termux: `pkg install ruby`.
     comando_tests="ruby -Ilib -Itest test/test_biblioteca.rb",
     comando_ejecutar="ruby bin/biblioteca",
     etiquetas=("ruby", "cli", "json"),
-    requiere=("ruby",),
+    requiere=("ruby", "ruby:minitest"),
 )
 
 # ======================================================================

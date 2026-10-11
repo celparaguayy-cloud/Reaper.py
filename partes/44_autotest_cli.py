@@ -318,7 +318,7 @@ class TestPlantillas(BaseTest):
                 if not plantilla.comando_tests:
                     continue
                 if not plantilla.disponible():
-                    continue
+                    self.skipTest("faltan: " + ", ".join(plantilla.faltantes()))
                 if set(plantilla.requiere) & {"go", "cargo", "javac", "make"} and not os.getenv("REAPER_AUTOTEST_COMPLETO"):
                     continue  # compilar Go/Rust/Java/C tarda: solo con REAPER_AUTOTEST_COMPLETO=1
                 destino = self.dir / "plantillas_generadas" / nombre.replace("-", "_")

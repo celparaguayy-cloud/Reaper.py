@@ -77,8 +77,9 @@ class TestDeteccionLenguajes(BaseTest):
         self.assertIsNone(self._detectar({"README.md": "hola"}))
 
     def test_plantilla_ruby_se_detecta_sin_config(self):
-        if not shutil.which("ruby"):
-            self.skipTest("sin ruby")
+        plantilla = PLANTILLAS["ruby-biblioteca"]
+        if not plantilla.disponible():
+            self.skipTest("faltan: " + ", ".join(plantilla.faltantes()))
         destino = self.dir / "bib"
         crear_desde_plantilla("ruby-biblioteca", destino)
         (destino / ".reaper" / "config.json").unlink(missing_ok=True)

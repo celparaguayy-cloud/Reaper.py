@@ -48,7 +48,8 @@ def _ent_sha256(ruta: Path) -> tuple:
     return h.hexdigest(), tam
 
 
-def ruta_destino_android(nombre: str, preferida: Optional[str] = None, interno: Optional[Path] = None):
+def ruta_destino_android(nombre: str, preferida: Optional[str] = None, interno: Optional[Path] = None,
+                         candidatas_sistema: Optional[Sequence[Path]] = None):
     """
     Elige una ruta de salida REAL y legible. Prefiere la autorizada; si no hay acceso a almacenamiento
     compartido, cae a una carpeta interna de REAPER (sin fingir que llegó a /sdcard). Devuelve (ruta, externo).
@@ -56,7 +57,8 @@ def ruta_destino_android(nombre: str, preferida: Optional[str] = None, interno: 
     candidatas = []
     if preferida:
         candidatas.append(Path(preferida).expanduser())
-    candidatas += [Path("~/storage/downloads").expanduser(), Path("/sdcard/Download"), Path("/sdcard")]
+    candidatas += list(candidatas_sistema) if candidatas_sistema is not None else [
+        Path("~/storage/downloads").expanduser(), Path("/sdcard/Download"), Path("/sdcard")]
     for base in candidatas:
         try:
             if base.is_dir() and os.access(base, os.W_OK):

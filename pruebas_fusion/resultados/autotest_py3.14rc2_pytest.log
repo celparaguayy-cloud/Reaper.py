@@ -1,0 +1,20 @@
+🐉 REAPER 8.10 · autotest (914 tests, sin API)
+..................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................No hay tests que coincidan con el filtro 'reaper810_no_existe_987'. Clases: TestAdvertenciasDeTests, TestAgente, TestAislamientoCredenciales, TestAnalizarDependencias, TestAnalizarMuestra, TestArchivoSensible, TestAuditorCLI, TestAuditorConfig, TestAutofix, TestAutonomiaV8, TestAvisoAlEscribirTests, TestBloqueSeguridad…
+......................................................................$ aceptación independiente: unittest /tmp/reaper_autotest_ja2unxic/evaluador_independiente
+exit code: 0
+STDERR:
+test_ok (test_calidad.TestX.test_ok) ... ok
+
+----------------------------------------------------------------------
+Ran 1 test in 0.000s
+
+OK
+
+ACEPTACIÓN: 1 corridos, 1 efectivos, 0 fallos, 0 errores, 0 omitidos (mínimo 1).
+..........................................................................................................................................................................................................................
+----------------------------------------------------------------------
+Ran 914 tests in 112.507s
+
+OK
+Tests más lentos: TestPlantillas.test_todas_las_plantillas_pasan_sus_tests 12.2s; TestCtrlCNoCuelga.test_sigint_real_sale_en_plazo_acotado 4.7s; TestPipeline.test_reparacion_con_escalada_y_leccion 3.6s; TestDoctor.test_instalar_lanzador 3.5s; TestRobustezModeloTorpe.test_cada_defecto_por_separado 3.4s; TestNoTestGaming.test_implementador_no_puede_debilitar_un_test_existente 3.2s; TestProcesosFondo.test_limites_y_seguridad 3.2s; TestPipelinePlanYRevision.test_revisor_no_aprueba_una_tarea_que_rompe_tests 3.2s
+✓ 914 tests OK en 1m52s

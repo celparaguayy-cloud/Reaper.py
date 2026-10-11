@@ -29,7 +29,46 @@ class Plantilla:
     requiere: tuple = ()
 
     def disponible(self) -> bool:
-        return all(shutil.which(r) for r in self.requiere)
+        return all(requisito_disponible(r) for r in self.requiere)
+
+    def faltantes(self) -> list:
+        """Qué falta instalar para correr sus tests, con el comando para instalarlo."""
+        return [instruccion_requisito(r) for r in self.requiere if not requisito_disponible(r)]
+
+
+_CARGA_LIBRERIA = {
+    "ruby": lambda lib: ["ruby", "-e", f"require {lib!r}"],
+    "python3": lambda lib: [sys.executable, "-c", f"import {lib}"],
+    "node": lambda lib: ["node", "-e", f"require({lib!r})"],
+}
+_INSTALAR_LIBRERIA = {"ruby": "gem install {lib}", "python3": "pip install {lib}", "node": "npm install {lib}"}
+
+
+@functools.lru_cache(maxsize=64)
+def requisito_disponible(requisito: str) -> bool:
+    """
+    "ruby" → el ejecutable existe. "ruby:minitest" → además la librería carga de verdad (en Termux el paquete
+    ruby NO trae la gema minitest y los tests de la plantilla fallaban con LoadError).
+    """
+    herramienta, _sep, libreria = requisito.partition(":")
+    if not shutil.which(herramienta if herramienta != "python3" else sys.executable):
+        return False
+    if not libreria:
+        return True
+    armar = _CARGA_LIBRERIA.get(herramienta)
+    if armar is None:
+        return False
+    try:
+        return subprocess.run(armar(libreria), capture_output=True, timeout=30).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def instruccion_requisito(requisito: str) -> str:
+    herramienta, _sep, libreria = requisito.partition(":")
+    if libreria:
+        return f"{libreria} ({_INSTALAR_LIBRERIA.get(herramienta, 'instalá {lib}').format(lib=libreria)})"
+    return f"{herramienta} (pkg install {herramienta})"
 
 
 PLANTILLAS: dict[str, Plantilla] = {}

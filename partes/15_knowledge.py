@@ -246,6 +246,9 @@ PISTAS: list[Pista] = [
     Pista(r"CONFLICT \(content\)|Automatic merge failed",
           "Conflicto de merge: editá los archivos marcados con <<<<<<< ======= >>>>>>> y hacé commit.", "git"),
     # ------------------------------------------------------------ HTML/CSS/web
+    Pista(r"cannot load such file -- minitest",
+          "Falta la gema minitest (en Termux no viene con ruby): `gem install minitest`. No es un error del "
+          "código del proyecto: no lo modifiques para esquivarlo.", "ruby"),
     Pista(r"recursos-html|referencia a '.*' que no existe",
           "El HTML apunta a un archivo que no existe: creá ESE archivo donde el servidor lo publica, o corregí el "
           "src/href (relativo a la carpeta del HTML; '/x' lo resuelve el servidor desde su raíz web). No cambies "

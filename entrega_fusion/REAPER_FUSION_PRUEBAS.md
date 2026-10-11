@@ -1,7 +1,8 @@
 # REAPER 8.10 fusionado — resultados exactos de las pruebas
 
-Archivo probado: `reaper_8.10_fusionado.py`, SHA-256 `abe85902082d7b339f3e1062dec40889f384374665ac4dbeb659fef67e127738`
-(idéntico a `reaper_v8.py` del commit final de la rama `ccr-6e025352-3tb6n4`). Fecha: 2026-10-11.
+Versión ACTUAL: `reaper_8.10_fusionado.py`, SHA-256 `0a5baa7f40afecd0747d03881f2cff6d6dcb1f2c60ad08141d1e5a2ab886ef63`
+(incluye los arreglos de la sección 7). Las secciones 1–6 se corrieron sobre la versión anterior `abe85902…`; la
+regresión completa de la versión actual está al final de la sección 7. Fecha: 2026-10-11.
 
 **Entorno:** contenedor Linux x86_64 en la nube (no Termux, no Android). Python 3.11.15, 3.12.3 y 3.13.14.
 Node 22, Java, Go, Perl 5.38 disponibles. **Sin claves de proveedores** (todas ausentes) y sin acceso al Termux del usuario.
@@ -113,3 +114,23 @@ de Android ni Gradle con el SDK aquí).
 | Termux/Android real, RAM en 2 GB, almacenamiento compartido | no hay dispositivo |
 | Suite en el Termux del usuario | debe correrse allí: `python3 reaper_8.10_fusionado.py --autotest` |
 | Apagón/kill a mitad de escritura del diario | no se hizo prueba de estrés de energía |
+
+## 7. Primera corrida en el Termux REAL del usuario (aarch64, Python 3.14.6)
+
+Archivo: `reaper_8.10_fusionado.py` SHA `abe85902…` (verificado por el usuario con `sha256sum`).
+`--version` → `REAPER 8.10`. `--autotest`: **910 tests en 1324 s (22 min): 906 OK, 4 fallos, 6 omitidos** (los omitidos son
+por herramientas ausentes en el teléfono). Diagnóstico de los 4 fallos:
+
+| Test | Causa | Tipo | Arreglo |
+|---|---|---|---|
+| `TestFalsosVerdesFusion.test_tests_todos_omitidos_no_verifican` | en el teléfono hay **pytest**; su resumen `1 skipped in 0.01s` no se reconocía (solo se leían líneas con passed/failed/error), caía a "exit 0 = 1 pasó" | **falso verde real de REAPER** | el parser de pytest reconoce resúmenes de solo skipped/xfailed/deselected; reproducido y verificado con pytest 9.1.1 |
+| `TestDeteccionLenguajes.test_plantilla_ruby_se_detecta_sin_config` | el paquete `ruby` de Termux no trae la gema **minitest** (`LoadError`) | entorno | requisitos `herramienta:librería` (`ruby:minitest`) comprobados cargando la librería; el test se omite diciendo `gem install minitest`; pista para el reparador |
+| `TestPlantillas.test_todas_las_plantillas_pasan_sus_tests` (ruby-biblioteca) | ídem minitest | entorno | ídem |
+| `TestEntregaArchivo.test_ruta_destino_cae_a_interna_sin_sdcard` | el test suponía que no existe `/sdcard`; en un teléfono real existe y la función elige bien el almacenamiento compartido | **test no hermético** | candidatas inyectables: se simula la ausencia y se agregó el caso positivo |
+
+El vigía saltó en `test_todas_las_plantillas_pasan_sus_tests` (122 s en el teléfono): no era un cuelgue. En Termux
+el umbral por defecto pasa a 180 s y el aviso aclara que el test sigue corriendo.
+
+**Después de los arreglos** (mismo código para todos): 914 tests OK en Python 3.11.15 (67 s), 3.12.3 (70 s),
+3.13.14 (75 s) y en **Python 3.14.0rc2 con pytest 9.1.1 instalado** (114 s; lo más parecido al teléfono que se pudo
+reproducir aquí). La repetición en el Termux real queda a cargo del usuario.

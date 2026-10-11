@@ -1,6 +1,6 @@
-🐉 REAPER 8.10 · autotest (910 tests, sin API)
-..............................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................No hay tests que coincidan con el filtro 'reaper810_no_existe_987'. Clases: TestAdvertenciasDeTests, TestAgente, TestAislamientoCredenciales, TestAnalizarDependencias, TestAnalizarMuestra, TestArchivoSensible, TestAuditorCLI, TestAuditorConfig, TestAutofix, TestAutonomiaV8, TestAvisoAlEscribirTests, TestBloqueSeguridad…
-......................................................................$ aceptación independiente: unittest /tmp/reaper_autotest_lji3o35k/evaluador_independiente
+🐉 REAPER 8.10 · autotest (914 tests, sin API)
+..................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................No hay tests que coincidan con el filtro 'reaper810_no_existe_987'. Clases: TestAdvertenciasDeTests, TestAgente, TestAislamientoCredenciales, TestAnalizarDependencias, TestAnalizarMuestra, TestArchivoSensible, TestAuditorCLI, TestAuditorConfig, TestAutofix, TestAutonomiaV8, TestAvisoAlEscribirTests, TestBloqueSeguridad…
+......................................................................$ aceptación independiente: unittest /tmp/reaper_autotest_ydh1ajlp/evaluador_independiente
 exit code: 0
 STDERR:
 test_ok (test_calidad.TestX.test_ok) ... ok
@@ -13,8 +13,8 @@ OK
 ACEPTACIÓN: 1 corridos, 1 efectivos, 0 fallos, 0 errores, 0 omitidos (mínimo 1).
 ..........................................................................................................................................................................................................................
 ----------------------------------------------------------------------
-Ran 910 tests in 71.799s
+Ran 914 tests in 73.479s
 
 OK
-Tests más lentos: TestPlantillas.test_todas_las_plantillas_pasan_sus_tests 11.8s; TestCtrlCNoCuelga.test_sigint_real_sale_en_plazo_acotado 4.6s; TestProcesosFondo.test_limites_y_seguridad 3.2s; TestDoctor.test_instalar_lanzador 3.2s; TestRecetasLenguajes.test_recetas_ejecutables_funcionan 3.1s; TestEvalsConSolucion.test_tests_ocultos_pasan_con_la_solucion_de_referencia 1.9s; TestEvalsConSolucion.test_solucion_vacia_no_pasa 1.6s; TestPlazosDePared.test_build_con_plazo_vencido_no_queda_verificada 1.3s
-✓ 910 tests OK en 1m11s
+Tests más lentos: TestPlantillas.test_todas_las_plantillas_pasan_sus_tests 12.2s; TestCtrlCNoCuelga.test_sigint_real_sale_en_plazo_acotado 4.5s; TestProcesosFondo.test_limites_y_seguridad 3.2s; TestRecetasLenguajes.test_recetas_ejecutables_funcionan 3.2s; TestDoctor.test_instalar_lanzador 3.1s; TestEvalsConSolucion.test_tests_ocultos_pasan_con_la_solucion_de_referencia 2.1s; TestEvalsConSolucion.test_solucion_vacia_no_pasa 1.6s; TestPipeline.test_reparacion_con_escalada_y_leccion 1.5s
+✓ 914 tests OK en 1m13s

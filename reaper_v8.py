@@ -6004,7 +6004,10 @@ _RE_CARGO_FALLO = re.compile(r"^test (\S+) \.\.\. FAILED", re.M)
 
 
 def _pytest(salida: str) -> Optional[ConteoTests]:
-    lineas = [l for l in salida.splitlines() if re.search(r"\b(passed|failed|errors?)\b", l)
+    # Un resumen con SOLO skipped/xfailed/deselected ("1 skipped in 0.01s") también cuenta: antes se ignoraba,
+    # se caía a "exit 0 = 1 pasó" y una suite toda salteada terminaba "verificada" (visto en Termux con pytest).
+    lineas = [l for l in salida.splitlines()
+              if re.search(r"\b(passed|failed|errors?|skipped|xfailed|xpassed|deselected)\b", l)
               and re.search(r"\bin\s+[\d.]+s", l) and not l.lstrip().startswith("test result:")]  # cargo
     if not lineas:
         if "no tests ran" in salida.lower():
@@ -7896,6 +7899,9 @@ PISTAS: list[Pista] = [
     Pista(r"CONFLICT \(content\)|Automatic merge failed",
           "Conflicto de merge: editá los archivos marcados con <<<<<<< ======= >>>>>>> y hacé commit.", "git"),
     # ------------------------------------------------------------ HTML/CSS/web
+    Pista(r"cannot load such file -- minitest",
+          "Falta la gema minitest (en Termux no viene con ruby): `gem install minitest`. No es un error del "
+          "código del proyecto: no lo modifiques para esquivarlo.", "ruby"),
     Pista(r"recursos-html|referencia a '.*' que no existe",
           "El HTML apunta a un archivo que no existe: creá ESE archivo donde el servidor lo publica, o corregí el "
           "src/href (relativo a la carpeta del HTML; '/x' lo resuelve el servidor desde su raíz web). No cambies "
@@ -16282,7 +16288,46 @@ class Plantilla:
     requiere: tuple = ()
 
     def disponible(self) -> bool:
-        return all(shutil.which(r) for r in self.requiere)
+        return all(requisito_disponible(r) for r in self.requiere)
+
+    def faltantes(self) -> list:
+        """Qué falta instalar para correr sus tests, con el comando para instalarlo."""
+        return [instruccion_requisito(r) for r in self.requiere if not requisito_disponible(r)]
+
+
+_CARGA_LIBRERIA = {
+    "ruby": lambda lib: ["ruby", "-e", f"require {lib!r}"],
+    "python3": lambda lib: [sys.executable, "-c", f"import {lib}"],
+    "node": lambda lib: ["node", "-e", f"require({lib!r})"],
+}
+_INSTALAR_LIBRERIA = {"ruby": "gem install {lib}", "python3": "pip install {lib}", "node": "npm install {lib}"}
+
+
+@functools.lru_cache(maxsize=64)
+def requisito_disponible(requisito: str) -> bool:
+    """
+    "ruby" → el ejecutable existe. "ruby:minitest" → además la librería carga de verdad (en Termux el paquete
+    ruby NO trae la gema minitest y los tests de la plantilla fallaban con LoadError).
+    """
+    herramienta, _sep, libreria = requisito.partition(":")
+    if not shutil.which(herramienta if herramienta != "python3" else sys.executable):
+        return False
+    if not libreria:
+        return True
+    armar = _CARGA_LIBRERIA.get(herramienta)
+    if armar is None:
+        return False
+    try:
+        return subprocess.run(armar(libreria), capture_output=True, timeout=30).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def instruccion_requisito(requisito: str) -> str:
+    herramienta, _sep, libreria = requisito.partition(":")
+    if libreria:
+        return f"{libreria} ({_INSTALAR_LIBRERIA.get(herramienta, 'instalá {lib}').format(lib=libreria)})"
+    return f"{herramienta} (pkg install {herramienta})"
 
 
 PLANTILLAS: dict[str, Plantilla] = {}
@@ -34205,7 +34250,7 @@ En Termux: `pkg install ruby`.
     comando_tests="ruby -Ilib -Itest test/test_biblioteca.rb",
     comando_ejecutar="ruby bin/biblioteca",
     etiquetas=("ruby", "cli", "json"),
-    requiere=("ruby",),
+    requiere=("ruby", "ruby:minitest"),
 )
 
 # ======================================================================
@@ -39984,7 +40029,7 @@ class TestPlantillas(BaseTest):
                 if not plantilla.comando_tests:
                     continue
                 if not plantilla.disponible():
-                    continue
+                    self.skipTest("faltan: " + ", ".join(plantilla.faltantes()))
                 if set(plantilla.requiere) & {"go", "cargo", "javac", "make"} and not os.getenv("REAPER_AUTOTEST_COMPLETO"):
                     continue  # compilar Go/Rust/Java/C tarda: solo con REAPER_AUTOTEST_COMPLETO=1
                 destino = self.dir / "plantillas_generadas" / nombre.replace("-", "_")
@@ -41195,8 +41240,9 @@ class TestDeteccionLenguajes(BaseTest):
         self.assertIsNone(self._detectar({"README.md": "hola"}))
 
     def test_plantilla_ruby_se_detecta_sin_config(self):
-        if not shutil.which("ruby"):
-            self.skipTest("sin ruby")
+        plantilla = PLANTILLAS["ruby-biblioteca"]
+        if not plantilla.disponible():
+            self.skipTest("faltan: " + ", ".join(plantilla.faltantes()))
         destino = self.dir / "bib"
         crear_desde_plantilla("ruby-biblioteca", destino)
         (destino / ".reaper" / "config.json").unlink(missing_ok=True)
@@ -43911,10 +43957,19 @@ class TestEntregaArchivo(BaseTest):
         self.assertEqual(destino.read_text(encoding="utf-8"), "previo")   # no lo pisó
 
     def test_ruta_destino_cae_a_interna_sin_sdcard(self):
-        # en el entorno de test no hay /sdcard ni ~/storage: debe caer a carpeta interna
-        ruta, externo = ruta_destino_android("x.md", interno=self.dir / "exports")
+        # Se simula que NO hay almacenamiento compartido (en un teléfono real /sdcard existe y este test,
+        # que dependía del sistema, fallaba en Termux aunque la función era correcta).
+        ruta, externo = ruta_destino_android("x.md", interno=self.dir / "exports",
+                                             candidatas_sistema=[self.dir / "no_hay_sdcard"])
         self.assertFalse(externo)
         self.assertTrue(str(ruta).endswith("x.md"))
+
+    def test_ruta_destino_usa_el_almacenamiento_compartido_si_existe(self):
+        compartido = self.dir / "storage_downloads"
+        compartido.mkdir()
+        ruta, externo = ruta_destino_android("x.md", interno=self.dir / "exports", candidatas_sistema=[compartido])
+        self.assertTrue(externo)
+        self.assertEqual(ruta, compartido / "x.md")
 
 
 class TestDeshacerEntrega(BaseTest):
@@ -45899,6 +45954,34 @@ class TestHooksDelRepoSinConsentimiento(BaseTest):
         self.assertFalse(marca.exists())                             # antes: se ejecutaba al abrir el repo
 
 
+class TestHallazgosTermux(BaseTest):
+    """Fallos vistos al correr el autotest en el Termux real del usuario (Python 3.14, pytest instalado)."""
+
+    def test_pytest_con_todo_salteado_se_reconoce(self):
+        for salida, omitidos in (("s                                  [100%]\n1 skipped in 0.01s", 1),
+                                 ("3 deselected in 0.02s", 3), ("xx\n2 xfailed in 0.10s", 2)):
+            with self.subTest(salida=salida):
+                c = contar_tests(salida, 0)
+                self.assertTrue(c.reconocido)
+                self.assertEqual((c.ejecutados, c.omitidos), (0, omitidos))   # antes: "1 pasó" por exit 0
+
+    def test_suite_pytest_toda_salteada_no_verifica(self):
+        from unittest.mock import patch
+        ws = self.proyecto({"app.py": "x = 1\n", "tests/test_app.py": "import pytest\n"})
+        falso = Resultado(True, "python -m pytest -q", 0, "s    [100%]\n1 skipped in 0.01s")
+        orq = Orquestador(MockLLM([]), ws, self.ajustes(forense=False, lecciones=False), self.ui())
+        with patch.dict(Orquestador.verificar.__globals__, {"ejecutar_tests": lambda *a, **k: falso}):
+            verif = orq.verificar(ws.checkpoints.iniciar("x"))
+        self.assertFalse(verif.ok)
+        self.assertIn("OMITIDOS", verif.diagnostico)
+
+    def test_requisito_de_libreria_se_comprueba_de_verdad(self):
+        self.assertFalse(requisito_disponible("herramienta_que_no_existe_xyz"))
+        self.assertFalse(requisito_disponible("python3:modulo_que_no_existe_xyz"))
+        self.assertTrue(requisito_disponible("python3:json"))
+        self.assertIn("gem install minitest", instruccion_requisito("ruby:minitest"))
+
+
 # ======================================================================
 # MÓDULO: autotest_runner
 # ======================================================================
@@ -45943,7 +46026,8 @@ def _vigia_tests(resultado: "_ResultadoCronometrado", alerta: float, fin: thread
         actual = resultado.actual
         if actual and actual != avisado and time.monotonic() - resultado.inicio_actual > alerta:
             avisado = actual
-            print(f"\n⏱ VIGÍA: {actual} lleva más de {alerta:.0f}s. Pila de los hilos:", file=sys.stderr, flush=True)
+            print(f"\n⏱ VIGÍA (no es un error; el test SIGUE corriendo): {actual} lleva más de {alerta:.0f}s. "
+                  "Si nunca termina, esta pila muestra dónde está trabado:", file=sys.stderr, flush=True)
             try:
                 faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
             except (OSError, ValueError, RuntimeError):
@@ -45971,7 +46055,8 @@ def correr_autotest(filtro: Optional[str] = None, verbosidad: Optional[int] = No
     runner = unittest.TextTestRunner(verbosity=verbosidad, stream=sys.stdout, resultclass=_ResultadoCronometrado)
     fin_vigia = threading.Event()
     try:
-        alerta = float(os.getenv("REAPER_AUTOTEST_ALERTA", "60"))
+        # En el teléfono todo es ~15x más lento (la suite tardó 22 min en Termux): umbral más alto allí.
+        alerta = float(os.getenv("REAPER_AUTOTEST_ALERTA", "180" if es_termux() else "60"))
     except ValueError:
         alerta = 60.0
     original_crear = runner._makeResult
@@ -51159,7 +51244,8 @@ def _ent_sha256(ruta: Path) -> tuple:
     return h.hexdigest(), tam
 
 
-def ruta_destino_android(nombre: str, preferida: Optional[str] = None, interno: Optional[Path] = None):
+def ruta_destino_android(nombre: str, preferida: Optional[str] = None, interno: Optional[Path] = None,
+                         candidatas_sistema: Optional[Sequence[Path]] = None):
     """
     Elige una ruta de salida REAL y legible. Prefiere la autorizada; si no hay acceso a almacenamiento
     compartido, cae a una carpeta interna de REAPER (sin fingir que llegó a /sdcard). Devuelve (ruta, externo).
@@ -51167,7 +51253,8 @@ def ruta_destino_android(nombre: str, preferida: Optional[str] = None, interno: 
     candidatas = []
     if preferida:
         candidatas.append(Path(preferida).expanduser())
-    candidatas += [Path("~/storage/downloads").expanduser(), Path("/sdcard/Download"), Path("/sdcard")]
+    candidatas += list(candidatas_sistema) if candidatas_sistema is not None else [
+        Path("~/storage/downloads").expanduser(), Path("/sdcard/Download"), Path("/sdcard")]
     for base in candidatas:
         try:
             if base.is_dir() and os.access(base, os.W_OK):

@@ -41,10 +41,19 @@ class TestEntregaArchivo(BaseTest):
         self.assertEqual(destino.read_text(encoding="utf-8"), "previo")   # no lo pisó
 
     def test_ruta_destino_cae_a_interna_sin_sdcard(self):
-        # en el entorno de test no hay /sdcard ni ~/storage: debe caer a carpeta interna
-        ruta, externo = ruta_destino_android("x.md", interno=self.dir / "exports")
+        # Se simula que NO hay almacenamiento compartido (en un teléfono real /sdcard existe y este test,
+        # que dependía del sistema, fallaba en Termux aunque la función era correcta).
+        ruta, externo = ruta_destino_android("x.md", interno=self.dir / "exports",
+                                             candidatas_sistema=[self.dir / "no_hay_sdcard"])
         self.assertFalse(externo)
         self.assertTrue(str(ruta).endswith("x.md"))
+
+    def test_ruta_destino_usa_el_almacenamiento_compartido_si_existe(self):
+        compartido = self.dir / "storage_downloads"
+        compartido.mkdir()
+        ruta, externo = ruta_destino_android("x.md", interno=self.dir / "exports", candidatas_sistema=[compartido])
+        self.assertTrue(externo)
+        self.assertEqual(ruta, compartido / "x.md")
 
 
 class TestDeshacerEntrega(BaseTest):

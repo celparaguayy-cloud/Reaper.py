@@ -39,7 +39,8 @@ def _vigia_tests(resultado: "_ResultadoCronometrado", alerta: float, fin: thread
         actual = resultado.actual
         if actual and actual != avisado and time.monotonic() - resultado.inicio_actual > alerta:
             avisado = actual
-            print(f"\n⏱ VIGÍA: {actual} lleva más de {alerta:.0f}s. Pila de los hilos:", file=sys.stderr, flush=True)
+            print(f"\n⏱ VIGÍA (no es un error; el test SIGUE corriendo): {actual} lleva más de {alerta:.0f}s. "
+                  "Si nunca termina, esta pila muestra dónde está trabado:", file=sys.stderr, flush=True)
             try:
                 faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
             except (OSError, ValueError, RuntimeError):
@@ -67,7 +68,8 @@ def correr_autotest(filtro: Optional[str] = None, verbosidad: Optional[int] = No
     runner = unittest.TextTestRunner(verbosity=verbosidad, stream=sys.stdout, resultclass=_ResultadoCronometrado)
     fin_vigia = threading.Event()
     try:
-        alerta = float(os.getenv("REAPER_AUTOTEST_ALERTA", "60"))
+        # En el teléfono todo es ~15x más lento (la suite tardó 22 min en Termux): umbral más alto allí.
+        alerta = float(os.getenv("REAPER_AUTOTEST_ALERTA", "180" if es_termux() else "60"))
     except ValueError:
         alerta = 60.0
     original_crear = runner._makeResult
