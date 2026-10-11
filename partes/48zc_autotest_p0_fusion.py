@@ -420,3 +420,38 @@ class TestHallazgosTermux(BaseTest):
         self.assertFalse(requisito_disponible("python3:modulo_que_no_existe_xyz"))
         self.assertTrue(requisito_disponible("python3:json"))
         self.assertIn("gem install minitest", instruccion_requisito("ruby:minitest"))
+
+
+class TestFlujoConstruirUI(BaseTest):
+    def test_resumen_diff_compacto(self):
+        diff = ("--- a/app.py\n+++ b/app.py\n@@\n+uno\n+dos\n-viejo\n"
+                "--- a/web.js\n+++ b/web.js\n@@\n+x\n")
+        self.assertEqual(_resumen_diff(diff), "2 archivo(s) · +3 −1")
+        self.assertEqual(_resumen_diff(""), "")
+
+    def test_cierre_en_caja_con_insignia(self):
+        ws = self.proyecto({"a.py": "x = 1\n"})
+        orq = Orquestador(MockLLM([]), ws, self.ajustes(), self.ui())
+        informe = InformeBuild("verificada", segundos=12.3, commit="a1b2c3d4e5")
+        orq._mostrar_cierre(informe)
+        texto = orq.ui.texto_registrado()
+        self.assertIn("BUILD VERIFICADA", texto)
+        self.assertIn("╭", texto)                       # va en caja
+        caja = [l for l in texto.splitlines() if l and l[0] in "╭│╰"]
+        self.assertEqual(len({ancho_visible(l) for l in caja}), 1)   # alineada
+        informe_mal = InformeBuild("fallida", segundos=1.0)
+        orq2 = Orquestador(MockLLM([]), ws, self.ajustes(), self.ui())
+        orq2._mostrar_cierre(informe_mal)
+        self.assertIn("BUILD FALLIDA", orq2.ui.texto_registrado())
+
+    def test_checklist_del_plan_lista_las_tareas(self):
+        plan = parsear_plan('<plan>\n<objetivo>x</objetivo>\n'
+                            '<tarea id="1" archivos="a.py">Crear a.py</tarea>\n'
+                            '<tarea id="2" archivos="b.py" deps="1">Crear b.py</tarea>\n</plan>', 'dos archivos')
+        ws = self.proyecto()
+        orq = Orquestador(MockLLM([]), ws, self.ajustes(), self.ui())
+        orq._checklist_plan(plan, GrafoTareas(plan.tareas))
+        texto = orq.ui.texto_registrado()
+        self.assertIn("Plan · 2 tareas", texto)
+        self.assertIn("Crear a.py", texto)
+        self.assertIn("← 1", texto)                      # la tarea 2 depende de la 1
