@@ -135,6 +135,26 @@ class TestUI(BaseTest):
         self.assertEqual(ancho_visible(ajustar("abcdef", 4)), 4)
         self.assertEqual(ajustar("ab", 4), "ab  ")
 
+    def test_ancho_visible_emojis_y_glifos(self):
+        self.assertEqual(ancho_visible("🐉"), 2)          # emoji del plano suplementario
+        self.assertEqual(ancho_visible("📁 x"), 4)         # emoji(2) + espacio + x
+        self.assertEqual(ancho_visible("👍🏽"), 2)          # emoji + modificador de tono: una sola celda
+        self.assertEqual(ancho_visible("✓"), 1)           # los glifos de REAPER siguen siendo ancho 1
+        self.assertEqual(ancho_visible("⚙"), 1)
+        self.assertEqual(ancho_visible("✗"), 1)
+        self.assertEqual(ancho_visible("▸◆↺❯"), 4)
+
+    def test_caja_alineada_con_emojis(self):
+        # una caja con emojis adentro debe quedar perfectamente alineada (mismo ancho en todas las líneas)
+        lineas = sin_ansi(caja(["🐉 proyecto", "✓ listo", "日本 texto", "normal"], titulo="T")).splitlines()
+        self.assertEqual(len({ancho_visible(l) for l in lineas}), 1)
+
+    def test_recortar_izq(self):
+        self.assertEqual(recortar_izq("corto", 20), "corto")
+        largo = recortar_izq("/home/user/proyectos/mi-app/archivo.py", 15)
+        self.assertEqual(ancho_visible(largo), 15)
+        self.assertTrue(largo.startswith("…") and largo.endswith("archivo.py"))
+
     def test_caja_y_tabla(self):
         dibujo = sin_ansi(caja(["uno", "dos"], titulo="T"))
         lineas = dibujo.splitlines()

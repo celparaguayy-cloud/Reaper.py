@@ -98,13 +98,43 @@ def sin_ansi(texto: str) -> str:
     return _ANSI.sub("", texto or "")
 
 
+# Emojis del plano básico (BMP) que las terminales dibujan con DOBLE ancho, aunque unicodedata los marque "N".
+# No se incluyen ✓ ✗ ⚙ ⚔ ↻ ⏱ ⟲ ★ (ancho 1, los usa REAPER): marcarlos doble desalinearía cajas y tablas.
+_EMOJI_BMP_DOBLES = frozenset({
+    0x231A, 0x231B, 0x23E9, 0x23EA, 0x23EB, 0x23EC, 0x23F0, 0x23F3, 0x25FD, 0x25FE,
+    0x2614, 0x2615, 0x267F, 0x2693, 0x26A1, 0x26AA, 0x26AB, 0x26BD, 0x26BE, 0x26C4,
+    0x26C5, 0x26CE, 0x26D4, 0x26EA, 0x26F2, 0x26F3, 0x26F5, 0x26FA, 0x26FD, 0x2705,
+    0x270A, 0x270B, 0x2728, 0x274C, 0x274E, 0x2753, 0x2754, 0x2755, 0x2757, 0x2795,
+    0x2796, 0x2797, 0x27B0, 0x27BF, 0x2B1B, 0x2B1C, 0x2B50, 0x2B55,
+})
+
+
+def _es_ancho_doble(ch: str) -> bool:
+    """¿El carácter ocupa 2 columnas? CJK ancho/completo y los emojis que la terminal dibuja al doble."""
+    if unicodedata.east_asian_width(ch) in ("W", "F"):
+        return True
+    cp = ord(ch)
+    return cp >= 0x1F000 or cp in _EMOJI_BMP_DOBLES    # plano suplementario (emojis) + set explícito BMP
+
+
 def ancho_visible(texto: str) -> int:
-    """Columnas que ocupa el texto en la terminal (sin ANSI, con anchos de Unicode)."""
+    """Columnas que ocupa el texto en la terminal (sin ANSI, con anchos de Unicode y emojis)."""
     total = 0
+    omitir = False
     for ch in sin_ansi(texto):
+        if ch == "️":          # selector de presentación emoji: no suma, ya contó el símbolo base
+            continue
+        if "\U0001F3FB" <= ch <= "\U0001F3FF":   # modificador de tono de piel: no suma, modifica al anterior
+            continue
         if unicodedata.combining(ch):
             continue
-        total += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+        if ch == "‍":          # zero-width joiner (emojis compuestos): lo que sigue no vuelve a sumar
+            omitir = True
+            continue
+        if omitir:
+            omitir = False
+            continue
+        total += 2 if _es_ancho_doble(ch) else 1
     return total
 
 
@@ -244,6 +274,31 @@ def recortar(texto: str, limite: int) -> str:
         return texto
     mitad = max(1, limite // 2)
     return texto[:mitad].rstrip() + "\n...[recortado]...\n" + texto[-mitad:].lstrip()
+
+
+def recortar_izq(texto: str, limite: int) -> str:
+    """Recorta por la IZQUIERDA conservando el final (p. ej. rutas largas: '…/proyecto/archivo')."""
+    texto = texto or ""
+    if ancho_visible(texto) <= limite:
+        return texto
+    return "…" + texto[-(max(1, limite - 1)):]
+
+
+# Glifos (ancho 1) por tipo de herramienta, para que se lea de un vistazo qué está haciendo el agente.
+_GLIFOS_HERRAMIENTA = {
+    "read_file": "▤", "list_files": "▤", "code_outline": "▤", "project_map": "▤", "find_references": "⌕",
+    "search_files": "⌕", "web_search": "⌕",
+    "write_to_file": "✎", "append_to_file": "✎", "write_large_file": "✎", "replace_in_file": "✎",
+    "replace_symbol": "✎", "insert_after_symbol": "✎", "insert_lines": "✎", "replace_lines": "✎",
+    "rename_symbol": "✎", "move_file": "✎", "delete_file": "✗", "revert_file": "↺",
+    "execute_command": "❯", "run_python": "❯", "run_tests": "✓", "inspect_tests": "✓",
+    "fetch_url": "🌐", "delegate": "⇉", "ask_user": "?", "attempt_completion": "✓",
+    "update_todo": "☑", "save_note": "✎", "learn_lesson": "★",
+}
+
+
+def glifo_herramienta(nombre: str) -> str:
+    return _GLIFOS_HERRAMIENTA.get(nombre, "⚙")
 
 
 def degradado(texto: str, desde: tuple, hasta: tuple) -> str:
@@ -683,10 +738,11 @@ class UI:
 
     def herramienta(self, etiqueta: str, nombre: str, detalle: str = "") -> None:
         detalle = detalle.replace("\n", " ")
+        glifo = glifo_herramienta(nombre)
         maximo = max(30, ancho_terminal() - len(etiqueta) - len(nombre) - 12)
         if len(detalle) > maximo:
             detalle = detalle[:maximo - 3] + "..."
-        self.linea(f"{Tema.tenue}  [{etiqueta}]{C.RESET} {Tema.herramienta}⚙ {nombre}{C.RESET} {Tema.tenue}{detalle}{C.RESET}")
+        self.linea(f"{Tema.tenue}  [{etiqueta}]{C.RESET} {Tema.herramienta}{glifo} {nombre}{C.RESET} {Tema.tenue}{detalle}{C.RESET}")
 
     def resultado_herramienta(self, ok: bool, texto: str) -> None:
         primera = (texto or "").strip().splitlines()[0] if (texto or "").strip() else ""

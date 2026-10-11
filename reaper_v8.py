@@ -232,13 +232,43 @@ def sin_ansi(texto: str) -> str:
     return _ANSI.sub("", texto or "")
 
 
+# Emojis del plano básico (BMP) que las terminales dibujan con DOBLE ancho, aunque unicodedata los marque "N".
+# No se incluyen ✓ ✗ ⚙ ⚔ ↻ ⏱ ⟲ ★ (ancho 1, los usa REAPER): marcarlos doble desalinearía cajas y tablas.
+_EMOJI_BMP_DOBLES = frozenset({
+    0x231A, 0x231B, 0x23E9, 0x23EA, 0x23EB, 0x23EC, 0x23F0, 0x23F3, 0x25FD, 0x25FE,
+    0x2614, 0x2615, 0x267F, 0x2693, 0x26A1, 0x26AA, 0x26AB, 0x26BD, 0x26BE, 0x26C4,
+    0x26C5, 0x26CE, 0x26D4, 0x26EA, 0x26F2, 0x26F3, 0x26F5, 0x26FA, 0x26FD, 0x2705,
+    0x270A, 0x270B, 0x2728, 0x274C, 0x274E, 0x2753, 0x2754, 0x2755, 0x2757, 0x2795,
+    0x2796, 0x2797, 0x27B0, 0x27BF, 0x2B1B, 0x2B1C, 0x2B50, 0x2B55,
+})
+
+
+def _es_ancho_doble(ch: str) -> bool:
+    """¿El carácter ocupa 2 columnas? CJK ancho/completo y los emojis que la terminal dibuja al doble."""
+    if unicodedata.east_asian_width(ch) in ("W", "F"):
+        return True
+    cp = ord(ch)
+    return cp >= 0x1F000 or cp in _EMOJI_BMP_DOBLES    # plano suplementario (emojis) + set explícito BMP
+
+
 def ancho_visible(texto: str) -> int:
-    """Columnas que ocupa el texto en la terminal (sin ANSI, con anchos de Unicode)."""
+    """Columnas que ocupa el texto en la terminal (sin ANSI, con anchos de Unicode y emojis)."""
     total = 0
+    omitir = False
     for ch in sin_ansi(texto):
+        if ch == "️":          # selector de presentación emoji: no suma, ya contó el símbolo base
+            continue
+        if "\U0001F3FB" <= ch <= "\U0001F3FF":   # modificador de tono de piel: no suma, modifica al anterior
+            continue
         if unicodedata.combining(ch):
             continue
-        total += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+        if ch == "‍":          # zero-width joiner (emojis compuestos): lo que sigue no vuelve a sumar
+            omitir = True
+            continue
+        if omitir:
+            omitir = False
+            continue
+        total += 2 if _es_ancho_doble(ch) else 1
     return total
 
 
@@ -378,6 +408,31 @@ def recortar(texto: str, limite: int) -> str:
         return texto
     mitad = max(1, limite // 2)
     return texto[:mitad].rstrip() + "\n...[recortado]...\n" + texto[-mitad:].lstrip()
+
+
+def recortar_izq(texto: str, limite: int) -> str:
+    """Recorta por la IZQUIERDA conservando el final (p. ej. rutas largas: '…/proyecto/archivo')."""
+    texto = texto or ""
+    if ancho_visible(texto) <= limite:
+        return texto
+    return "…" + texto[-(max(1, limite - 1)):]
+
+
+# Glifos (ancho 1) por tipo de herramienta, para que se lea de un vistazo qué está haciendo el agente.
+_GLIFOS_HERRAMIENTA = {
+    "read_file": "▤", "list_files": "▤", "code_outline": "▤", "project_map": "▤", "find_references": "⌕",
+    "search_files": "⌕", "web_search": "⌕",
+    "write_to_file": "✎", "append_to_file": "✎", "write_large_file": "✎", "replace_in_file": "✎",
+    "replace_symbol": "✎", "insert_after_symbol": "✎", "insert_lines": "✎", "replace_lines": "✎",
+    "rename_symbol": "✎", "move_file": "✎", "delete_file": "✗", "revert_file": "↺",
+    "execute_command": "❯", "run_python": "❯", "run_tests": "✓", "inspect_tests": "✓",
+    "fetch_url": "🌐", "delegate": "⇉", "ask_user": "?", "attempt_completion": "✓",
+    "update_todo": "☑", "save_note": "✎", "learn_lesson": "★",
+}
+
+
+def glifo_herramienta(nombre: str) -> str:
+    return _GLIFOS_HERRAMIENTA.get(nombre, "⚙")
 
 
 def degradado(texto: str, desde: tuple, hasta: tuple) -> str:
@@ -817,10 +872,11 @@ class UI:
 
     def herramienta(self, etiqueta: str, nombre: str, detalle: str = "") -> None:
         detalle = detalle.replace("\n", " ")
+        glifo = glifo_herramienta(nombre)
         maximo = max(30, ancho_terminal() - len(etiqueta) - len(nombre) - 12)
         if len(detalle) > maximo:
             detalle = detalle[:maximo - 3] + "..."
-        self.linea(f"{Tema.tenue}  [{etiqueta}]{C.RESET} {Tema.herramienta}⚙ {nombre}{C.RESET} {Tema.tenue}{detalle}{C.RESET}")
+        self.linea(f"{Tema.tenue}  [{etiqueta}]{C.RESET} {Tema.herramienta}{glifo} {nombre}{C.RESET} {Tema.tenue}{detalle}{C.RESET}")
 
     def resultado_herramienta(self, ok: bool, texto: str) -> None:
         primera = (texto or "").strip().splitlines()[0] if (texto or "").strip() else ""
@@ -28062,10 +28118,13 @@ COMANDOS_AYUDA = [
 
 
 def texto_ayuda() -> str:
-    lineas = []
+    lineas = [
+        f"\n{Tema.acento}{C.BOLD}REAPER {__version__}{C.RESET} {Tema.tenue}· agente de programación · comandos{C.RESET}",
+        f"{Tema.tenue}  Escribí en lenguaje natural para pedir algo, o usá un comando. @archivo adjunta archivos.{C.RESET}",
+    ]
     ancho = min(ancho_terminal(), 100)
     for seccion, comandos in COMANDOS_AYUDA:
-        lineas.append(f"\n{Tema.titulo}{C.BOLD} {seccion} {C.RESET}")
+        lineas.append(f"\n{Tema.titulo}{C.BOLD} ▸ {seccion} {C.RESET}")
         for comando, descripcion in comandos:
             if ancho < 70:
                 lineas.append(f"  {Tema.ok}{comando}{C.RESET}")
@@ -29744,7 +29803,7 @@ class App:
 
     def _leer_entrada(self) -> str:
         marca = f"{Tema.aviso}[plan] {C.RESET}" if self.modo_plan else ""
-        entrada = input(f"{marca}{Tema.prompt}{C.BOLD}vos ›{C.RESET} ")
+        entrada = input(f"{marca}{Tema.prompt}{C.BOLD}❯{C.RESET} {Tema.prompt}vos{C.RESET} ")
         if entrada.strip().lower() not in ('"""', '/pegar'):
             return entrada.strip()
         lineas = []
@@ -29776,20 +29835,39 @@ class App:
             funciones.append(f"escalada→{self.settings.modelo_fuerte}")
         if self.settings.lecciones:
             funciones.append("lecciones")
-        modelo_corto = self.settings.modelo.split("/")[-1]
+        modelo_corto = self.settings.modelo.split(":")[-1].split("/")[-1]
+        try:
+            proveedor = destino_modelo(self.settings.modelo, self.settings).proveedor
+        except Exception:
+            proveedor = self.settings.proveedor
+
+        def fila(etiqueta: str, valor: str, glifo: str = "▸") -> str:
+            return f"{Tema.acento}{glifo}{C.RESET} {Tema.tenue}{etiqueta:<9}{C.RESET}{valor}"
+
+        def ruta_corta(p) -> str:
+            texto = str(p)
+            casa = str(Path.home())
+            if texto.startswith(casa):
+                texto = "~" + texto[len(casa):]
+            return recortar_izq(texto, max(24, ancho_terminal() - 16))
+
         lineas = [
-            f"{Tema.tenue}proyecto{C.RESET}  {self.ws.raiz}",
-            f"{Tema.tenue}modelo{C.RESET}    {modelo_corto} · modo {self.settings.modo}",
-            f"{Tema.tenue}equipo{C.RESET}    {' · '.join(funciones) or 'básico'}",
-            f"{Tema.tenue}agentes{C.RESET}   {resumen_arranque_equipo(self.settings)}",
-            f"{Tema.tenue}tests{C.RESET}     {detectado[0].split()[-1] if detectado else 'no detectados'}",
+            fila("proyecto", ruta_corta(self.ws.raiz), "◆"),
+            fila("modelo", f"{modelo_corto} {Tema.tenue}· {proveedor} · modo {self.settings.modo}{C.RESET}"),
+            fila("equipo", resumen_arranque_equipo(self.settings)),
+            fila("flujo", " · ".join(funciones) or "básico"),
+            fila("tests", detectado[0].split()[-1] if detectado else "no detectados todavía"),
         ]
         if self.aviso_sesion:
-            lineas.append(f"{Tema.tenue}sesión{C.RESET}    {self.aviso_sesion}")
+            lineas.append(fila("sesión", self.aviso_sesion, "↺"))
         self.ui.linea("")
-        self.ui.caja(lineas, color=C.VIOLETA)
-        self.ui.tenue('  Para instrucciones de varias líneas: escribí /pegar, pegá TODO y cerrá con """.')
-        self.ui.tenue("  /ayuda · /buscar <consulta> · /construir <pedido> · @archivo para adjuntar\n")
+        self.ui.caja(lineas, titulo=f"REAPER {__version__}", color=C.VIOLETA)
+        acento, tenue, reset = Tema.acento, Tema.tenue, C.RESET
+        self.ui.linea(f"  {acento}❯{reset} escribí lo que querés hacer, o usá un comando:")
+        self.ui.linea(f"    {acento}/construir{reset} {tenue}<pedido>{reset}   "
+                      f"{acento}/buscar{reset} {tenue}<tema>{reset}   "
+                      f"{acento}@archivo{reset} {tenue}adjuntar{reset}   {acento}/ayuda{reset}")
+        self.ui.linea(f"  {tenue}varias líneas: /pegar, pegá todo y cerrá con \"\"\"  ·  Ctrl+C corta  ·  /salir{reset}\n")
 
     def repl(self, animar: bool = True) -> int:
         self._configurar_readline()
@@ -37489,6 +37567,26 @@ class TestUI(BaseTest):
         self.assertEqual(ancho_visible(ajustar("abcdef", 4)), 4)
         self.assertEqual(ajustar("ab", 4), "ab  ")
 
+    def test_ancho_visible_emojis_y_glifos(self):
+        self.assertEqual(ancho_visible("🐉"), 2)          # emoji del plano suplementario
+        self.assertEqual(ancho_visible("📁 x"), 4)         # emoji(2) + espacio + x
+        self.assertEqual(ancho_visible("👍🏽"), 2)          # emoji + modificador de tono: una sola celda
+        self.assertEqual(ancho_visible("✓"), 1)           # los glifos de REAPER siguen siendo ancho 1
+        self.assertEqual(ancho_visible("⚙"), 1)
+        self.assertEqual(ancho_visible("✗"), 1)
+        self.assertEqual(ancho_visible("▸◆↺❯"), 4)
+
+    def test_caja_alineada_con_emojis(self):
+        # una caja con emojis adentro debe quedar perfectamente alineada (mismo ancho en todas las líneas)
+        lineas = sin_ansi(caja(["🐉 proyecto", "✓ listo", "日本 texto", "normal"], titulo="T")).splitlines()
+        self.assertEqual(len({ancho_visible(l) for l in lineas}), 1)
+
+    def test_recortar_izq(self):
+        self.assertEqual(recortar_izq("corto", 20), "corto")
+        largo = recortar_izq("/home/user/proyectos/mi-app/archivo.py", 15)
+        self.assertEqual(ancho_visible(largo), 15)
+        self.assertTrue(largo.startswith("…") and largo.endswith("archivo.py"))
+
     def test_caja_y_tabla(self):
         dibujo = sin_ansi(caja(["uno", "dos"], titulo="T"))
         lineas = dibujo.splitlines()
@@ -39861,6 +39959,12 @@ class TestCLI(BaseTest):
         texto = self.salida(app)
         self.assertIn("proyecto", texto)
         self.assertIn(__version__, texto)
+        self.assertIn("modelo", texto)
+        self.assertIn("/construir", texto)              # pie de comandos rápidos, más amigable
+        # el panel queda alineado (todas las líneas de la caja miden lo mismo)
+        caja = [l for l in texto.splitlines() if l.startswith(("│", "╭", "╰"))]
+        self.assertGreaterEqual(len(caja), 5)
+        self.assertEqual(len({ancho_visible(l) for l in caja}), 1)
 
     def test_sesion_persistente(self):
         ws = self.proyecto()

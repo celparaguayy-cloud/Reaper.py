@@ -81,10 +81,13 @@ COMANDOS_AYUDA = [
 
 
 def texto_ayuda() -> str:
-    lineas = []
+    lineas = [
+        f"\n{Tema.acento}{C.BOLD}REAPER {__version__}{C.RESET} {Tema.tenue}· agente de programación · comandos{C.RESET}",
+        f"{Tema.tenue}  Escribí en lenguaje natural para pedir algo, o usá un comando. @archivo adjunta archivos.{C.RESET}",
+    ]
     ancho = min(ancho_terminal(), 100)
     for seccion, comandos in COMANDOS_AYUDA:
-        lineas.append(f"\n{Tema.titulo}{C.BOLD} {seccion} {C.RESET}")
+        lineas.append(f"\n{Tema.titulo}{C.BOLD} ▸ {seccion} {C.RESET}")
         for comando, descripcion in comandos:
             if ancho < 70:
                 lineas.append(f"  {Tema.ok}{comando}{C.RESET}")
@@ -1763,7 +1766,7 @@ class App:
 
     def _leer_entrada(self) -> str:
         marca = f"{Tema.aviso}[plan] {C.RESET}" if self.modo_plan else ""
-        entrada = input(f"{marca}{Tema.prompt}{C.BOLD}vos ›{C.RESET} ")
+        entrada = input(f"{marca}{Tema.prompt}{C.BOLD}❯{C.RESET} {Tema.prompt}vos{C.RESET} ")
         if entrada.strip().lower() not in ('"""', '/pegar'):
             return entrada.strip()
         lineas = []
@@ -1795,20 +1798,39 @@ class App:
             funciones.append(f"escalada→{self.settings.modelo_fuerte}")
         if self.settings.lecciones:
             funciones.append("lecciones")
-        modelo_corto = self.settings.modelo.split("/")[-1]
+        modelo_corto = self.settings.modelo.split(":")[-1].split("/")[-1]
+        try:
+            proveedor = destino_modelo(self.settings.modelo, self.settings).proveedor
+        except Exception:
+            proveedor = self.settings.proveedor
+
+        def fila(etiqueta: str, valor: str, glifo: str = "▸") -> str:
+            return f"{Tema.acento}{glifo}{C.RESET} {Tema.tenue}{etiqueta:<9}{C.RESET}{valor}"
+
+        def ruta_corta(p) -> str:
+            texto = str(p)
+            casa = str(Path.home())
+            if texto.startswith(casa):
+                texto = "~" + texto[len(casa):]
+            return recortar_izq(texto, max(24, ancho_terminal() - 16))
+
         lineas = [
-            f"{Tema.tenue}proyecto{C.RESET}  {self.ws.raiz}",
-            f"{Tema.tenue}modelo{C.RESET}    {modelo_corto} · modo {self.settings.modo}",
-            f"{Tema.tenue}equipo{C.RESET}    {' · '.join(funciones) or 'básico'}",
-            f"{Tema.tenue}agentes{C.RESET}   {resumen_arranque_equipo(self.settings)}",
-            f"{Tema.tenue}tests{C.RESET}     {detectado[0].split()[-1] if detectado else 'no detectados'}",
+            fila("proyecto", ruta_corta(self.ws.raiz), "◆"),
+            fila("modelo", f"{modelo_corto} {Tema.tenue}· {proveedor} · modo {self.settings.modo}{C.RESET}"),
+            fila("equipo", resumen_arranque_equipo(self.settings)),
+            fila("flujo", " · ".join(funciones) or "básico"),
+            fila("tests", detectado[0].split()[-1] if detectado else "no detectados todavía"),
         ]
         if self.aviso_sesion:
-            lineas.append(f"{Tema.tenue}sesión{C.RESET}    {self.aviso_sesion}")
+            lineas.append(fila("sesión", self.aviso_sesion, "↺"))
         self.ui.linea("")
-        self.ui.caja(lineas, color=C.VIOLETA)
-        self.ui.tenue('  Para instrucciones de varias líneas: escribí /pegar, pegá TODO y cerrá con """.')
-        self.ui.tenue("  /ayuda · /buscar <consulta> · /construir <pedido> · @archivo para adjuntar\n")
+        self.ui.caja(lineas, titulo=f"REAPER {__version__}", color=C.VIOLETA)
+        acento, tenue, reset = Tema.acento, Tema.tenue, C.RESET
+        self.ui.linea(f"  {acento}❯{reset} escribí lo que querés hacer, o usá un comando:")
+        self.ui.linea(f"    {acento}/construir{reset} {tenue}<pedido>{reset}   "
+                      f"{acento}/buscar{reset} {tenue}<tema>{reset}   "
+                      f"{acento}@archivo{reset} {tenue}adjuntar{reset}   {acento}/ayuda{reset}")
+        self.ui.linea(f"  {tenue}varias líneas: /pegar, pegá todo y cerrá con \"\"\"  ·  Ctrl+C corta  ·  /salir{reset}\n")
 
     def repl(self, animar: bool = True) -> int:
         self._configurar_readline()

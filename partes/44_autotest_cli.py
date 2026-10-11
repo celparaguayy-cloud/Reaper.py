@@ -150,6 +150,12 @@ class TestCLI(BaseTest):
         texto = self.salida(app)
         self.assertIn("proyecto", texto)
         self.assertIn(__version__, texto)
+        self.assertIn("modelo", texto)
+        self.assertIn("/construir", texto)              # pie de comandos rápidos, más amigable
+        # el panel queda alineado (todas las líneas de la caja miden lo mismo)
+        caja = [l for l in texto.splitlines() if l.startswith(("│", "╭", "╰"))]
+        self.assertGreaterEqual(len(caja), 5)
+        self.assertEqual(len({ancho_visible(l) for l in caja}), 1)
 
     def test_sesion_persistente(self):
         ws = self.proyecto()
