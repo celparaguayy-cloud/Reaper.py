@@ -197,3 +197,32 @@ produce assets estáticos (`.html`/`.css`) NO dispara la especificación ejecuta
 estática no aporta y trababa pedidos como "construí una web" en modelos flojos); la validación web igual corre. Si
 hay lógica (`.py`/`.js`/`.ts`) en el plan o el proyecto, o si el proyecto está vacío y el plan aún no nombra
 archivos, sigue habiendo tests primero. Cobertura: `TestTrabajosChicos` (3 tests).
+
+## 10. El juez como MOTOR CENTRAL de /construir (bajo costo)
+
+El juez pasó de "gate final" a motor central del build, pero sigue siendo el agente MÁS BARATO: hace lo más que
+puede de forma DETERMINISTA (con la evidencia que ya existe) y solo gasta tokens del modelo en los juicios
+semánticos que de verdad lo necesitan. En un build limpio son ~2 llamadas chicas (contrato + veredicto); gasta más
+solo "si no, interviene".
+
+1. **Dueño del contrato (1 llamada chica al inicio).** Antes de construir, el juez convierte el PEDIDO en criterios
+   de aceptación concretos (`_contrato_de_entrega` → `parsear_criterios_entrega`, `max_tokens=350`). Ese contrato se
+   guarda en el diario (se reusa al reanudar, sin otra llamada) y es contra lo que mide el veredicto final.
+2. **Vigía por fase (determinista, 0 llamadas).** `cobertura_criterios()` marca, por solape de palabras/archivos,
+   qué criterios el plan todavía no parece cubrir — señal temprana de desvío, no un veredicto.
+3. **Veredicto final (1 llamada chica).** Como antes: juzga la entrega contra el contrato con la evidencia real;
+   solo endurece (verde→parcial), nunca sube un rojo a verde.
+4. **Cierra el trabajo (solo si falta algo).** Si el veredicto es NO CUMPLE con confianza media/alta y quedan
+   intervenciones (`juez_max_intervenciones`, por defecto 1), el juez INTERVIENE: arma un diagnóstico con los
+   faltantes, el reparador los implementa, se **re-verifica de verdad** (tests/validadores) y el juez vuelve a
+   juzgar. Acotado (no entra en bucle) y honesto: si la verificación real no queda verde, la build no se declara
+   cumplida. `_cerrar_con_juez` + `_debe_intervenir_juez`.
+5. **Ruteo (determinista).** La intervención reusa el bucle de reparación con escalada ya existente (mejor modelo
+   disponible / escala al fuerte); no se agrega otra decisión por modelo.
+
+Cobertura nueva: `TestJuezContrato` (6) y `TestJuezCierra` (3): parser de criterios (dedup, tope 8, basura→[]),
+cobertura determinista, contrato desde el pedido (apagado/basura no rompen), el gate usa el contrato, la lógica de
+intervención (`_debe_intervenir_juez`: cumple / confianza baja / sin faltantes / cupo agotado / build roja / sin
+juicio), un `/construir` completo donde el juez detecta un módulo faltante, interviene, el reparador lo agrega,
+re-verifica y cierra en verde, y el caso cupo=0 (solo avisa, no interviene, queda parcial). Regresión: 953 tests OK
+en Python 3.11.15 / 3.12.3 / 3.13.14.

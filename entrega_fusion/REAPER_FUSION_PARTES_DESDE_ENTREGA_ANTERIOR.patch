@@ -173,7 +173,7 @@ index 4210bef..782455c 100644
      except (OSError, ValueError):
          return False
 diff --git a/partes/03_config.py b/partes/03_config.py
-index 9f76627..1735eed 100644
+index 9f76627..33332f3 100644
 --- a/partes/03_config.py
 +++ b/partes/03_config.py
 @@ -69,10 +69,14 @@ PROVEEDORES = {
@@ -280,7 +280,7 @@ index 9f76627..1735eed 100644
  
  
  @dataclass
-@@ -146,6 +208,13 @@ class Settings:
+@@ -146,6 +208,16 @@ class Settings:
      modelos_rol: dict = field(default_factory=dict)
      # Modelos de respaldo si el principal falla (404, 402, caídas persistentes).
      fallbacks: list = field(default_factory=list)
@@ -291,10 +291,13 @@ index 9f76627..1735eed 100644
 +    # Juez de entrega (8.º agente): al cerrar /construir compara lo entregado contra el pedido y solo puede
 +    # ENDURECER el estado (verificada/validada → parcial si falta algo); nunca convierte una build roja en verde.
 +    juez: bool = True
++    # Cuántas veces el juez puede INTERVENIR para cerrar: si al final falta algo del pedido, dispara una pasada
++    # de reparación hacia los faltantes y vuelve a juzgar. 0 = solo avisa, no interviene. Acotado para no entrar en bucle.
++    juez_max_intervenciones: int = 1
      proveedor: str = "openrouter"
      api_url: str = ""
  
-@@ -169,6 +238,10 @@ class Settings:
+@@ -169,6 +241,10 @@ class Settings:
      max_llamadas_turno: int = 4
      max_reparaciones: int = 3
      max_revisiones: int = 2
@@ -305,7 +308,7 @@ index 9f76627..1735eed 100644
      max_tareas: int = 8
      paralelo: int = 2
      qa: bool = True
-@@ -274,6 +347,8 @@ class Settings:
+@@ -274,6 +350,8 @@ class Settings:
          acotar("max_profundidad", 0, 3)
          acotar("max_llamadas_turno", 1, 10)
          acotar("max_reparaciones", 0, 10)
@@ -314,7 +317,7 @@ index 9f76627..1735eed 100644
          acotar("max_revisiones", 0, 5)
          acotar("max_tareas", 1, 30)
          acotar("paralelo", 1, 8)
-@@ -322,9 +397,11 @@ class Settings:
+@@ -322,9 +400,11 @@ class Settings:
  
  PERFILES = {
      "gratis": {
@@ -328,7 +331,7 @@ index 9f76627..1735eed 100644
      },
      "rapido": {
          "descripcion": "sin torneo ni tests previos: un intento por tarea (barato y veloz)",
-@@ -370,6 +447,11 @@ def cargar_settings(ruta: Optional[Path] = None) -> Settings:
+@@ -370,6 +450,11 @@ def cargar_settings(ruta: Optional[Path] = None) -> Settings:
          except (OSError, ValueError, TypeError):
              settings = Settings()
  
@@ -340,7 +343,7 @@ index 9f76627..1735eed 100644
      if os.getenv("MODEL_NAME"):
          settings.modelo = resolver_modelo(os.environ["MODEL_NAME"])
      if os.getenv("REAPER_MODO") in MODOS:
-@@ -381,6 +463,27 @@ def cargar_settings(ruta: Optional[Path] = None) -> Settings:
+@@ -381,6 +466,27 @@ def cargar_settings(ruta: Optional[Path] = None) -> Settings:
      return settings.validar()
  
  
@@ -368,7 +371,7 @@ index 9f76627..1735eed 100644
  def guardar_settings(settings: Settings, ruta: Optional[Path] = None) -> None:
      ruta = ruta or CONFIG_FILE
      ruta.parent.mkdir(parents=True, exist_ok=True)
-@@ -389,16 +492,47 @@ def guardar_settings(settings: Settings, ruta: Optional[Path] = None) -> None:
+@@ -389,16 +495,47 @@ def guardar_settings(settings: Settings, ruta: Optional[Path] = None) -> None:
      os.replace(tmp, ruta)
  
  
@@ -1619,7 +1622,7 @@ index d8102fb..b6ebe29 100644
          'File "<string>"', 'File "<fragmento>"')
      if not r.ok and parece_interactivo(f"{r.stdout}\n{r.stderr}"):
 diff --git a/partes/19_roles.py b/partes/19_roles.py
-index 4e3765c..569f84b 100644
+index 4e3765c..36c5449 100644
 --- a/partes/19_roles.py
 +++ b/partes/19_roles.py
 @@ -43,7 +43,7 @@ necesario, editar, verificar con herramientas reales y reportar.
@@ -1655,7 +1658,7 @@ index 4e3765c..569f84b 100644
  Sé concreto y breve. No propongas reescribir lo que funciona.""",
          LECTURA + ("attempt_completion",),
          0.1,
-@@ -259,6 +267,76 @@ AFIRMACIÓN → NIVEL (qué evidencia la respalda y qué faltaría para subir de
+@@ -259,6 +267,80 @@ AFIRMACIÓN → NIVEL (qué evidencia la respalda y qué faltaría para subir de
          0.1,
          solo_lectura=True,
      ),
@@ -1715,16 +1718,20 @@ index 4e3765c..569f84b 100644
 +    ),
 +    "juez": Rol(
 +        "juez",
-+        """Sos el JUEZ DE ENTREGA: el último control antes de dar algo por entregado. Una sola pregunta:
-+¿lo construido cumple el PEDIDO del usuario, tal como se pidió, ni más ni menos? Juzgás SOLO con la EVIDENCIA
-+dada (cada pieza tiene un id EV-...): estado real de la build, tests, validación, aceptación y el resumen del
-+diff (qué archivos cambiaron). No ejecutás nada, no leés el repo y no inventás requisitos que el usuario no
-+pidió. Regla dura: NO podés convertir una build roja en verde — si la evidencia muestra fallos o tareas sin
-+completar, cumple=false. Si falta algo que el pedido pedía (un archivo, una pantalla, un endpoint, un
-+comportamiento concreto), listalo en "faltantes", puntual y accionable. Si la evidencia alcanza y el pedido
-+está cubierto, cumple=true. Usá confianza alta solo cuando la evidencia es contundente.
-+Respondé SOLO un objeto JSON: {"cumple": true|false, "faltantes": ["lo que falta, concreto"],
-+"evidence_ids": ["EV-..."], "confianza": "low|medium|high"}""",
++        """Sos el JUEZ DE ENTREGA: el control CENTRAL de que el trabajo se haga y se entregue TAL COMO se pidió.
++Trabajás con poco: texto corto, sin herramientas, sin leer el repo. Según lo que te pidan hacés UNA de dos tareas:
++
++(A) CONTRATO — convertir el PEDIDO del usuario en criterios de aceptación concretos y verificables (archivos,
++pantallas, endpoints, comportamientos observables), SIN inventar nada que el usuario no haya pedido ni agregar
++"extras". De 1 a 8, solo los esenciales. Respondé SOLO: {"criterios": ["criterio concreto y verificable", ...]}
++
++(B) VEREDICTO — decidir si lo construido cumple el pedido/contrato, ni más ni menos, juzgando SOLO con la
++EVIDENCIA dada (cada pieza tiene un id EV-...): estado real de la build, tests, validación, aceptación y el
++resumen del diff. No ejecutás ni leés el repo. Regla dura: NO podés convertir una build roja en verde — si la
++evidencia muestra fallos o tareas sin completar, cumple=false. Si falta algo que se pidió (un archivo, una
++pantalla, un endpoint, un comportamiento), listalo en "faltantes", puntual y accionable. Si la evidencia alcanza
++y el pedido está cubierto, cumple=true. Usá confianza alta solo con evidencia contundente.
++Respondé SOLO: {"cumple": true|false, "faltantes": ["..."], "evidence_ids": ["EV-..."], "confianza": "low|medium|high"}""",
 +        (),
 +        0.1,
 +        solo_lectura=True,
@@ -1732,7 +1739,7 @@ index 4e3765c..569f84b 100644
  }
  
  ROLES_DELEGABLES = ("explorador", "implementador", "revisor", "qa", "reparador", "arquitecto", "especificador",
-@@ -278,6 +356,12 @@ PRINCIPIOS
+@@ -278,6 +360,12 @@ PRINCIPIOS
     el test. Un test en rojo no implica que el código esté mal (puede ser el test, la ruta, una dependencia,
     un fixture, la entrada o un flaky): decidí QUÉ falla antes de tocar nada.
  7. Seguridad ofensiva solo en sistemas propios, laboratorios, CTF o con autorización explícita.
@@ -1745,7 +1752,7 @@ index 4e3765c..569f84b 100644
  
  CÓMO USAR LAS HERRAMIENTAS
  - Escribí la herramienta como etiquetas XML, igual que en los ejemplos. Podés poner 1-3 frases de
-@@ -351,8 +435,11 @@ def _entorno() -> str:
+@@ -351,8 +439,11 @@ def _entorno() -> str:
      sistema = "Termux en Android" if termux else f"{platform.system()} {platform.release()}"
      herramientas = [n for n in ("node", "npm", "git", "ruff", "go", "cargo", "make", "clang", "php")
                      if shutil.which(n)]
@@ -1757,7 +1764,7 @@ index 4e3765c..569f84b 100644
          f"- Python: {sys.version.split()[0]} ({sys.executable})\n"
          f"- Herramientas disponibles: {', '.join(herramientas) or 'solo python'}"
      )
-@@ -367,6 +454,12 @@ def system_prompt(rol: Rol, ws: Workspace, max_llamadas: int = 4, arbol: bool =
+@@ -367,6 +458,12 @@ def system_prompt(rol: Rol, ws: Workspace, max_llamadas: int = 4, arbol: bool =
          f"\n# TU ROL: {rol.nombre.upper()}\n{rol.mision}",
          "\n# HERRAMIENTAS DISPONIBLES\n" + documentacion(list(rol.herramientas)),
          f"\n# ENTORNO\n- Workspace: {ws.raiz}\n{_entorno()}",
@@ -2178,10 +2185,10 @@ index 4eba772..e986b98 100644
                  (self.ws.raiz / rel).unlink()
                  self.restaurados.append(f"{rel} (creado por los tests, borrado)")
 diff --git a/partes/25_pipeline.py b/partes/25_pipeline.py
-index ad78b6b..ecf2c8b 100644
+index ad78b6b..d21b2f5 100644
 --- a/partes/25_pipeline.py
 +++ b/partes/25_pipeline.py
-@@ -40,6 +40,18 @@ _RE_VEREDICTO = re.compile(r"VEREDICTO\s*:?\s*\**\s*(APROBADO|CAMBIOS|RECHAZADO)
+@@ -40,6 +40,39 @@ _RE_VEREDICTO = re.compile(r"VEREDICTO\s*:?\s*\**\s*(APROBADO|CAMBIOS|RECHAZADO)
  EXTENSIONES_TESTEABLES = (".py", ".js", ".mjs", ".cjs", ".ts")
  
  
@@ -2197,10 +2204,31 @@ index ad78b6b..ecf2c8b 100644
 +    return not archivos_plan and not archivos_ws
 +
 +
++def _palabras_clave(texto: str) -> set:
++    return {p for p in re.findall(r"[a-záéíóúñ0-9/._-]{4,}", (texto or "").lower())}
++
++
++def cobertura_criterios(criterios: list, plan) -> list:
++    """Determinista (0 llamadas al modelo): criterios del contrato que NINGUNA tarea del plan parece cubrir, por
++    solape de palabras/archivos. Es una señal temprana de desvío para el juez, NO un veredicto: lo real lo decide
++    el juez al final con la evidencia. Conservadora: solo marca un criterio si no comparte ni una palabra con el plan."""
++    if not criterios:
++        return []
++    texto = " ".join(f"{t.descripcion} {' '.join(t.archivos)}" for t in plan.tareas)
++    texto += " " + (plan.objetivo or "") + " " + (plan.interfaz or "")
++    palabras = _palabras_clave(texto)
++    sin_cubrir = []
++    for c in criterios:
++        pc = _palabras_clave(c)
++        if pc and not (pc & palabras):
++            sin_cubrir.append(c)
++    return sin_cubrir
++
++
  @dataclass
  class Tarea:
      id: str
-@@ -178,13 +190,218 @@ def verificacion_peor(despues: "Verificacion", antes: "Verificacion") -> bool:
+@@ -178,13 +211,218 @@ def verificacion_peor(despues: "Verificacion", antes: "Verificacion") -> bool:
  
  
  def veredicto(informe: str) -> tuple[bool, bool]:
@@ -2421,7 +2449,7 @@ index ad78b6b..ecf2c8b 100644
  @dataclass
  class Verificacion:
      ok: bool
-@@ -193,6 +410,7 @@ class Verificacion:
+@@ -193,6 +431,7 @@ class Verificacion:
      diagnostico: str
      archivos: list
      conteo: ConteoTests = field(default_factory=ConteoTests)
@@ -2429,7 +2457,7 @@ index ad78b6b..ecf2c8b 100644
  
  
  @dataclass
-@@ -201,6 +419,7 @@ class InformeBuild:
+@@ -201,6 +440,7 @@ class InformeBuild:
      plan: Optional[Plan] = None
      archivos: list = field(default_factory=list)
      tests: Optional[Resultado] = None
@@ -2437,13 +2465,15 @@ index ad78b6b..ecf2c8b 100644
      diagnostico: str = ""
      cid: Optional[int] = None
      ruta_informe: Optional[Path] = None
-@@ -211,12 +430,25 @@ class InformeBuild:
+@@ -211,12 +451,27 @@ class InformeBuild:
      commit: Optional[str] = None
      spec_tests: list = field(default_factory=list)
      segundos: float = 0.0
 +    tareas_fallidas: list = field(default_factory=list)    # quedaron con fallos tras reparar
 +    tareas_bloqueadas: list = field(default_factory=list)  # no se ejecutaron: dependen de una fallida
 +    juicio: Optional["Juicio"] = None                      # veredicto del 8.º agente (juez de entrega)
++    criterios_entrega: list = field(default_factory=list)  # contrato: criterios que el juez derivó del pedido
++    intervenciones_juez: int = 0                           # cuántas veces el juez tuvo que intervenir para cerrar
  
      @property
      def ok(self) -> bool:
@@ -2463,7 +2493,7 @@ index ad78b6b..ecf2c8b 100644
  def _diffstat(diff: str) -> str:
      stats: dict[str, list[int]] = {}
      actual = None
-@@ -231,6 +463,23 @@ def _diffstat(diff: str) -> str:
+@@ -231,6 +486,23 @@ def _diffstat(diff: str) -> str:
      return "\n".join(f"  {a}  +{m} -{n}" for a, (m, n) in stats.items())
  
  
@@ -2487,7 +2517,7 @@ index ad78b6b..ecf2c8b 100644
  def _es_test(rel: str) -> bool:
      return any(fnmatch.fnmatch(rel, p) for p in PATRONES_TESTS)
  
-@@ -246,6 +495,214 @@ def _es_de_especificacion(nombre_test: str, protegidos: dict) -> bool:
+@@ -246,6 +518,214 @@ def _es_de_especificacion(nombre_test: str, protegidos: dict) -> bool:
      return False
  
  
@@ -2702,7 +2732,7 @@ index ad78b6b..ecf2c8b 100644
  class Orquestador:
      def __init__(self, llm, ws: Workspace, settings: Settings, ui: UI):
          self.llm = llm
-@@ -255,6 +712,7 @@ class Orquestador:
+@@ -255,6 +735,7 @@ class Orquestador:
          self.memoria = MemoriaLecciones(ws) if settings.lecciones else None
          self.escalador = Escalador(llm, settings, ui)
          self._protegidos: dict[str, Optional[str]] = {}
@@ -2710,7 +2740,7 @@ index ad78b6b..ecf2c8b 100644
  
      def _sub(self, rol: str, tarea: str, cid: Optional[int], archivos: str = "", titulo: str = "",
               **opciones) -> ResultadoAgente:
-@@ -264,6 +722,20 @@ class Orquestador:
+@@ -264,6 +745,20 @@ class Orquestador:
              profundidad=1, cid_inicio=cid,
          )[0]
  
@@ -2731,7 +2761,7 @@ index ad78b6b..ecf2c8b 100644
      # ------------------------------------------------------------ fases
      def explorar(self, pedido: str) -> str:
          archivos = self.ws.archivos_codigo(limite=500)
-@@ -296,7 +768,13 @@ class Orquestador:
+@@ -296,7 +791,13 @@ class Orquestador:
                  "cómo se ejecuta y se prueba el proyecto",
                  {"memoria": self.memoria},
              ))
@@ -2746,7 +2776,7 @@ index ad78b6b..ecf2c8b 100644
          informe = "\n\n".join(
              f"### Informe explorador {i}\n{r.resumen}" for i, r in enumerate(resultados, start=1)
          )
-@@ -431,17 +909,23 @@ class Orquestador:
+@@ -431,17 +932,23 @@ class Orquestador:
              f"Validación automática de los archivos cambiados: {validacion}\n\n"
              "Leé los archivos completos si necesitás contexto. Empezá tu informe con la línea VEREDICTO."
          )
@@ -2773,7 +2803,7 @@ index ad78b6b..ecf2c8b 100644
          detectado = detectar_comando_tests(self.ws)
          criterios = "\n".join(f"- {c}" for c in plan.criterios) or "- (derivalos del pedido)"
          texto = (
-@@ -452,7 +936,7 @@ class Orquestador:
+@@ -452,7 +959,7 @@ class Orquestador:
              "Escribí (o completá) tests automáticos que verifiquen los criterios y corrélos con run_tests. "
              "Reportá el resultado REAL."
          )
@@ -2782,7 +2812,7 @@ index ad78b6b..ecf2c8b 100644
  
      def verificar(self, cid: int) -> Verificacion:
          archivos = [r for r in self.ws.checkpoints.archivos_desde(cid) if (self.ws.raiz / r).is_file()]
-@@ -462,13 +946,32 @@ class Orquestador:
+@@ -462,13 +969,32 @@ class Orquestador:
          malos = fallos(validaciones)
          tests_ok = tests is None or tests.ok
          partes = [r.resumen(2500) for r in malos]
@@ -2817,7 +2847,7 @@ index ad78b6b..ecf2c8b 100644
  
      def reparar(self, pedido: str, verif: Verificacion, cid: int, base_fallaba: bool,
                  diagnostico_experto: str = "", contexto: str = "") -> ResultadoAgente:
-@@ -485,7 +988,8 @@ class Orquestador:
+@@ -485,7 +1011,8 @@ class Orquestador:
          if diagnostico_experto:
              texto = tarea_con_diagnostico(texto, diagnostico_experto)
          protegidos = set(self._protegidos)
@@ -2827,7 +2857,7 @@ index ad78b6b..ecf2c8b 100644
                                                                                      if diagnostico_experto else ""),
                           protegidos=protegidos)
  
-@@ -513,7 +1017,17 @@ class Orquestador:
+@@ -513,7 +1040,17 @@ class Orquestador:
          intentos_txt: list[str] = []
          forense_hecho = False
          informe_forense = ""
@@ -2845,7 +2875,7 @@ index ad78b6b..ecf2c8b 100644
              firma = _firma_error(verif.diagnostico)
              if diagnosticos_vistos.count(firma) >= 3:
                  informe.notas.append(f"{etiqueta}: la reparación no logró avances (mismo diagnóstico repetido).")
-@@ -549,6 +1063,7 @@ class Orquestador:
+@@ -549,6 +1086,7 @@ class Orquestador:
                                       + "\n---\n".join(intentos_txt[-2:]))
              res = self.reparar(pedido, verif, rcid, base_fallaba, experto, contexto_intento.strip())
              intentos_txt.append(recortar(res.resumen, 1200))
@@ -2853,7 +2883,7 @@ index ad78b6b..ecf2c8b 100644
              verif = verificador()
              self._mostrar_verificacion(verif)
              if verif.ok:
-@@ -566,6 +1081,146 @@ class Orquestador:
+@@ -566,6 +1104,204 @@ class Orquestador:
                  verif = antes
          return verif
  
@@ -2948,6 +2978,29 @@ index ad78b6b..ecf2c8b 100644
 +            informe.estado, notas = estado_controlado(informe.estado, dictamen)
 +            informe.notas.extend(notas)
 +
++    def _contrato_de_entrega(self, pedido: str) -> list:
++        """Motor central, paso 1: el juez convierte el PEDIDO en criterios de aceptación ANTES de construir.
++        Una sola llamada chica (max_tokens 350). Si el juez está apagado o no responde en contrato, devuelve [] y
++        el build sigue con los criterios del plan: nunca bloquea por esto."""
++        if not getattr(self.settings, "juez", True):
++            return []
++        prompt = (f"TAREA: CONTRATO. Convertí este PEDIDO en criterios de aceptación concretos y verificables, "
++                  f"sin inventar extras.\n\nPEDIDO:\n{recortar(pedido, 1500)}")
++        texto, _p, _s = self._consultar_rol_x("juez", prompt, max_tokens=350)
++        return parsear_criterios_entrega(texto or "")
++
++    def _mostrar_contrato(self, criterios: list, plan: Plan) -> None:
++        """Muestra el contrato del juez y la vigía DETERMINISTA de cobertura (criterios que el plan no parece cubrir)."""
++        if not criterios:
++            return
++        self.ui.tenue("  Juez · contrato de entrega (lo que hay que cumplir):")
++        for c in criterios:
++            self.ui.tenue(f"    • {recortar(c, 90)}")
++        sin_cubrir = cobertura_criterios(criterios, plan)
++        if sin_cubrir:
++            self.ui.aviso("  Juez · el plan todavía no parece cubrir: "
++                          + "; ".join(recortar(c, 60) for c in sin_cubrir))
++
 +    def _juicio_de_entrega(self, pedido: str, plan: Plan, verif: Verificacion, informe: InformeBuild) -> None:
 +        """8.º agente (JUEZ DE ENTREGA): compara lo entregado contra el PEDIDO y solo puede ENDURECER el estado.
 +
@@ -2960,7 +3013,7 @@ index ad78b6b..ecf2c8b 100644
 +        if informe.estado not in ("verificada", "validada"):
 +            return  # la build ya está en rojo/parcial: el juez solo endurece, no hay verde que revisar
 +        diff = self.ws.checkpoints.diff_desde(informe.cid) if informe.cid else ""
-+        criterios = "\n".join(f"- {c}" for c in plan.criterios) or "- (derivalos del pedido)"
++        criterios = "\n".join(f"- {c}" for c in (informe.criterios_entrega or plan.criterios)) or "- (derivalos del pedido)"
 +        evidencia = {
 +            "EV-ESTADO": f"estado por verificación real: {informe.estado}; tareas fallidas: "
 +                         f"{', '.join(informe.tareas_fallidas) or 'ninguna'}; bloqueadas: "
@@ -2997,10 +3050,45 @@ index ad78b6b..ecf2c8b 100644
 +        elif not juicio.cumple:
 +            informe.notas.append("Juez de entrega: duda de que se cumpla el pedido (confianza baja); lo dejo como aviso.")
 +
++    def _debe_intervenir_juez(self, informe: InformeBuild, maximo: int) -> bool:
++        """¿El juez debe intervenir para cerrar? Solo si dio un veredicto VÁLIDO de NO cumple con confianza
++        media/alta, hay faltantes concretos, quedan intervenciones y la build no está en rojo."""
++        j = informe.juicio
++        return bool(j is not None and j.valido and not j.cumple and j.confianza in ("medium", "high")
++                    and j.faltantes and informe.intervenciones_juez < maximo
++                    and informe.estado in ("verificada", "validada", "parcial"))
++
++    def _cerrar_con_juez(self, pedido: str, plan: Plan, verif: Verificacion, informe: InformeBuild,
++                         grupo: int, base_fallaba: bool) -> Verificacion:
++        """Motor central, paso final: si el juez dice que falta algo, INTERVIENE — el reparador implementa los
++        faltantes, se re-verifica DE VERDAD y el juez vuelve a juzgar. Acotado por juez_max_intervenciones; solo
++        gasta tokens cuando realmente faltaba algo. Nunca declara verde sin que la verificación real lo confirme."""
++        maximo = max(0, int(getattr(self.settings, "juez_max_intervenciones", 1)))
++        while self._debe_intervenir_juez(informe, maximo):
++            if PLAZO.vencido():
++                informe.notas.append("Juez: no intervengo más; se agotó el tiempo.")
++                break
++            faltantes = list(informe.juicio.faltantes)
++            informe.intervenciones_juez += 1
++            self.ui.info(f"  Juez · intervención {informe.intervenciones_juez}: completar lo que falta "
++                         f"({'; '.join(recortar(f, 50) for f in faltantes[:3])})")
++            diag = ("El JUEZ DE ENTREGA detecta que el pedido NO quedó cumplido. Implementá EXACTAMENTE lo que "
++                    "falta, sin romper lo que ya anda:\n" + "\n".join(f"- {f}" for f in faltantes))
++            verif_sint = replace(verif, ok=False, diagnostico=diag)
++            verif = self._reparar_con_escalada(pedido, verif_sint, grupo, base_fallaba, informe,
++                                               f"cierre-juez {informe.intervenciones_juez}", 2,
++                                               lambda: self.verificar(grupo), contexto=diag)
++            informe.estado = estado_final_build(verif, informe)
++            informe.juicio = None
++            self._juicio_de_entrega(pedido, plan, verif, informe)
++        if informe.intervenciones_juez and informe.juicio is not None and informe.juicio.cumple:
++            informe.notas.append(f"Juez: el pedido quedó cumplido tras {informe.intervenciones_juez} intervención(es).")
++        return verif
++
      # ------------------------------------------------------------ flujos
      def _mostrar_plan(self, plan: Plan) -> None:
          self.ui.titulo("PLAN")
-@@ -575,7 +1230,19 @@ class Orquestador:
+@@ -575,7 +1311,19 @@ class Orquestador:
          self.ui.fase(1, "Exploración")
          exploracion = self.explorar(pedido)
          self.ui.fase(2, "Arquitectura")
@@ -3021,7 +3109,7 @@ index ad78b6b..ecf2c8b 100644
          for _ in range(3):
              self._mostrar_plan(plan)
              if not confirmar or self.ui.confirmar("¿Aprobás el plan y arrancamos?", defecto=True):
-@@ -599,7 +1266,10 @@ class Orquestador:
+@@ -599,7 +1347,10 @@ class Orquestador:
          return ruta
  
      def _verificar_tarea(self, tcid: int, antes: ConteoTests, nombres_antes: set,
@@ -3033,7 +3121,7 @@ index ad78b6b..ecf2c8b 100644
          """
          Una tarea intermedia no necesita que pasen TODOS los tests (los de tareas
          siguientes todavía fallan): alcanza con validadores OK y que no se rompa
-@@ -609,7 +1279,31 @@ class Orquestador:
+@@ -609,7 +1360,31 @@ class Orquestador:
          validaciones = validar_archivos(self.ws, archivos)
          tests = ejecutar_tests(self.ws, timeout=self.settings.tests_timeout, completo=True)
          conteo = conteo_de_resultado(tests)
@@ -3066,7 +3154,7 @@ index ad78b6b..ecf2c8b 100644
          if tests is not None and not tests.ok and conteo.reconocido:
              # Los tests de la especificación de tareas siguientes fallan a propósito: no son regresión.
              nuevos_fallos = [n for n in conteo.nombres_fallados
-@@ -642,30 +1336,166 @@ class Orquestador:
+@@ -642,30 +1417,177 @@ class Orquestador:
              diagnostico = anexar_pistas(diagnostico, 2)
          return Verificacion(not problemas, validaciones, tests, diagnostico, archivos, conteo)
  
@@ -3206,6 +3294,17 @@ index ad78b6b..ecf2c8b 100644
  
 -        testeable = any(a.endswith(EXTENSIONES_TESTEABLES) for a in plan.archivos()) or any(
 -            a.endswith(EXTENSIONES_TESTEABLES) for a in self.ws.archivos_codigo(limite=200)) or not self.ws.archivos_codigo(limite=5)
++        # Motor central: el juez fija el CONTRATO (criterios del pedido) antes de construir. En reanudación se
++        # reutiliza el que ya quedó en el diario: no se gasta otra llamada.
++        if not reanudar:
++            informe.criterios_entrega = self._contrato_de_entrega(pedido)
++            if informe.criterios_entrega:
++                previo["criterios_entrega"] = informe.criterios_entrega
++                registro_build.guardar(previo)
++                self._mostrar_contrato(informe.criterios_entrega, plan)
++        else:
++            informe.criterios_entrega = list(previo.get("criterios_entrega", []))
++
 +        testeable = _es_testeable(plan.archivos(), self.ws.archivos_codigo(limite=200))
          numero_fase = 3
 -        if self.settings.tests_primero and testeable:
@@ -3245,7 +3344,7 @@ index ad78b6b..ecf2c8b 100644
  
          self.ui.fase(numero_fase, "Implementación" + (" · torneo" if self.settings.torneo and self.settings.candidatos > 1 else ""))
          numero_fase += 1
-@@ -676,35 +1506,83 @@ class Orquestador:
+@@ -676,35 +1598,83 @@ class Orquestador:
          if [t.id for t in orden] != [t.id for t in plan.tareas]:
              self.ui.tenue("  Orden por dependencias: " + " → ".join(t.id for t in orden))
              plan.tareas = orden
@@ -3331,7 +3430,7 @@ index ad78b6b..ecf2c8b 100644
                  continue
  
              for ronda in range(self.settings.max_revisiones):
-@@ -722,6 +1600,30 @@ class Orquestador:
+@@ -722,6 +1692,30 @@ class Orquestador:
                      break
                  self.implementar(pedido, plan, i, exploracion, tcid, correcciones=revision,
                                   protegidos=self._protegidos)
@@ -3362,7 +3461,7 @@ index ad78b6b..ecf2c8b 100644
  
          archivos = [r for r in self.ws.checkpoints.archivos_desde(grupo) if (self.ws.raiz / r).is_file()]
          hay_tests_build = any(_es_test(a) for a in archivos)
-@@ -734,21 +1636,38 @@ class Orquestador:
+@@ -734,21 +1728,40 @@ class Orquestador:
          self.ui.fase(numero_fase, "Verificación real")
          verif = self.verificar(grupo)
          self._mostrar_verificacion(verif)
@@ -3384,6 +3483,8 @@ index ad78b6b..ecf2c8b 100644
 +        informe.estado = estado_final_build(verif, informe)
 +        # 8.º agente: el juez de entrega puede bajar de verde a parcial si el pedido no quedó cumplido (nunca sube).
 +        self._juicio_de_entrega(pedido, plan, verif, informe)
++        # Motor central: si falta algo del pedido, el juez interviene para cerrarlo (acotado) y vuelve a juzgar.
++        verif = self._cerrar_con_juez(pedido, plan, verif, informe, grupo, base_fallaba)
 +        if informe.estado == "parcial":
 +            if informe.tareas_bloqueadas or informe.tareas_fallidas:
 +                informe.notas.append("Verificación final verde, pero hay tareas fallidas/bloqueadas sin completar.")
@@ -3405,7 +3506,7 @@ index ad78b6b..ecf2c8b 100644
          informe.ruta_informe = self._guardar_informe(pedido, informe)
          self._mostrar_cierre(informe)
          return informe
-@@ -769,6 +1688,12 @@ class Orquestador:
+@@ -769,6 +1782,12 @@ class Orquestador:
          else:
              self.ui.error(f"tests: fallaron ({verif.conteo.texto() if verif.conteo.reconocido else verif.tests.comando})")
              self.ui.tenue(recortar(fallos_relevantes(verif.tests.stdout + "\n" + verif.tests.stderr, 2, 1500), 1500))
@@ -3418,7 +3519,7 @@ index ad78b6b..ecf2c8b 100644
  
      def _guardar_informe(self, pedido: str, informe: InformeBuild) -> Optional[Path]:
          try:
-@@ -781,7 +1706,14 @@ class Orquestador:
+@@ -781,7 +1800,14 @@ class Orquestador:
                  f"## Plan\n```\n{informe.plan.como_texto() if informe.plan else '-'}\n```\n\n"
                  f"## Archivos\n```\n{_diffstat(diff) or '-'}\n```\n\n"
                  f"## Tests\n```\n{tests}\n```\n\n"
@@ -3434,7 +3535,7 @@ index ad78b6b..ecf2c8b 100644
                     if informe.spec_tests else "")
                  + (f"## Escaladas al modelo fuerte\n{informe.escaladas}\n\n" if informe.escaladas else "")
                  + ("## Lecciones aprendidas\n" + "\n".join(f"- {l}" for l in informe.lecciones) + "\n\n" if informe.lecciones else "")
-@@ -790,40 +1722,69 @@ class Orquestador:
+@@ -790,40 +1816,69 @@ class Orquestador:
                  + ("## Notas\n" + "\n".join(f"- {n}" for n in informe.notas) + "\n" if informe.notas else "")
              )
              ruta = self.ws.raiz / ".reaper" / "informes" / f"build_{datetime.now():%Y%m%d_%H%M%S}.md"
@@ -7110,10 +7211,10 @@ index 0000000..43841a9
 +        self.assertNotEqual(app.settings.modelo, "")
 diff --git a/partes/48ze_autotest_juez.py b/partes/48ze_autotest_juez.py
 new file mode 100644
-index 0000000..1962543
+index 0000000..ace4fb1
 --- /dev/null
 +++ b/partes/48ze_autotest_juez.py
-@@ -0,0 +1,107 @@
+@@ -0,0 +1,237 @@
 +"""
 +Autotests del 8.º agente: el JUEZ DE ENTREGA. Al cerrar /construir compara lo entregado contra el PEDIDO y
 +SOLO endurece el estado (verde → parcial); nunca convierte una build roja en verde. Entrada compacta + veredicto
@@ -7206,6 +7307,136 @@ index 0000000..1962543
 +        orq._juicio_de_entrega("pedido", _plan_web(), _verif_ok(), InformeBuild("verificada"))
 +        llamada = next(c for c in llm.llamadas if c.get("rol") == "juez")
 +        self.assertEqual(llamada["max_tokens"], 400)        # presupuesto chico (los roles que escriben usan miles)
++
++
++class TestJuezContrato(BaseTest):
++    """Motor central, paso 1: el juez convierte el pedido en un CONTRATO de criterios y vigila la cobertura."""
++    def _orq(self, respuesta_juez):
++        llm = MockLLM(lambda mensajes, kw: respuesta_juez if kw.get("rol") == "juez" else "{}")
++        return Orquestador(llm, self.proyecto(), self.ajustes(), self.ui()), llm
++
++    def test_parsea_criterios(self):
++        c = parsear_criterios_entrega('{"criterios": ["hay login", "lista productos", "hay login"]}')
++        self.assertEqual(c, ["hay login", "lista productos"])        # dedup
++
++    def test_criterios_cap_y_basura(self):
++        self.assertEqual(parsear_criterios_entrega("no json"), [])
++        muchos = '{"criterios": [' + ",".join(f'"c{i}"' for i in range(20)) + ']}'
++        self.assertEqual(len(parsear_criterios_entrega(muchos)), 8)   # acotado
++
++    def test_cobertura_detecta_criterio_sin_tarea(self):
++        plan = Plan("web", [Tarea("1", "crear index.html con el listado", ["index.html"])], [])
++        self.assertEqual(cobertura_criterios(["mostrar listado"], plan), [])          # 'listado' está en el plan
++        self.assertEqual(cobertura_criterios(["enviar emails"], plan), ["enviar emails"])  # nada que ver
++        self.assertEqual(cobertura_criterios([], plan), [])
++
++    def test_contrato_desde_el_pedido(self):
++        orq, _ = self._orq('{"criterios": ["hay login", "hay listado"]}')
++        self.assertEqual(orq._contrato_de_entrega("una web con login y listado"), ["hay login", "hay listado"])
++
++    def test_contrato_apagado_o_basura_no_rompe(self):
++        orq, llm = self._orq('{"criterios": ["x"]}')
++        orq.settings.juez = False
++        self.assertEqual(orq._contrato_de_entrega("algo"), [])        # apagado: ni una llamada
++        self.assertEqual(llm.llamadas, [])
++        orq2, _ = self._orq("no json")
++        self.assertEqual(orq2._contrato_de_entrega("algo"), [])       # basura: lista vacía, sin romper
++
++    def test_gate_usa_el_contrato(self):
++        orq, _ = self._orq('{"cumple": false, "faltantes": ["falta el login"], "confianza": "high"}')
++        informe = InformeBuild("verificada")
++        informe.criterios_entrega = ["hay login", "hay listado"]      # contrato ya fijado
++        orq._juicio_de_entrega("una web con login", _plan_web(), _verif_ok(), informe)
++        self.assertEqual(informe.estado, "parcial")                  # juzgó contra el contrato y endureció
++
++
++class TestJuezCierra(BaseTest):
++    """Motor central, paso final: si falta algo del pedido, el juez INTERVIENE (acotado) y re-juzga."""
++    PLAN = """<plan>
++<objetivo>App con dos módulos</objetivo>
++<interfaz>
++- app.py: módulo principal
++</interfaz>
++<tarea id="1" archivos="app.py">Crear app.py.</tarea>
++<criterios>
++- existe app.py
++</criterios>
++</plan>"""
++
++    def test_debe_intervenir_logica(self):
++        llm = MockLLM(lambda m, k: "{}")
++        orq = Orquestador(llm, self.proyecto(), self.ajustes(), self.ui())
++        inf = InformeBuild("verificada")
++        inf.juicio = Juicio(False, ["falta x"], confianza="high")
++        self.assertTrue(orq._debe_intervenir_juez(inf, 1))
++        inf.juicio = Juicio(True, [], confianza="high")
++        self.assertFalse(orq._debe_intervenir_juez(inf, 1))            # cumple
++        inf.juicio = Juicio(False, ["x"], confianza="low")
++        self.assertFalse(orq._debe_intervenir_juez(inf, 1))            # confianza baja
++        inf.juicio = Juicio(False, [], confianza="high")
++        self.assertFalse(orq._debe_intervenir_juez(inf, 1))            # sin faltantes
++        inf.juicio = Juicio(False, ["x"], confianza="high"); inf.intervenciones_juez = 1
++        self.assertFalse(orq._debe_intervenir_juez(inf, 1))            # agotó el cupo
++        inf.intervenciones_juez = 0; inf.estado = "fallida"
++        self.assertFalse(orq._debe_intervenir_juez(inf, 1))            # build roja: no interviene
++        self.assertFalse(orq._debe_intervenir_juez(InformeBuild("verificada"), 1))   # sin juicio
++
++    def test_juez_interviene_y_cierra(self):
++        st = {"verdict": 0}
++
++        def guion(mensajes, kw):
++            rol = MockLLM.rol_de(mensajes)
++            turno = _turno(mensajes)
++            user = mensajes[-1]["content"]
++            if rol == "arquitecto":
++                return terminar_xml(self.PLAN)
++            if rol == "implementador":
++                return herramienta_xml("write_to_file", path="app.py", content="x = 1\n") if turno == 0 \
++                    else terminar_xml("app.py listo")
++            if rol == "reparador":
++                return herramienta_xml("write_to_file", path="extra.py", content="y = 2\n") if turno == 0 \
++                    else terminar_xml("extra.py agregado")
++            if rol == "juez":
++                if "CONTRATO" in user:
++                    return '{"criterios": ["existe app.py", "existe extra.py"]}'
++                st["verdict"] += 1
++                if st["verdict"] == 1:
++                    return '{"cumple": false, "faltantes": ["falta extra.py"], "confianza": "high"}'
++                return '{"cumple": true, "confianza": "high"}'
++            return terminar_xml("ok")
++
++        ws = self.proyecto()
++        ajustes = self.ajustes(tests_primero=False, torneo=False, escalar=False, max_revisiones=0, qa=False,
++                               max_reparaciones=0, juez=True, juez_max_intervenciones=1)
++        informe = Orquestador(MockLLM(guion), ws, ajustes, self.ui()).construir("app con dos módulos", confirmar=False)
++        self.assertTrue(ws.existe("extra.py"))                         # el juez intervino y agregó lo que faltaba
++        self.assertEqual(informe.intervenciones_juez, 1)
++        self.assertTrue(informe.juicio and informe.juicio.cumple)
++        self.assertIn(informe.estado, ("verificada", "validada"))
++
++    def test_juez_no_interviene_si_el_cupo_es_cero(self):
++        def guion(mensajes, kw):
++            rol = MockLLM.rol_de(mensajes)
++            turno = _turno(mensajes)
++            user = mensajes[-1]["content"]
++            if rol == "arquitecto":
++                return terminar_xml(self.PLAN)
++            if rol == "implementador":
++                return herramienta_xml("write_to_file", path="app.py", content="x = 1\n") if turno == 0 \
++                    else terminar_xml("app.py listo")
++            if rol == "juez" and "CONTRATO" not in user:
++                return '{"cumple": false, "faltantes": ["falta extra.py"], "confianza": "high"}'
++            if rol == "juez":
++                return '{"criterios": ["existe app.py"]}'
++            return terminar_xml("ok")
++
++        ws = self.proyecto()
++        ajustes = self.ajustes(tests_primero=False, torneo=False, escalar=False, max_revisiones=0, qa=False,
++                               max_reparaciones=0, juez=True, juez_max_intervenciones=0)
++        informe = Orquestador(MockLLM(guion), ws, ajustes, self.ui()).construir("app", confirmar=False)
++        self.assertEqual(informe.intervenciones_juez, 0)              # cupo 0: solo avisa
++        self.assertFalse(ws.existe("extra.py"))
++        self.assertEqual(informe.estado, "parcial")                  # el juez igual bajó a parcial
 +
 +
 +class TestTrabajosChicos(BaseTest):
@@ -7801,7 +8032,7 @@ index 04beb5e..4fdfd45 100644
  
  
 diff --git a/partes/54_ingles.py b/partes/54_ingles.py
-index 8456a11..b7bc7fb 100644
+index 8456a11..3c027dd 100644
 --- a/partes/54_ingles.py
 +++ b/partes/54_ingles.py
 @@ -19,6 +19,11 @@ PRINCIPLES
@@ -7816,7 +8047,7 @@ index 8456a11..b7bc7fb 100644
  
  HOW TO USE TOOLS
  - Write tool calls as XML tags exactly like the examples. You may write 1-3 sentences of reasoning first.
-@@ -177,6 +182,40 @@ TEST_SUITE_GREEN (tests pass), BEHAVIOR_VERIFIED (the program was also run and g
+@@ -177,6 +182,45 @@ TEST_SUITE_GREEN (tests pass), BEHAVIOR_VERIFIED (the program was also run and g
  CONTRADICTED (evidence says otherwise). Remember: 'tests pass' does NOT imply 'no bugs' (that exceeds the
  evidence), and green tests that don't discriminate (inspect_tests) don't rise above TEST_SUITE_GREEN.
  attempt_completion with one line per claim: CLAIM → LEVEL (what evidence backs it and what's missing to raise it).""",
@@ -7844,20 +8075,25 @@ index 8456a11..b7bc7fb 100644
 +A criterion is MET only if you cite evidence that proves it; without evidence it is UNKNOWN.
 +Reply ONLY a JSON object: {"criteria": [{"criterion": "...", "status": "MET|NOT_MET|UNKNOWN",
 +"evidence_ids": ["EV-..."]}]}""",
-+    "juez": """You are the DELIVERY JUDGE: the last gate before anything is called delivered. One question only:
-+does what was built meet the user's REQUEST, exactly as asked, no more and no less? Judge ONLY from the EVIDENCE
-+given (each piece has an EV-... id): real build state, tests, validation, acceptance and the diff summary (which
-+files changed). You run nothing, you do not read the repo and you do not invent requirements the user never asked
-+for. Hard rule: you CANNOT turn a red build green — if the evidence shows failures or unfinished tasks, cumple=false.
-+If something the request asked for is missing (a file, a screen, an endpoint, a concrete behavior), list it under
-+"faltantes", specific and actionable. If the evidence is enough and the request is covered, cumple=true. Use high
-+confidence only when the evidence is conclusive.
-+Reply ONLY a JSON object: {"cumple": true|false, "faltantes": ["what is missing, concrete"],
-+"evidence_ids": ["EV-..."], "confianza": "low|medium|high"}""",
++    "juez": """You are the DELIVERY JUDGE: the CENTRAL control that the work gets done and delivered EXACTLY as
++requested. You work with little: short text, no tools, no reading the repo. Depending on what you are asked, you do
++ONE of two tasks:
++
++(A) CONTRACT — turn the user's REQUEST into concrete, verifiable acceptance criteria (files, screens, endpoints,
++observable behaviors), WITHOUT inventing anything the user did not ask for and without adding "extras". 1 to 8,
++only the essentials. Reply ONLY: {"criterios": ["concrete, verifiable criterion", ...]}
++
++(B) VERDICT — decide whether what was built meets the request/contract, no more and no less, judging ONLY from the
++EVIDENCE given (each piece has an EV-... id): real build state, tests, validation, acceptance and the diff summary.
++You run nothing and do not read the repo. Hard rule: you CANNOT turn a red build green — if the evidence shows
++failures or unfinished tasks, cumple=false. If something the request asked for is missing (a file, a screen, an
++endpoint, a behavior), list it under "faltantes", specific and actionable. If the evidence is enough and the
++request is covered, cumple=true. Use high confidence only when the evidence is conclusive.
++Reply ONLY: {"cumple": true|false, "faltantes": ["..."], "evidence_ids": ["EV-..."], "confianza": "low|medium|high"}""",
  }
  
  DOCS_EN = {
-@@ -259,6 +298,9 @@ DOCS_EN = {
+@@ -259,6 +303,9 @@ DOCS_EN = {
      "fetch_url": ("Reads a web page (official docs, README, an answer to an error) and returns its clean text. With "
                    "'buscar' only paragraphs with those words are returned. GET only; never sends project data.",
                    {"url": "full http(s) URL", "buscar": "keywords to keep only the relevant part (optional)"}),
@@ -7867,7 +8103,7 @@ index 8456a11..b7bc7fb 100644
      "rename_symbol": ("Renames a function, class, variable or method across the WHOLE project safely: never touches "
                        "strings or comments and validates everything at the end.",
                        {"old": "current name", "new": "new name", "paths": "comma-separated files (optional)"}),
-@@ -296,6 +338,10 @@ def system_prompt_en(rol: "Rol", ws: Workspace, max_llamadas: int = 4, arbol: bo
+@@ -296,6 +343,10 @@ def system_prompt_en(rol: "Rol", ws: Workspace, max_llamadas: int = 4, arbol: bo
          f"\n# YOUR ROLE: {rol.nombre.upper()}\n{MISIONES_EN.get(rol.nombre, rol.mision)}",
          "\n# AVAILABLE TOOLS\n" + documentacion_en(list(rol.herramientas)),
          f"\n# ENVIRONMENT\n- Workspace: {ws.raiz}\n{_entorno()}",
@@ -8183,10 +8419,10 @@ index a202d43..a6b37c9 100644
      Contadores HONESTOS y separados (§0.1). Lo que no se puede verificar sin red queda en 0 / NO VERIFICADO.
 diff --git a/partes/75_reaper_x.py b/partes/75_reaper_x.py
 new file mode 100644
-index 0000000..21751ad
+index 0000000..21215d0
 --- /dev/null
 +++ b/partes/75_reaper_x.py
-@@ -0,0 +1,280 @@
+@@ -0,0 +1,296 @@
 +"""
 +REAPER X: equipo de 10 roles con dictámenes estructurados y un controlador determinista.
 +
@@ -8428,6 +8664,22 @@ index 0000000..21751ad
 +            return f"Juez de entrega: CUMPLE el pedido (confianza {self.confianza})"
 +        falta = "; ".join(self.faltantes[:4]) if self.faltantes else "sin detalle"
 +        return f"Juez de entrega: NO CUMPLE (confianza {self.confianza}) · falta: {falta}"
++
++
++def parsear_criterios_entrega(texto: str, maximo: int = 8) -> list:
++    """Criterios de aceptación que el juez derivó del pedido (contrato). Lista de strings, acotada y deduplicada."""
++    datos = extraer_json_x(texto)
++    if not isinstance(datos, dict):
++        return []
++    salida, vistos = [], set()
++    for c in _lista_str(datos.get("criterios")):
++        clave = c.lower()
++        if clave not in vistos:
++            vistos.add(clave)
++            salida.append(c[:200])
++        if len(salida) >= maximo:
++            break
++    return salida
 +
 +
 +def parsear_juicio(texto: str, evidencia: Optional[dict] = None) -> Juicio:

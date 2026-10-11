@@ -110,3 +110,19 @@ Archivos nuevos/modificados de esta tanda: `19_roles`, `54_ingles` (rol `juez`),
 `/diagnostico`, `/equipo juez`), `70_equipo` (`validar_configuracion`, `diagnostico_texto`, `estado_juez`);
 tests: `48ze_autotest_juez` (15) y `TestConfigValidarDiagnostico` en `48zc` (9). Regresión 944 tests OK en
 Python 3.11/3.12/3.13.
+
+## 9. El juez como MOTOR CENTRAL (bajo costo)
+
+El juez ahora dirige el build, pero mayormente DETERMINISTA para no gastar tokens: en un build limpio son ~2
+llamadas chicas (contrato + veredicto) y más solo si interviene.
+- **Contrato**: `_contrato_de_entrega` convierte el pedido en criterios al inicio (`parsear_criterios_entrega`,
+  max_tokens 350); se guarda en el diario y se reusa al reanudar.
+- **Vigía determinista**: `cobertura_criterios` (0 llamadas) marca criterios que el plan no parece cubrir.
+- **Cierre**: `_cerrar_con_juez` + `_debe_intervenir_juez`: si el veredicto final es NO CUMPLE (confianza media/alta)
+  y hay cupo (`juez_max_intervenciones`, def. 1), el reparador implementa los faltantes, se re-verifica de verdad y
+  el juez re-juzga. Acotado; nunca declara verde sin verificación real.
+
+**A romper:** (1) que el cierre entre en bucle o declare cumplido sin que la verificación real lo confirme;
+(2) que `cobertura_criterios` dé falsos "sin cubrir" molestos con sinónimos; (3) que el contrato invente criterios
+que el usuario no pidió (el prompt lo prohíbe, pero medirlo con modelos reales). Tests: `TestJuezContrato` (6),
+`TestJuezCierra` (3). Regresión 953 tests OK en Python 3.11/3.12/3.13.
