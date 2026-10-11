@@ -84,43 +84,62 @@ def ejecutar(
 ) -> Resultado:
     etiqueta = cmd if isinstance(cmd, str) else " ".join(shlex.quote(str(c)) for c in cmd)
     inicio = time.monotonic()
-    try:
-        proceso = subprocess.Popen(
-            cmd,
-            shell=shell,
-            executable=(shutil.which("bash") if shell else None),
-            cwd=str(cwd),
-            stdin=subprocess.PIPE if entrada is not None else subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            env=entorno_seguro(),
-            start_new_session=True,
-        )
-    except FileNotFoundError:
-        nombre = cmd.split()[0] if isinstance(cmd, str) else cmd[0]
-        return Resultado(False, etiqueta, 127, stderr=f"No existe el ejecutable: {nombre}")
-    except OSError as e:
-        return Resultado(False, etiqueta, 1, stderr=f"{type(e).__name__}: {e}")
-
-    try:
-        out, err = proceso.communicate(input=entrada, timeout=timeout)
-    except subprocess.TimeoutExpired:
+    # La salida va a archivos temporales en disco, NO a memoria: un comando que imprime cientos de MB no agota
+    # la RAM del teléfono (A09). Después se lee solo la cola (MAX_SALIDA_PROCESO) de cada stream.
+    def _cola(f) -> str:
         try:
-            os.killpg(proceso.pid, signal.SIGKILL)
+            f.flush()
+            f.seek(0, os.SEEK_END)
+            tam = f.tell()
+            f.seek(max(0, tam - MAX_SALIDA_PROCESO))
+            return f.read().decode("utf-8", "replace")
         except OSError:
-            proceso.kill()
-        out, err = proceso.communicate()
-        return Resultado(
-            False, etiqueta, 124, (out or "")[-MAX_SALIDA_PROCESO:],
-            (err or "")[-MAX_SALIDA_PROCESO:] + f"\nTiempo agotado después de {timeout}s (¿programa interactivo o servidor?).",
-            timeout=True, duracion=time.monotonic() - inicio,
-        )
-    return Resultado(proceso.returncode == 0, etiqueta, proceso.returncode,
-                     (out or "")[-MAX_SALIDA_PROCESO:], (err or "")[-MAX_SALIDA_PROCESO:],
-                     duracion=time.monotonic() - inicio)
+            return ""
+
+    f_out, f_err = tempfile.TemporaryFile(), tempfile.TemporaryFile()
+    try:
+        try:
+            proceso = subprocess.Popen(
+                cmd,
+                shell=shell,
+                executable=(shutil.which("bash") if shell else None),
+                cwd=str(cwd),
+                stdin=subprocess.PIPE if entrada is not None else subprocess.DEVNULL,
+                stdout=f_out,
+                stderr=f_err,
+                env=entorno_seguro(),
+                start_new_session=True,
+            )
+        except FileNotFoundError:
+            nombre = cmd.split()[0] if isinstance(cmd, str) else cmd[0]
+            return Resultado(False, etiqueta, 127, stderr=f"No existe el ejecutable: {nombre}")
+        except OSError as e:
+            return Resultado(False, etiqueta, 1, stderr=f"{type(e).__name__}: {e}")
+
+        if entrada is not None:
+            try:
+                proceso.stdin.write(entrada.encode("utf-8", "replace"))
+                proceso.stdin.close()
+            except OSError:
+                pass
+        try:
+            proceso.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proceso.pid, signal.SIGKILL)
+            except OSError:
+                proceso.kill()
+            proceso.wait()
+            return Resultado(
+                False, etiqueta, 124, _cola(f_out),
+                _cola(f_err) + f"\nTiempo agotado después de {timeout}s (¿programa interactivo o servidor?).",
+                timeout=True, duracion=time.monotonic() - inicio,
+            )
+        return Resultado(proceso.returncode == 0, etiqueta, proceso.returncode,
+                         _cola(f_out), _cola(f_err), duracion=time.monotonic() - inicio)
+    finally:
+        f_out.close()
+        f_err.close()
 
 
 # ==================================================================

@@ -227,7 +227,8 @@ def probar_proveedores(llm, settings, proveedores: Sequence[str] = ()) -> list:
     """Prueba cada proveedor pedido (o todos los que tengan credencial). Dedup implícito por proveedor."""
     if not proveedores:
         proveedores = [p for p, d in PROVEEDORES.items()
-                       if not d.get("clave") or clave_de_proveedor(p, replace(settings, proveedor=p))]
+                       if not d.get("retirado") and (not d.get("clave")
+                                                      or clave_de_proveedor(p, replace(settings, proveedor=p)))]
     return [probar_proveedor(llm, p, settings) for p in proveedores]
 
 

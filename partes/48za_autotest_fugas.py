@@ -119,3 +119,20 @@ class TestSalidaComandoRedactada(_BaseFuga):
         texto = app._ruta_sesion().read_text(encoding="utf-8")
         self.assertIn("[REDACTADO]", texto)
         self.assertNotIn("gsk_0AbCdEfGhIjKl", texto)
+
+
+class TestLogsYProveedorRetirado(_BaseFuga):
+    def test_log_redacta_secretos(self):
+        log = self.dir / "r.log"
+        ui = UI(silencioso=True, interactivo=False, log=log)
+        ui.linea("conecté con GROQ_API_KEY=gsk_0AbCdEfGhIjKlMnOpQrStUvWxYz0123456789AbCdEfGh ok")
+        texto = log.read_text(encoding="utf-8")
+        self.assertIn("[REDACTADO]", texto)
+        self.assertNotIn("gsk_0AbCdEfGhIjKl", texto)
+
+    def test_proveedor_retirado_no_se_sondea(self):
+        os.environ["GITHUB_MODELS_TOKEN"] = "tok-falso"
+        self.addCleanup(os.environ.pop, "GITHUB_MODELS_TOKEN", None)
+        res = probar_proveedores(MockLLM([]), self.ajustes())
+        self.assertNotIn("github-models", [r["proveedor"] for r in res])   # retirado: no gasta intentos
+        self.assertIn("github-models", PROVEEDORES_RETIRADOS)

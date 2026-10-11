@@ -69,9 +69,13 @@ PROVEEDORES = {
     "github-models": {
         "url": "https://models.inference.ai.azure.com/chat/completions",
         "clave": "GITHUB_MODELS_TOKEN",
-        "nota": "GitHub Models: requiere token propio; confirmar acceso por cuenta",
+        "nota": "RETIRADO (GitHub Models cerró el endpoint heredado en 2026): no se prueba automáticamente",
+        "retirado": True,
     },
 }
+
+# Proveedores retirados/no operativos: no se sondean solos ni cuentan como opción activa (A15).
+PROVEEDORES_RETIRADOS = frozenset(p for p, d in PROVEEDORES.items() if d.get("retirado"))
 
 
 @dataclass(frozen=True)

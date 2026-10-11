@@ -152,6 +152,8 @@ class TestHooks(BaseTest):
             "antes_de_comando": ["echo {comando} | grep -qv prohibido"],
         }})})
         ctx = self.contexto(ws)
+        _HOOKS_APROBADOS.add(str(ws.raiz))                    # el usuario autorizó los hooks de este proyecto
+        self.addCleanup(_HOOKS_APROBADOS.discard, str(ws.raiz))
         salida = self.herramienta(ctx, "write_to_file", path="a.py", content="x = 1")
         self.assertIn("un hook del proyecto modificó a.py", salida)
         self.assertIn("# formateado", ws.leer("a.py"))
@@ -159,6 +161,14 @@ class TestHooks(BaseTest):
         with self.assertRaises(ErrorHerramienta) as cm:
             self.herramienta(ctx, "execute_command", command="echo prohibido")
         self.assertIn("hook", str(cm.exception))
+
+    def test_hooks_del_repo_no_corren_sin_autorizacion(self):
+        # A11: un repo no confiable NO ejecuta sus hooks sin consentimiento (modo no interactivo = fail-closed)
+        ws = self.proyecto({".reaper/config.json": json.dumps({"hooks": {
+            "despues_de_escribir": ["echo '# inyectado' >> {archivo}"]}})})
+        ctx = self.contexto(ws)                               # UI no interactiva: confirmar() → defecto False
+        self.herramienta(ctx, "write_to_file", path="a.py", content="x = 1")
+        self.assertNotIn("# inyectado", ws.leer("a.py"))      # el hook del repo no corrió
 
     def test_eventos_y_desactivados(self):
         ws = self.proyecto({".reaper/config.json": '{"hooks": {"despues_de_build": "echo {estado}"}}'})

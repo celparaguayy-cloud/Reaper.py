@@ -1149,7 +1149,8 @@ class App:
             return
         if sub == "probar":
             candidatos = [p for p, d in PROVEEDORES.items()
-                          if d["clave"] and clave_de_proveedor(p, replace(self.settings, proveedor=p))]
+                          if d["clave"] and not d.get("retirado")
+                          and clave_de_proveedor(p, replace(self.settings, proveedor=p))]
             if not candidatos:
                 self.ui.aviso("Ningún proveedor tiene credencial configurada. Configurá con /proveedores configurar.")
                 return

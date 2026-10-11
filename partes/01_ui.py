@@ -599,7 +599,7 @@ class UI:
         try:
             self.log.parent.mkdir(parents=True, exist_ok=True)
             with open(self.log, "a", encoding="utf-8") as f:
-                f.write(f"[{datetime.now():%H:%M:%S}] {sin_ansi(texto)}\n")
+                f.write(f"[{datetime.now():%H:%M:%S}] {redactar_secretos(sin_ansi(texto))}\n")
         except OSError:
             self.log = None
 

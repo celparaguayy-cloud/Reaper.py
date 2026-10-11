@@ -221,6 +221,31 @@ def hooks_de(ws: Workspace, evento: str) -> list[str]:
     return [c for c in comandos if isinstance(c, str) and c.strip()]
 
 
+# Los hooks de .reaper/config.json ejecutan comandos del REPOSITORIO: un repo no confiable no debe correr
+# comandos en tu equipo sin permiso (A11). Se pide consentimiento una vez por proyecto; si no hay quién
+# apruebe (modo no interactivo/auto), NO se corren (fail-closed).
+_HOOKS_APROBADOS: set = set()
+_HOOKS_RECHAZADOS: set = set()
+
+
+def hooks_autorizados(ctx) -> bool:
+    if not ctx.settings.hooks:
+        return False
+    raiz = str(ctx.ws.raiz)
+    if raiz in _HOOKS_APROBADOS:
+        return True
+    if raiz in _HOOKS_RECHAZADOS:
+        return False
+    if not any(hooks_de(ctx.ws, ev) for ev in EVENTOS_HOOK):
+        return True        # el proyecto no define hooks: no hay nada que autorizar
+    ok = ctx.ui.confirmar("Este proyecto define hooks en .reaper/config.json que ejecutan comandos del "
+                          "repositorio. ¿Autorizás correrlos en esta sesión?", defecto=False)
+    (_HOOKS_APROBADOS if ok else _HOOKS_RECHAZADOS).add(raiz)
+    if not ok:
+        ctx.ui.aviso("  Hooks del proyecto DESACTIVADOS (no autorizados). Se ignoran por seguridad.")
+    return ok
+
+
 def ejecutar_hooks(ws: Workspace, evento: str, variables: Optional[dict] = None, timeout: int = 60) -> list[ResultadoHook]:
     if evento not in EVENTOS_HOOK:
         raise ValueError(f"evento de hook desconocido: {evento}")
@@ -236,7 +261,7 @@ def ejecutar_hooks(ws: Workspace, evento: str, variables: Optional[dict] = None,
 
 def _hook_post_escritura(ctx: Contexto, rel: str) -> str:
     """Corre los hooks despues_de_escribir; devuelve texto para el agente si alguno falló o cambió algo."""
-    if not ctx.settings.hooks:
+    if not hooks_autorizados(ctx):
         return ""
     antes = ctx.ws.hash(rel)
     resultados = ejecutar_hooks(ctx.ws, "despues_de_escribir", {"archivo": rel})
@@ -253,7 +278,7 @@ def _hook_post_escritura(ctx: Contexto, rel: str) -> str:
 
 def _hook_antes_de_comando(ctx: Contexto, comando: str) -> Optional[str]:
     """Devuelve el motivo si un hook bloquea el comando."""
-    if not ctx.settings.hooks:
+    if not hooks_autorizados(ctx):
         return None
     for r in ejecutar_hooks(ctx.ws, "antes_de_comando", {"comando": comando}):
         if not r.ok:

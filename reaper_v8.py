@@ -732,7 +732,7 @@ class UI:
         try:
             self.log.parent.mkdir(parents=True, exist_ok=True)
             with open(self.log, "a", encoding="utf-8") as f:
-                f.write(f"[{datetime.now():%H:%M:%S}] {sin_ansi(texto)}\n")
+                f.write(f"[{datetime.now():%H:%M:%S}] {redactar_secretos(sin_ansi(texto))}\n")
         except OSError:
             self.log = None
 
@@ -1511,9 +1511,13 @@ PROVEEDORES = {
     "github-models": {
         "url": "https://models.inference.ai.azure.com/chat/completions",
         "clave": "GITHUB_MODELS_TOKEN",
-        "nota": "GitHub Models: requiere token propio; confirmar acceso por cuenta",
+        "nota": "RETIRADO (GitHub Models cerró el endpoint heredado en 2026): no se prueba automáticamente",
+        "retirado": True,
     },
 }
+
+# Proveedores retirados/no operativos: no se sondean solos ni cuentan como opción activa (A15).
+PROVEEDORES_RETIRADOS = frozenset(p for p, d in PROVEEDORES.items() if d.get("retirado"))
 
 
 @dataclass(frozen=True)
@@ -4484,43 +4488,62 @@ def ejecutar(
 ) -> Resultado:
     etiqueta = cmd if isinstance(cmd, str) else " ".join(shlex.quote(str(c)) for c in cmd)
     inicio = time.monotonic()
-    try:
-        proceso = subprocess.Popen(
-            cmd,
-            shell=shell,
-            executable=(shutil.which("bash") if shell else None),
-            cwd=str(cwd),
-            stdin=subprocess.PIPE if entrada is not None else subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            env=entorno_seguro(),
-            start_new_session=True,
-        )
-    except FileNotFoundError:
-        nombre = cmd.split()[0] if isinstance(cmd, str) else cmd[0]
-        return Resultado(False, etiqueta, 127, stderr=f"No existe el ejecutable: {nombre}")
-    except OSError as e:
-        return Resultado(False, etiqueta, 1, stderr=f"{type(e).__name__}: {e}")
-
-    try:
-        out, err = proceso.communicate(input=entrada, timeout=timeout)
-    except subprocess.TimeoutExpired:
+    # La salida va a archivos temporales en disco, NO a memoria: un comando que imprime cientos de MB no agota
+    # la RAM del teléfono (A09). Después se lee solo la cola (MAX_SALIDA_PROCESO) de cada stream.
+    def _cola(f) -> str:
         try:
-            os.killpg(proceso.pid, signal.SIGKILL)
+            f.flush()
+            f.seek(0, os.SEEK_END)
+            tam = f.tell()
+            f.seek(max(0, tam - MAX_SALIDA_PROCESO))
+            return f.read().decode("utf-8", "replace")
         except OSError:
-            proceso.kill()
-        out, err = proceso.communicate()
-        return Resultado(
-            False, etiqueta, 124, (out or "")[-MAX_SALIDA_PROCESO:],
-            (err or "")[-MAX_SALIDA_PROCESO:] + f"\nTiempo agotado después de {timeout}s (¿programa interactivo o servidor?).",
-            timeout=True, duracion=time.monotonic() - inicio,
-        )
-    return Resultado(proceso.returncode == 0, etiqueta, proceso.returncode,
-                     (out or "")[-MAX_SALIDA_PROCESO:], (err or "")[-MAX_SALIDA_PROCESO:],
-                     duracion=time.monotonic() - inicio)
+            return ""
+
+    f_out, f_err = tempfile.TemporaryFile(), tempfile.TemporaryFile()
+    try:
+        try:
+            proceso = subprocess.Popen(
+                cmd,
+                shell=shell,
+                executable=(shutil.which("bash") if shell else None),
+                cwd=str(cwd),
+                stdin=subprocess.PIPE if entrada is not None else subprocess.DEVNULL,
+                stdout=f_out,
+                stderr=f_err,
+                env=entorno_seguro(),
+                start_new_session=True,
+            )
+        except FileNotFoundError:
+            nombre = cmd.split()[0] if isinstance(cmd, str) else cmd[0]
+            return Resultado(False, etiqueta, 127, stderr=f"No existe el ejecutable: {nombre}")
+        except OSError as e:
+            return Resultado(False, etiqueta, 1, stderr=f"{type(e).__name__}: {e}")
+
+        if entrada is not None:
+            try:
+                proceso.stdin.write(entrada.encode("utf-8", "replace"))
+                proceso.stdin.close()
+            except OSError:
+                pass
+        try:
+            proceso.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proceso.pid, signal.SIGKILL)
+            except OSError:
+                proceso.kill()
+            proceso.wait()
+            return Resultado(
+                False, etiqueta, 124, _cola(f_out),
+                _cola(f_err) + f"\nTiempo agotado después de {timeout}s (¿programa interactivo o servidor?).",
+                timeout=True, duracion=time.monotonic() - inicio,
+            )
+        return Resultado(proceso.returncode == 0, etiqueta, proceso.returncode,
+                         _cola(f_out), _cola(f_err), duracion=time.monotonic() - inicio)
+    finally:
+        f_out.close()
+        f_err.close()
 
 
 # ==================================================================
@@ -27950,7 +27973,8 @@ class App:
             return
         if sub == "probar":
             candidatos = [p for p, d in PROVEEDORES.items()
-                          if d["clave"] and clave_de_proveedor(p, replace(self.settings, proveedor=p))]
+                          if d["clave"] and not d.get("retirado")
+                          and clave_de_proveedor(p, replace(self.settings, proveedor=p))]
             if not candidatos:
                 self.ui.aviso("Ningún proveedor tiene credencial configurada. Configurá con /proveedores configurar.")
                 return
@@ -38635,6 +38659,8 @@ class TestHooks(BaseTest):
             "antes_de_comando": ["echo {comando} | grep -qv prohibido"],
         }})})
         ctx = self.contexto(ws)
+        _HOOKS_APROBADOS.add(str(ws.raiz))                    # el usuario autorizó los hooks de este proyecto
+        self.addCleanup(_HOOKS_APROBADOS.discard, str(ws.raiz))
         salida = self.herramienta(ctx, "write_to_file", path="a.py", content="x = 1")
         self.assertIn("un hook del proyecto modificó a.py", salida)
         self.assertIn("# formateado", ws.leer("a.py"))
@@ -38642,6 +38668,14 @@ class TestHooks(BaseTest):
         with self.assertRaises(ErrorHerramienta) as cm:
             self.herramienta(ctx, "execute_command", command="echo prohibido")
         self.assertIn("hook", str(cm.exception))
+
+    def test_hooks_del_repo_no_corren_sin_autorizacion(self):
+        # A11: un repo no confiable NO ejecuta sus hooks sin consentimiento (modo no interactivo = fail-closed)
+        ws = self.proyecto({".reaper/config.json": json.dumps({"hooks": {
+            "despues_de_escribir": ["echo '# inyectado' >> {archivo}"]}})})
+        ctx = self.contexto(ws)                               # UI no interactiva: confirmar() → defecto False
+        self.herramienta(ctx, "write_to_file", path="a.py", content="x = 1")
+        self.assertNotIn("# inyectado", ws.leer("a.py"))      # el hook del repo no corrió
 
     def test_eventos_y_desactivados(self):
         ws = self.proyecto({".reaper/config.json": '{"hooks": {"despues_de_build": "echo {estado}"}}'})
@@ -43541,6 +43575,23 @@ class TestSalidaComandoRedactada(_BaseFuga):
         self.assertNotIn("gsk_0AbCdEfGhIjKl", texto)
 
 
+class TestLogsYProveedorRetirado(_BaseFuga):
+    def test_log_redacta_secretos(self):
+        log = self.dir / "r.log"
+        ui = UI(silencioso=True, interactivo=False, log=log)
+        ui.linea("conecté con GROQ_API_KEY=gsk_0AbCdEfGhIjKlMnOpQrStUvWxYz0123456789AbCdEfGh ok")
+        texto = log.read_text(encoding="utf-8")
+        self.assertIn("[REDACTADO]", texto)
+        self.assertNotIn("gsk_0AbCdEfGhIjKl", texto)
+
+    def test_proveedor_retirado_no_se_sondea(self):
+        os.environ["GITHUB_MODELS_TOKEN"] = "tok-falso"
+        self.addCleanup(os.environ.pop, "GITHUB_MODELS_TOKEN", None)
+        res = probar_proveedores(MockLLM([]), self.ajustes())
+        self.assertNotIn("github-models", [r["proveedor"] for r in res])   # retirado: no gasta intentos
+        self.assertIn("github-models", PROVEEDORES_RETIRADOS)
+
+
 # ======================================================================
 # MÓDULO: autotest_dataloss
 # ======================================================================
@@ -43702,6 +43753,12 @@ def correr_autotest(filtro: Optional[str] = None, verbosidad: Optional[int] = No
             continue
         suite.addTests(cargador.loadTestsFromTestCase(clase))
     total = suite.countTestCases()
+    if total == 0:
+        # Un filtro que no matchea nada NO es "todo verde": sería un falso éxito (A20).
+        disponibles = ", ".join(c.__name__ for c in clases_de_test()[:12])
+        print(f"{Tema.error}✗ 0 tests seleccionados"
+              + (f" con el filtro '{filtro}'" if filtro else "") + f". Clases: {disponibles}…{C.RESET}")
+        return 2
     print(f"{Tema.titulo}{C.BOLD}🐉 REAPER v{__version__} · autotest{C.RESET} {Tema.tenue}"
           f"({total} tests, sin API){C.RESET}")
     inicio = time.monotonic()
@@ -44340,6 +44397,31 @@ def hooks_de(ws: Workspace, evento: str) -> list[str]:
     return [c for c in comandos if isinstance(c, str) and c.strip()]
 
 
+# Los hooks de .reaper/config.json ejecutan comandos del REPOSITORIO: un repo no confiable no debe correr
+# comandos en tu equipo sin permiso (A11). Se pide consentimiento una vez por proyecto; si no hay quién
+# apruebe (modo no interactivo/auto), NO se corren (fail-closed).
+_HOOKS_APROBADOS: set = set()
+_HOOKS_RECHAZADOS: set = set()
+
+
+def hooks_autorizados(ctx) -> bool:
+    if not ctx.settings.hooks:
+        return False
+    raiz = str(ctx.ws.raiz)
+    if raiz in _HOOKS_APROBADOS:
+        return True
+    if raiz in _HOOKS_RECHAZADOS:
+        return False
+    if not any(hooks_de(ctx.ws, ev) for ev in EVENTOS_HOOK):
+        return True        # el proyecto no define hooks: no hay nada que autorizar
+    ok = ctx.ui.confirmar("Este proyecto define hooks en .reaper/config.json que ejecutan comandos del "
+                          "repositorio. ¿Autorizás correrlos en esta sesión?", defecto=False)
+    (_HOOKS_APROBADOS if ok else _HOOKS_RECHAZADOS).add(raiz)
+    if not ok:
+        ctx.ui.aviso("  Hooks del proyecto DESACTIVADOS (no autorizados). Se ignoran por seguridad.")
+    return ok
+
+
 def ejecutar_hooks(ws: Workspace, evento: str, variables: Optional[dict] = None, timeout: int = 60) -> list[ResultadoHook]:
     if evento not in EVENTOS_HOOK:
         raise ValueError(f"evento de hook desconocido: {evento}")
@@ -44355,7 +44437,7 @@ def ejecutar_hooks(ws: Workspace, evento: str, variables: Optional[dict] = None,
 
 def _hook_post_escritura(ctx: Contexto, rel: str) -> str:
     """Corre los hooks despues_de_escribir; devuelve texto para el agente si alguno falló o cambió algo."""
-    if not ctx.settings.hooks:
+    if not hooks_autorizados(ctx):
         return ""
     antes = ctx.ws.hash(rel)
     resultados = ejecutar_hooks(ctx.ws, "despues_de_escribir", {"archivo": rel})
@@ -44372,7 +44454,7 @@ def _hook_post_escritura(ctx: Contexto, rel: str) -> str:
 
 def _hook_antes_de_comando(ctx: Contexto, comando: str) -> Optional[str]:
     """Devuelve el motivo si un hook bloquea el comando."""
-    if not ctx.settings.hooks:
+    if not hooks_autorizados(ctx):
         return None
     for r in ejecutar_hooks(ctx.ws, "antes_de_comando", {"comando": comando}):
         if not r.ok:
@@ -48913,7 +48995,8 @@ def probar_proveedores(llm, settings, proveedores: Sequence[str] = ()) -> list:
     """Prueba cada proveedor pedido (o todos los que tengan credencial). Dedup implícito por proveedor."""
     if not proveedores:
         proveedores = [p for p, d in PROVEEDORES.items()
-                       if not d.get("clave") or clave_de_proveedor(p, replace(settings, proveedor=p))]
+                       if not d.get("retirado") and (not d.get("clave")
+                                                      or clave_de_proveedor(p, replace(settings, proveedor=p)))]
     return [probar_proveedor(llm, p, settings) for p in proveedores]
 
 
