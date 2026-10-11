@@ -14673,6 +14673,104 @@ def verificar_arranque(ws, timeout: int = 12) -> list:
     return problemas
 
 
+def _cuerpo_vacio(fn) -> Optional[str]:
+    """'vacia' si el cuerpo es solo pass / ... (sin contar el docstring), 'no_implementada' si solo lanza
+    NotImplementedError; None si hace algo de verdad."""
+    cuerpo = list(fn.body)
+    if (cuerpo and isinstance(cuerpo[0], ast.Expr) and isinstance(cuerpo[0].value, ast.Constant)
+            and isinstance(cuerpo[0].value.value, str)):
+        cuerpo = cuerpo[1:]
+    if not cuerpo:
+        return "vacia"
+    if len(cuerpo) != 1:
+        return None
+    sentencia = cuerpo[0]
+    if isinstance(sentencia, ast.Pass):
+        return "vacia"
+    if isinstance(sentencia, ast.Expr) and isinstance(sentencia.value, ast.Constant) \
+            and sentencia.value.value is Ellipsis:
+        return "vacia"
+    if isinstance(sentencia, ast.Raise) and sentencia.exc is not None:
+        objetivo = sentencia.exc.func if isinstance(sentencia.exc, ast.Call) else sentencia.exc
+        if isinstance(objetivo, ast.Name) and objetivo.id == "NotImplementedError":
+            return "no_implementada"
+    return None
+
+
+def stubs_en_codigo(fuente: str) -> list:
+    """[(funcion, linea, 'vacia'|'no_implementada')]. No cuenta métodos abstractos, sobrecargas, Protocols ni
+    métodos especiales (__init__, __exit__...), donde un cuerpo vacío suele ser lo correcto."""
+    try:
+        arbol = ast.parse(fuente)
+    except SyntaxError:
+        return []
+    salida = []
+
+    def nombre_de(nodo) -> str:
+        return nodo.attr if isinstance(nodo, ast.Attribute) else getattr(nodo, "id", "")
+
+    def clase_abstracta(clase) -> bool:
+        return (any(nombre_de(b) in ("Protocol", "ABC") for b in clase.bases)
+                or any(k.arg == "metaclass" for k in clase.keywords))
+
+    def visitar(nodo, abstracta: bool = False) -> None:
+        for hijo in ast.iter_child_nodes(nodo):
+            if isinstance(hijo, ast.ClassDef):
+                visitar(hijo, clase_abstracta(hijo))
+            elif isinstance(hijo, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                decoradores = {nombre_de(d.func if isinstance(d, ast.Call) else d) for d in hijo.decorator_list}
+                especial = hijo.name.startswith("__") and hijo.name.endswith("__")
+                if not (abstracta or especial or decoradores & {"abstractmethod", "overload", "abstractproperty"}):
+                    tipo = _cuerpo_vacio(hijo)
+                    if tipo:
+                        salida.append((hijo.name, hijo.lineno, tipo))
+                visitar(hijo, abstracta)
+    visitar(arbol)
+    return salida
+
+
+def examen_de_realidad(ws, cid_build: Optional[int], plan=None) -> list:
+    """
+    Determinista (0 tokens): ¿lo entregado es REAL o una simulación? Revisa lo que cambió en esta build:
+    - funciones que el plan pidió (def nombre en la interfaz o las tareas) y quedaron vacías (pass / ...), y
+      cualquier `raise NotImplementedError` fuera de métodos abstractos: el código existe pero no hace nada;
+    - tests creados o tocados en esta build que no prueban nada (tautologías, sin assert, mockean justo lo que
+      deberían probar, esperan el valor que inyectó el propio mock): un verde que no demuestra nada.
+    Devuelve hallazgos legibles; [] si lo revisado es real.
+    """
+    if cid_build is None:
+        return []
+    declaradas = set()
+    if plan is not None:
+        texto = (getattr(plan, "interfaz", "") or "") + "\n" + "\n".join(t.descripcion for t in plan.tareas)
+        declaradas = set(re.findall(r"\bdef\s+([A-Za-z_]\w*)", texto))
+    hallazgos = []
+    for rel in ws.checkpoints.archivos_desde(cid_build):
+        ruta = ws.raiz / rel
+        if not rel.endswith(".py") or not ruta.is_file():
+            continue
+        try:
+            fuente = ruta.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if _es_test(rel):
+            graves = [p for p in analizar_tests_python(fuente).problemas if p.severidad == "alta"]
+            for p in graves[:3]:
+                hallazgos.append(f"TEST SIN VALOR en {rel}::{p.test} (línea {p.linea}): {p.detalle}")
+            continue
+        for nombre, linea, tipo in stubs_en_codigo(fuente):
+            if tipo == "no_implementada" or nombre in declaradas:
+                motivo = "lanza NotImplementedError" if tipo == "no_implementada" else "quedó vacía (pass/...)"
+                hallazgos.append(f"SIMULACIÓN en {rel}:{linea}: `{nombre}` {motivo}: existe pero no hace nada.")
+    return hallazgos[:12]
+
+
+def _tokens_usados(llm) -> int:
+    """Tokens (entrada + salida) que lleva gastados el cliente de modelos; 0 si no lleva la cuenta."""
+    uso = getattr(llm, "uso", None)
+    return int(getattr(uso, "tokens_entrada", 0) or 0) + int(getattr(uso, "tokens_salida", 0) or 0)
+
+
 def _palabras_clave(texto: str) -> set:
     return {p for p in re.findall(r"[a-záéíóúñ0-9/._-]{4,}", (texto or "").lower())}
 
@@ -15077,6 +15175,8 @@ class InformeBuild:
     juicio: Optional["Juicio"] = None                      # veredicto del 8.º agente (juez de entrega)
     criterios_entrega: list = field(default_factory=list)  # contrato: criterios que el juez derivó del pedido
     intervenciones_juez: int = 0                           # cuántas veces el juez tuvo que intervenir para cerrar
+    tokens_juez: int = 0                                   # lo que gastó el juez en ESTA build (estimado)
+    tokens_build: int = 0                                  # lo que gastó la build entera (para comparar)
 
     @property
     def ok(self) -> bool:
@@ -15752,6 +15852,10 @@ class Orquestador:
                 raise
             self.ui.aviso(f"  {rol}: el modelo no respondió ({recortar(str(e), 160)}); sigo sin su dictamen.")
             return None, pedido_modelo, "unknown"
+        if rol == "juez":
+            # Contabilidad del juez: así se puede mostrar que es el que menos gasta.
+            self._tokens_juez = getattr(self, "_tokens_juez", 0) + tokens_mensajes(mensajes) + int(
+                getattr(resp, "tokens_salida", 0) or estimar_tokens(str(getattr(resp, "texto", "") or "")))
         servido = str(getattr(resp, "modelo", "") or "unknown")
         if servido not in ("unknown", "mock", pedido_modelo) and resolver_modelo(servido) != resolver_modelo(pedido_modelo):
             self.ui.tenue(f"  {rol}: pedido {pedido_modelo} → respondió {servido} (respaldo del equipo)")
@@ -15860,6 +15964,12 @@ class Orquestador:
             return
         if informe.estado not in ("verificada", "validada"):
             return  # la build ya está en rojo/parcial: el juez solo endurece, no hay verde que revisar
+        # 1) EXAMEN DE REALIDAD, gratis: si algo es una simulación (funciones pedidas vacías, NotImplementedError,
+        #    tests que no prueban nada), el juez decide SIN llamar al modelo. Gasta 0 tokens y hace más que nadie.
+        realidad = examen_de_realidad(self.ws, informe.cid, plan)
+        if realidad:
+            self._aplicar_juicio(Juicio(False, realidad, [], "high", determinista=True), informe)
+            return
         diff = self.ws.checkpoints.diff_desde(informe.cid) if informe.cid else ""
         criterios = "\n".join(f"- {c}" for c in (informe.criterios_entrega or plan.criterios)) or "- (derivalos del pedido)"
         evidencia = {
@@ -15873,6 +15983,8 @@ class Orquestador:
             "EV-DIFF": _diffstat(diff) or "(sin cambios)",
             # Qué pasó con lo que ya existía antes de esta actualización (determinista, 0 tokens extra de cálculo).
             "EV-PRESERVA": resumen_preservacion(self.ws, informe.cid),
+            "EV-REAL": "examen de realidad OK: las funciones pedidas tienen cuerpo y los tests de la build "
+                       "tienen asserts reales (sin tautologías ni mocks del código bajo prueba)",
         }
         bloque = "\n".join(f"{k}: {v}" for k, v in evidencia.items())
         prompt = (f"PEDIDO DEL USUARIO:\n{recortar(pedido, 1200)}\n\nOBJETIVO DEL PLAN: {recortar(plan.objetivo, 300)}\n\n"
@@ -15882,7 +15994,10 @@ class Orquestador:
         if texto is None:
             informe.notas.append("Juez de entrega: el modelo no respondió; sin veredicto (no se cambió el estado).")
             return
-        juicio = parsear_juicio(texto, evidencia)
+        self._aplicar_juicio(parsear_juicio(texto, evidencia), informe)
+
+    def _aplicar_juicio(self, juicio: "Juicio", informe: InformeBuild) -> None:
+        """Registra el veredicto (venga del examen determinista o del modelo) y endurece el estado si corresponde."""
         informe.juicio = juicio
         self.ui.tenue("  " + juicio.texto())
         if not juicio.valido:
@@ -16128,6 +16243,8 @@ class Orquestador:
     def _construir(self, pedido: str, confirmar: bool = True, reanudar: bool = False) -> InformeBuild:
         inicio = time.monotonic()
         self._protegidos: dict[str, Optional[str]] = {}
+        self._tokens_juez = 0
+        self._tokens_inicio = _tokens_usados(self.llm)
         registro_build = RegistroBuild(self.ws)
         try:
             previo = registro_build.leer()
@@ -16464,6 +16581,8 @@ class Orquestador:
             self.ui.fase(numero_fase + 1, "Auditoría REAPER X (seguridad defensiva · entrega · supervisor)")
             self._auditoria_x(pedido, plan, verif, informe)
         informe.segundos = time.monotonic() - inicio
+        informe.tokens_juez = getattr(self, "_tokens_juez", 0)
+        informe.tokens_build = max(0, _tokens_usados(self.llm) - getattr(self, "_tokens_inicio", 0))
         previo["estado"] = informe.estado
         registro_build.guardar(previo)
         if informe.ok:
@@ -16573,6 +16692,14 @@ class Orquestador:
         if informe.juicio is not None and informe.juicio.valido and not informe.juicio.cumple:
             faltan = "; ".join(informe.juicio.faltantes[:3]) or "sin detalle"
             lineas.append(f"{Tema.aviso}juez: no cumple el pedido → {recortar(faltan, 90)}{C.RESET}")
+        if getattr(self.settings, "juez", True) and informe.tokens_build:
+            # El juez es el que más controla y el que menos gasta: que se vea con números.
+            if informe.tokens_juez:
+                pct = 100 * informe.tokens_juez / informe.tokens_build
+                lineas.append(f"{Tema.tenue}⚖ juez: ~{formatear_numero(informe.tokens_juez)} tokens "
+                              f"({pct:.1f}% de la build){C.RESET}")
+            else:
+                lineas.append(f"{Tema.tenue}⚖ juez: 0 tokens · decidió con evidencia local{C.RESET}")
         if informe.commit:
             lineas.append(f"{Tema.ok}git {informe.commit[:10]} · rama {self.settings.rama_git}{C.RESET}")
         self.ui.linea("")
@@ -47192,6 +47319,120 @@ class TestArranqueReal(BaseTest):
         self.assertTrue(orq.verificar(grupo).ok)
 
 
+class TestJuezRealidad(BaseTest):
+    """El juez hace más que nadie y gasta menos que nadie: el examen de realidad es gratis (0 tokens)."""
+    PLAN = """<plan>
+<objetivo>Sumadora</objetivo>
+<interfaz>
+- app.py: def sumar(a, b) -> int
+</interfaz>
+<tarea id="1" archivos="app.py">Crear app.py con def sumar(a, b).</tarea>
+<criterios>
+- sumar(2, 3) == 5
+</criterios>
+</plan>"""
+
+    def test_detecta_cuerpos_de_mentira(self):
+        self.assertEqual(stubs_en_codigo("def f():\n    pass\n"), [("f", 1, "vacia")])
+        self.assertEqual(stubs_en_codigo("def f():\n    ...\n")[0][2], "vacia")
+        self.assertEqual(stubs_en_codigo('def f():\n    """solo doc"""\n')[0][2], "vacia")
+        self.assertEqual(stubs_en_codigo("def f():\n    raise NotImplementedError\n")[0][2], "no_implementada")
+        self.assertEqual(stubs_en_codigo("def f():\n    return 1\n"), [])
+
+    def test_no_marca_cuerpos_vacios_legitimos(self):
+        fuente = ("from abc import ABC, abstractmethod\nfrom typing import Protocol\n"
+                  "class Base(ABC):\n    @abstractmethod\n    def correr(self):\n        raise NotImplementedError\n"
+                  "class P(Protocol):\n    def leer(self): ...\n"
+                  "class C:\n    def __init__(self):\n        pass\n")
+        self.assertEqual(stubs_en_codigo(fuente), [])
+
+    def _build(self, archivos):
+        ws = self.proyecto()
+        grupo = ws.checkpoints.iniciar("construir")
+        for rel, contenido in archivos.items():
+            ws.escribir(rel, contenido)
+        return ws, grupo
+
+    def test_examen_marca_lo_pedido_vacio_y_no_los_hooks(self):
+        ws, grupo = self._build({"app.py": "def sumar(a, b):\n    pass\n\ndef al_cerrar():\n    pass\n"})
+        plan = parsear_plan(self.PLAN, "sumadora")
+        hallazgos = examen_de_realidad(ws, grupo, plan)
+        self.assertEqual(len(hallazgos), 1)                    # sumar (pedida) sí; al_cerrar (hook) no
+        self.assertIn("sumar", hallazgos[0])
+        self.assertIn("SIMULACIÓN", hallazgos[0])
+
+    def test_examen_marca_not_implemented_aunque_no_este_en_el_plan(self):
+        ws, grupo = self._build({"util.py": "def calcular():\n    raise NotImplementedError('después')\n"})
+        self.assertTrue(any("NotImplementedError" in h for h in examen_de_realidad(ws, grupo, None)))
+
+    def test_examen_marca_tests_que_no_prueban_nada(self):
+        ws, grupo = self._build({"app.py": "def sumar(a, b):\n    return a + b\n",
+                                 "tests/test_app.py": "def test_suma():\n    assert True\n"})
+        hallazgos = examen_de_realidad(ws, grupo, parsear_plan(self.PLAN, "sumadora"))
+        self.assertTrue(any("TEST SIN VALOR" in h for h in hallazgos))
+
+    def test_examen_ok_si_todo_es_real(self):
+        ws, grupo = self._build({"app.py": "def sumar(a, b):\n    return a + b\n",
+                                 "tests/test_app.py": "from app import sumar\n\ndef test_suma():\n"
+                                                      "    assert sumar(2, 3) == 5\n"})
+        self.assertEqual(examen_de_realidad(ws, grupo, parsear_plan(self.PLAN, "sumadora")), [])
+
+    def test_veredicto_determinista_no_gasta_tokens(self):
+        ws, grupo = self._build({"app.py": "def sumar(a, b):\n    pass\n"})
+        llm = MockLLM(lambda m, k: '{"cumple": true, "confianza": "high"}')
+        orq = Orquestador(llm, ws, self.ajustes(), self.ui())
+        informe = InformeBuild("validada", cid=grupo)
+        orq._juicio_de_entrega("una sumadora", parsear_plan(self.PLAN, "sumadora"), _verif_ok(), informe)
+        self.assertTrue(informe.juicio.determinista)
+        self.assertFalse(informe.juicio.cumple)
+        self.assertEqual(informe.estado, "parcial")
+        self.assertEqual([c for c in llm.llamadas if c.get("rol") == "juez"], [])   # ni una llamada al modelo
+        self.assertEqual(getattr(orq, "_tokens_juez", 0), 0)
+
+    def test_si_todo_es_real_consulta_al_modelo_y_cuenta_sus_tokens(self):
+        ws, grupo = self._build({"app.py": "def sumar(a, b):\n    return a + b\n"})
+        llm = MockLLM(lambda m, k: '{"cumple": true, "confianza": "high"}' if k.get("rol") == "juez" else "{}")
+        orq = Orquestador(llm, ws, self.ajustes(), self.ui())
+        informe = InformeBuild("validada", cid=grupo)
+        orq._juicio_de_entrega("una sumadora", parsear_plan(self.PLAN, "sumadora"), _verif_ok(), informe)
+        llamada = next(c for c in llm.llamadas if c.get("rol") == "juez")
+        self.assertIn("EV-REAL", llamada["mensajes"][-1]["content"])
+        self.assertGreater(orq._tokens_juez, 0)
+        self.assertEqual(informe.estado, "validada")
+
+    def test_build_con_funcion_vacia_el_juez_la_hace_real(self):
+        st = {"rep": 0}
+
+        def guion(mensajes, kw):
+            rol = MockLLM.rol_de(mensajes)
+            turno = _turno(mensajes)
+            user = mensajes[-1]["content"]
+            if rol == "arquitecto":
+                return terminar_xml(self.PLAN)
+            if rol == "implementador":           # deja la función pedida vacía: una simulación
+                return herramienta_xml("write_to_file", path="app.py", content="def sumar(a, b):\n    pass\n") \
+                    if turno == 0 else terminar_xml("listo")
+            if rol == "reparador":               # el juez interviene y el reparador la implementa de verdad
+                st["rep"] += 1
+                return herramienta_xml("write_to_file", path="app.py", content="def sumar(a, b):\n    return a + b\n") \
+                    if turno == 0 else terminar_xml("sumar implementada")
+            if rol == "juez":
+                return '{"criterios": ["sumar(2, 3) == 5"]}' if "CONTRATO" in user \
+                    else '{"cumple": true, "confianza": "high"}'
+            return terminar_xml("ok")
+
+        ws = self.proyecto()
+        ajustes = self.ajustes(tests_primero=False, torneo=False, escalar=False, max_revisiones=0, qa=False,
+                               max_reparaciones=0, juez=True, juez_max_intervenciones=1)
+        informe = Orquestador(MockLLM(guion), ws, ajustes, self.ui()).construir("una sumadora", confirmar=False)
+        self.assertEqual(ws.leer("app.py"), "def sumar(a, b):\n    return a + b\n")   # quedó real
+        self.assertEqual(informe.intervenciones_juez, 1)
+        self.assertTrue(informe.juicio and informe.juicio.cumple)
+        self.assertIn(informe.estado, ("verificada", "validada"))
+        self.assertGreater(informe.tokens_build, 0)
+        self.assertLess(informe.tokens_juez, informe.tokens_build)   # el juez gastó menos que la build
+
+
 class TestTrabajosChicos(BaseTest):
     """Una página estática no debería disparar 'tests primero' y trabarse: eso rompía trabajos chicos."""
     def test_web_estatica_no_fuerza_tests_primero(self):
@@ -53288,14 +53529,16 @@ class Juicio:
     confianza: str = "low"
     valido: bool = True
     problema: str = ""
+    determinista: bool = False      # lo decidió con evidencia local, sin llamar al modelo (0 tokens)
 
     def texto(self) -> str:
         if not self.valido:
             return f"Juez de entrega: veredicto fuera de contrato ({self.problema})"
+        origen = " · determinista, 0 tokens" if self.determinista else ""
         if self.cumple:
-            return f"Juez de entrega: CUMPLE el pedido (confianza {self.confianza})"
+            return f"Juez de entrega: CUMPLE el pedido (confianza {self.confianza}{origen})"
         falta = "; ".join(self.faltantes[:4]) if self.faltantes else "sin detalle"
-        return f"Juez de entrega: NO CUMPLE (confianza {self.confianza}) · falta: {falta}"
+        return f"Juez de entrega: NO CUMPLE (confianza {self.confianza}{origen}) · falta: {falta}"
 
 
 def parsear_criterios_entrega(texto: str, maximo: int = 8) -> list:

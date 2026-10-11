@@ -423,6 +423,120 @@ class TestArranqueReal(BaseTest):
         self.assertTrue(orq.verificar(grupo).ok)
 
 
+class TestJuezRealidad(BaseTest):
+    """El juez hace más que nadie y gasta menos que nadie: el examen de realidad es gratis (0 tokens)."""
+    PLAN = """<plan>
+<objetivo>Sumadora</objetivo>
+<interfaz>
+- app.py: def sumar(a, b) -> int
+</interfaz>
+<tarea id="1" archivos="app.py">Crear app.py con def sumar(a, b).</tarea>
+<criterios>
+- sumar(2, 3) == 5
+</criterios>
+</plan>"""
+
+    def test_detecta_cuerpos_de_mentira(self):
+        self.assertEqual(stubs_en_codigo("def f():\n    pass\n"), [("f", 1, "vacia")])
+        self.assertEqual(stubs_en_codigo("def f():\n    ...\n")[0][2], "vacia")
+        self.assertEqual(stubs_en_codigo('def f():\n    """solo doc"""\n')[0][2], "vacia")
+        self.assertEqual(stubs_en_codigo("def f():\n    raise NotImplementedError\n")[0][2], "no_implementada")
+        self.assertEqual(stubs_en_codigo("def f():\n    return 1\n"), [])
+
+    def test_no_marca_cuerpos_vacios_legitimos(self):
+        fuente = ("from abc import ABC, abstractmethod\nfrom typing import Protocol\n"
+                  "class Base(ABC):\n    @abstractmethod\n    def correr(self):\n        raise NotImplementedError\n"
+                  "class P(Protocol):\n    def leer(self): ...\n"
+                  "class C:\n    def __init__(self):\n        pass\n")
+        self.assertEqual(stubs_en_codigo(fuente), [])
+
+    def _build(self, archivos):
+        ws = self.proyecto()
+        grupo = ws.checkpoints.iniciar("construir")
+        for rel, contenido in archivos.items():
+            ws.escribir(rel, contenido)
+        return ws, grupo
+
+    def test_examen_marca_lo_pedido_vacio_y_no_los_hooks(self):
+        ws, grupo = self._build({"app.py": "def sumar(a, b):\n    pass\n\ndef al_cerrar():\n    pass\n"})
+        plan = parsear_plan(self.PLAN, "sumadora")
+        hallazgos = examen_de_realidad(ws, grupo, plan)
+        self.assertEqual(len(hallazgos), 1)                    # sumar (pedida) sí; al_cerrar (hook) no
+        self.assertIn("sumar", hallazgos[0])
+        self.assertIn("SIMULACIÓN", hallazgos[0])
+
+    def test_examen_marca_not_implemented_aunque_no_este_en_el_plan(self):
+        ws, grupo = self._build({"util.py": "def calcular():\n    raise NotImplementedError('después')\n"})
+        self.assertTrue(any("NotImplementedError" in h for h in examen_de_realidad(ws, grupo, None)))
+
+    def test_examen_marca_tests_que_no_prueban_nada(self):
+        ws, grupo = self._build({"app.py": "def sumar(a, b):\n    return a + b\n",
+                                 "tests/test_app.py": "def test_suma():\n    assert True\n"})
+        hallazgos = examen_de_realidad(ws, grupo, parsear_plan(self.PLAN, "sumadora"))
+        self.assertTrue(any("TEST SIN VALOR" in h for h in hallazgos))
+
+    def test_examen_ok_si_todo_es_real(self):
+        ws, grupo = self._build({"app.py": "def sumar(a, b):\n    return a + b\n",
+                                 "tests/test_app.py": "from app import sumar\n\ndef test_suma():\n"
+                                                      "    assert sumar(2, 3) == 5\n"})
+        self.assertEqual(examen_de_realidad(ws, grupo, parsear_plan(self.PLAN, "sumadora")), [])
+
+    def test_veredicto_determinista_no_gasta_tokens(self):
+        ws, grupo = self._build({"app.py": "def sumar(a, b):\n    pass\n"})
+        llm = MockLLM(lambda m, k: '{"cumple": true, "confianza": "high"}')
+        orq = Orquestador(llm, ws, self.ajustes(), self.ui())
+        informe = InformeBuild("validada", cid=grupo)
+        orq._juicio_de_entrega("una sumadora", parsear_plan(self.PLAN, "sumadora"), _verif_ok(), informe)
+        self.assertTrue(informe.juicio.determinista)
+        self.assertFalse(informe.juicio.cumple)
+        self.assertEqual(informe.estado, "parcial")
+        self.assertEqual([c for c in llm.llamadas if c.get("rol") == "juez"], [])   # ni una llamada al modelo
+        self.assertEqual(getattr(orq, "_tokens_juez", 0), 0)
+
+    def test_si_todo_es_real_consulta_al_modelo_y_cuenta_sus_tokens(self):
+        ws, grupo = self._build({"app.py": "def sumar(a, b):\n    return a + b\n"})
+        llm = MockLLM(lambda m, k: '{"cumple": true, "confianza": "high"}' if k.get("rol") == "juez" else "{}")
+        orq = Orquestador(llm, ws, self.ajustes(), self.ui())
+        informe = InformeBuild("validada", cid=grupo)
+        orq._juicio_de_entrega("una sumadora", parsear_plan(self.PLAN, "sumadora"), _verif_ok(), informe)
+        llamada = next(c for c in llm.llamadas if c.get("rol") == "juez")
+        self.assertIn("EV-REAL", llamada["mensajes"][-1]["content"])
+        self.assertGreater(orq._tokens_juez, 0)
+        self.assertEqual(informe.estado, "validada")
+
+    def test_build_con_funcion_vacia_el_juez_la_hace_real(self):
+        st = {"rep": 0}
+
+        def guion(mensajes, kw):
+            rol = MockLLM.rol_de(mensajes)
+            turno = _turno(mensajes)
+            user = mensajes[-1]["content"]
+            if rol == "arquitecto":
+                return terminar_xml(self.PLAN)
+            if rol == "implementador":           # deja la función pedida vacía: una simulación
+                return herramienta_xml("write_to_file", path="app.py", content="def sumar(a, b):\n    pass\n") \
+                    if turno == 0 else terminar_xml("listo")
+            if rol == "reparador":               # el juez interviene y el reparador la implementa de verdad
+                st["rep"] += 1
+                return herramienta_xml("write_to_file", path="app.py", content="def sumar(a, b):\n    return a + b\n") \
+                    if turno == 0 else terminar_xml("sumar implementada")
+            if rol == "juez":
+                return '{"criterios": ["sumar(2, 3) == 5"]}' if "CONTRATO" in user \
+                    else '{"cumple": true, "confianza": "high"}'
+            return terminar_xml("ok")
+
+        ws = self.proyecto()
+        ajustes = self.ajustes(tests_primero=False, torneo=False, escalar=False, max_revisiones=0, qa=False,
+                               max_reparaciones=0, juez=True, juez_max_intervenciones=1)
+        informe = Orquestador(MockLLM(guion), ws, ajustes, self.ui()).construir("una sumadora", confirmar=False)
+        self.assertEqual(ws.leer("app.py"), "def sumar(a, b):\n    return a + b\n")   # quedó real
+        self.assertEqual(informe.intervenciones_juez, 1)
+        self.assertTrue(informe.juicio and informe.juicio.cumple)
+        self.assertIn(informe.estado, ("verificada", "validada"))
+        self.assertGreater(informe.tokens_build, 0)
+        self.assertLess(informe.tokens_juez, informe.tokens_build)   # el juez gastó menos que la build
+
+
 class TestTrabajosChicos(BaseTest):
     """Una página estática no debería disparar 'tests primero' y trabarse: eso rompía trabajos chicos."""
     def test_web_estatica_no_fuerza_tests_primero(self):

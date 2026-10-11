@@ -231,14 +231,16 @@ class Juicio:
     confianza: str = "low"
     valido: bool = True
     problema: str = ""
+    determinista: bool = False      # lo decidió con evidencia local, sin llamar al modelo (0 tokens)
 
     def texto(self) -> str:
         if not self.valido:
             return f"Juez de entrega: veredicto fuera de contrato ({self.problema})"
+        origen = " · determinista, 0 tokens" if self.determinista else ""
         if self.cumple:
-            return f"Juez de entrega: CUMPLE el pedido (confianza {self.confianza})"
+            return f"Juez de entrega: CUMPLE el pedido (confianza {self.confianza}{origen})"
         falta = "; ".join(self.faltantes[:4]) if self.faltantes else "sin detalle"
-        return f"Juez de entrega: NO CUMPLE (confianza {self.confianza}) · falta: {falta}"
+        return f"Juez de entrega: NO CUMPLE (confianza {self.confianza}{origen}) · falta: {falta}"
 
 
 def parsear_criterios_entrega(texto: str, maximo: int = 8) -> list:
