@@ -1,0 +1,9 @@
+REAPER: /home/user/Reaper.py/reaper_v8.py
+Python: 3.11.15
+Modelo: MockLLM (simulado)
+
+=== rota: estado=fallida aceptación_ok=False · 2.2s OK
+  ACEPTACIÓN: 12 corridos, 12 efectivos, 5 fallos, 7 errores, 0 omitidos (mínimo 10).
+=== referencia: estado=verificada aceptación_ok=True · 1.6s OK
+  ACEPTACIÓN: 12 corridos, 12 efectivos, 0 fallos, 0 errores, 0 omitidos (mínimo 10).
+RESULTADO: sin falsos verdes

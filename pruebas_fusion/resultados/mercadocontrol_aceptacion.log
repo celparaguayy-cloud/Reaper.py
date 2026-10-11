@@ -1,0 +1,42 @@
+REAPER: /home/user/Reaper.py/reaper_v8.py
+Python: 3.11.15
+Fecha: 2026-10-11 03:07:04
+
+=== vacio: exit 2 (esperado 2) OK · 1.3s
+  setUpClass (test_mercadocontrol.TestApi) ... ERROR
+  setUpClass (test_mercadocontrol.TestFrontend) ... ERROR
+  test_12_los_datos_sobreviven_al_reinicio (test_mercadocontrol.TestPersistencia.test_12_los_datos_sobreviven_al_reinicio) ... FAIL
+  ACEPTACIÓN: 1 corridos, 1 efectivos, 1 fallos, 2 errores, 0 omitidos (mínimo 10).
+  ACEPTACIÓN: solo 1/10 pruebas ejecutadas sin omisiones o fallos esperados.
+
+=== rota: exit 2 (esperado 2) OK · 1.4s
+  test_05_crear_y_listar_devuelve_un_array (test_mercadocontrol.TestApi.test_05_crear_y_listar_devuelve_un_array) ... ERROR
+  test_06_obtener_por_id_y_404 (test_mercadocontrol.TestApi.test_06_obtener_por_id_y_404) ... ERROR
+  test_07_editar (test_mercadocontrol.TestApi.test_07_editar) ... ERROR
+  test_08_eliminar (test_mercadocontrol.TestApi.test_08_eliminar) ... ERROR
+  test_09_validaciones_devuelven_400_con_error (test_mercadocontrol.TestApi.test_09_validaciones_devuelven_400_con_error) ... ERROR
+  test_10_rutas_desconocidas_y_traversal (test_mercadocontrol.TestApi.test_10_rutas_desconocidas_y_traversal) ... FAIL
+  test_11_altas_concurrentes_sin_perder_datos (test_mercadocontrol.TestApi.test_11_altas_concurrentes_sin_perder_datos) ... ERROR
+  test_01_raiz_entrega_html (test_mercadocontrol.TestFrontend.test_01_raiz_entrega_html) ... FAIL
+  test_02_css_con_mime_y_contenido (test_mercadocontrol.TestFrontend.test_02_css_con_mime_y_contenido) ... FAIL
+  test_03_js_con_mime_y_contenido (test_mercadocontrol.TestFrontend.test_03_js_con_mime_y_contenido) ... FAIL
+  test_04_raiz_sobrevive_a_assets_y_enlaza_recursos_cargables (test_mercadocontrol.TestFrontend.test_04_raiz_sobrevive_a_assets_y_enlaza_recursos_cargables) ... FAIL
+  test_12_los_datos_sobreviven_al_reinicio (test_mercadocontrol.TestPersistencia.test_12_los_datos_sobreviven_al_reinicio) ... ERROR
+  ACEPTACIÓN: 12 corridos, 12 efectivos, 5 fallos, 7 errores, 0 omitidos (mínimo 10).
+
+=== referencia: exit 0 (esperado 0) OK · 1.6s
+  test_05_crear_y_listar_devuelve_un_array (test_mercadocontrol.TestApi.test_05_crear_y_listar_devuelve_un_array) ... ok
+  test_06_obtener_por_id_y_404 (test_mercadocontrol.TestApi.test_06_obtener_por_id_y_404) ... ok
+  test_07_editar (test_mercadocontrol.TestApi.test_07_editar) ... ok
+  test_08_eliminar (test_mercadocontrol.TestApi.test_08_eliminar) ... ok
+  test_09_validaciones_devuelven_400_con_error (test_mercadocontrol.TestApi.test_09_validaciones_devuelven_400_con_error) ... ok
+  test_10_rutas_desconocidas_y_traversal (test_mercadocontrol.TestApi.test_10_rutas_desconocidas_y_traversal) ... ok
+  test_11_altas_concurrentes_sin_perder_datos (test_mercadocontrol.TestApi.test_11_altas_concurrentes_sin_perder_datos) ... ok
+  test_01_raiz_entrega_html (test_mercadocontrol.TestFrontend.test_01_raiz_entrega_html) ... ok
+  test_02_css_con_mime_y_contenido (test_mercadocontrol.TestFrontend.test_02_css_con_mime_y_contenido) ... ok
+  test_03_js_con_mime_y_contenido (test_mercadocontrol.TestFrontend.test_03_js_con_mime_y_contenido) ... ok
+  test_04_raiz_sobrevive_a_assets_y_enlaza_recursos_cargables (test_mercadocontrol.TestFrontend.test_04_raiz_sobrevive_a_assets_y_enlaza_recursos_cargables) ... ok
+  test_12_los_datos_sobreviven_al_reinicio (test_mercadocontrol.TestPersistencia.test_12_los_datos_sobreviven_al_reinicio) ... ok
+  ACEPTACIÓN: 12 corridos, 12 efectivos, 0 fallos, 0 errores, 0 omitidos (mínimo 10).
+
+RESULTADO: el gate distingue vacío/roto/correcto

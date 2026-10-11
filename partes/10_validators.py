@@ -891,6 +891,10 @@ _SCRIPT_HTML = re.compile(r"<script(?![^>]*\bsrc\s*=)([^>]*)>(.*?)</script\s*>",
 _RECURSOS_HTML = re.compile(r"""<(?:script|link|img|source)\b[^>]*?\b(?:src|href)\s*=\s*["']([^"'#?]+)""", re.I)
 
 
+# Carpetas que un servidor suele publicar como raíz web ("/style.css" → <carpeta>/style.css).
+_RAICES_WEB = ("public", "static", "web", "www", "assets", "dist", "build", "frontend")
+
+
 def recursos_html_faltantes(ws: Workspace, ruta: Path, texto: str) -> list[str]:
     faltan = []
     for m in _RECURSOS_HTML.finditer(texto):
@@ -898,10 +902,15 @@ def recursos_html_faltantes(ws: Workspace, ruta: Path, texto: str) -> list[str]:
         if not destino or re.match(r"^(https?:|//|data:|mailto:|tel:|javascript:|\{\{|\$\{)", destino):
             continue
         if destino.startswith("/"):
-            candidato = ws.raiz / destino.lstrip("/")
+            # Una URL absoluta la resuelve el SERVIDOR desde su raíz web, que no siempre es la del proyecto:
+            # con web/index.html y "/script.js" el archivo real es web/script.js. Antes se buscaba solo en la raíz
+            # del proyecto, se marcaba como faltante y el reparador "arreglaba" rutas y servidor hasta romper "/".
+            limpio = destino.lstrip("/")
+            candidatos = [ws.raiz / limpio, ruta.parent / limpio] + [ws.raiz / d / limpio for d in _RAICES_WEB]
+            existe = any(c.exists() for c in candidatos)
         else:
-            candidato = ruta.parent / destino
-        if not candidato.exists():
+            existe = (ruta.parent / destino).exists()
+        if not existe:
             linea = texto.count("\n", 0, m.start()) + 1
             faltan.append(f"línea {linea}: referencia a '{destino}' que no existe")
     return faltan

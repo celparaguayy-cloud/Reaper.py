@@ -247,3 +247,126 @@ class TestPlazosDePared(BaseTest):
                                           lambda: orq.verificar(grupo))
         self.assertFalse(final.ok)
         self.assertTrue(any("sin cambiar" in n or "no cambió" in n for n in informe.notas), informe.notas)
+
+
+class TestRecursosHtmlRaizWeb(BaseTest):
+    def test_url_absoluta_se_resuelve_desde_la_raiz_web_servida(self):
+        # web/index.html con "/style.css" y "/script.js" (el servidor publica web/): antes se marcaba como faltante
+        # y el reparador terminaba moviendo assets o tocando el ruteo hasta romper "/" (patrón MercadoControl).
+        ws = self.proyecto({"web/index.html": '<link href="/style.css"><script src="/script.js"></script>',
+                            "web/style.css": "body{}", "web/script.js": "1;"})
+        self.assertEqual(recursos_html_faltantes(ws, ws.raiz / "web" / "index.html",
+                                                 ws.leer("web/index.html")), [])
+
+    def test_recurso_realmente_ausente_se_sigue_marcando(self):
+        ws = self.proyecto({"web/index.html": '<script src="/falta.js"></script>'})
+        faltan = recursos_html_faltantes(ws, ws.raiz / "web" / "index.html", ws.leer("web/index.html"))
+        self.assertEqual(len(faltan), 1)
+        self.assertIn("/falta.js", faltan[0])
+
+    def test_pista_no_empuja_a_romper_la_raiz(self):
+        pista = next(p for p in PISTAS if "recursos-html" in p.patron)
+        self.assertIn("No cambies la ruta '/'", pista.texto)
+
+
+class TestTareasIntermediasWeb(BaseTest):
+    def test_html_que_enlaza_assets_de_tareas_posteriores_no_falla(self):
+        ws = self.proyecto({"README.md": "x\n"})
+        orq = Orquestador(MockLLM([]), ws, self.ajustes(lecciones=False, forense=False), self.ui())
+        grupo = ws.checkpoints.iniciar("build")
+        tcid = ws.checkpoints.iniciar("tarea 2", grupo=grupo)
+        ws.escribir("web/index.html", '<link href="/style.css"><script src="/script.js"></script>')
+        v = orq._verificar_tarea(tcid, ConteoTests(), set(), verificar_entrega=True,
+                                 archivos_esperados=["web/index.html"],
+                                 archivos_planeados=["web/style.css", "web/script.js"], cid_build=grupo)
+        self.assertTrue(v.ok, v.diagnostico)
+        v2 = orq._verificar_tarea(tcid, ConteoTests(), set(), verificar_entrega=True,
+                                  archivos_esperados=["web/index.html"], archivos_planeados=["web/style.css"],
+                                  cid_build=grupo)
+        self.assertFalse(v2.ok)                                      # /script.js no lo crea nadie: sigue fallando
+        self.assertIn("script.js", v2.diagnostico)
+
+    def test_archivo_creado_por_una_tarea_anterior_no_es_sin_cambios(self):
+        ws = self.proyecto({"app.py": "x = 1\n"})
+        orq = Orquestador(MockLLM([]), ws, self.ajustes(lecciones=False, forense=False), self.ui())
+        grupo = ws.checkpoints.iniciar("build")
+        ws.escribir("web/style.css", "body{}\n")                     # lo hizo la tarea 1 (creó de más)
+        tcid = ws.checkpoints.iniciar("tarea 3", grupo=grupo)
+        v = orq._verificar_tarea(tcid, ConteoTests(), set(), verificar_entrega=True,
+                                 archivos_esperados=["web/style.css"], cid_build=grupo)
+        self.assertTrue(v.ok, v.diagnostico)
+        v2 = orq._verificar_tarea(tcid, ConteoTests(), set(), verificar_entrega=True,
+                                  archivos_esperados=["app.py"], cid_build=grupo)
+        self.assertFalse(v2.ok)                                      # app.py ya existía: había que modificarlo
+        self.assertIn("SIN CAMBIOS", v2.diagnostico)
+
+
+class TestGateWebDePuntaAPunta(BaseTest):
+    """/construir con modelo simulado, servidor HTTP REAL y evaluador externo real: la app rota no se verifica."""
+
+    APP = (
+        "import os\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\n"
+        "class H(BaseHTTPRequestHandler):\n"
+        "    def log_message(self, *a): pass\n"
+        "    def do_GET(self):\n"
+        "        rutas = {'/': (b'<html><link href=\"/style.css\"></html>', 'text/html'),\n"
+        "                 '/style.css': (b'body{}', 'text/css')}\n"
+        "        if ROTA and self.path == '/': rutas.pop('/')\n"
+        "        cuerpo, tipo = rutas.get(self.path, (b'no', 'text/plain'))\n"
+        "        self.send_response(200 if self.path in rutas else 404)\n"
+        "        self.send_header('Content-Type', tipo); self.end_headers(); self.wfile.write(cuerpo)\n"
+        "HTTPServer(('127.0.0.1', int(os.environ['PORT'])), H).serve_forever()\n")
+    EVALUADOR = (
+        "import os, socket, subprocess, sys, time, unittest, urllib.request, urllib.error\n"
+        "class T(unittest.TestCase):\n"
+        "    @classmethod\n"
+        "    def setUpClass(cls):\n"
+        "        s = socket.socket(); s.bind(('127.0.0.1', 0)); cls.p = s.getsockname()[1]; s.close()\n"
+        "        cls.srv = subprocess.Popen([sys.executable, 'app.py'], cwd=os.environ['REAPER_PROYECTO'],\n"
+        "                                   env=dict(os.environ, PORT=str(cls.p)))\n"
+        "        for _ in range(50):\n"
+        "            try: socket.create_connection(('127.0.0.1', cls.p), 0.2).close(); break\n"
+        "            except OSError: time.sleep(0.1)\n"
+        "    @classmethod\n"
+        "    def tearDownClass(cls): cls.srv.terminate(); cls.srv.wait(5)\n"
+        "    def get(self, r):\n"
+        "        try:\n"
+        "            with urllib.request.urlopen(f'http://127.0.0.1:{self.p}{r}', timeout=5) as x:\n"
+        "                return x.status, x.headers['Content-Type']\n"
+        "        except urllib.error.HTTPError as e: return e.code, ''\n"
+        "    def test_raiz(self): self.assertEqual(self.get('/'), (200, 'text/html'))\n"
+        "    def test_css(self): self.assertEqual(self.get('/style.css'), (200, 'text/css'))\n"
+        "    def test_404(self): self.assertEqual(self.get('/nada')[0], 404)\n")
+
+    def _build(self, rota: bool) -> InformeBuild:
+        suite = self.dir / f"evaluador_{int(rota)}"
+        suite.mkdir()
+        (suite / "test_web.py").write_text(self.EVALUADOR, encoding="utf-8")
+        ws = self.proyecto({"README.md": "web\n", ".reaper/acceptance.json": json.dumps(
+            {"suite_dir": str(suite), "min_tests": 3, "timeout": 60})})
+        codigo = f"ROTA = {rota}\n" + self.APP
+        plan = ('<plan>\n<objetivo>web</objetivo>\n<tarea id="1" archivos="app.py">Crear el servidor app.py'
+                '</tarea>\n<criterios>\n- GET / devuelve HTML\n</criterios>\n</plan>')
+
+        def guion(mensajes, kwargs):
+            rol = MockLLM.rol_de(mensajes)
+            if rol == "arquitecto":
+                return terminar_xml(plan)
+            if rol == "implementador" and _turno(mensajes) == 0:
+                return herramienta_xml("write_to_file", path="app.py", content=codigo)
+            return terminar_xml("hecho")
+
+        ajustes = self.ajustes(tests_primero=False, torneo=False, qa=False, max_revisiones=0, max_reparaciones=1,
+                               lecciones=False, forense=False, escalar=False, roles_x=False)
+        return Orquestador(MockLLM(guion), ws, ajustes, self.ui()).construir("web", confirmar=False)
+
+    def test_app_rota_no_queda_verificada(self):
+        informe = self._build(rota=True)
+        self.assertNotEqual(informe.estado, "verificada")
+        self.assertIsNotNone(informe.aceptacion)
+        self.assertFalse(informe.aceptacion.ok)
+
+    def test_app_correcta_se_verifica_por_aceptacion_externa(self):
+        informe = self._build(rota=False)
+        self.assertEqual(informe.estado, "verificada", informe.diagnostico)
+        self.assertTrue(informe.aceptacion.ok)

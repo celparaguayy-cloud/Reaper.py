@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MercadoControl</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <main>
+    <h1>MercadoControl</h1>
+    <form id="alta">
+      <input name="nombre" placeholder="Producto" required>
+      <input name="precio" type="number" min="0" step="0.01" placeholder="Precio" required>
+      <input name="stock" type="number" min="0" step="1" placeholder="Stock" required>
+      <button type="submit">Agregar</button>
+    </form>
+    <p id="error" role="alert"></p>
+    <table>
+      <thead><tr><th>Producto</th><th>Precio</th><th>Stock</th><th></th></tr></thead>
+      <tbody id="lista"></tbody>
+    </table>
+  </main>
+  <script src="/script.js"></script>
+</body>
+</html>

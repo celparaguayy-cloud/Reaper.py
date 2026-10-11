@@ -5408,6 +5408,10 @@ _SCRIPT_HTML = re.compile(r"<script(?![^>]*\bsrc\s*=)([^>]*)>(.*?)</script\s*>",
 _RECURSOS_HTML = re.compile(r"""<(?:script|link|img|source)\b[^>]*?\b(?:src|href)\s*=\s*["']([^"'#?]+)""", re.I)
 
 
+# Carpetas que un servidor suele publicar como raíz web ("/style.css" → <carpeta>/style.css).
+_RAICES_WEB = ("public", "static", "web", "www", "assets", "dist", "build", "frontend")
+
+
 def recursos_html_faltantes(ws: Workspace, ruta: Path, texto: str) -> list[str]:
     faltan = []
     for m in _RECURSOS_HTML.finditer(texto):
@@ -5415,10 +5419,15 @@ def recursos_html_faltantes(ws: Workspace, ruta: Path, texto: str) -> list[str]:
         if not destino or re.match(r"^(https?:|//|data:|mailto:|tel:|javascript:|\{\{|\$\{)", destino):
             continue
         if destino.startswith("/"):
-            candidato = ws.raiz / destino.lstrip("/")
+            # Una URL absoluta la resuelve el SERVIDOR desde su raíz web, que no siempre es la del proyecto:
+            # con web/index.html y "/script.js" el archivo real es web/script.js. Antes se buscaba solo en la raíz
+            # del proyecto, se marcaba como faltante y el reparador "arreglaba" rutas y servidor hasta romper "/".
+            limpio = destino.lstrip("/")
+            candidatos = [ws.raiz / limpio, ruta.parent / limpio] + [ws.raiz / d / limpio for d in _RAICES_WEB]
+            existe = any(c.exists() for c in candidatos)
         else:
-            candidato = ruta.parent / destino
-        if not candidato.exists():
+            existe = (ruta.parent / destino).exists()
+        if not existe:
             linea = texto.count("\n", 0, m.start()) + 1
             faltan.append(f"línea {linea}: referencia a '{destino}' que no existe")
     return faltan
@@ -7886,8 +7895,10 @@ PISTAS: list[Pista] = [
           "Conflicto de merge: editá los archivos marcados con <<<<<<< ======= >>>>>>> y hacé commit.", "git"),
     # ------------------------------------------------------------ HTML/CSS/web
     Pista(r"recursos-html|referencia a '.*' que no existe",
-          "El HTML apunta a un archivo que no existe: creá ese archivo o corregí la ruta del src/href "
-          "(relativa a la carpeta del HTML).", "web"),
+          "El HTML apunta a un archivo que no existe: creá ESE archivo donde el servidor lo publica, o corregí el "
+          "src/href (relativo a la carpeta del HTML; '/x' lo resuelve el servidor desde su raíz web). No cambies "
+          "la ruta '/' ni el ruteo del servidor para arreglar un CSS/JS: después de cada cambio comprobá que "
+          "GET / siga devolviendo el HTML.", "web"),
     Pista(r"css-llaves",
           "Llaves desbalanceadas en el CSS: buscá un bloque sin cerrar (la línea indicada o la regla anterior).",
           "web"),
@@ -14773,6 +14784,35 @@ def ejecutar_aceptacion_independiente(ws: Workspace, *,
         return _aceptacion_error(f'ACEPTACIÓN inválida: {exc}')
 
 
+_RE_REF_FALTANTE = re.compile(r"referencia a '([^']+)' que no existe")
+
+
+def _sin_recursos_planeados(ws: Workspace, resultado: Resultado, planeados: Sequence[str]) -> Optional[Resultado]:
+    """
+    En una tarea INTERMEDIA, un HTML que enlaza un CSS/JS que crea una tarea POSTERIOR del plan no es un fallo
+    todavía (antes: la tarea del HTML fallaba, las de los assets quedaban bloqueadas y la build nunca los creaba).
+    Devuelve None si todas las referencias faltantes están planeadas, o el resultado con solo las no planeadas.
+    La verificación FINAL sigue exigiéndolas todas.
+    """
+    if not planeados or not resultado.comando.startswith("recursos-html"):
+        return resultado
+    base_html = Path(resultado.archivo or "").parent
+    planeados_norm = {Path(p).as_posix().lstrip("./") for p in planeados}
+    pendientes = []
+    for linea in resultado.stderr.splitlines():
+        m = _RE_REF_FALTANTE.search(linea)
+        if not m:
+            pendientes.append(linea)
+            continue
+        ref = m.group(1).lstrip("/")
+        candidatos = {ref, (base_html / ref).as_posix()} | {f"{d}/{ref}" for d in _RAICES_WEB}
+        if not ({Path(c).as_posix().lstrip("./") for c in candidatos} & planeados_norm):
+            pendientes.append(linea)
+    if not [l for l in pendientes if l.strip()]:
+        return None
+    return replace(resultado, stderr="\n".join(pendientes))
+
+
 @dataclass
 class Verificacion:
     ok: bool
@@ -15571,7 +15611,9 @@ class Orquestador:
 
     def _verificar_tarea(self, tcid: int, antes: ConteoTests, nombres_antes: set,
                          exigir_progreso: bool = False, verificar_entrega: bool = False,
-                         archivos_esperados: Sequence[str] = ()) -> Verificacion:
+                         archivos_esperados: Sequence[str] = (),
+                         archivos_planeados: Sequence[str] = (),
+                         cid_build: Optional[int] = None) -> Verificacion:
         """
         Una tarea intermedia no necesita que pasen TODOS los tests (los de tareas
         siguientes todavía fallan): alcanza con validadores OK y que no se rompa
@@ -15581,7 +15623,11 @@ class Orquestador:
         validaciones = validar_archivos(self.ws, archivos)
         tests = ejecutar_tests(self.ws, timeout=self.settings.tests_timeout, completo=True)
         conteo = conteo_de_resultado(tests)
-        problemas = [r.resumen(2500) for r in fallos(validaciones)]
+        problemas = []
+        for r in fallos(validaciones):
+            r = _sin_recursos_planeados(self.ws, r, archivos_planeados)
+            if r is not None:
+                problemas.append(r.resumen(2500))
         if verificar_entrega:
             # La palabra "listo" del modelo NO es evidencia. Cada tarea debe
             # materializar sus objetivos declarados y producir cambios reales.
@@ -15592,7 +15638,14 @@ class Orquestador:
             if faltantes:
                 problemas.append("ENTREGA INCOMPLETA: faltan archivos declarados por la tarea: "
                                  + ", ".join(map(str, faltantes[:10])))
-            if not archivos:
+            declarados = [rel for rel in archivos_esperados if isinstance(rel, str) and rel.strip()]
+            # Un modelo suele crear de más: si TODOS los archivos de esta tarea ya los creó una tarea anterior de
+            # ESTA build (no existían al empezar), la entrega está en disco y no es "sin cambios" (antes fallaba,
+            # bloqueaba las dependientes y gastaba reparaciones). Un archivo previo que había que MODIFICAR sigue
+            # exigiendo cambios reales.
+            creados_en_build = bool(declarados) and not faltantes and cid_build is not None and all(
+                self.ws.checkpoints._origen(rel, cid_build)[0] == "nuevo" for rel in declarados)
+            if not archivos and not creados_en_build:
                 problemas.append("SIN CAMBIOS: la tarea no modificó archivos del proyecto. "
                                  "No se puede verificar una implementación solo por el texto del modelo.")
         if tests is not None and not tests.ok and conteo.reconocido:
@@ -15832,6 +15885,7 @@ class Orquestador:
             previo["tarea_activa"] = tarea.id
             previo["huellas_inicio"] = registro_build.huellas()
             registro_build.guardar(previo)
+            planeados_despues = [a for t_sig in plan.tareas[i + 1:] for a in t_sig.archivos]
             antes_tests = ejecutar_tests(self.ws, timeout=self.settings.tests_timeout, completo=True)
             conteo_antes = conteo_de_resultado(antes_tests)
             nombres_antes = set(conteo_antes.nombres_fallados)
@@ -15846,7 +15900,8 @@ class Orquestador:
             exigir = not resultado.ok
             verif_tarea = self._verificar_tarea(tcid, conteo_antes, nombres_antes,
                                                  exigir_progreso=exigir, verificar_entrega=True,
-                                                 archivos_esperados=tarea.archivos)
+                                                 archivos_esperados=tarea.archivos,
+                                                 archivos_planeados=planeados_despues, cid_build=grupo)
             if not verif_tarea.ok:
                 self.ui.aviso(f"  La tarea {tarea.id} no pasó su verificación: la reparo con el error real.")
                 verif_tarea = self._reparar_con_escalada(
@@ -15854,7 +15909,8 @@ class Orquestador:
                     max(1, self.settings.umbral_escalada + 1),
                     lambda: self._verificar_tarea(tcid, conteo_antes, nombres_antes,
                                                  exigir_progreso=exigir, verificar_entrega=True,
-                                                 archivos_esperados=tarea.archivos),
+                                                 archivos_esperados=tarea.archivos,
+                                                 archivos_planeados=planeados_despues, cid_build=grupo),
                     contexto=f"TAREA EN CURSO (#{tarea.id}): {tarea.descripcion}",
                 )
                 if not verif_tarea.ok:
@@ -15892,7 +15948,8 @@ class Orquestador:
             # registrar la tarea como hecha: tests verdes previos no bastan.
             verif_post = self._verificar_tarea(tcid, conteo_antes, nombres_antes,
                                               exigir_progreso=exigir, verificar_entrega=True,
-                                              archivos_esperados=tarea.archivos)
+                                              archivos_esperados=tarea.archivos,
+                                              archivos_planeados=planeados_despues, cid_build=grupo)
             if verif_post.ok:
                 previo["estados"][tarea.id] = "verificada"
                 # Archivo verificado por primera vez: no permitir que una tarea
@@ -45693,6 +45750,129 @@ class TestPlazosDePared(BaseTest):
                                           lambda: orq.verificar(grupo))
         self.assertFalse(final.ok)
         self.assertTrue(any("sin cambiar" in n or "no cambió" in n for n in informe.notas), informe.notas)
+
+
+class TestRecursosHtmlRaizWeb(BaseTest):
+    def test_url_absoluta_se_resuelve_desde_la_raiz_web_servida(self):
+        # web/index.html con "/style.css" y "/script.js" (el servidor publica web/): antes se marcaba como faltante
+        # y el reparador terminaba moviendo assets o tocando el ruteo hasta romper "/" (patrón MercadoControl).
+        ws = self.proyecto({"web/index.html": '<link href="/style.css"><script src="/script.js"></script>',
+                            "web/style.css": "body{}", "web/script.js": "1;"})
+        self.assertEqual(recursos_html_faltantes(ws, ws.raiz / "web" / "index.html",
+                                                 ws.leer("web/index.html")), [])
+
+    def test_recurso_realmente_ausente_se_sigue_marcando(self):
+        ws = self.proyecto({"web/index.html": '<script src="/falta.js"></script>'})
+        faltan = recursos_html_faltantes(ws, ws.raiz / "web" / "index.html", ws.leer("web/index.html"))
+        self.assertEqual(len(faltan), 1)
+        self.assertIn("/falta.js", faltan[0])
+
+    def test_pista_no_empuja_a_romper_la_raiz(self):
+        pista = next(p for p in PISTAS if "recursos-html" in p.patron)
+        self.assertIn("No cambies la ruta '/'", pista.texto)
+
+
+class TestTareasIntermediasWeb(BaseTest):
+    def test_html_que_enlaza_assets_de_tareas_posteriores_no_falla(self):
+        ws = self.proyecto({"README.md": "x\n"})
+        orq = Orquestador(MockLLM([]), ws, self.ajustes(lecciones=False, forense=False), self.ui())
+        grupo = ws.checkpoints.iniciar("build")
+        tcid = ws.checkpoints.iniciar("tarea 2", grupo=grupo)
+        ws.escribir("web/index.html", '<link href="/style.css"><script src="/script.js"></script>')
+        v = orq._verificar_tarea(tcid, ConteoTests(), set(), verificar_entrega=True,
+                                 archivos_esperados=["web/index.html"],
+                                 archivos_planeados=["web/style.css", "web/script.js"], cid_build=grupo)
+        self.assertTrue(v.ok, v.diagnostico)
+        v2 = orq._verificar_tarea(tcid, ConteoTests(), set(), verificar_entrega=True,
+                                  archivos_esperados=["web/index.html"], archivos_planeados=["web/style.css"],
+                                  cid_build=grupo)
+        self.assertFalse(v2.ok)                                      # /script.js no lo crea nadie: sigue fallando
+        self.assertIn("script.js", v2.diagnostico)
+
+    def test_archivo_creado_por_una_tarea_anterior_no_es_sin_cambios(self):
+        ws = self.proyecto({"app.py": "x = 1\n"})
+        orq = Orquestador(MockLLM([]), ws, self.ajustes(lecciones=False, forense=False), self.ui())
+        grupo = ws.checkpoints.iniciar("build")
+        ws.escribir("web/style.css", "body{}\n")                     # lo hizo la tarea 1 (creó de más)
+        tcid = ws.checkpoints.iniciar("tarea 3", grupo=grupo)
+        v = orq._verificar_tarea(tcid, ConteoTests(), set(), verificar_entrega=True,
+                                 archivos_esperados=["web/style.css"], cid_build=grupo)
+        self.assertTrue(v.ok, v.diagnostico)
+        v2 = orq._verificar_tarea(tcid, ConteoTests(), set(), verificar_entrega=True,
+                                  archivos_esperados=["app.py"], cid_build=grupo)
+        self.assertFalse(v2.ok)                                      # app.py ya existía: había que modificarlo
+        self.assertIn("SIN CAMBIOS", v2.diagnostico)
+
+
+class TestGateWebDePuntaAPunta(BaseTest):
+    """/construir con modelo simulado, servidor HTTP REAL y evaluador externo real: la app rota no se verifica."""
+
+    APP = (
+        "import os\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\n"
+        "class H(BaseHTTPRequestHandler):\n"
+        "    def log_message(self, *a): pass\n"
+        "    def do_GET(self):\n"
+        "        rutas = {'/': (b'<html><link href=\"/style.css\"></html>', 'text/html'),\n"
+        "                 '/style.css': (b'body{}', 'text/css')}\n"
+        "        if ROTA and self.path == '/': rutas.pop('/')\n"
+        "        cuerpo, tipo = rutas.get(self.path, (b'no', 'text/plain'))\n"
+        "        self.send_response(200 if self.path in rutas else 404)\n"
+        "        self.send_header('Content-Type', tipo); self.end_headers(); self.wfile.write(cuerpo)\n"
+        "HTTPServer(('127.0.0.1', int(os.environ['PORT'])), H).serve_forever()\n")
+    EVALUADOR = (
+        "import os, socket, subprocess, sys, time, unittest, urllib.request, urllib.error\n"
+        "class T(unittest.TestCase):\n"
+        "    @classmethod\n"
+        "    def setUpClass(cls):\n"
+        "        s = socket.socket(); s.bind(('127.0.0.1', 0)); cls.p = s.getsockname()[1]; s.close()\n"
+        "        cls.srv = subprocess.Popen([sys.executable, 'app.py'], cwd=os.environ['REAPER_PROYECTO'],\n"
+        "                                   env=dict(os.environ, PORT=str(cls.p)))\n"
+        "        for _ in range(50):\n"
+        "            try: socket.create_connection(('127.0.0.1', cls.p), 0.2).close(); break\n"
+        "            except OSError: time.sleep(0.1)\n"
+        "    @classmethod\n"
+        "    def tearDownClass(cls): cls.srv.terminate(); cls.srv.wait(5)\n"
+        "    def get(self, r):\n"
+        "        try:\n"
+        "            with urllib.request.urlopen(f'http://127.0.0.1:{self.p}{r}', timeout=5) as x:\n"
+        "                return x.status, x.headers['Content-Type']\n"
+        "        except urllib.error.HTTPError as e: return e.code, ''\n"
+        "    def test_raiz(self): self.assertEqual(self.get('/'), (200, 'text/html'))\n"
+        "    def test_css(self): self.assertEqual(self.get('/style.css'), (200, 'text/css'))\n"
+        "    def test_404(self): self.assertEqual(self.get('/nada')[0], 404)\n")
+
+    def _build(self, rota: bool) -> InformeBuild:
+        suite = self.dir / f"evaluador_{int(rota)}"
+        suite.mkdir()
+        (suite / "test_web.py").write_text(self.EVALUADOR, encoding="utf-8")
+        ws = self.proyecto({"README.md": "web\n", ".reaper/acceptance.json": json.dumps(
+            {"suite_dir": str(suite), "min_tests": 3, "timeout": 60})})
+        codigo = f"ROTA = {rota}\n" + self.APP
+        plan = ('<plan>\n<objetivo>web</objetivo>\n<tarea id="1" archivos="app.py">Crear el servidor app.py'
+                '</tarea>\n<criterios>\n- GET / devuelve HTML\n</criterios>\n</plan>')
+
+        def guion(mensajes, kwargs):
+            rol = MockLLM.rol_de(mensajes)
+            if rol == "arquitecto":
+                return terminar_xml(plan)
+            if rol == "implementador" and _turno(mensajes) == 0:
+                return herramienta_xml("write_to_file", path="app.py", content=codigo)
+            return terminar_xml("hecho")
+
+        ajustes = self.ajustes(tests_primero=False, torneo=False, qa=False, max_revisiones=0, max_reparaciones=1,
+                               lecciones=False, forense=False, escalar=False, roles_x=False)
+        return Orquestador(MockLLM(guion), ws, ajustes, self.ui()).construir("web", confirmar=False)
+
+    def test_app_rota_no_queda_verificada(self):
+        informe = self._build(rota=True)
+        self.assertNotEqual(informe.estado, "verificada")
+        self.assertIsNotNone(informe.aceptacion)
+        self.assertFalse(informe.aceptacion.ok)
+
+    def test_app_correcta_se_verifica_por_aceptacion_externa(self):
+        informe = self._build(rota=False)
+        self.assertEqual(informe.estado, "verificada", informe.diagnostico)
+        self.assertTrue(informe.aceptacion.ok)
 
 
 # ======================================================================

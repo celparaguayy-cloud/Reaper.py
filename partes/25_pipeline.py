@@ -361,6 +361,35 @@ def ejecutar_aceptacion_independiente(ws: Workspace, *,
         return _aceptacion_error(f'ACEPTACIÓN inválida: {exc}')
 
 
+_RE_REF_FALTANTE = re.compile(r"referencia a '([^']+)' que no existe")
+
+
+def _sin_recursos_planeados(ws: Workspace, resultado: Resultado, planeados: Sequence[str]) -> Optional[Resultado]:
+    """
+    En una tarea INTERMEDIA, un HTML que enlaza un CSS/JS que crea una tarea POSTERIOR del plan no es un fallo
+    todavía (antes: la tarea del HTML fallaba, las de los assets quedaban bloqueadas y la build nunca los creaba).
+    Devuelve None si todas las referencias faltantes están planeadas, o el resultado con solo las no planeadas.
+    La verificación FINAL sigue exigiéndolas todas.
+    """
+    if not planeados or not resultado.comando.startswith("recursos-html"):
+        return resultado
+    base_html = Path(resultado.archivo or "").parent
+    planeados_norm = {Path(p).as_posix().lstrip("./") for p in planeados}
+    pendientes = []
+    for linea in resultado.stderr.splitlines():
+        m = _RE_REF_FALTANTE.search(linea)
+        if not m:
+            pendientes.append(linea)
+            continue
+        ref = m.group(1).lstrip("/")
+        candidatos = {ref, (base_html / ref).as_posix()} | {f"{d}/{ref}" for d in _RAICES_WEB}
+        if not ({Path(c).as_posix().lstrip("./") for c in candidatos} & planeados_norm):
+            pendientes.append(linea)
+    if not [l for l in pendientes if l.strip()]:
+        return None
+    return replace(resultado, stderr="\n".join(pendientes))
+
+
 @dataclass
 class Verificacion:
     ok: bool
@@ -1159,7 +1188,9 @@ class Orquestador:
 
     def _verificar_tarea(self, tcid: int, antes: ConteoTests, nombres_antes: set,
                          exigir_progreso: bool = False, verificar_entrega: bool = False,
-                         archivos_esperados: Sequence[str] = ()) -> Verificacion:
+                         archivos_esperados: Sequence[str] = (),
+                         archivos_planeados: Sequence[str] = (),
+                         cid_build: Optional[int] = None) -> Verificacion:
         """
         Una tarea intermedia no necesita que pasen TODOS los tests (los de tareas
         siguientes todavía fallan): alcanza con validadores OK y que no se rompa
@@ -1169,7 +1200,11 @@ class Orquestador:
         validaciones = validar_archivos(self.ws, archivos)
         tests = ejecutar_tests(self.ws, timeout=self.settings.tests_timeout, completo=True)
         conteo = conteo_de_resultado(tests)
-        problemas = [r.resumen(2500) for r in fallos(validaciones)]
+        problemas = []
+        for r in fallos(validaciones):
+            r = _sin_recursos_planeados(self.ws, r, archivos_planeados)
+            if r is not None:
+                problemas.append(r.resumen(2500))
         if verificar_entrega:
             # La palabra "listo" del modelo NO es evidencia. Cada tarea debe
             # materializar sus objetivos declarados y producir cambios reales.
@@ -1180,7 +1215,14 @@ class Orquestador:
             if faltantes:
                 problemas.append("ENTREGA INCOMPLETA: faltan archivos declarados por la tarea: "
                                  + ", ".join(map(str, faltantes[:10])))
-            if not archivos:
+            declarados = [rel for rel in archivos_esperados if isinstance(rel, str) and rel.strip()]
+            # Un modelo suele crear de más: si TODOS los archivos de esta tarea ya los creó una tarea anterior de
+            # ESTA build (no existían al empezar), la entrega está en disco y no es "sin cambios" (antes fallaba,
+            # bloqueaba las dependientes y gastaba reparaciones). Un archivo previo que había que MODIFICAR sigue
+            # exigiendo cambios reales.
+            creados_en_build = bool(declarados) and not faltantes and cid_build is not None and all(
+                self.ws.checkpoints._origen(rel, cid_build)[0] == "nuevo" for rel in declarados)
+            if not archivos and not creados_en_build:
                 problemas.append("SIN CAMBIOS: la tarea no modificó archivos del proyecto. "
                                  "No se puede verificar una implementación solo por el texto del modelo.")
         if tests is not None and not tests.ok and conteo.reconocido:
@@ -1420,6 +1462,7 @@ class Orquestador:
             previo["tarea_activa"] = tarea.id
             previo["huellas_inicio"] = registro_build.huellas()
             registro_build.guardar(previo)
+            planeados_despues = [a for t_sig in plan.tareas[i + 1:] for a in t_sig.archivos]
             antes_tests = ejecutar_tests(self.ws, timeout=self.settings.tests_timeout, completo=True)
             conteo_antes = conteo_de_resultado(antes_tests)
             nombres_antes = set(conteo_antes.nombres_fallados)
@@ -1434,7 +1477,8 @@ class Orquestador:
             exigir = not resultado.ok
             verif_tarea = self._verificar_tarea(tcid, conteo_antes, nombres_antes,
                                                  exigir_progreso=exigir, verificar_entrega=True,
-                                                 archivos_esperados=tarea.archivos)
+                                                 archivos_esperados=tarea.archivos,
+                                                 archivos_planeados=planeados_despues, cid_build=grupo)
             if not verif_tarea.ok:
                 self.ui.aviso(f"  La tarea {tarea.id} no pasó su verificación: la reparo con el error real.")
                 verif_tarea = self._reparar_con_escalada(
@@ -1442,7 +1486,8 @@ class Orquestador:
                     max(1, self.settings.umbral_escalada + 1),
                     lambda: self._verificar_tarea(tcid, conteo_antes, nombres_antes,
                                                  exigir_progreso=exigir, verificar_entrega=True,
-                                                 archivos_esperados=tarea.archivos),
+                                                 archivos_esperados=tarea.archivos,
+                                                 archivos_planeados=planeados_despues, cid_build=grupo),
                     contexto=f"TAREA EN CURSO (#{tarea.id}): {tarea.descripcion}",
                 )
                 if not verif_tarea.ok:
@@ -1480,7 +1525,8 @@ class Orquestador:
             # registrar la tarea como hecha: tests verdes previos no bastan.
             verif_post = self._verificar_tarea(tcid, conteo_antes, nombres_antes,
                                               exigir_progreso=exigir, verificar_entrega=True,
-                                              archivos_esperados=tarea.archivos)
+                                              archivos_esperados=tarea.archivos,
+                                              archivos_planeados=planeados_despues, cid_build=grupo)
             if verif_post.ok:
                 previo["estados"][tarea.id] = "verificada"
                 # Archivo verificado por primera vez: no permitir que una tarea

@@ -247,8 +247,10 @@ PISTAS: list[Pista] = [
           "Conflicto de merge: editá los archivos marcados con <<<<<<< ======= >>>>>>> y hacé commit.", "git"),
     # ------------------------------------------------------------ HTML/CSS/web
     Pista(r"recursos-html|referencia a '.*' que no existe",
-          "El HTML apunta a un archivo que no existe: creá ese archivo o corregí la ruta del src/href "
-          "(relativa a la carpeta del HTML).", "web"),
+          "El HTML apunta a un archivo que no existe: creá ESE archivo donde el servidor lo publica, o corregí el "
+          "src/href (relativo a la carpeta del HTML; '/x' lo resuelve el servidor desde su raíz web). No cambies "
+          "la ruta '/' ni el ruteo del servidor para arreglar un CSS/JS: después de cada cambio comprobá que "
+          "GET / siga devolviendo el HTML.", "web"),
     Pista(r"css-llaves",
           "Llaves desbalanceadas en el CSS: buscá un bloque sin cerrar (la línea indicada o la regla anterior).",
           "web"),
