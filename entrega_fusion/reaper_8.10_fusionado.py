@@ -1711,6 +1711,9 @@ class Settings:
     respaldo_equipo: bool = True
     # REAPER X: equipo de 10 roles (director, supervisor, integrador, seguridad defensiva, auditor de entrega)
     roles_x: bool = False
+    # Juez de entrega (8.º agente): al cerrar /construir compara lo entregado contra el pedido y solo puede
+    # ENDURECER el estado (verificada/validada → parcial si falta algo); nunca convierte una build roja en verde.
+    juez: bool = True
     proveedor: str = "openrouter"
     api_url: str = ""
 
@@ -10721,6 +10724,22 @@ Respondé SOLO un objeto JSON: {"criteria": [{"criterion": "...", "status": "MET
         0.1,
         solo_lectura=True,
     ),
+    "juez": Rol(
+        "juez",
+        """Sos el JUEZ DE ENTREGA: el último control antes de dar algo por entregado. Una sola pregunta:
+¿lo construido cumple el PEDIDO del usuario, tal como se pidió, ni más ni menos? Juzgás SOLO con la EVIDENCIA
+dada (cada pieza tiene un id EV-...): estado real de la build, tests, validación, aceptación y el resumen del
+diff (qué archivos cambiaron). No ejecutás nada, no leés el repo y no inventás requisitos que el usuario no
+pidió. Regla dura: NO podés convertir una build roja en verde — si la evidencia muestra fallos o tareas sin
+completar, cumple=false. Si falta algo que el pedido pedía (un archivo, una pantalla, un endpoint, un
+comportamiento concreto), listalo en "faltantes", puntual y accionable. Si la evidencia alcanza y el pedido
+está cubierto, cumple=true. Usá confianza alta solo cuando la evidencia es contundente.
+Respondé SOLO un objeto JSON: {"cumple": true|false, "faltantes": ["lo que falta, concreto"],
+"evidence_ids": ["EV-..."], "confianza": "low|medium|high"}""",
+        (),
+        0.1,
+        solo_lectura=True,
+    ),
 }
 
 ROLES_DELEGABLES = ("explorador", "implementador", "revisor", "qa", "reparador", "arquitecto", "especificador",
@@ -14527,6 +14546,18 @@ _RE_VEREDICTO = re.compile(r"VEREDICTO\s*:?\s*\**\s*(APROBADO|CAMBIOS|RECHAZADO)
 EXTENSIONES_TESTEABLES = (".py", ".js", ".mjs", ".cjs", ".ts")
 
 
+def _es_testeable(archivos_plan: list, archivos_ws: list) -> bool:
+    """¿Tiene sentido 'tests primero'? Sí si hay lógica (.py/.js/.ts) en el plan o en el proyecto, o si el proyecto
+    está vacío y el plan TODAVÍA no nombra archivos (no sabemos qué construirá, así que no bajamos la guardia).
+    NO para un plan que solo produce assets estáticos (.html/.css): escribir 'tests ejecutables' para una página
+    estática no aporta y traba trabajos chicos ('construí una web') en modelos flojos. La validación igual corre."""
+    if any(a.endswith(EXTENSIONES_TESTEABLES) for a in archivos_plan):
+        return True
+    if any(a.endswith(EXTENSIONES_TESTEABLES) for a in archivos_ws):
+        return True
+    return not archivos_plan and not archivos_ws
+
+
 @dataclass
 class Tarea:
     id: str
@@ -14907,6 +14938,7 @@ class InformeBuild:
     segundos: float = 0.0
     tareas_fallidas: list = field(default_factory=list)    # quedaron con fallos tras reparar
     tareas_bloqueadas: list = field(default_factory=list)  # no se ejecutaron: dependen de una fallida
+    juicio: Optional["Juicio"] = None                      # veredicto del 8.º agente (juez de entrega)
 
     @property
     def ok(self) -> bool:
@@ -15556,7 +15588,7 @@ class Orquestador:
         return verif
 
     # ------------------------------------------------------------ REAPER X (10 roles)
-    def _consultar_rol_x(self, rol: str, prompt: str) -> tuple:
+    def _consultar_rol_x(self, rol: str, prompt: str, max_tokens: int = 1500) -> tuple:
         """
         Rol de dirección/auditoría por TEXTO (sin herramientas): devuelve (texto|None, modelo_pedido, modelo_servido).
         Si respondió otro modelo (respaldo del equipo), se declara: nada de degradación silenciosa.
@@ -15566,7 +15598,7 @@ class Orquestador:
                     {"role": "user", "content": prompt}]
         try:
             resp = self.llm.chat(mensajes, modelo=pedido_modelo, temperatura=ROLES[rol].temperatura,
-                                 max_tokens=1500, rol=rol)
+                                 max_tokens=max_tokens, rol=rol)
         except LLMError as e:
             if e.presupuesto:
                 raise
@@ -15645,6 +15677,55 @@ class Orquestador:
             self.ui.tenue("  " + dictamen.texto())
             informe.estado, notas = estado_controlado(informe.estado, dictamen)
             informe.notas.extend(notas)
+
+    def _juicio_de_entrega(self, pedido: str, plan: Plan, verif: Verificacion, informe: InformeBuild) -> None:
+        """8.º agente (JUEZ DE ENTREGA): compara lo entregado contra el PEDIDO y solo puede ENDURECER el estado.
+
+        Nunca convierte una build roja en verde. Entrada compacta (diffstat, no el diff entero) y un veredicto JSON
+        chico: consume MUCHOS menos tokens que los roles que escriben o razonan. Si el modelo no responde o contesta
+        fuera de contrato, NO cambia el estado (no inventamos ni un éxito ni un fracaso).
+        """
+        if not getattr(self.settings, "juez", True):
+            return
+        if informe.estado not in ("verificada", "validada"):
+            return  # la build ya está en rojo/parcial: el juez solo endurece, no hay verde que revisar
+        diff = self.ws.checkpoints.diff_desde(informe.cid) if informe.cid else ""
+        criterios = "\n".join(f"- {c}" for c in plan.criterios) or "- (derivalos del pedido)"
+        evidencia = {
+            "EV-ESTADO": f"estado por verificación real: {informe.estado}; tareas fallidas: "
+                         f"{', '.join(informe.tareas_fallidas) or 'ninguna'}; bloqueadas: "
+                         f"{', '.join(informe.tareas_bloqueadas) or 'ninguna'}",
+            "EV-TESTS": (verif.conteo.texto() if verif.conteo.reconocido else
+                         ("sin suite de tests" if verif.tests is None else f"exit {verif.tests.codigo}")),
+            "EV-VALID": resumen_validacion(verif.validaciones, limite=600),
+            "EV-ACEPTACION": (verif.aceptacion.resumen(600) if verif.aceptacion is not None else "no configurada"),
+            "EV-DIFF": _diffstat(diff) or "(sin cambios)",
+        }
+        bloque = "\n".join(f"{k}: {v}" for k, v in evidencia.items())
+        prompt = (f"PEDIDO DEL USUARIO:\n{recortar(pedido, 1200)}\n\nOBJETIVO DEL PLAN: {recortar(plan.objetivo, 300)}\n\n"
+                  f"CRITERIOS DE ACEPTACIÓN:\n{criterios}\n\nEVIDENCIA:\n{bloque}\n\n"
+                  f"¿La entrega cumple el pedido tal como se pidió?")
+        texto, _pedido_m, _servido = self._consultar_rol_x("juez", prompt, max_tokens=400)
+        if texto is None:
+            informe.notas.append("Juez de entrega: el modelo no respondió; sin veredicto (no se cambió el estado).")
+            return
+        juicio = parsear_juicio(texto, evidencia)
+        informe.juicio = juicio
+        self.ui.tenue("  " + juicio.texto())
+        if not juicio.valido:
+            informe.notas.append("Juez de entrega: respuesta fuera de contrato; veredicto descartado.")
+            return
+        informe.notas.append(juicio.texto())
+        for f in juicio.faltantes[:6]:
+            informe.notas.append(f"Falta según el juez: {f}")
+        # Gate en dirección segura: solo baja de verde a parcial. Pide confianza media/alta para no castigar
+        # por el ruido de un modelo débil; un 'no cumple' dudoso queda como nota, no como veredicto.
+        if (not juicio.cumple and juicio.confianza in ("medium", "high")
+                and informe.estado in ("verificada", "validada")):
+            informe.estado = "parcial"
+            self.ui.aviso("  El juez de entrega observa que el pedido NO quedó cumplido: marco la build como parcial.")
+        elif not juicio.cumple:
+            informe.notas.append("Juez de entrega: duda de que se cumpla el pedido (confianza baja); lo dejo como aviso.")
 
     # ------------------------------------------------------------ flujos
     def _mostrar_plan(self, plan: Plan) -> None:
@@ -15888,8 +15969,7 @@ class Orquestador:
 
         informe = InformeBuild("fallida", plan=plan, cid=grupo)
 
-        testeable = any(a.endswith(EXTENSIONES_TESTEABLES) for a in plan.archivos()) or any(
-            a.endswith(EXTENSIONES_TESTEABLES) for a in self.ws.archivos_codigo(limite=200)) or not self.ws.archivos_codigo(limite=5)
+        testeable = _es_testeable(plan.archivos(), self.ws.archivos_codigo(limite=200))
         numero_fase = 3
         if not reanudar:
             # Proteger los tests que YA existían en el proyecto: ni el implementador ni un candidato del torneo
@@ -16074,8 +16154,11 @@ class Orquestador:
         informe.aceptacion = verif.aceptacion
         informe.diagnostico = verif.diagnostico
         informe.estado = estado_final_build(verif, informe)
+        # 8.º agente: el juez de entrega puede bajar de verde a parcial si el pedido no quedó cumplido (nunca sube).
+        self._juicio_de_entrega(pedido, plan, verif, informe)
         if informe.estado == "parcial":
-            informe.notas.append("Verificación final verde, pero hay tareas fallidas/bloqueadas sin completar.")
+            if informe.tareas_bloqueadas or informe.tareas_fallidas:
+                informe.notas.append("Verificación final verde, pero hay tareas fallidas/bloqueadas sin completar.")
         elif informe.ok:
             if self.settings.git_snapshots and es_repo_git(self.ws):
                 try:
@@ -16190,9 +16273,12 @@ class Orquestador:
         if informe.lecciones:
             datos.append(f"{len(informe.lecciones)} lección(es)")
         lineas = [f"{color}{subt}{C.RESET}", f"{Tema.tenue}{' · '.join(datos)}{C.RESET}"]
-        if informe.estado == "parcial":
+        if informe.estado == "parcial" and (informe.tareas_fallidas or informe.tareas_bloqueadas):
             lineas.append(f"{Tema.aviso}fallidas: {', '.join(informe.tareas_fallidas) or '—'} · "
                           f"bloqueadas: {', '.join(informe.tareas_bloqueadas) or '—'}{C.RESET}")
+        if informe.juicio is not None and informe.juicio.valido and not informe.juicio.cumple:
+            faltan = "; ".join(informe.juicio.faltantes[:3]) or "sin detalle"
+            lineas.append(f"{Tema.aviso}juez: no cumple el pedido → {recortar(faltan, 90)}{C.RESET}")
         if informe.commit:
             lineas.append(f"{Tema.ok}git {informe.commit[:10]} · rama {self.settings.rama_git}{C.RESET}")
         self.ui.linea("")
@@ -28108,7 +28194,7 @@ COMANDOS_AYUDA = [
         ("/nuevo <plantilla> <carpeta>", "crea un proyecto listo y testeado desde una plantilla"),
         ("/plantillas", "lista las plantillas disponibles"),
         ("/auditar-web", "auditoría local de HTML y recursos sin ejecutar código"),
-        ("/scan · /tests · /validar [archivos]", "validadores, suite de tests, validación puntual"),
+        ("/scan · /tests · /validar [cambios|archivo]", "validadores, suite de tests, validación de archivos (sin arg valida config)"),
         ("/correr <archivo> [args]", "ejecuta y ofrece reparar si crashea"),
         ("/vigilar [comando]", "corre los tests cada vez que cambia un archivo (Ctrl+C para salir)"),
         ("/diff · /deshacer [id] · /rehacer", "cambios del último pedido, revertir, volver a aplicar"),
@@ -28141,7 +28227,8 @@ COMANDOS_AYUDA = [
         ("/modelos · /config [clave valor] · /tema [nombre]", "catálogo, configuración, colores"),
         ("/uso · /contexto · /compactar · /estado", "consumo, contexto del agente, estado general"),
         ("/desempeno · /pentest <alcance>", "ranking de modelos por rol; modo seguridad (pentest/CTF/lab) con gate"),
-        ("/doctor · /instalar · /dragon · /evaluar", "diagnóstico, comando `reaper`, el dragón, benchmark"),
+        ("/doctor · /validar [config] · /diagnostico [archivo]", "diagnóstico del entorno · validar config de modelos · reporte sin claves"),
+        ("/instalar · /dragon · /evaluar", "comando `reaper`, el dragón, benchmark"),
         ("/evaluar comportamiento [ids]", "mide si el agente responde directo, no repite herramientas, no miente..."),
         ("/todo · /reset · /salir", "lista de tareas, reiniciar conversación, salir"),
     ]),
@@ -28513,6 +28600,7 @@ class App:
             "/history": "historial", "/status": "estado", "/context": "contexto", "/compact": "compactar",
             "/run": "correr", "/test": "tests", "/project": "proyecto", "/model": "modelo", "/mode": "modo",
             "/strong": "modelo_fuerte", "/privacy": "privacidad", "/providers": "proveedores", "/team": "equipo",
+            "/validate": "validar", "/diagnose": "diagnostico", "/diag": "diagnostico",
         }
         nombre = alias.get(cmd, cmd[1:]).replace("-", "_")
         metodo = getattr(self, "cmd_" + nombre, None)
@@ -28832,14 +28920,38 @@ class App:
             f"tests {'OK' if r.ok else 'FALLARON'} (exit {r.codigo}) · {conteo.texto()} · {formatear_duracion(r.duracion)}")
 
     def cmd_validar(self, arg: str) -> None:
-        rels = shlex.split(arg) if arg else self.ws.checkpoints.archivos_desde(self.ws.checkpoints.inicio_grupo() or 1)
+        # Un solo /validar con dos modos: config de modelos/equipo (lo nuevo) y validación de archivos (lo de antes).
+        sub = arg.strip()
+        low = sub.lower()
+        if low in ("", "config", "configuracion", "configuración", "equipo", "modelos"):
+            self._validar_config()
+            return
+        if low in ("cambios", "changed", "."):
+            rels = self.ws.checkpoints.archivos_desde(self.ws.checkpoints.inicio_grupo() or 1)
+        else:
+            rels = shlex.split(sub)
         if not rels:
-            self.ui.tenue("Uso: /validar archivo.py [otro.js ...]")
+            self.ui.tenue("Uso: /validar [config] · /validar cambios · /validar archivo.py [otro.js ...]")
             return
         for r in validar_archivos(self.ws, rels):
             (self.ui.ok if r.ok else self.ui.error)(r.linea()[2:])
             if not r.ok:
                 self.ui.tenue(recortar(r.stderr or r.stdout, 1500))
+
+    def _validar_config(self) -> None:
+        """Valida la configuración de modelos y equipo (sin tocar la red; la conectividad real la da /equipo probar)."""
+        self.ui.titulo("VALIDACIÓN DE CONFIGURACIÓN")
+        glifos = {"ok": (Tema.ok, "✓"), "aviso": (Tema.aviso, "○"), "error": (Tema.error, "✗")}
+        issues = validar_configuracion(self.settings)
+        for nivel, msg in issues:
+            color, g = glifos.get(nivel, (Tema.tenue, "·"))
+            self.ui.linea(f"  {color}{g}{C.RESET} {msg}")
+        errores = sum(1 for n, _ in issues if n == "error")
+        if errores:
+            self.ui.error(f"{errores} error(es) bloqueante(s): revisá tus claves o el ruteo (/equipo, /modelo).")
+        else:
+            self.ui.ok("Configuración sin errores bloqueantes.")
+        self.ui.tenue("  Conectividad real: /equipo probar · ruteo por rol: /equipo · diagnóstico: /diagnostico")
 
     def cmd_correr(self, arg: str) -> None:
         try:
@@ -29167,13 +29279,63 @@ class App:
         self._guardar_settings()
         self.ui.ok(f"Tema: {nombre}")
 
+    def _catalogo_alias(self) -> list:
+        return sorted(INFO_MODELOS.items(), key=lambda kv: (kv[1].proveedor, kv[0]))
+
+    def _buscar_modelos(self, texto: str) -> None:
+        texto = texto.lower().strip()
+        encontrados = [(a, i) for a, i in self._catalogo_alias()
+                       if not texto or texto in a.lower() or texto in i.id.lower()
+                       or texto in (i.nota or "").lower() or texto in (i.proveedor or "").lower()]
+        if not encontrados:
+            self.ui.tenue(f"Sin modelos que coincidan con '{texto}'. /modelos para el catálogo completo.")
+            return
+        self.ui.info(f"Modelos que coinciden con '{texto}' ({len(encontrados)}):" if texto
+                     else f"Catálogo de modelos ({len(encontrados)}):")
+        for a, i in encontrados[:40]:
+            marca = f"{Tema.ok}●{C.RESET}" if resolver_modelo(a) == self.settings.modelo else " "
+            etiqueta = f"{Tema.acento}free{C.RESET} " if i.free else ""
+            prov = i.proveedor or self.settings.proveedor
+            self.ui.linea(f"  {marca} {Tema.ok}{a:<26}{C.RESET} {Tema.tenue}{prov} · {etiqueta}"
+                          f"{recortar(i.nota or i.id, 46)}{C.RESET}")
+        self.ui.tenue("  Elegí: /modelo <alias> · por rol: /modelo <rol> <alias> · interactivo: /modelo elegir [rol]")
+
+    def _elegir_modelo_interactivo(self, rol: str = "") -> None:
+        catalogo = self._catalogo_alias()
+        if not self.ui.interactivo:
+            self.ui.tenue("Selector interactivo no disponible sin terminal. Usá /modelo buscar <texto> y "
+                          "después /modelo <alias>.")
+            return
+        opciones = [f"{a:<26} {i.proveedor or self.settings.proveedor} · "
+                    f"{'free · ' if i.free else ''}{recortar(i.nota or i.id, 40)}" for a, i in catalogo]
+        actual = self.settings.modelo_para(rol) if rol else self.settings.modelo
+        defecto = next((n for n, (a, _i) in enumerate(catalogo) if resolver_modelo(a) == actual), 0)
+        destino = f"rol {rol}" if rol else "modelo principal"
+        idx = self.ui.elegir(f"Elegí el {destino}", opciones, defecto=defecto)
+        alias = catalogo[idx][0]
+        if rol:
+            self.settings.modelos_rol[rol] = resolver_modelo(alias)
+            self.ui.ok(f"{rol} → {self.settings.modelo_para(rol)} (NO VERIFICADO; /equipo probar)")
+        else:
+            self.settings.modelo = resolver_modelo(alias)
+            self.ui.ok(f"Modelo principal: {self.settings.modelo} (NO VERIFICADO; /equipo probar)")
+        self._guardar_settings()
+
     def cmd_modelo(self, arg: str) -> None:
         partes = arg.split()
+        if partes and partes[0].lower() in ("elegir", "elige", "seleccionar", "picker"):
+            rol = partes[1].lower() if len(partes) > 1 and partes[1].lower() in ROLES else ""
+            self._elegir_modelo_interactivo(rol)
+            return
+        if partes and partes[0].lower() in ("buscar", "search", "find", "filtrar"):
+            self._buscar_modelos(" ".join(partes[1:]))
+            return
         if not partes:
             self.ui.info(f"Modelo principal: {self.settings.modelo}")
             for rol, modelo in self.settings.modelos_rol.items():
                 self.ui.tenue(f"  {rol}: {resolver_modelo(modelo)}")
             self.ui.tenue(f"  escalada: {resolver_modelo(self.settings.modelo_fuerte)}")
+            self.ui.tenue("  Elegir de una lista: /modelo elegir [rol] · buscar: /modelo buscar <texto>")
             return
         # Ω §5.1: solo /modelo <alias> o /modelo <rol> <alias> con rol conocido. Nada más se guarda.
         if len(partes) == 1:
@@ -29336,6 +29498,20 @@ class App:
                           "defensiva y auditor de entrega a /construir. El estado final lo sigue decidiendo la "
                           "verificación real. /equipo x on | /equipo x preset | /equipo x off")
             sub = ""
+        if sub.startswith("juez"):
+            partes_j = sub.split()
+            opcion = partes_j[1] if len(partes_j) > 1 else ""
+            if opcion in ("on", "off", "si", "sí", "no"):
+                self.settings.juez = opcion not in ("off", "no")
+                self._guardar_settings()
+            ej = estado_juez(self.settings)
+            marca = "✓ clave" if ej["tiene_clave"] else "⚠ FALTA CLAVE"
+            self.ui.ok(f"Juez de entrega (8.º agente): {'ON' if ej['activo'] else 'OFF'}")
+            self.ui.info(f"  juez → {ej['proveedor']}/{ej.get('modelo_real') or ej['modelo']}   {marca}")
+            self.ui.tenue("  Al cerrar /construir compara lo entregado contra tu pedido y SOLO puede bajar de verde a "
+                          "parcial (nunca sube un rojo a verde). Bajo costo: entrada compacta + veredicto JSON corto.")
+            self.ui.tenue("  Asignarle modelo: /modelo juez <alias> · apagarlo: /equipo juez off")
+            return
         estado = estado_equipo(self.settings)
         ind = independencia_equipo(estado)
         if sub in ("independencia", "independence"):
@@ -29376,6 +29552,11 @@ class App:
         for e in estado:
             marca = "✓ clave" if e["tiene_clave"] else "⚠ FALTA CLAVE"
             self.ui.info(f"  {e['rol']:<13} → {e['proveedor']}/{e.get('modelo_real') or e['modelo']}   {marca}")
+        ej = estado_juez(self.settings)
+        if ej["activo"]:
+            marca = "✓ clave" if ej["tiene_clave"] else "⚠ FALTA CLAVE"
+            self.ui.info(f"  {'juez (8.º)':<13} → {ej['proveedor']}/{ej.get('modelo_real') or ej['modelo']}   {marca}"
+                         "   · control final del pedido")
         self.ui.tenue(f"  proveedores distintos: {ind['proveedores_distintos']} · "
                       f"modelos distintos: {ind['modelos_distintos']}"
                       + ("  · independencia REDUCIDA" if ind["reducida"] else ""))
@@ -29768,6 +29949,22 @@ class App:
 
     def cmd_doctor(self, arg: str) -> None:
         diagnostico_sistema(self.ui, self.settings, self.llm)
+        self.ui.tenue("  Validar la config de modelos/equipo: /validar · diagnóstico para reportar bugs: /diagnostico")
+
+    def cmd_diagnostico(self, arg: str) -> None:
+        """Diagnóstico redactado (sin claves) para pegar al reportar un bug. Con un nombre de archivo, lo guarda."""
+        texto = diagnostico_texto(self.settings)
+        self.ui.linea(texto)
+        destino = arg.strip()
+        if destino:
+            try:
+                ruta = self.ws.ruta(destino, escribir=True)
+                escritura_atomica(ruta, texto + "\n")
+                self.ui.ok(f"diagnóstico guardado en {ruta} (sin claves; seguro para compartir)")
+            except (ErrorRuta, OSError) as e:
+                self.ui.error(str(e))
+        else:
+            self.ui.tenue("  Guardalo para compartir: /diagnostico diagnostico.txt (se redactan los secretos)")
 
     def cmd_instalar(self, arg: str) -> None:
         instalar_lanzador(self.ui)
@@ -46158,6 +46355,202 @@ class TestFlujoConstruirUI(BaseTest):
         self.assertIn("← 1", texto)                      # la tarea 2 depende de la 1
 
 
+class TestConfigValidarDiagnostico(BaseTest):
+    """Tres ideas tomadas de free-claude-code (solo las ideas): validar config, selector y diagnóstico."""
+    _VARS = ("OPENROUTER_API_KEY", "GROQ_API_KEY", "GEMINI_API_KEY", "MISTRAL_API_KEY", "REAPER_CLAVE_PROVEEDOR")
+
+    def setUp(self):
+        super().setUp()
+        self._bak = {k: os.environ.pop(k, None) for k in self._VARS}
+
+    def tearDown(self):
+        for k, v in self._bak.items():
+            os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+        super().tearDown()
+
+    def test_validar_detecta_falta_de_clave(self):
+        s = self.ajustes(modelo="deepseek")        # openrouter, sin clave en el entorno
+        issues = validar_configuracion(s)
+        self.assertTrue(any(n == "error" for n, _ in issues))
+        self.assertTrue(any("credencial" in msg for n, msg in issues if n == "error"))
+        os.environ["OPENROUTER_API_KEY"] = "x"
+        issues2 = validar_configuracion(self.ajustes(modelo="deepseek", escalar=False))
+        self.assertFalse(any(n == "error" for n, _ in issues2))      # con clave, sin errores
+        self.assertTrue(any(n == "ok" for n, _ in issues2))
+
+    def test_validar_marca_proveedor_retirado(self):
+        os.environ["OPENROUTER_API_KEY"] = "x"
+        s = self.ajustes(modelo="github-models:gpt-4o", escalar=False)
+        self.assertTrue(any("retirado" in msg for n, msg in validar_configuracion(s) if n == "error"))
+
+    def test_diagnostico_redacta_y_tiene_lo_esencial(self):
+        os.environ["OPENROUTER_API_KEY"] = "sk-or-v1-0123456789abcdef0123456789"
+        texto = diagnostico_texto(self.ajustes(modelo="deepseek"))
+        self.assertIn("REAPER", texto)
+        self.assertIn(__version__, texto)
+        self.assertIn("Ruteo del equipo", texto)
+        self.assertIn("Validación de configuración", texto)
+        self.assertNotIn("sk-or-v1-0123456789", texto)               # la clave NUNCA aparece
+        self.assertIn("openrouter", texto)
+
+    def test_cmd_validar_y_diagnostico_imprimen(self):
+        app = App(self.ajustes(modelo="deepseek"), MockLLM([]), self.ui(), self.proyecto(), persistir=False)
+        app.cmd_validar("")
+        app.cmd_diagnostico("")
+        texto = app.ui.texto_registrado()
+        self.assertIn("VALIDACIÓN", texto)
+        self.assertIn("diagnóstico", texto)
+
+    def test_validar_dos_modos_no_se_pisan(self):
+        # /validar sin args (o 'config') valida config; /validar archivo.py valida archivos (modo viejo intacto).
+        ws = self.proyecto()
+        ws.escribir("modulo.py", "x = 1\n")
+        app = App(self.ajustes(modelo="deepseek"), MockLLM([]), self.ui(), ws, persistir=False)
+        app.cmd_validar("config")
+        self.assertIn("VALIDACIÓN DE CONFIGURACIÓN", app.ui.texto_registrado())
+        app2 = App(self.ajustes(modelo="deepseek"), MockLLM([]), self.ui(), ws, persistir=False)
+        app2.cmd_validar("modulo.py")                                # modo archivos: NO es el validador de config
+        self.assertNotIn("VALIDACIÓN DE CONFIGURACIÓN", app2.ui.texto_registrado())
+
+    def test_diagnostico_se_guarda_a_archivo(self):
+        ws = self.proyecto()
+        app = App(self.ajustes(), MockLLM([]), self.ui(), ws, persistir=False)
+        app.cmd_diagnostico("reporte.txt")
+        self.assertTrue(ws.existe("reporte.txt"))
+        self.assertIn("REAPER", ws.leer("reporte.txt"))
+
+    def test_modelo_buscar_filtra_el_catalogo(self):
+        app = App(self.ajustes(), MockLLM([]), self.ui(), self.proyecto(), persistir=False)
+        app.cmd_modelo("buscar nemotron")
+        texto = app.ui.texto_registrado()
+        self.assertIn("nemotron", texto.lower())
+        self.assertNotIn("deepseek", texto.lower())                  # filtró de verdad
+
+    def test_modelo_elegir_sin_terminal_no_rompe(self):
+        app = App(self.ajustes(), MockLLM([]), self.ui(), self.proyecto(), persistir=False)
+        app.cmd_modelo("elegir")                                     # UI no interactiva
+        self.assertIn("no disponible sin terminal", app.ui.texto_registrado())
+
+    def test_modelo_elegir_interactivo_setea(self):
+        ui = self.ui(respuestas=["1"])                               # elige la primera opción
+        ui.interactivo = True
+        app = App(self.ajustes(), MockLLM([]), ui, self.proyecto(), persistir=False)
+        app.cmd_modelo("elegir")
+        self.assertNotEqual(app.settings.modelo, "")
+
+
+# ======================================================================
+# MÓDULO: autotest_juez
+# ======================================================================
+"""
+Autotests del 8.º agente: el JUEZ DE ENTREGA. Al cerrar /construir compara lo entregado contra el PEDIDO y
+SOLO endurece el estado (verde → parcial); nunca convierte una build roja en verde. Entrada compacta + veredicto
+JSON corto = mucho menos consumo que los roles que escriben o razonan.
+"""
+
+
+def _verif_ok() -> Verificacion:
+    return Verificacion(True, [], None, "", [], ConteoTests(pasados=3, reconocido=True))
+
+
+def _plan_web() -> Plan:
+    return Plan("una web con login y listado", [], ["hay login", "hay listado de productos"])
+
+
+class TestJuezDeEntrega(BaseTest):
+    def _orq(self, respuesta_juez):
+        llm = MockLLM(lambda mensajes, kw: respuesta_juez if kw.get("rol") == "juez" else "{}")
+        return Orquestador(llm, self.proyecto(), self.ajustes(), self.ui()), llm
+
+    # ---- parser ----
+    def test_parsea_cumple(self):
+        j = parsear_juicio('{"cumple": true, "faltantes": [], "confianza": "high"}')
+        self.assertTrue(j.cumple and j.valido)
+
+    def test_parsea_no_cumple_con_faltantes(self):
+        j = parsear_juicio('{"cumple": false, "faltantes": ["falta el login"], "confianza": "high"}')
+        self.assertFalse(j.cumple)
+        self.assertEqual(j.faltantes, ["falta el login"])
+
+    def test_fuera_de_contrato_no_es_cumple(self):
+        j = parsear_juicio("blah blah, no hay json")
+        self.assertFalse(j.valido)
+        self.assertFalse(j.cumple)
+
+    def test_confianza_invalida_se_normaliza(self):
+        self.assertEqual(parsear_juicio('{"cumple": false, "confianza": "altísima"}').confianza, "low")
+
+    def test_no_puede_subir_una_build_roja(self):
+        ev = {"EV-ESTADO": "estado por verificación real: fallida; tareas fallidas: T1"}
+        j = parsear_juicio('{"cumple": true, "confianza": "high"}', ev)   # el JSON dice true, la evidencia es roja
+        self.assertFalse(j.cumple)
+
+    # ---- gate en el pipeline ----
+    def test_juez_baja_verde_a_parcial(self):
+        orq, _ = self._orq('{"cumple": false, "faltantes": ["falta el login"], "confianza": "high"}')
+        informe = InformeBuild("verificada", plan=_plan_web())
+        orq._juicio_de_entrega("hacé una web con login", _plan_web(), _verif_ok(), informe)
+        self.assertEqual(informe.estado, "parcial")
+        self.assertIsNotNone(informe.juicio)
+        self.assertFalse(informe.juicio.cumple)
+        self.assertTrue(any("login" in n for n in informe.notas))
+
+    def test_juez_cumple_no_cambia(self):
+        orq, _ = self._orq('{"cumple": true, "confianza": "high"}')
+        informe = InformeBuild("verificada")
+        orq._juicio_de_entrega("pedido", _plan_web(), _verif_ok(), informe)
+        self.assertEqual(informe.estado, "verificada")
+
+    def test_confianza_baja_no_castiga(self):
+        orq, _ = self._orq('{"cumple": false, "faltantes": ["x"], "confianza": "low"}')
+        informe = InformeBuild("validada")
+        orq._juicio_de_entrega("pedido", _plan_web(), _verif_ok(), informe)
+        self.assertEqual(informe.estado, "validada")        # con baja confianza no baja: queda como aviso
+
+    def test_juez_no_toca_una_build_fallida(self):
+        orq, _ = self._orq('{"cumple": true, "confianza": "high"}')
+        informe = InformeBuild("fallida")
+        orq._juicio_de_entrega("pedido", _plan_web(), Verificacion(False, [], None, "", []), informe)
+        self.assertEqual(informe.estado, "fallida")         # solo endurece; nunca sube
+
+    def test_juez_apagado_no_consulta(self):
+        orq, llm = self._orq('{"cumple": false, "confianza": "high"}')
+        orq.settings.juez = False
+        informe = InformeBuild("verificada")
+        orq._juicio_de_entrega("pedido", _plan_web(), _verif_ok(), informe)
+        self.assertEqual(informe.estado, "verificada")
+        self.assertIsNone(informe.juicio)
+        self.assertEqual(llm.llamadas, [])                  # apagado = no gasta ni una llamada
+
+    def test_fuera_de_contrato_no_cambia_estado(self):
+        orq, _ = self._orq("no soy json")
+        informe = InformeBuild("verificada")
+        orq._juicio_de_entrega("pedido", _plan_web(), _verif_ok(), informe)
+        self.assertEqual(informe.estado, "verificada")
+        self.assertTrue(any("fuera de contrato" in n for n in informe.notas))
+
+    def test_juez_consume_pocos_tokens(self):
+        orq, llm = self._orq('{"cumple": true, "confianza": "high"}')
+        orq._juicio_de_entrega("pedido", _plan_web(), _verif_ok(), InformeBuild("verificada"))
+        llamada = next(c for c in llm.llamadas if c.get("rol") == "juez")
+        self.assertEqual(llamada["max_tokens"], 400)        # presupuesto chico (los roles que escriben usan miles)
+
+
+class TestTrabajosChicos(BaseTest):
+    """Una página estática no debería disparar 'tests primero' y trabarse: eso rompía trabajos chicos."""
+    def test_web_estatica_no_fuerza_tests_primero(self):
+        self.assertFalse(_es_testeable(["index.html", "style.css"], []))      # solo assets estáticos
+        self.assertFalse(_es_testeable(["index.html"], ["logo.png"]))          # ni con assets no-código
+
+    def test_logica_si_es_testeable(self):
+        self.assertTrue(_es_testeable(["calc.py"], []))                        # lógica en el plan
+        self.assertTrue(_es_testeable(["index.html"], ["app.py"]))             # ya hay lógica en el proyecto
+        self.assertTrue(_es_testeable(["main.js"], []))
+
+    def test_vacio_sin_plan_sigue_testeable(self):
+        self.assertTrue(_es_testeable([], []))     # proyecto vacío y plan sin archivos: no bajamos la guardia
+
+
 # ======================================================================
 # MÓDULO: autotest_runner
 # ======================================================================
@@ -47615,6 +48008,16 @@ Reply ONLY a JSON object: {"findings": [{"severity": "high|medium|low", "file": 
 A criterion is MET only if you cite evidence that proves it; without evidence it is UNKNOWN.
 Reply ONLY a JSON object: {"criteria": [{"criterion": "...", "status": "MET|NOT_MET|UNKNOWN",
 "evidence_ids": ["EV-..."]}]}""",
+    "juez": """You are the DELIVERY JUDGE: the last gate before anything is called delivered. One question only:
+does what was built meet the user's REQUEST, exactly as asked, no more and no less? Judge ONLY from the EVIDENCE
+given (each piece has an EV-... id): real build state, tests, validation, acceptance and the diff summary (which
+files changed). You run nothing, you do not read the repo and you do not invent requirements the user never asked
+for. Hard rule: you CANNOT turn a red build green — if the evidence shows failures or unfinished tasks, cumple=false.
+If something the request asked for is missing (a file, a screen, an endpoint, a concrete behavior), list it under
+"faltantes", specific and actionable. If the evidence is enough and the request is covered, cumple=true. Use high
+confidence only when the evidence is conclusive.
+Reply ONLY a JSON object: {"cumple": true|false, "faltantes": ["what is missing, concrete"],
+"evidence_ids": ["EV-..."], "confianza": "low|medium|high"}""",
 }
 
 DOCS_EN = {
@@ -50998,6 +51401,100 @@ def estado_equipo(settings) -> list:
     return salida
 
 
+def estado_juez(settings) -> dict:
+    """El 8.º agente: el JUEZ DE ENTREGA. Va aparte de los 6 trabajadores porque es el control final, no un obrero."""
+    modelo = settings.modelo_para("juez")
+    destino = destino_modelo(modelo, settings)
+    try:
+        tiene = bool(clave_de_proveedor(destino.proveedor, replace(settings, proveedor=destino.proveedor)))
+    except (TypeError, ValueError):
+        tiene = False
+    return {"rol": "juez", "activo": bool(getattr(settings, "juez", True)), "modelo": modelo,
+            "modelo_real": destino.modelo, "proveedor": destino.proveedor, "tiene_clave": tiene}
+
+
+def validar_configuracion(settings) -> list:
+    """
+    Revisa la config de modelos/equipo SIN tocar la red (la conectividad real la da /equipo probar). Devuelve
+    una lista de (nivel, mensaje) con nivel 'error' (bloqueante), 'aviso' (mejorable) u 'ok' (bien).
+    """
+    retirados = globals().get("PROVEEDORES_RETIRADOS", frozenset())
+
+    def tiene_clave(prov: str) -> bool:
+        try:
+            return bool(clave_de_proveedor(prov, replace(settings, proveedor=prov)))
+        except (TypeError, ValueError):
+            return False
+
+    issues = []
+    principal = destino_modelo(settings.modelo, settings)
+    if principal.proveedor in retirados:
+        issues.append(("error", f"el modelo principal usa un proveedor retirado ({principal.proveedor})"))
+    elif not principal.es_local() and not tiene_clave(principal.proveedor):
+        issues.append(("error", f"falta la credencial del proveedor del modelo principal ({principal.proveedor})"))
+    else:
+        issues.append(("ok", f"modelo principal: {settings.modelo} → {principal.proveedor}"))
+
+    estado = estado_equipo(settings)
+    sin_clave = [e["rol"] for e in estado if not e["tiene_clave"]]
+    if sin_clave:
+        issues.append(("error", f"{len(sin_clave)} rol(es) sin credencial para su proveedor: {', '.join(sin_clave)}"))
+    retirados_rol = sorted({e["proveedor"] for e in estado if e["proveedor"] in retirados})
+    if retirados_rol:
+        issues.append(("error", f"rol(es) con proveedor retirado: {', '.join(retirados_rol)}"))
+
+    provs = {e["proveedor"] for e in estado}
+    if len(estado) > 1 and len(provs) <= 1:
+        issues.append(("aviso", f"independencia REDUCIDA: los {len(estado)} roles usan un solo proveedor "
+                                f"({next(iter(provs))}); si se cae, cae todo el equipo"))
+
+    if settings.escalar:
+        fuerte = destino_modelo(settings.modelo_fuerte, settings)
+        if fuerte.proveedor in retirados:
+            issues.append(("error", f"el modelo de escalada usa un proveedor retirado ({fuerte.proveedor})"))
+        elif not fuerte.es_local() and not tiene_clave(fuerte.proveedor):
+            issues.append(("aviso", f"escalada activada pero falta la credencial de {fuerte.proveedor}: no podrá escalar"))
+
+    if not any(nivel == "error" for nivel, _ in issues):
+        issues.append(("ok", "sin errores bloqueantes en la configuración"))
+    issues.append(("aviso", "la conectividad real NO se valida acá: usá /equipo probar"))
+    return issues
+
+
+def diagnostico_texto(settings, incluir_equipo: bool = True) -> str:
+    """
+    Resumen para reportar bugs: versión, entorno, chequeos, config, qué proveedores tienen clave (solo sí/no) y
+    el ruteo del equipo. Pasa por redactar_secretos: NUNCA incluye una clave, aunque aparezca en algún campo.
+    """
+    entorno = "Termux/Android" if es_termux() else f"{platform.system()} {platform.machine()}"
+    lineas = [f"REAPER {__version__} · diagnóstico", f"python {sys.version.split()[0]} · {entorno}", ""]
+    lineas.append("Chequeos del entorno:")
+    for c in chequeos_sistema(settings):
+        marca = "OK" if c.ok else ("FALTA" if c.critico else "opcional")
+        lineas.append(f"  [{marca}] {c.nombre}: {recortar(c.detalle, 70).replace(chr(10), ' ')}")
+    lineas.append("")
+    lineas.append(f"Config: modo={settings.modo} · candidatos={settings.candidatos} · tests_primero={settings.tests_primero}"
+                  f" · torneo={settings.torneo} · escalar={settings.escalar} · roles_x={settings.roles_x}"
+                  f" · privacidad_estricta={settings.privacidad_estricta} · web={settings.web}")
+    marcas = []
+    for prov in PROVEEDORES:
+        try:
+            tiene = bool(clave_de_proveedor(prov, replace(settings, proveedor=prov)))
+        except (TypeError, ValueError):
+            tiene = False
+        marcas.append(f"{prov}{'✓' if tiene else '·'}")
+    lineas.append("Proveedores (✓=con clave, ·=sin clave): " + " ".join(marcas))
+    if incluir_equipo:
+        lineas += ["", "Ruteo del equipo (rol → modelo @ proveedor · credencial):"]
+        for e in estado_equipo(settings):
+            lineas.append(f"  {e['rol']:<16} {e['modelo_real']} @ {e['proveedor']} · "
+                          f"{'con clave' if e['tiene_clave'] else 'SIN CLAVE'}")
+        lineas += ["", "Validación de configuración:"]
+        for nivel, msg in validar_configuracion(settings):
+            lineas.append(f"  [{nivel}] {msg}")
+    return redactar_secretos("\n".join(lineas))
+
+
 def modelos_potentes_free() -> list:
     """Alias curados de modelos free POTENTES (del catálogo estático), como (alias, info)."""
     return [(alias, info) for alias, info in INFO_MODELOS.items() if info.free]
@@ -51081,7 +51578,8 @@ def resumen_arranque_equipo(settings) -> str:
     ind = independencia_equipo(estado)
     con_clave = sum(1 for e in estado if e["tiene_clave"])
     aviso = "" if con_clave == len(estado) else f" · {len(estado) - con_clave} sin clave"
-    return (f"{len(estado)} roles → {ind['modelos_distintos']} modelo(s)/{ind['proveedores_distintos']} prov{aviso}"
+    juez = " + juez" if getattr(settings, "juez", True) else ""
+    return (f"{len(estado)} roles{juez} → {ind['modelos_distintos']} modelo(s)/{ind['proveedores_distintos']} prov{aviso}"
             f" · conectividad NO VERIFICADA (/equipo probar)")
 
 
@@ -52026,6 +52524,47 @@ def parsear_auditoria(texto: str, evidencia: dict) -> Optional[list]:
             status = "UNKNOWN"
         salida.append({"criterion": str(c["criterion"]).strip()[:200], "status": status, "evidence_ids": ids})
     return salida
+
+
+@dataclass
+class Juicio:
+    """Veredicto del 8.º agente (JUEZ DE ENTREGA): ¿lo entregado cumple el pedido? Solo endurece, nunca mejora."""
+    cumple: bool
+    faltantes: list = field(default_factory=list)
+    evidence_ids: list = field(default_factory=list)
+    confianza: str = "low"
+    valido: bool = True
+    problema: str = ""
+
+    def texto(self) -> str:
+        if not self.valido:
+            return f"Juez de entrega: veredicto fuera de contrato ({self.problema})"
+        if self.cumple:
+            return f"Juez de entrega: CUMPLE el pedido (confianza {self.confianza})"
+        falta = "; ".join(self.faltantes[:4]) if self.faltantes else "sin detalle"
+        return f"Juez de entrega: NO CUMPLE (confianza {self.confianza}) · falta: {falta}"
+
+
+def parsear_juicio(texto: str, evidencia: Optional[dict] = None) -> Juicio:
+    """Veredicto del juez desde su JSON. Si la evidencia muestra la build roja/parcial, nunca se acepta 'cumple'."""
+    datos = extraer_json_x(texto)
+    if not isinstance(datos, dict) or not isinstance(datos.get("cumple"), bool):
+        return Juicio(False, valido=False, problema='sin JSON {"cumple": true|false}')
+    cumple = bool(datos["cumple"])
+    faltantes = _lista_str(datos.get("faltantes"))[:12]
+    conf = str(datos.get("confianza", "low")).strip().lower()
+    if conf not in _CONFIANZAS_X:
+        conf = "low"
+    ids = _lista_str(datos.get("evidence_ids"))
+    if isinstance(evidencia, dict):
+        ids = [e for e in ids if e in evidencia]
+        estado_global = str(evidencia.get("EV-ESTADO", "")).lower()
+        if cumple and re.search(r"estado por verificación real: (?:fallida|parcial|cancelada)", estado_global):
+            # Defensa en profundidad: el juez no puede convertir una build roja/parcial en 'cumple'.
+            cumple = False
+            if not faltantes:
+                faltantes = ["la verificación real no quedó en verde"]
+    return Juicio(cumple, faltantes, ids, conf, valido=True)
 
 
 def conteo_equipo_x(settings, probados: Optional[dict] = None) -> dict:

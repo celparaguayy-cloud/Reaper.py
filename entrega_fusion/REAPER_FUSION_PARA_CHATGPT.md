@@ -78,3 +78,35 @@ todo omitido) · `35_cli` (hooks con consentimiento) · `39_plantillas_lenguajes
 No declarar éxito sin evidencia ejecutada · no modificar tests para ocultar defectos (el único test ajustado se
 justificó con el catálogo real de OpenRouter) · mocks nunca como única evidencia de funcionamiento real (están
 rotulados) · no aflojar permisos ni autorizaciones · claves solo por entorno, nunca en repo/logs/ZIP.
+
+## 8. Lo agregado DESPUÉS de la fusión (acumulativo, con tests)
+
+Sobre el código estabilizado, en la misma sesión:
+
+1. **Interfaz** (panel de arranque, prompt `❯`, íconos por herramienta, ancho con emojis) y **flujo visual de
+   `/construir`** (checklist del plan, cierre en caja con insignia de estado). Ideas de free-claude-code: solo las
+   ideas, implementación propia (AGPL, no se copió código).
+2. **Tres comandos**: `/validar` (config de modelos/equipo sin red; un solo `/validar` con dos modos: config y
+   archivos), `/modelo elegir|buscar` (selector y búsqueda del catálogo) y `/diagnostico [archivo]` (reporte
+   redactado por `redactar_secretos`, nunca filtra claves).
+3. **8.º agente: JUEZ DE ENTREGA** (rol `juez`, solo JSON `{cumple,faltantes,evidence_ids,confianza}`). Corre al
+   cerrar `/construir` SOLO sobre builds verdes; compara lo entregado contra el pedido y SOLO endurece
+   (verificada/validada → parcial); nunca sube un rojo a verde (`parsear_juicio` lo fuerza desde la evidencia).
+   Bajo costo: diffstat + `max_tokens=400`. Se apaga con `/equipo juez off`.
+4. **Robustez en trabajos chicos**: `_es_testeable()` deja de forzar "tests primero" para una página estática
+   (.html/.css) en carpeta vacía.
+
+**Qué conviene auditar (además de lo de la sección 6):**
+- El juez con modelos reales: ¿da falsos "no cumple" (castiga builds buenas) o se lo puede empujar a aprobar un
+  pedido no cumplido? El gate exige confianza media/alta justamente para no castigar por ruido; revisá ese umbral.
+- `parsear_juicio`: intentar que un veredicto `cumple:true` pase con la evidencia en rojo (no debería: se fuerza a
+  false). Y que un JSON inválido no cambie nunca el estado.
+- `_es_testeable`: casos límite (proyecto mixto, monorepo, assets + un `.js` suelto) para no apagar tests primero
+  cuando sí hacen falta.
+
+Archivos nuevos/modificados de esta tanda: `19_roles`, `54_ingles` (rol `juez`), `75_reaper_x`
+(`Juicio`/`parsear_juicio`), `25_pipeline` (`_juicio_de_entrega`, `_es_testeable`, `max_tokens` en
+`_consultar_rol_x`), `03_config` (`settings.juez`), `35_cli` (`/validar`, `/modelo elegir|buscar`,
+`/diagnostico`, `/equipo juez`), `70_equipo` (`validar_configuracion`, `diagnostico_texto`, `estado_juez`);
+tests: `48ze_autotest_juez` (15) y `TestConfigValidarDiagnostico` en `48zc` (9). Regresión 944 tests OK en
+Python 3.11/3.12/3.13.

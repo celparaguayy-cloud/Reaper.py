@@ -1,8 +1,9 @@
 # REAPER 8.10 fusionado — resultados exactos de las pruebas
 
-Versión ACTUAL: `reaper_8.10_fusionado.py`, SHA-256 `0a5baa7f40afecd0747d03881f2cff6d6dcb1f2c60ad08141d1e5a2ab886ef63`
-(incluye los arreglos de la sección 7). Las secciones 1–6 se corrieron sobre la versión anterior `abe85902…`; la
-regresión completa de la versión actual está al final de la sección 7. Fecha: 2026-10-11.
+Versión ACTUAL: `reaper_8.10_fusionado.py`, SHA-256 en `REAPER_FUSION_SHA256.txt` (se recalcula en cada entrega).
+Las secciones 1–6 se corrieron sobre la versión `abe85902…`; la sección 7 sobre `0a5baa7f…` (Termux real). Las
+secciones 8–9 cubren lo agregado DESPUÉS de la fusión (interfaz, flujo de /construir, tres comandos nuevos, el
+8.º agente juez y la robustez en trabajos chicos), con su propia regresión de 3 Pythons. Fecha: 2026-10-11.
 
 **Entorno:** contenedor Linux x86_64 en la nube (no Termux, no Android). Python 3.11.15, 3.12.3 y 3.13.14.
 Node 22, Java, Go, Perl 5.38 disponibles. **Sin claves de proveedores** (todas ausentes) y sin acceso al Termux del usuario.
@@ -134,3 +135,65 @@ el umbral por defecto pasa a 180 s y el aviso aclara que el test sigue corriendo
 **Después de los arreglos** (mismo código para todos): 914 tests OK en Python 3.11.15 (67 s), 3.12.3 (70 s),
 3.13.14 (75 s) y en **Python 3.14.0rc2 con pytest 9.1.1 instalado** (114 s; lo más parecido al teléfono que se pudo
 reproducir aquí). La repetición en el Termux real queda a cargo del usuario.
+
+
+## 8. Mejoras de UX posteriores a la fusión (misma sesión, acumulativo)
+
+Sobre el código ya estabilizado se agregaron tres tandas de interfaz/ergonomía, con tests en cada una. Las ideas se
+tomaron de free-claude-code (**solo las ideas**: implementación propia, no se copió código — es AGPL-3.0).
+
+1. **Interfaz más legible** (917 tests): panel de arranque en caja con versión/modelo/equipo/ruta, prompt `❯`, íconos
+   por herramienta, y ancho visible que cuenta bien los emojis (plano suplementario, ZWJ, selector de variación,
+   modificadores de tono de piel) para que las cajas queden alineadas.
+2. **Flujo visual de `/construir`** (920 tests): checklist del plan antes de implementar (con dependencias por tarea) y
+   cierre en caja con insignia de estado (verificada/validada/parcial/cancelada/fallida) y resumen del diff.
+3. **Tres comandos nuevos** (929 tests, esta tanda):
+   - `/validar` sin argumentos (o `config`): revisa la config de modelos/equipo **sin tocar la red** — falta de
+     credencial, proveedor retirado, independencia reducida, escalada sin clave. El modo viejo (validar archivos:
+     `/validar archivo.py`, `/validar cambios`) se conserva: **un solo `/validar` con dos modos**.
+   - `/modelo elegir` (selector interactivo del catálogo) y `/modelo buscar <texto>` (filtra por alias/id/nota/proveedor).
+   - `/diagnostico [archivo]`: reporte para pegar al reportar un bug (versión, entorno, chequeos, config, qué
+     proveedores tienen clave sí/no, ruteo del equipo, validación). Pasa por `redactar_secretos`: **nunca** incluye una clave.
+
+Regresión de esta tanda (contenedor Linux x86_64, sin claves):
+
+| Python | Tests | Resultado | Fallos | Errores | Omitidos | exit |
+|---|---|---|---|---|---|---|
+| 3.11.15 | 929 | OK | 0 | 0 | 0 | 0 |
+| 3.12.3  | 929 | OK | 0 | 0 | 0 | 0 |
+| 3.13.14 | 929 | OK | 0 | 0 | 0 | 0 |
+
+Composición: 920 previos + 9 nuevos en `TestConfigValidarDiagnostico` (`48zc_autotest_p0_fusion`): la validación
+detecta falta de clave y proveedor retirado; el diagnóstico redacta la clave sintética y trae lo esencial; `/validar`
+y `/diagnostico` imprimen; el diagnóstico se guarda a archivo; **los dos modos de `/validar` no se pisan** (regresión
+de una colisión de nombres que se corrigió: el validador de config tapaba al de archivos porque son métodos de la
+misma clase — `ruff --select F811` no lo veía; ahora el config vive en `_validar_config` y el comando despacha según
+el argumento); `buscar` filtra de verdad; el selector sin terminal no rompe y el interactivo sí asigna el modelo.
+
+## 9. 8.º agente: el JUEZ DE ENTREGA + robustez en trabajos chicos
+
+**Juez de entrega (rol `juez`).** Un 8.º agente, aparte de los 6 trabajadores, que corre al cerrar `/construir`.
+Compara lo ENTREGADO contra el PEDIDO del usuario (objetivo + criterios + evidencia real: estado, tests,
+validación, aceptación y diffstat) y responde un veredicto JSON corto `{cumple, faltantes, evidence_ids, confianza}`.
+
+- **Solo endurece, nunca mejora.** Si con confianza media/alta dice que NO se cumple el pedido, baja la build de
+  `verificada`/`validada` a `parcial` y lista los faltantes. NUNCA convierte una build roja en verde: el parser
+  fuerza `cumple=false` si la evidencia muestra la build roja/parcial, aunque el modelo diga lo contrario. Así solo
+  puede CAZAR falsos verdes, nunca crearlos.
+- **Bajo costo.** Entrada compacta (diffstat, no el diff entero) y `max_tokens=400`: consume mucho menos que los
+  roles que escriben o razonan (miles de tokens). Test `test_juez_consume_pocos_tokens` lo fija.
+- **Siempre activo** (clásico y REAPER X); se apaga con `/equipo juez off`. Modelo propio ruteable: `/modelo juez <alias>`.
+- Fuera de contrato o sin respuesta del modelo → NO cambia el estado (no inventamos ni éxito ni fracaso), solo deja nota.
+- Visible en `/equipo` como "juez (8.º) · control final del pedido" y en el banner de arranque ("6 roles + juez").
+
+Cobertura: `TestJuezDeEntrega` (12 tests) — parser (cumple / no cumple con faltantes / fuera de contrato /
+confianza inválida normalizada / no puede subir una build roja) y gate (baja verde→parcial con alta confianza;
+cumple no cambia; baja confianza no castiga; no toca una build fallida; apagado no gasta llamadas; fuera de
+contrato no cambia estado; presupuesto de 400 tokens).
+
+**Robustez en trabajos chicos.** `_es_testeable(archivos_plan, archivos_ws)` reemplaza la heurística vieja que, en
+una carpeta vacía, forzaba "tests primero" SIEMPRE — incluso para una página estática. Ahora un plan que solo
+produce assets estáticos (`.html`/`.css`) NO dispara la especificación ejecutable (escribir "tests" para una web
+estática no aporta y trababa pedidos como "construí una web" en modelos flojos); la validación web igual corre. Si
+hay lógica (`.py`/`.js`/`.ts`) en el plan o el proyecto, o si el proyecto está vacío y el plan aún no nombra
+archivos, sigue habiendo tests primero. Cobertura: `TestTrabajosChicos` (3 tests).
