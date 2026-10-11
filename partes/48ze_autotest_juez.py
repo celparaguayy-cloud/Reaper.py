@@ -92,6 +92,136 @@ class TestJuezDeEntrega(BaseTest):
         self.assertEqual(llamada["max_tokens"], 400)        # presupuesto chico (los roles que escriben usan miles)
 
 
+class TestJuezContrato(BaseTest):
+    """Motor central, paso 1: el juez convierte el pedido en un CONTRATO de criterios y vigila la cobertura."""
+    def _orq(self, respuesta_juez):
+        llm = MockLLM(lambda mensajes, kw: respuesta_juez if kw.get("rol") == "juez" else "{}")
+        return Orquestador(llm, self.proyecto(), self.ajustes(), self.ui()), llm
+
+    def test_parsea_criterios(self):
+        c = parsear_criterios_entrega('{"criterios": ["hay login", "lista productos", "hay login"]}')
+        self.assertEqual(c, ["hay login", "lista productos"])        # dedup
+
+    def test_criterios_cap_y_basura(self):
+        self.assertEqual(parsear_criterios_entrega("no json"), [])
+        muchos = '{"criterios": [' + ",".join(f'"c{i}"' for i in range(20)) + ']}'
+        self.assertEqual(len(parsear_criterios_entrega(muchos)), 8)   # acotado
+
+    def test_cobertura_detecta_criterio_sin_tarea(self):
+        plan = Plan("web", [Tarea("1", "crear index.html con el listado", ["index.html"])], [])
+        self.assertEqual(cobertura_criterios(["mostrar listado"], plan), [])          # 'listado' está en el plan
+        self.assertEqual(cobertura_criterios(["enviar emails"], plan), ["enviar emails"])  # nada que ver
+        self.assertEqual(cobertura_criterios([], plan), [])
+
+    def test_contrato_desde_el_pedido(self):
+        orq, _ = self._orq('{"criterios": ["hay login", "hay listado"]}')
+        self.assertEqual(orq._contrato_de_entrega("una web con login y listado"), ["hay login", "hay listado"])
+
+    def test_contrato_apagado_o_basura_no_rompe(self):
+        orq, llm = self._orq('{"criterios": ["x"]}')
+        orq.settings.juez = False
+        self.assertEqual(orq._contrato_de_entrega("algo"), [])        # apagado: ni una llamada
+        self.assertEqual(llm.llamadas, [])
+        orq2, _ = self._orq("no json")
+        self.assertEqual(orq2._contrato_de_entrega("algo"), [])       # basura: lista vacía, sin romper
+
+    def test_gate_usa_el_contrato(self):
+        orq, _ = self._orq('{"cumple": false, "faltantes": ["falta el login"], "confianza": "high"}')
+        informe = InformeBuild("verificada")
+        informe.criterios_entrega = ["hay login", "hay listado"]      # contrato ya fijado
+        orq._juicio_de_entrega("una web con login", _plan_web(), _verif_ok(), informe)
+        self.assertEqual(informe.estado, "parcial")                  # juzgó contra el contrato y endureció
+
+
+class TestJuezCierra(BaseTest):
+    """Motor central, paso final: si falta algo del pedido, el juez INTERVIENE (acotado) y re-juzga."""
+    PLAN = """<plan>
+<objetivo>App con dos módulos</objetivo>
+<interfaz>
+- app.py: módulo principal
+</interfaz>
+<tarea id="1" archivos="app.py">Crear app.py.</tarea>
+<criterios>
+- existe app.py
+</criterios>
+</plan>"""
+
+    def test_debe_intervenir_logica(self):
+        llm = MockLLM(lambda m, k: "{}")
+        orq = Orquestador(llm, self.proyecto(), self.ajustes(), self.ui())
+        inf = InformeBuild("verificada")
+        inf.juicio = Juicio(False, ["falta x"], confianza="high")
+        self.assertTrue(orq._debe_intervenir_juez(inf, 1))
+        inf.juicio = Juicio(True, [], confianza="high")
+        self.assertFalse(orq._debe_intervenir_juez(inf, 1))            # cumple
+        inf.juicio = Juicio(False, ["x"], confianza="low")
+        self.assertFalse(orq._debe_intervenir_juez(inf, 1))            # confianza baja
+        inf.juicio = Juicio(False, [], confianza="high")
+        self.assertFalse(orq._debe_intervenir_juez(inf, 1))            # sin faltantes
+        inf.juicio = Juicio(False, ["x"], confianza="high"); inf.intervenciones_juez = 1
+        self.assertFalse(orq._debe_intervenir_juez(inf, 1))            # agotó el cupo
+        inf.intervenciones_juez = 0; inf.estado = "fallida"
+        self.assertFalse(orq._debe_intervenir_juez(inf, 1))            # build roja: no interviene
+        self.assertFalse(orq._debe_intervenir_juez(InformeBuild("verificada"), 1))   # sin juicio
+
+    def test_juez_interviene_y_cierra(self):
+        st = {"verdict": 0}
+
+        def guion(mensajes, kw):
+            rol = MockLLM.rol_de(mensajes)
+            turno = _turno(mensajes)
+            user = mensajes[-1]["content"]
+            if rol == "arquitecto":
+                return terminar_xml(self.PLAN)
+            if rol == "implementador":
+                return herramienta_xml("write_to_file", path="app.py", content="x = 1\n") if turno == 0 \
+                    else terminar_xml("app.py listo")
+            if rol == "reparador":
+                return herramienta_xml("write_to_file", path="extra.py", content="y = 2\n") if turno == 0 \
+                    else terminar_xml("extra.py agregado")
+            if rol == "juez":
+                if "CONTRATO" in user:
+                    return '{"criterios": ["existe app.py", "existe extra.py"]}'
+                st["verdict"] += 1
+                if st["verdict"] == 1:
+                    return '{"cumple": false, "faltantes": ["falta extra.py"], "confianza": "high"}'
+                return '{"cumple": true, "confianza": "high"}'
+            return terminar_xml("ok")
+
+        ws = self.proyecto()
+        ajustes = self.ajustes(tests_primero=False, torneo=False, escalar=False, max_revisiones=0, qa=False,
+                               max_reparaciones=0, juez=True, juez_max_intervenciones=1)
+        informe = Orquestador(MockLLM(guion), ws, ajustes, self.ui()).construir("app con dos módulos", confirmar=False)
+        self.assertTrue(ws.existe("extra.py"))                         # el juez intervino y agregó lo que faltaba
+        self.assertEqual(informe.intervenciones_juez, 1)
+        self.assertTrue(informe.juicio and informe.juicio.cumple)
+        self.assertIn(informe.estado, ("verificada", "validada"))
+
+    def test_juez_no_interviene_si_el_cupo_es_cero(self):
+        def guion(mensajes, kw):
+            rol = MockLLM.rol_de(mensajes)
+            turno = _turno(mensajes)
+            user = mensajes[-1]["content"]
+            if rol == "arquitecto":
+                return terminar_xml(self.PLAN)
+            if rol == "implementador":
+                return herramienta_xml("write_to_file", path="app.py", content="x = 1\n") if turno == 0 \
+                    else terminar_xml("app.py listo")
+            if rol == "juez" and "CONTRATO" not in user:
+                return '{"cumple": false, "faltantes": ["falta extra.py"], "confianza": "high"}'
+            if rol == "juez":
+                return '{"criterios": ["existe app.py"]}'
+            return terminar_xml("ok")
+
+        ws = self.proyecto()
+        ajustes = self.ajustes(tests_primero=False, torneo=False, escalar=False, max_revisiones=0, qa=False,
+                               max_reparaciones=0, juez=True, juez_max_intervenciones=0)
+        informe = Orquestador(MockLLM(guion), ws, ajustes, self.ui()).construir("app", confirmar=False)
+        self.assertEqual(informe.intervenciones_juez, 0)              # cupo 0: solo avisa
+        self.assertFalse(ws.existe("extra.py"))
+        self.assertEqual(informe.estado, "parcial")                  # el juez igual bajó a parcial
+
+
 class TestTrabajosChicos(BaseTest):
     """Una página estática no debería disparar 'tests primero' y trabarse: eso rompía trabajos chicos."""
     def test_web_estatica_no_fuerza_tests_primero(self):

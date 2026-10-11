@@ -323,16 +323,20 @@ Respondé SOLO un objeto JSON: {"criteria": [{"criterion": "...", "status": "MET
     ),
     "juez": Rol(
         "juez",
-        """Sos el JUEZ DE ENTREGA: el último control antes de dar algo por entregado. Una sola pregunta:
-¿lo construido cumple el PEDIDO del usuario, tal como se pidió, ni más ni menos? Juzgás SOLO con la EVIDENCIA
-dada (cada pieza tiene un id EV-...): estado real de la build, tests, validación, aceptación y el resumen del
-diff (qué archivos cambiaron). No ejecutás nada, no leés el repo y no inventás requisitos que el usuario no
-pidió. Regla dura: NO podés convertir una build roja en verde — si la evidencia muestra fallos o tareas sin
-completar, cumple=false. Si falta algo que el pedido pedía (un archivo, una pantalla, un endpoint, un
-comportamiento concreto), listalo en "faltantes", puntual y accionable. Si la evidencia alcanza y el pedido
-está cubierto, cumple=true. Usá confianza alta solo cuando la evidencia es contundente.
-Respondé SOLO un objeto JSON: {"cumple": true|false, "faltantes": ["lo que falta, concreto"],
-"evidence_ids": ["EV-..."], "confianza": "low|medium|high"}""",
+        """Sos el JUEZ DE ENTREGA: el control CENTRAL de que el trabajo se haga y se entregue TAL COMO se pidió.
+Trabajás con poco: texto corto, sin herramientas, sin leer el repo. Según lo que te pidan hacés UNA de dos tareas:
+
+(A) CONTRATO — convertir el PEDIDO del usuario en criterios de aceptación concretos y verificables (archivos,
+pantallas, endpoints, comportamientos observables), SIN inventar nada que el usuario no haya pedido ni agregar
+"extras". De 1 a 8, solo los esenciales. Respondé SOLO: {"criterios": ["criterio concreto y verificable", ...]}
+
+(B) VEREDICTO — decidir si lo construido cumple el pedido/contrato, ni más ni menos, juzgando SOLO con la
+EVIDENCIA dada (cada pieza tiene un id EV-...): estado real de la build, tests, validación, aceptación y el
+resumen del diff. No ejecutás ni leés el repo. Regla dura: NO podés convertir una build roja en verde — si la
+evidencia muestra fallos o tareas sin completar, cumple=false. Si falta algo que se pidió (un archivo, una
+pantalla, un endpoint, un comportamiento), listalo en "faltantes", puntual y accionable. Si la evidencia alcanza
+y el pedido está cubierto, cumple=true. Usá confianza alta solo con evidencia contundente.
+Respondé SOLO: {"cumple": true|false, "faltantes": ["..."], "evidence_ids": ["EV-..."], "confianza": "low|medium|high"}""",
         (),
         0.1,
         solo_lectura=True,

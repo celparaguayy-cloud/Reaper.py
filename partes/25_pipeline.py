@@ -52,6 +52,27 @@ def _es_testeable(archivos_plan: list, archivos_ws: list) -> bool:
     return not archivos_plan and not archivos_ws
 
 
+def _palabras_clave(texto: str) -> set:
+    return {p for p in re.findall(r"[a-záéíóúñ0-9/._-]{4,}", (texto or "").lower())}
+
+
+def cobertura_criterios(criterios: list, plan) -> list:
+    """Determinista (0 llamadas al modelo): criterios del contrato que NINGUNA tarea del plan parece cubrir, por
+    solape de palabras/archivos. Es una señal temprana de desvío para el juez, NO un veredicto: lo real lo decide
+    el juez al final con la evidencia. Conservadora: solo marca un criterio si no comparte ni una palabra con el plan."""
+    if not criterios:
+        return []
+    texto = " ".join(f"{t.descripcion} {' '.join(t.archivos)}" for t in plan.tareas)
+    texto += " " + (plan.objetivo or "") + " " + (plan.interfaz or "")
+    palabras = _palabras_clave(texto)
+    sin_cubrir = []
+    for c in criterios:
+        pc = _palabras_clave(c)
+        if pc and not (pc & palabras):
+            sin_cubrir.append(c)
+    return sin_cubrir
+
+
 @dataclass
 class Tarea:
     id: str
@@ -433,6 +454,8 @@ class InformeBuild:
     tareas_fallidas: list = field(default_factory=list)    # quedaron con fallos tras reparar
     tareas_bloqueadas: list = field(default_factory=list)  # no se ejecutaron: dependen de una fallida
     juicio: Optional["Juicio"] = None                      # veredicto del 8.º agente (juez de entrega)
+    criterios_entrega: list = field(default_factory=list)  # contrato: criterios que el juez derivó del pedido
+    intervenciones_juez: int = 0                           # cuántas veces el juez tuvo que intervenir para cerrar
 
     @property
     def ok(self) -> bool:
@@ -1172,6 +1195,29 @@ class Orquestador:
             informe.estado, notas = estado_controlado(informe.estado, dictamen)
             informe.notas.extend(notas)
 
+    def _contrato_de_entrega(self, pedido: str) -> list:
+        """Motor central, paso 1: el juez convierte el PEDIDO en criterios de aceptación ANTES de construir.
+        Una sola llamada chica (max_tokens 350). Si el juez está apagado o no responde en contrato, devuelve [] y
+        el build sigue con los criterios del plan: nunca bloquea por esto."""
+        if not getattr(self.settings, "juez", True):
+            return []
+        prompt = (f"TAREA: CONTRATO. Convertí este PEDIDO en criterios de aceptación concretos y verificables, "
+                  f"sin inventar extras.\n\nPEDIDO:\n{recortar(pedido, 1500)}")
+        texto, _p, _s = self._consultar_rol_x("juez", prompt, max_tokens=350)
+        return parsear_criterios_entrega(texto or "")
+
+    def _mostrar_contrato(self, criterios: list, plan: Plan) -> None:
+        """Muestra el contrato del juez y la vigía DETERMINISTA de cobertura (criterios que el plan no parece cubrir)."""
+        if not criterios:
+            return
+        self.ui.tenue("  Juez · contrato de entrega (lo que hay que cumplir):")
+        for c in criterios:
+            self.ui.tenue(f"    • {recortar(c, 90)}")
+        sin_cubrir = cobertura_criterios(criterios, plan)
+        if sin_cubrir:
+            self.ui.aviso("  Juez · el plan todavía no parece cubrir: "
+                          + "; ".join(recortar(c, 60) for c in sin_cubrir))
+
     def _juicio_de_entrega(self, pedido: str, plan: Plan, verif: Verificacion, informe: InformeBuild) -> None:
         """8.º agente (JUEZ DE ENTREGA): compara lo entregado contra el PEDIDO y solo puede ENDURECER el estado.
 
@@ -1184,7 +1230,7 @@ class Orquestador:
         if informe.estado not in ("verificada", "validada"):
             return  # la build ya está en rojo/parcial: el juez solo endurece, no hay verde que revisar
         diff = self.ws.checkpoints.diff_desde(informe.cid) if informe.cid else ""
-        criterios = "\n".join(f"- {c}" for c in plan.criterios) or "- (derivalos del pedido)"
+        criterios = "\n".join(f"- {c}" for c in (informe.criterios_entrega or plan.criterios)) or "- (derivalos del pedido)"
         evidencia = {
             "EV-ESTADO": f"estado por verificación real: {informe.estado}; tareas fallidas: "
                          f"{', '.join(informe.tareas_fallidas) or 'ninguna'}; bloqueadas: "
@@ -1220,6 +1266,41 @@ class Orquestador:
             self.ui.aviso("  El juez de entrega observa que el pedido NO quedó cumplido: marco la build como parcial.")
         elif not juicio.cumple:
             informe.notas.append("Juez de entrega: duda de que se cumpla el pedido (confianza baja); lo dejo como aviso.")
+
+    def _debe_intervenir_juez(self, informe: InformeBuild, maximo: int) -> bool:
+        """¿El juez debe intervenir para cerrar? Solo si dio un veredicto VÁLIDO de NO cumple con confianza
+        media/alta, hay faltantes concretos, quedan intervenciones y la build no está en rojo."""
+        j = informe.juicio
+        return bool(j is not None and j.valido and not j.cumple and j.confianza in ("medium", "high")
+                    and j.faltantes and informe.intervenciones_juez < maximo
+                    and informe.estado in ("verificada", "validada", "parcial"))
+
+    def _cerrar_con_juez(self, pedido: str, plan: Plan, verif: Verificacion, informe: InformeBuild,
+                         grupo: int, base_fallaba: bool) -> Verificacion:
+        """Motor central, paso final: si el juez dice que falta algo, INTERVIENE — el reparador implementa los
+        faltantes, se re-verifica DE VERDAD y el juez vuelve a juzgar. Acotado por juez_max_intervenciones; solo
+        gasta tokens cuando realmente faltaba algo. Nunca declara verde sin que la verificación real lo confirme."""
+        maximo = max(0, int(getattr(self.settings, "juez_max_intervenciones", 1)))
+        while self._debe_intervenir_juez(informe, maximo):
+            if PLAZO.vencido():
+                informe.notas.append("Juez: no intervengo más; se agotó el tiempo.")
+                break
+            faltantes = list(informe.juicio.faltantes)
+            informe.intervenciones_juez += 1
+            self.ui.info(f"  Juez · intervención {informe.intervenciones_juez}: completar lo que falta "
+                         f"({'; '.join(recortar(f, 50) for f in faltantes[:3])})")
+            diag = ("El JUEZ DE ENTREGA detecta que el pedido NO quedó cumplido. Implementá EXACTAMENTE lo que "
+                    "falta, sin romper lo que ya anda:\n" + "\n".join(f"- {f}" for f in faltantes))
+            verif_sint = replace(verif, ok=False, diagnostico=diag)
+            verif = self._reparar_con_escalada(pedido, verif_sint, grupo, base_fallaba, informe,
+                                               f"cierre-juez {informe.intervenciones_juez}", 2,
+                                               lambda: self.verificar(grupo), contexto=diag)
+            informe.estado = estado_final_build(verif, informe)
+            informe.juicio = None
+            self._juicio_de_entrega(pedido, plan, verif, informe)
+        if informe.intervenciones_juez and informe.juicio is not None and informe.juicio.cumple:
+            informe.notas.append(f"Juez: el pedido quedó cumplido tras {informe.intervenciones_juez} intervención(es).")
+        return verif
 
     # ------------------------------------------------------------ flujos
     def _mostrar_plan(self, plan: Plan) -> None:
@@ -1463,6 +1544,17 @@ class Orquestador:
 
         informe = InformeBuild("fallida", plan=plan, cid=grupo)
 
+        # Motor central: el juez fija el CONTRATO (criterios del pedido) antes de construir. En reanudación se
+        # reutiliza el que ya quedó en el diario: no se gasta otra llamada.
+        if not reanudar:
+            informe.criterios_entrega = self._contrato_de_entrega(pedido)
+            if informe.criterios_entrega:
+                previo["criterios_entrega"] = informe.criterios_entrega
+                registro_build.guardar(previo)
+                self._mostrar_contrato(informe.criterios_entrega, plan)
+        else:
+            informe.criterios_entrega = list(previo.get("criterios_entrega", []))
+
         testeable = _es_testeable(plan.archivos(), self.ws.archivos_codigo(limite=200))
         numero_fase = 3
         if not reanudar:
@@ -1650,6 +1742,8 @@ class Orquestador:
         informe.estado = estado_final_build(verif, informe)
         # 8.º agente: el juez de entrega puede bajar de verde a parcial si el pedido no quedó cumplido (nunca sube).
         self._juicio_de_entrega(pedido, plan, verif, informe)
+        # Motor central: si falta algo del pedido, el juez interviene para cerrarlo (acotado) y vuelve a juzgar.
+        verif = self._cerrar_con_juez(pedido, plan, verif, informe, grupo, base_fallaba)
         if informe.estado == "parcial":
             if informe.tareas_bloqueadas or informe.tareas_fallidas:
                 informe.notas.append("Verificación final verde, pero hay tareas fallidas/bloqueadas sin completar.")

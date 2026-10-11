@@ -241,6 +241,22 @@ class Juicio:
         return f"Juez de entrega: NO CUMPLE (confianza {self.confianza}) · falta: {falta}"
 
 
+def parsear_criterios_entrega(texto: str, maximo: int = 8) -> list:
+    """Criterios de aceptación que el juez derivó del pedido (contrato). Lista de strings, acotada y deduplicada."""
+    datos = extraer_json_x(texto)
+    if not isinstance(datos, dict):
+        return []
+    salida, vistos = [], set()
+    for c in _lista_str(datos.get("criterios")):
+        clave = c.lower()
+        if clave not in vistos:
+            vistos.add(clave)
+            salida.append(c[:200])
+        if len(salida) >= maximo:
+            break
+    return salida
+
+
 def parsear_juicio(texto: str, evidencia: Optional[dict] = None) -> Juicio:
     """Veredicto del juez desde su JSON. Si la evidencia muestra la build roja/parcial, nunca se acepta 'cumple'."""
     datos = extraer_json_x(texto)

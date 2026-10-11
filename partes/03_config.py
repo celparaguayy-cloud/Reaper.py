@@ -215,6 +215,9 @@ class Settings:
     # Juez de entrega (8.º agente): al cerrar /construir compara lo entregado contra el pedido y solo puede
     # ENDURECER el estado (verificada/validada → parcial si falta algo); nunca convierte una build roja en verde.
     juez: bool = True
+    # Cuántas veces el juez puede INTERVENIR para cerrar: si al final falta algo del pedido, dispara una pasada
+    # de reparación hacia los faltantes y vuelve a juzgar. 0 = solo avisa, no interviene. Acotado para no entrar en bucle.
+    juez_max_intervenciones: int = 1
     proveedor: str = "openrouter"
     api_url: str = ""
 
