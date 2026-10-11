@@ -311,3 +311,24 @@ Caso real: en `mi_script` los tests pasaban y `python -m mi_script` daba `No mod
 Se apaga con `verificar_arranque=false`.
 
 Cobertura: `TestJuezArmaEquipo` (7) y `TestArranqueReal` (7).
+
+## 15. El juez: el que más hace y el que menos gasta (examen de realidad)
+
+El juez ahora resuelve lo máximo posible **sin llamar al modelo** y solo usa tokens para el juicio de sentido que
+de verdad lo necesita. Lo nuevo:
+
+- **Examen de realidad** (`examen_de_realidad`, AST, 0 tokens) sobre lo que cambió en la build:
+  - funciones que el plan pidió (`def nombre` en la interfaz o las tareas) y quedaron **vacías** (`pass`, `...`,
+    solo docstring), y cualquier **`raise NotImplementedError`** fuera de métodos abstractos;
+  - **tests que no prueban nada**: tautologías (`assert True`, `x == x`), sin ningún assert, que mockean justo lo
+    que deberían probar o que esperan el valor que inyectó el propio mock (reusa el analizador de calidad de tests).
+  No marca cuerpos vacíos legítimos: métodos abstractos, sobrecargas, Protocols, `__init__`/`__exit__` vacíos ni
+  hooks que el plan no pidió.
+- **Veredicto determinista**: si el examen encuentra algo, el juez decide `NO CUMPLE` **sin llamar al modelo**
+  (marcado "determinista, 0 tokens") y su bucle de intervención manda al reparador a implementarlo de verdad, re-
+  verifica y vuelve a juzgar. Solo si todo es real consulta al modelo, y le pasa `EV-REAL` como evidencia.
+- **Cuenta de tokens del juez**: el cierre de cada build muestra cuánto gastó el juez y qué % de la build fue
+  (`⚖ juez: ~N tokens (X% de la build)`, o `0 tokens · decidió con evidencia local`).
+
+Cobertura: `TestJuezRealidad` (9), incluida una build de punta a punta donde el implementador deja vacía la función
+pedida: el juez lo detecta gratis, interviene, queda implementada y el juez gasta menos que la build.
