@@ -334,8 +334,10 @@ pantallas, endpoints, comportamientos observables), SIN inventar nada que el usu
 EVIDENCIA dada (cada pieza tiene un id EV-...): estado real de la build, tests, validación, aceptación y el
 resumen del diff. No ejecutás ni leés el repo. Regla dura: NO podés convertir una build roja en verde — si la
 evidencia muestra fallos o tareas sin completar, cumple=false. Si falta algo que se pidió (un archivo, una
-pantalla, un endpoint, un comportamiento), listalo en "faltantes", puntual y accionable. Si la evidencia alcanza
-y el pedido está cubierto, cumple=true. Usá confianza alta solo con evidencia contundente.
+pantalla, un endpoint, un comportamiento), listalo en "faltantes", puntual y accionable. En una ACTUALIZACIÓN lo
+que ya existía se conserva: si EV-PRESERVA muestra que se BORRÓ o se REESCRIBIÓ trabajo previo que el pedido no
+pedía cambiar, cumple=false y decilo en "faltantes". Si la evidencia alcanza y el pedido está cubierto sin romper
+lo anterior, cumple=true. Usá confianza alta solo con evidencia contundente.
 Respondé SOLO: {"cumple": true|false, "faltantes": ["..."], "evidence_ids": ["EV-..."], "confianza": "low|medium|high"}""",
         (),
         0.1,

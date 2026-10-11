@@ -222,6 +222,94 @@ class TestJuezCierra(BaseTest):
         self.assertEqual(informe.estado, "parcial")                  # el juez igual bajó a parcial
 
 
+class TestPreservarTrabajoPrevio(BaseTest):
+    """En una ACTUALIZACIÓN, lo que ya existía antes de la build no se borra ni se reescribe por accidente."""
+
+    def _actualizacion(self, archivos):
+        ws = self.proyecto(archivos)
+        orq = Orquestador(MockLLM([]), ws, self.ajustes(), self.ui())
+        orq._protegidos = {}
+        return orq, ws, ws.checkpoints.iniciar("construir: actualización")
+
+    def _verif(self, orq, tcid, declarados, build):
+        return orq._verificar_tarea(tcid, ConteoTests(), set(), verificar_entrega=True,
+                                    archivos_esperados=declarados, cid_build=build)
+
+    def test_lineas_borradas(self):
+        self.assertEqual(_lineas_borradas("a\nb\n", "a\nb\nc\n"), (0, 2))      # agregar no cuenta
+        self.assertEqual(_lineas_borradas("a\nb\n", "a\nB\n"), (1, 2))         # cambiar una línea cuenta
+        self.assertEqual(_lineas_borradas("a\n\nb\n", ""), (2, 2))             # las vacías no cuentan
+
+    def test_borrar_archivo_previo_no_declarado(self):
+        orq, ws, build = self._actualizacion({"viejo.py": "A = 1\n"})
+        t = ws.checkpoints.iniciar("tarea 1", grupo=build)
+        ws.escribir("nuevo.py", "N = 1\n")
+        ws.borrar("viejo.py")                                                   # no le correspondía
+        verif = self._verif(orq, t, ["nuevo.py"], build)
+        self.assertFalse(verif.ok)
+        self.assertIn("BORRÓ TRABAJO PREVIO", verif.diagnostico)
+
+    def test_vaciar_archivo_previo_no_declarado(self):
+        previo = "def a():\n    return 1\n\ndef b():\n    return 2\n\ndef c():\n    return 3\n"
+        orq, ws, build = self._actualizacion({"util.py": previo})
+        t = ws.checkpoints.iniciar("tarea 1", grupo=build)
+        ws.escribir("nuevo.py", "N = 1\n")
+        ws.escribir("util.py", "def a():\n    return 1\n")                     # perdió b() y c()
+        verif = self._verif(orq, t, ["nuevo.py"], build)
+        self.assertFalse(verif.ok)
+        self.assertIn("MODIFICÓ TRABAJO PREVIO", verif.diagnostico)
+
+    def test_edicion_chica_en_archivo_previo_pasa(self):
+        orq, ws, build = self._actualizacion({"main.py": "import os\n\nprint('hola')\n"})
+        t = ws.checkpoints.iniciar("tarea 1", grupo=build)
+        ws.escribir("nuevo.py", "N = 1\n")
+        ws.escribir("main.py", "import os\nimport nuevo\n\nprint('hola')\n")   # solo agrega un import
+        verif = self._verif(orq, t, ["nuevo.py"], build)
+        self.assertTrue(verif.ok, verif.diagnostico)
+
+    def test_reescritura_destructiva_de_archivo_declarado(self):
+        previo = "".join(f"def f{i}():\n    return {i}\n" for i in range(10))
+        orq, ws, build = self._actualizacion({"app.py": previo})
+        t = ws.checkpoints.iniciar("tarea 1", grupo=build)
+        ws.escribir("app.py", "def nueva():\n    return 0\n")                 # lo rehízo de cero
+        verif = self._verif(orq, t, ["app.py"], build)
+        self.assertFalse(verif.ok)
+        self.assertIn("REESCRITURA DESTRUCTIVA", verif.diagnostico)
+
+    def test_extender_archivo_declarado_pasa(self):
+        previo = "".join(f"def f{i}():\n    return {i}\n" for i in range(10))
+        orq, ws, build = self._actualizacion({"app.py": previo})
+        t = ws.checkpoints.iniciar("tarea 1", grupo=build)
+        ws.escribir("app.py", previo + "def nueva():\n    return 0\n")         # agrega sin perder nada
+        verif = self._verif(orq, t, ["app.py"], build)
+        self.assertTrue(verif.ok, verif.diagnostico)
+
+    def test_lo_creado_en_esta_build_no_esta_protegido(self):
+        orq, ws, build = self._actualizacion({"README.md": "# x\n"})
+        ws.checkpoints.iniciar("tarea 1", grupo=build)
+        ws.escribir("modulo.py", "".join(f"L{i} = {i}\n" for i in range(10)))
+        t2 = ws.checkpoints.iniciar("tarea 2", grupo=build)
+        ws.escribir("modulo.py", "X = 1\n")                                   # misma actualización: se puede
+        verif = self._verif(orq, t2, ["modulo.py"], build)
+        self.assertTrue(verif.ok, verif.diagnostico)
+
+    def test_resumen_preservacion_para_el_juez(self):
+        orq, ws, build = self._actualizacion({"viejo.py": "A = 1\n"})
+        self.assertIn("solo se agregó trabajo nuevo", resumen_preservacion(ws, build))
+        ws.checkpoints.iniciar("tarea", grupo=build)
+        ws.escribir("nuevo.py", "N = 1\n")
+        self.assertIn("solo se agregó trabajo nuevo", resumen_preservacion(ws, build))   # lo nuevo no es previo
+        ws.borrar("viejo.py")
+        self.assertIn("BORRADOS: viejo.py", resumen_preservacion(ws, build))
+
+    def test_el_juez_recibe_la_evidencia_de_preservacion(self):
+        llm = MockLLM(lambda m, k: '{"cumple": true, "confianza": "high"}' if k.get("rol") == "juez" else "{}")
+        orq = Orquestador(llm, self.proyecto(), self.ajustes(), self.ui())
+        orq._juicio_de_entrega("pedido", _plan_web(), _verif_ok(), InformeBuild("verificada"))
+        prompt = next(c for c in llm.llamadas if c.get("rol") == "juez")["mensajes"][-1]["content"]
+        self.assertIn("EV-PRESERVA", prompt)
+
+
 class TestTrabajosChicos(BaseTest):
     """Una página estática no debería disparar 'tests primero' y trabarse: eso rompía trabajos chicos."""
     def test_web_estatica_no_fuerza_tests_primero(self):

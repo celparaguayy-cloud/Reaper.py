@@ -218,8 +218,10 @@ only the essentials. Reply ONLY: {"criterios": ["concrete, verifiable criterion"
 EVIDENCE given (each piece has an EV-... id): real build state, tests, validation, acceptance and the diff summary.
 You run nothing and do not read the repo. Hard rule: you CANNOT turn a red build green — if the evidence shows
 failures or unfinished tasks, cumple=false. If something the request asked for is missing (a file, a screen, an
-endpoint, a behavior), list it under "faltantes", specific and actionable. If the evidence is enough and the
-request is covered, cumple=true. Use high confidence only when the evidence is conclusive.
+endpoint, a behavior), list it under "faltantes", specific and actionable. In an UPDATE, what already existed must
+be kept: if EV-PRESERVA shows previous work was DELETED or REWRITTEN that the request did not ask to change,
+cumple=false and say so in "faltantes". If the evidence is enough and the request is covered without breaking what
+was there, cumple=true. Use high confidence only when the evidence is conclusive.
 Reply ONLY: {"cumple": true|false, "faltantes": ["..."], "evidence_ids": ["EV-..."], "confianza": "low|medium|high"}""",
 }
 

@@ -52,6 +52,50 @@ def _es_testeable(archivos_plan: list, archivos_ws: list) -> bool:
     return not archivos_plan and not archivos_ws
 
 
+def _lineas_borradas(antes: str, ahora: str) -> tuple:
+    """(borradas, total_previas) sobre líneas no vacías: cuántas líneas del contenido previo YA NO están.
+    Agregar no cuenta; cambiar una línea cuenta como una borrada (la versión vieja desapareció)."""
+    previas = [l for l in (antes or "").splitlines() if l.strip()]
+    quedan = collections.Counter(l for l in (ahora or "").splitlines() if l.strip())
+    borradas = 0
+    for linea in previas:
+        if quedan[linea] > 0:
+            quedan[linea] -= 1
+        else:
+            borradas += 1
+    return borradas, len(previas)
+
+
+def resumen_preservacion(ws, cid_build: Optional[int]) -> str:
+    """Determinista: qué pasó con el trabajo que YA EXISTÍA antes de esta actualización (evidencia para el juez)."""
+    if cid_build is None:
+        return "sin datos"
+    modificados, borrados, reescritos = [], [], []
+    for rel in ws.checkpoints.archivos_desde(cid_build):
+        antes = ws.checkpoints.original(rel, cid_build)
+        if antes is None:
+            continue                                   # nació en esta actualización: no es trabajo previo
+        ruta = ws.raiz / rel
+        if not ruta.is_file():
+            borrados.append(rel)
+            continue
+        ahora = ruta.read_text(encoding="utf-8", errors="replace")
+        if ahora == antes:
+            continue
+        modificados.append(rel)
+        borradas, total = _lineas_borradas(antes, ahora)
+        if total and borradas >= 8 and borradas / total >= 0.6:
+            reescritos.append(f"{rel} ({borradas}/{total} líneas previas borradas)")
+    if not (modificados or borrados):
+        return "no se tocó ningún archivo previo: solo se agregó trabajo nuevo"
+    partes = [f"archivos previos modificados: {', '.join(modificados[:8]) or 'ninguno'}"]
+    if borrados:
+        partes.append(f"BORRADOS: {', '.join(borrados[:8])}")
+    if reescritos:
+        partes.append(f"REESCRITOS casi por completo: {'; '.join(reescritos[:5])}")
+    return "; ".join(partes)
+
+
 def _palabras_clave(texto: str) -> set:
     return {p for p in re.findall(r"[a-záéíóúñ0-9/._-]{4,}", (texto or "").lower())}
 
@@ -1247,6 +1291,8 @@ class Orquestador:
             "EV-VALID": resumen_validacion(verif.validaciones, limite=600),
             "EV-ACEPTACION": (verif.aceptacion.resumen(600) if verif.aceptacion is not None else "no configurada"),
             "EV-DIFF": _diffstat(diff) or "(sin cambios)",
+            # Qué pasó con lo que ya existía antes de esta actualización (determinista, 0 tokens extra de cálculo).
+            "EV-PRESERVA": resumen_preservacion(self.ws, informe.cid),
         }
         bloque = "\n".join(f"{k}: {v}" for k, v in evidencia.items())
         prompt = (f"PEDIDO DEL USUARIO:\n{recortar(pedido, 1200)}\n\nOBJETIVO DEL PLAN: {recortar(plan.objetivo, 300)}\n\n"
@@ -1401,6 +1447,35 @@ class Orquestador:
                     "DESVÍO: la tarea declaró trabajar en " + ", ".join(declarados[:6])
                     + " pero no tocó ninguno de esos archivos; cambió " + ", ".join(archivos[:6])
                     + ". Implementá EXACTAMENTE lo pedido en sus archivos, no otra cosa.")
+            # PRESERVAR TRABAJO PREVIO: en una actualización, lo que ya existía ANTES de esta build no se borra ni se
+            # reescribe por accidente. Agregar está bien; borrar un archivo previo que la tarea no declaró, o perder
+            # buena parte de su contenido, no. Los archivos creados en esta misma build no cuentan (se construyen
+            # unos sobre otros). Ediciones chicas (un import, una línea) pasan.
+            if cid_build is not None:
+                for rel in self.ws.checkpoints.archivos_desde(tcid):
+                    if self.ws.checkpoints.original(rel, cid_build) is None:
+                        continue                               # nació en esta actualización
+                    antes_tarea = self.ws.checkpoints.original(rel, tcid)
+                    if antes_tarea is None:
+                        continue
+                    declarado = rel in declarados
+                    ruta = self.ws.raiz / rel
+                    if not ruta.is_file():
+                        if not declarado:
+                            problemas.append(f"BORRÓ TRABAJO PREVIO: eliminó {rel}, que ya existía antes de esta "
+                                             f"actualización y la tarea no lo pedía. Restauralo.")
+                        continue
+                    borradas, total = _lineas_borradas(antes_tarea, ruta.read_text(encoding="utf-8",
+                                                                                    errors="replace"))
+                    if not total:
+                        continue
+                    fraccion = borradas / total
+                    if (not declarado and borradas >= 3 and fraccion >= 0.2) or \
+                            (declarado and borradas >= 8 and fraccion >= 0.6):
+                        tipo = "REESCRITURA DESTRUCTIVA" if declarado else "MODIFICÓ TRABAJO PREVIO"
+                        problemas.append(
+                            f"{tipo}: borró {borradas} de {total} líneas ({fraccion:.0%}) que ya había en {rel} antes "
+                            f"de esta actualización. Extendé el archivo sin perder lo que ya hacía.")
         if tests is not None and not tests.ok and conteo.reconocido:
             # Los tests de la especificación de tareas siguientes fallan a propósito: no son regresión.
             nuevos_fallos = [n for n in conteo.nombres_fallados
