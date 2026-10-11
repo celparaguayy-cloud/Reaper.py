@@ -61,5 +61,6 @@ roles de apoyo no fatales) y pytest abortaba la colección (corregido: `--contin
 
 ## Evidencia
 
-`python3 reaper_v8.py --autotest` → 736 tests OK en Python 3.11, 3.12 y 3.13 (sin red, transportes simulados).
+`python3 reaper_v8.py --autotest` → 772 tests OK en Python 3.11, 3.12 y 3.13 (sin red, transportes simulados).
 Smoke test de los 76 comandos (556 invocaciones): 0 excepciones, 0 archivos escritos fuera del proyecto.
+Ver `REAPER_CAZA_BUGS.md` para la bitácora de la caza de bugs críticos (fugas de secretos y pérdida de datos).
