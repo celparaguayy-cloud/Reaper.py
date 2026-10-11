@@ -212,6 +212,9 @@ class Settings:
     respaldo_equipo: bool = True
     # REAPER X: equipo de 10 roles (director, supervisor, integrador, seguridad defensiva, auditor de entrega)
     roles_x: bool = False
+    # Juez de entrega (8.º agente): al cerrar /construir compara lo entregado contra el pedido y solo puede
+    # ENDURECER el estado (verificada/validada → parcial si falta algo); nunca convierte una build roja en verde.
+    juez: bool = True
     proveedor: str = "openrouter"
     api_url: str = ""
 

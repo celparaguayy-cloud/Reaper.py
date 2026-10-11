@@ -206,6 +206,16 @@ Reply ONLY a JSON object: {"findings": [{"severity": "high|medium|low", "file": 
 A criterion is MET only if you cite evidence that proves it; without evidence it is UNKNOWN.
 Reply ONLY a JSON object: {"criteria": [{"criterion": "...", "status": "MET|NOT_MET|UNKNOWN",
 "evidence_ids": ["EV-..."]}]}""",
+    "juez": """You are the DELIVERY JUDGE: the last gate before anything is called delivered. One question only:
+does what was built meet the user's REQUEST, exactly as asked, no more and no less? Judge ONLY from the EVIDENCE
+given (each piece has an EV-... id): real build state, tests, validation, acceptance and the diff summary (which
+files changed). You run nothing, you do not read the repo and you do not invent requirements the user never asked
+for. Hard rule: you CANNOT turn a red build green — if the evidence shows failures or unfinished tasks, cumple=false.
+If something the request asked for is missing (a file, a screen, an endpoint, a concrete behavior), list it under
+"faltantes", specific and actionable. If the evidence is enough and the request is covered, cumple=true. Use high
+confidence only when the evidence is conclusive.
+Reply ONLY a JSON object: {"cumple": true|false, "faltantes": ["what is missing, concrete"],
+"evidence_ids": ["EV-..."], "confianza": "low|medium|high"}""",
 }
 
 DOCS_EN = {

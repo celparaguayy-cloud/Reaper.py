@@ -1338,6 +1338,20 @@ class App:
                           "defensiva y auditor de entrega a /construir. El estado final lo sigue decidiendo la "
                           "verificación real. /equipo x on | /equipo x preset | /equipo x off")
             sub = ""
+        if sub.startswith("juez"):
+            partes_j = sub.split()
+            opcion = partes_j[1] if len(partes_j) > 1 else ""
+            if opcion in ("on", "off", "si", "sí", "no"):
+                self.settings.juez = opcion not in ("off", "no")
+                self._guardar_settings()
+            ej = estado_juez(self.settings)
+            marca = "✓ clave" if ej["tiene_clave"] else "⚠ FALTA CLAVE"
+            self.ui.ok(f"Juez de entrega (8.º agente): {'ON' if ej['activo'] else 'OFF'}")
+            self.ui.info(f"  juez → {ej['proveedor']}/{ej.get('modelo_real') or ej['modelo']}   {marca}")
+            self.ui.tenue("  Al cerrar /construir compara lo entregado contra tu pedido y SOLO puede bajar de verde a "
+                          "parcial (nunca sube un rojo a verde). Bajo costo: entrada compacta + veredicto JSON corto.")
+            self.ui.tenue("  Asignarle modelo: /modelo juez <alias> · apagarlo: /equipo juez off")
+            return
         estado = estado_equipo(self.settings)
         ind = independencia_equipo(estado)
         if sub in ("independencia", "independence"):
@@ -1378,6 +1392,11 @@ class App:
         for e in estado:
             marca = "✓ clave" if e["tiene_clave"] else "⚠ FALTA CLAVE"
             self.ui.info(f"  {e['rol']:<13} → {e['proveedor']}/{e.get('modelo_real') or e['modelo']}   {marca}")
+        ej = estado_juez(self.settings)
+        if ej["activo"]:
+            marca = "✓ clave" if ej["tiene_clave"] else "⚠ FALTA CLAVE"
+            self.ui.info(f"  {'juez (8.º)':<13} → {ej['proveedor']}/{ej.get('modelo_real') or ej['modelo']}   {marca}"
+                         "   · control final del pedido")
         self.ui.tenue(f"  proveedores distintos: {ind['proveedores_distintos']} · "
                       f"modelos distintos: {ind['modelos_distintos']}"
                       + ("  · independencia REDUCIDA" if ind["reducida"] else ""))

@@ -40,6 +40,18 @@ _RE_VEREDICTO = re.compile(r"VEREDICTO\s*:?\s*\**\s*(APROBADO|CAMBIOS|RECHAZADO)
 EXTENSIONES_TESTEABLES = (".py", ".js", ".mjs", ".cjs", ".ts")
 
 
+def _es_testeable(archivos_plan: list, archivos_ws: list) -> bool:
+    """¿Tiene sentido 'tests primero'? Sí si hay lógica (.py/.js/.ts) en el plan o en el proyecto, o si el proyecto
+    está vacío y el plan TODAVÍA no nombra archivos (no sabemos qué construirá, así que no bajamos la guardia).
+    NO para un plan que solo produce assets estáticos (.html/.css): escribir 'tests ejecutables' para una página
+    estática no aporta y traba trabajos chicos ('construí una web') en modelos flojos. La validación igual corre."""
+    if any(a.endswith(EXTENSIONES_TESTEABLES) for a in archivos_plan):
+        return True
+    if any(a.endswith(EXTENSIONES_TESTEABLES) for a in archivos_ws):
+        return True
+    return not archivos_plan and not archivos_ws
+
+
 @dataclass
 class Tarea:
     id: str
@@ -420,6 +432,7 @@ class InformeBuild:
     segundos: float = 0.0
     tareas_fallidas: list = field(default_factory=list)    # quedaron con fallos tras reparar
     tareas_bloqueadas: list = field(default_factory=list)  # no se ejecutaron: dependen de una fallida
+    juicio: Optional["Juicio"] = None                      # veredicto del 8.º agente (juez de entrega)
 
     @property
     def ok(self) -> bool:
@@ -1069,7 +1082,7 @@ class Orquestador:
         return verif
 
     # ------------------------------------------------------------ REAPER X (10 roles)
-    def _consultar_rol_x(self, rol: str, prompt: str) -> tuple:
+    def _consultar_rol_x(self, rol: str, prompt: str, max_tokens: int = 1500) -> tuple:
         """
         Rol de dirección/auditoría por TEXTO (sin herramientas): devuelve (texto|None, modelo_pedido, modelo_servido).
         Si respondió otro modelo (respaldo del equipo), se declara: nada de degradación silenciosa.
@@ -1079,7 +1092,7 @@ class Orquestador:
                     {"role": "user", "content": prompt}]
         try:
             resp = self.llm.chat(mensajes, modelo=pedido_modelo, temperatura=ROLES[rol].temperatura,
-                                 max_tokens=1500, rol=rol)
+                                 max_tokens=max_tokens, rol=rol)
         except LLMError as e:
             if e.presupuesto:
                 raise
@@ -1158,6 +1171,55 @@ class Orquestador:
             self.ui.tenue("  " + dictamen.texto())
             informe.estado, notas = estado_controlado(informe.estado, dictamen)
             informe.notas.extend(notas)
+
+    def _juicio_de_entrega(self, pedido: str, plan: Plan, verif: Verificacion, informe: InformeBuild) -> None:
+        """8.º agente (JUEZ DE ENTREGA): compara lo entregado contra el PEDIDO y solo puede ENDURECER el estado.
+
+        Nunca convierte una build roja en verde. Entrada compacta (diffstat, no el diff entero) y un veredicto JSON
+        chico: consume MUCHOS menos tokens que los roles que escriben o razonan. Si el modelo no responde o contesta
+        fuera de contrato, NO cambia el estado (no inventamos ni un éxito ni un fracaso).
+        """
+        if not getattr(self.settings, "juez", True):
+            return
+        if informe.estado not in ("verificada", "validada"):
+            return  # la build ya está en rojo/parcial: el juez solo endurece, no hay verde que revisar
+        diff = self.ws.checkpoints.diff_desde(informe.cid) if informe.cid else ""
+        criterios = "\n".join(f"- {c}" for c in plan.criterios) or "- (derivalos del pedido)"
+        evidencia = {
+            "EV-ESTADO": f"estado por verificación real: {informe.estado}; tareas fallidas: "
+                         f"{', '.join(informe.tareas_fallidas) or 'ninguna'}; bloqueadas: "
+                         f"{', '.join(informe.tareas_bloqueadas) or 'ninguna'}",
+            "EV-TESTS": (verif.conteo.texto() if verif.conteo.reconocido else
+                         ("sin suite de tests" if verif.tests is None else f"exit {verif.tests.codigo}")),
+            "EV-VALID": resumen_validacion(verif.validaciones, limite=600),
+            "EV-ACEPTACION": (verif.aceptacion.resumen(600) if verif.aceptacion is not None else "no configurada"),
+            "EV-DIFF": _diffstat(diff) or "(sin cambios)",
+        }
+        bloque = "\n".join(f"{k}: {v}" for k, v in evidencia.items())
+        prompt = (f"PEDIDO DEL USUARIO:\n{recortar(pedido, 1200)}\n\nOBJETIVO DEL PLAN: {recortar(plan.objetivo, 300)}\n\n"
+                  f"CRITERIOS DE ACEPTACIÓN:\n{criterios}\n\nEVIDENCIA:\n{bloque}\n\n"
+                  f"¿La entrega cumple el pedido tal como se pidió?")
+        texto, _pedido_m, _servido = self._consultar_rol_x("juez", prompt, max_tokens=400)
+        if texto is None:
+            informe.notas.append("Juez de entrega: el modelo no respondió; sin veredicto (no se cambió el estado).")
+            return
+        juicio = parsear_juicio(texto, evidencia)
+        informe.juicio = juicio
+        self.ui.tenue("  " + juicio.texto())
+        if not juicio.valido:
+            informe.notas.append("Juez de entrega: respuesta fuera de contrato; veredicto descartado.")
+            return
+        informe.notas.append(juicio.texto())
+        for f in juicio.faltantes[:6]:
+            informe.notas.append(f"Falta según el juez: {f}")
+        # Gate en dirección segura: solo baja de verde a parcial. Pide confianza media/alta para no castigar
+        # por el ruido de un modelo débil; un 'no cumple' dudoso queda como nota, no como veredicto.
+        if (not juicio.cumple and juicio.confianza in ("medium", "high")
+                and informe.estado in ("verificada", "validada")):
+            informe.estado = "parcial"
+            self.ui.aviso("  El juez de entrega observa que el pedido NO quedó cumplido: marco la build como parcial.")
+        elif not juicio.cumple:
+            informe.notas.append("Juez de entrega: duda de que se cumpla el pedido (confianza baja); lo dejo como aviso.")
 
     # ------------------------------------------------------------ flujos
     def _mostrar_plan(self, plan: Plan) -> None:
@@ -1401,8 +1463,7 @@ class Orquestador:
 
         informe = InformeBuild("fallida", plan=plan, cid=grupo)
 
-        testeable = any(a.endswith(EXTENSIONES_TESTEABLES) for a in plan.archivos()) or any(
-            a.endswith(EXTENSIONES_TESTEABLES) for a in self.ws.archivos_codigo(limite=200)) or not self.ws.archivos_codigo(limite=5)
+        testeable = _es_testeable(plan.archivos(), self.ws.archivos_codigo(limite=200))
         numero_fase = 3
         if not reanudar:
             # Proteger los tests que YA existían en el proyecto: ni el implementador ni un candidato del torneo
@@ -1587,8 +1648,11 @@ class Orquestador:
         informe.aceptacion = verif.aceptacion
         informe.diagnostico = verif.diagnostico
         informe.estado = estado_final_build(verif, informe)
+        # 8.º agente: el juez de entrega puede bajar de verde a parcial si el pedido no quedó cumplido (nunca sube).
+        self._juicio_de_entrega(pedido, plan, verif, informe)
         if informe.estado == "parcial":
-            informe.notas.append("Verificación final verde, pero hay tareas fallidas/bloqueadas sin completar.")
+            if informe.tareas_bloqueadas or informe.tareas_fallidas:
+                informe.notas.append("Verificación final verde, pero hay tareas fallidas/bloqueadas sin completar.")
         elif informe.ok:
             if self.settings.git_snapshots and es_repo_git(self.ws):
                 try:
@@ -1703,9 +1767,12 @@ class Orquestador:
         if informe.lecciones:
             datos.append(f"{len(informe.lecciones)} lección(es)")
         lineas = [f"{color}{subt}{C.RESET}", f"{Tema.tenue}{' · '.join(datos)}{C.RESET}"]
-        if informe.estado == "parcial":
+        if informe.estado == "parcial" and (informe.tareas_fallidas or informe.tareas_bloqueadas):
             lineas.append(f"{Tema.aviso}fallidas: {', '.join(informe.tareas_fallidas) or '—'} · "
                           f"bloqueadas: {', '.join(informe.tareas_bloqueadas) or '—'}{C.RESET}")
+        if informe.juicio is not None and informe.juicio.valido and not informe.juicio.cumple:
+            faltan = "; ".join(informe.juicio.faltantes[:3]) or "sin detalle"
+            lineas.append(f"{Tema.aviso}juez: no cumple el pedido → {recortar(faltan, 90)}{C.RESET}")
         if informe.commit:
             lineas.append(f"{Tema.ok}git {informe.commit[:10]} · rama {self.settings.rama_git}{C.RESET}")
         self.ui.linea("")

@@ -33,6 +33,18 @@ def estado_equipo(settings) -> list:
     return salida
 
 
+def estado_juez(settings) -> dict:
+    """El 8.º agente: el JUEZ DE ENTREGA. Va aparte de los 6 trabajadores porque es el control final, no un obrero."""
+    modelo = settings.modelo_para("juez")
+    destino = destino_modelo(modelo, settings)
+    try:
+        tiene = bool(clave_de_proveedor(destino.proveedor, replace(settings, proveedor=destino.proveedor)))
+    except (TypeError, ValueError):
+        tiene = False
+    return {"rol": "juez", "activo": bool(getattr(settings, "juez", True)), "modelo": modelo,
+            "modelo_real": destino.modelo, "proveedor": destino.proveedor, "tiene_clave": tiene}
+
+
 def validar_configuracion(settings) -> list:
     """
     Revisa la config de modelos/equipo SIN tocar la red (la conectividad real la da /equipo probar). Devuelve
@@ -198,7 +210,8 @@ def resumen_arranque_equipo(settings) -> str:
     ind = independencia_equipo(estado)
     con_clave = sum(1 for e in estado if e["tiene_clave"])
     aviso = "" if con_clave == len(estado) else f" · {len(estado) - con_clave} sin clave"
-    return (f"{len(estado)} roles → {ind['modelos_distintos']} modelo(s)/{ind['proveedores_distintos']} prov{aviso}"
+    juez = " + juez" if getattr(settings, "juez", True) else ""
+    return (f"{len(estado)} roles{juez} → {ind['modelos_distintos']} modelo(s)/{ind['proveedores_distintos']} prov{aviso}"
             f" · conectividad NO VERIFICADA (/equipo probar)")
 
 

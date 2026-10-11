@@ -222,6 +222,47 @@ def parsear_auditoria(texto: str, evidencia: dict) -> Optional[list]:
     return salida
 
 
+@dataclass
+class Juicio:
+    """Veredicto del 8.º agente (JUEZ DE ENTREGA): ¿lo entregado cumple el pedido? Solo endurece, nunca mejora."""
+    cumple: bool
+    faltantes: list = field(default_factory=list)
+    evidence_ids: list = field(default_factory=list)
+    confianza: str = "low"
+    valido: bool = True
+    problema: str = ""
+
+    def texto(self) -> str:
+        if not self.valido:
+            return f"Juez de entrega: veredicto fuera de contrato ({self.problema})"
+        if self.cumple:
+            return f"Juez de entrega: CUMPLE el pedido (confianza {self.confianza})"
+        falta = "; ".join(self.faltantes[:4]) if self.faltantes else "sin detalle"
+        return f"Juez de entrega: NO CUMPLE (confianza {self.confianza}) · falta: {falta}"
+
+
+def parsear_juicio(texto: str, evidencia: Optional[dict] = None) -> Juicio:
+    """Veredicto del juez desde su JSON. Si la evidencia muestra la build roja/parcial, nunca se acepta 'cumple'."""
+    datos = extraer_json_x(texto)
+    if not isinstance(datos, dict) or not isinstance(datos.get("cumple"), bool):
+        return Juicio(False, valido=False, problema='sin JSON {"cumple": true|false}')
+    cumple = bool(datos["cumple"])
+    faltantes = _lista_str(datos.get("faltantes"))[:12]
+    conf = str(datos.get("confianza", "low")).strip().lower()
+    if conf not in _CONFIANZAS_X:
+        conf = "low"
+    ids = _lista_str(datos.get("evidence_ids"))
+    if isinstance(evidencia, dict):
+        ids = [e for e in ids if e in evidencia]
+        estado_global = str(evidencia.get("EV-ESTADO", "")).lower()
+        if cumple and re.search(r"estado por verificación real: (?:fallida|parcial|cancelada)", estado_global):
+            # Defensa en profundidad: el juez no puede convertir una build roja/parcial en 'cumple'.
+            cumple = False
+            if not faltantes:
+                faltantes = ["la verificación real no quedó en verde"]
+    return Juicio(cumple, faltantes, ids, conf, valido=True)
+
+
 def conteo_equipo_x(settings, probados: Optional[dict] = None) -> dict:
     """
     Conteos honestos y separados: roles, modelos distintos configurados, modelos distintos VERIFICADOS (solo los

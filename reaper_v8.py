@@ -1711,6 +1711,9 @@ class Settings:
     respaldo_equipo: bool = True
     # REAPER X: equipo de 10 roles (director, supervisor, integrador, seguridad defensiva, auditor de entrega)
     roles_x: bool = False
+    # Juez de entrega (8.º agente): al cerrar /construir compara lo entregado contra el pedido y solo puede
+    # ENDURECER el estado (verificada/validada → parcial si falta algo); nunca convierte una build roja en verde.
+    juez: bool = True
     proveedor: str = "openrouter"
     api_url: str = ""
 
@@ -10721,6 +10724,22 @@ Respondé SOLO un objeto JSON: {"criteria": [{"criterion": "...", "status": "MET
         0.1,
         solo_lectura=True,
     ),
+    "juez": Rol(
+        "juez",
+        """Sos el JUEZ DE ENTREGA: el último control antes de dar algo por entregado. Una sola pregunta:
+¿lo construido cumple el PEDIDO del usuario, tal como se pidió, ni más ni menos? Juzgás SOLO con la EVIDENCIA
+dada (cada pieza tiene un id EV-...): estado real de la build, tests, validación, aceptación y el resumen del
+diff (qué archivos cambiaron). No ejecutás nada, no leés el repo y no inventás requisitos que el usuario no
+pidió. Regla dura: NO podés convertir una build roja en verde — si la evidencia muestra fallos o tareas sin
+completar, cumple=false. Si falta algo que el pedido pedía (un archivo, una pantalla, un endpoint, un
+comportamiento concreto), listalo en "faltantes", puntual y accionable. Si la evidencia alcanza y el pedido
+está cubierto, cumple=true. Usá confianza alta solo cuando la evidencia es contundente.
+Respondé SOLO un objeto JSON: {"cumple": true|false, "faltantes": ["lo que falta, concreto"],
+"evidence_ids": ["EV-..."], "confianza": "low|medium|high"}""",
+        (),
+        0.1,
+        solo_lectura=True,
+    ),
 }
 
 ROLES_DELEGABLES = ("explorador", "implementador", "revisor", "qa", "reparador", "arquitecto", "especificador",
@@ -14527,6 +14546,18 @@ _RE_VEREDICTO = re.compile(r"VEREDICTO\s*:?\s*\**\s*(APROBADO|CAMBIOS|RECHAZADO)
 EXTENSIONES_TESTEABLES = (".py", ".js", ".mjs", ".cjs", ".ts")
 
 
+def _es_testeable(archivos_plan: list, archivos_ws: list) -> bool:
+    """¿Tiene sentido 'tests primero'? Sí si hay lógica (.py/.js/.ts) en el plan o en el proyecto, o si el proyecto
+    está vacío y el plan TODAVÍA no nombra archivos (no sabemos qué construirá, así que no bajamos la guardia).
+    NO para un plan que solo produce assets estáticos (.html/.css): escribir 'tests ejecutables' para una página
+    estática no aporta y traba trabajos chicos ('construí una web') en modelos flojos. La validación igual corre."""
+    if any(a.endswith(EXTENSIONES_TESTEABLES) for a in archivos_plan):
+        return True
+    if any(a.endswith(EXTENSIONES_TESTEABLES) for a in archivos_ws):
+        return True
+    return not archivos_plan and not archivos_ws
+
+
 @dataclass
 class Tarea:
     id: str
@@ -14907,6 +14938,7 @@ class InformeBuild:
     segundos: float = 0.0
     tareas_fallidas: list = field(default_factory=list)    # quedaron con fallos tras reparar
     tareas_bloqueadas: list = field(default_factory=list)  # no se ejecutaron: dependen de una fallida
+    juicio: Optional["Juicio"] = None                      # veredicto del 8.º agente (juez de entrega)
 
     @property
     def ok(self) -> bool:
@@ -15556,7 +15588,7 @@ class Orquestador:
         return verif
 
     # ------------------------------------------------------------ REAPER X (10 roles)
-    def _consultar_rol_x(self, rol: str, prompt: str) -> tuple:
+    def _consultar_rol_x(self, rol: str, prompt: str, max_tokens: int = 1500) -> tuple:
         """
         Rol de dirección/auditoría por TEXTO (sin herramientas): devuelve (texto|None, modelo_pedido, modelo_servido).
         Si respondió otro modelo (respaldo del equipo), se declara: nada de degradación silenciosa.
@@ -15566,7 +15598,7 @@ class Orquestador:
                     {"role": "user", "content": prompt}]
         try:
             resp = self.llm.chat(mensajes, modelo=pedido_modelo, temperatura=ROLES[rol].temperatura,
-                                 max_tokens=1500, rol=rol)
+                                 max_tokens=max_tokens, rol=rol)
         except LLMError as e:
             if e.presupuesto:
                 raise
@@ -15645,6 +15677,55 @@ class Orquestador:
             self.ui.tenue("  " + dictamen.texto())
             informe.estado, notas = estado_controlado(informe.estado, dictamen)
             informe.notas.extend(notas)
+
+    def _juicio_de_entrega(self, pedido: str, plan: Plan, verif: Verificacion, informe: InformeBuild) -> None:
+        """8.º agente (JUEZ DE ENTREGA): compara lo entregado contra el PEDIDO y solo puede ENDURECER el estado.
+
+        Nunca convierte una build roja en verde. Entrada compacta (diffstat, no el diff entero) y un veredicto JSON
+        chico: consume MUCHOS menos tokens que los roles que escriben o razonan. Si el modelo no responde o contesta
+        fuera de contrato, NO cambia el estado (no inventamos ni un éxito ni un fracaso).
+        """
+        if not getattr(self.settings, "juez", True):
+            return
+        if informe.estado not in ("verificada", "validada"):
+            return  # la build ya está en rojo/parcial: el juez solo endurece, no hay verde que revisar
+        diff = self.ws.checkpoints.diff_desde(informe.cid) if informe.cid else ""
+        criterios = "\n".join(f"- {c}" for c in plan.criterios) or "- (derivalos del pedido)"
+        evidencia = {
+            "EV-ESTADO": f"estado por verificación real: {informe.estado}; tareas fallidas: "
+                         f"{', '.join(informe.tareas_fallidas) or 'ninguna'}; bloqueadas: "
+                         f"{', '.join(informe.tareas_bloqueadas) or 'ninguna'}",
+            "EV-TESTS": (verif.conteo.texto() if verif.conteo.reconocido else
+                         ("sin suite de tests" if verif.tests is None else f"exit {verif.tests.codigo}")),
+            "EV-VALID": resumen_validacion(verif.validaciones, limite=600),
+            "EV-ACEPTACION": (verif.aceptacion.resumen(600) if verif.aceptacion is not None else "no configurada"),
+            "EV-DIFF": _diffstat(diff) or "(sin cambios)",
+        }
+        bloque = "\n".join(f"{k}: {v}" for k, v in evidencia.items())
+        prompt = (f"PEDIDO DEL USUARIO:\n{recortar(pedido, 1200)}\n\nOBJETIVO DEL PLAN: {recortar(plan.objetivo, 300)}\n\n"
+                  f"CRITERIOS DE ACEPTACIÓN:\n{criterios}\n\nEVIDENCIA:\n{bloque}\n\n"
+                  f"¿La entrega cumple el pedido tal como se pidió?")
+        texto, _pedido_m, _servido = self._consultar_rol_x("juez", prompt, max_tokens=400)
+        if texto is None:
+            informe.notas.append("Juez de entrega: el modelo no respondió; sin veredicto (no se cambió el estado).")
+            return
+        juicio = parsear_juicio(texto, evidencia)
+        informe.juicio = juicio
+        self.ui.tenue("  " + juicio.texto())
+        if not juicio.valido:
+            informe.notas.append("Juez de entrega: respuesta fuera de contrato; veredicto descartado.")
+            return
+        informe.notas.append(juicio.texto())
+        for f in juicio.faltantes[:6]:
+            informe.notas.append(f"Falta según el juez: {f}")
+        # Gate en dirección segura: solo baja de verde a parcial. Pide confianza media/alta para no castigar
+        # por el ruido de un modelo débil; un 'no cumple' dudoso queda como nota, no como veredicto.
+        if (not juicio.cumple and juicio.confianza in ("medium", "high")
+                and informe.estado in ("verificada", "validada")):
+            informe.estado = "parcial"
+            self.ui.aviso("  El juez de entrega observa que el pedido NO quedó cumplido: marco la build como parcial.")
+        elif not juicio.cumple:
+            informe.notas.append("Juez de entrega: duda de que se cumpla el pedido (confianza baja); lo dejo como aviso.")
 
     # ------------------------------------------------------------ flujos
     def _mostrar_plan(self, plan: Plan) -> None:
@@ -15888,8 +15969,7 @@ class Orquestador:
 
         informe = InformeBuild("fallida", plan=plan, cid=grupo)
 
-        testeable = any(a.endswith(EXTENSIONES_TESTEABLES) for a in plan.archivos()) or any(
-            a.endswith(EXTENSIONES_TESTEABLES) for a in self.ws.archivos_codigo(limite=200)) or not self.ws.archivos_codigo(limite=5)
+        testeable = _es_testeable(plan.archivos(), self.ws.archivos_codigo(limite=200))
         numero_fase = 3
         if not reanudar:
             # Proteger los tests que YA existían en el proyecto: ni el implementador ni un candidato del torneo
@@ -16074,8 +16154,11 @@ class Orquestador:
         informe.aceptacion = verif.aceptacion
         informe.diagnostico = verif.diagnostico
         informe.estado = estado_final_build(verif, informe)
+        # 8.º agente: el juez de entrega puede bajar de verde a parcial si el pedido no quedó cumplido (nunca sube).
+        self._juicio_de_entrega(pedido, plan, verif, informe)
         if informe.estado == "parcial":
-            informe.notas.append("Verificación final verde, pero hay tareas fallidas/bloqueadas sin completar.")
+            if informe.tareas_bloqueadas or informe.tareas_fallidas:
+                informe.notas.append("Verificación final verde, pero hay tareas fallidas/bloqueadas sin completar.")
         elif informe.ok:
             if self.settings.git_snapshots and es_repo_git(self.ws):
                 try:
@@ -16190,9 +16273,12 @@ class Orquestador:
         if informe.lecciones:
             datos.append(f"{len(informe.lecciones)} lección(es)")
         lineas = [f"{color}{subt}{C.RESET}", f"{Tema.tenue}{' · '.join(datos)}{C.RESET}"]
-        if informe.estado == "parcial":
+        if informe.estado == "parcial" and (informe.tareas_fallidas or informe.tareas_bloqueadas):
             lineas.append(f"{Tema.aviso}fallidas: {', '.join(informe.tareas_fallidas) or '—'} · "
                           f"bloqueadas: {', '.join(informe.tareas_bloqueadas) or '—'}{C.RESET}")
+        if informe.juicio is not None and informe.juicio.valido and not informe.juicio.cumple:
+            faltan = "; ".join(informe.juicio.faltantes[:3]) or "sin detalle"
+            lineas.append(f"{Tema.aviso}juez: no cumple el pedido → {recortar(faltan, 90)}{C.RESET}")
         if informe.commit:
             lineas.append(f"{Tema.ok}git {informe.commit[:10]} · rama {self.settings.rama_git}{C.RESET}")
         self.ui.linea("")
@@ -29412,6 +29498,20 @@ class App:
                           "defensiva y auditor de entrega a /construir. El estado final lo sigue decidiendo la "
                           "verificación real. /equipo x on | /equipo x preset | /equipo x off")
             sub = ""
+        if sub.startswith("juez"):
+            partes_j = sub.split()
+            opcion = partes_j[1] if len(partes_j) > 1 else ""
+            if opcion in ("on", "off", "si", "sí", "no"):
+                self.settings.juez = opcion not in ("off", "no")
+                self._guardar_settings()
+            ej = estado_juez(self.settings)
+            marca = "✓ clave" if ej["tiene_clave"] else "⚠ FALTA CLAVE"
+            self.ui.ok(f"Juez de entrega (8.º agente): {'ON' if ej['activo'] else 'OFF'}")
+            self.ui.info(f"  juez → {ej['proveedor']}/{ej.get('modelo_real') or ej['modelo']}   {marca}")
+            self.ui.tenue("  Al cerrar /construir compara lo entregado contra tu pedido y SOLO puede bajar de verde a "
+                          "parcial (nunca sube un rojo a verde). Bajo costo: entrada compacta + veredicto JSON corto.")
+            self.ui.tenue("  Asignarle modelo: /modelo juez <alias> · apagarlo: /equipo juez off")
+            return
         estado = estado_equipo(self.settings)
         ind = independencia_equipo(estado)
         if sub in ("independencia", "independence"):
@@ -29452,6 +29552,11 @@ class App:
         for e in estado:
             marca = "✓ clave" if e["tiene_clave"] else "⚠ FALTA CLAVE"
             self.ui.info(f"  {e['rol']:<13} → {e['proveedor']}/{e.get('modelo_real') or e['modelo']}   {marca}")
+        ej = estado_juez(self.settings)
+        if ej["activo"]:
+            marca = "✓ clave" if ej["tiene_clave"] else "⚠ FALTA CLAVE"
+            self.ui.info(f"  {'juez (8.º)':<13} → {ej['proveedor']}/{ej.get('modelo_real') or ej['modelo']}   {marca}"
+                         "   · control final del pedido")
         self.ui.tenue(f"  proveedores distintos: {ind['proveedores_distintos']} · "
                       f"modelos distintos: {ind['modelos_distintos']}"
                       + ("  · independencia REDUCIDA" if ind["reducida"] else ""))
@@ -46335,6 +46440,118 @@ class TestConfigValidarDiagnostico(BaseTest):
 
 
 # ======================================================================
+# MÓDULO: autotest_juez
+# ======================================================================
+"""
+Autotests del 8.º agente: el JUEZ DE ENTREGA. Al cerrar /construir compara lo entregado contra el PEDIDO y
+SOLO endurece el estado (verde → parcial); nunca convierte una build roja en verde. Entrada compacta + veredicto
+JSON corto = mucho menos consumo que los roles que escriben o razonan.
+"""
+
+
+def _verif_ok() -> Verificacion:
+    return Verificacion(True, [], None, "", [], ConteoTests(pasados=3, reconocido=True))
+
+
+def _plan_web() -> Plan:
+    return Plan("una web con login y listado", [], ["hay login", "hay listado de productos"])
+
+
+class TestJuezDeEntrega(BaseTest):
+    def _orq(self, respuesta_juez):
+        llm = MockLLM(lambda mensajes, kw: respuesta_juez if kw.get("rol") == "juez" else "{}")
+        return Orquestador(llm, self.proyecto(), self.ajustes(), self.ui()), llm
+
+    # ---- parser ----
+    def test_parsea_cumple(self):
+        j = parsear_juicio('{"cumple": true, "faltantes": [], "confianza": "high"}')
+        self.assertTrue(j.cumple and j.valido)
+
+    def test_parsea_no_cumple_con_faltantes(self):
+        j = parsear_juicio('{"cumple": false, "faltantes": ["falta el login"], "confianza": "high"}')
+        self.assertFalse(j.cumple)
+        self.assertEqual(j.faltantes, ["falta el login"])
+
+    def test_fuera_de_contrato_no_es_cumple(self):
+        j = parsear_juicio("blah blah, no hay json")
+        self.assertFalse(j.valido)
+        self.assertFalse(j.cumple)
+
+    def test_confianza_invalida_se_normaliza(self):
+        self.assertEqual(parsear_juicio('{"cumple": false, "confianza": "altísima"}').confianza, "low")
+
+    def test_no_puede_subir_una_build_roja(self):
+        ev = {"EV-ESTADO": "estado por verificación real: fallida; tareas fallidas: T1"}
+        j = parsear_juicio('{"cumple": true, "confianza": "high"}', ev)   # el JSON dice true, la evidencia es roja
+        self.assertFalse(j.cumple)
+
+    # ---- gate en el pipeline ----
+    def test_juez_baja_verde_a_parcial(self):
+        orq, _ = self._orq('{"cumple": false, "faltantes": ["falta el login"], "confianza": "high"}')
+        informe = InformeBuild("verificada", plan=_plan_web())
+        orq._juicio_de_entrega("hacé una web con login", _plan_web(), _verif_ok(), informe)
+        self.assertEqual(informe.estado, "parcial")
+        self.assertIsNotNone(informe.juicio)
+        self.assertFalse(informe.juicio.cumple)
+        self.assertTrue(any("login" in n for n in informe.notas))
+
+    def test_juez_cumple_no_cambia(self):
+        orq, _ = self._orq('{"cumple": true, "confianza": "high"}')
+        informe = InformeBuild("verificada")
+        orq._juicio_de_entrega("pedido", _plan_web(), _verif_ok(), informe)
+        self.assertEqual(informe.estado, "verificada")
+
+    def test_confianza_baja_no_castiga(self):
+        orq, _ = self._orq('{"cumple": false, "faltantes": ["x"], "confianza": "low"}')
+        informe = InformeBuild("validada")
+        orq._juicio_de_entrega("pedido", _plan_web(), _verif_ok(), informe)
+        self.assertEqual(informe.estado, "validada")        # con baja confianza no baja: queda como aviso
+
+    def test_juez_no_toca_una_build_fallida(self):
+        orq, _ = self._orq('{"cumple": true, "confianza": "high"}')
+        informe = InformeBuild("fallida")
+        orq._juicio_de_entrega("pedido", _plan_web(), Verificacion(False, [], None, "", []), informe)
+        self.assertEqual(informe.estado, "fallida")         # solo endurece; nunca sube
+
+    def test_juez_apagado_no_consulta(self):
+        orq, llm = self._orq('{"cumple": false, "confianza": "high"}')
+        orq.settings.juez = False
+        informe = InformeBuild("verificada")
+        orq._juicio_de_entrega("pedido", _plan_web(), _verif_ok(), informe)
+        self.assertEqual(informe.estado, "verificada")
+        self.assertIsNone(informe.juicio)
+        self.assertEqual(llm.llamadas, [])                  # apagado = no gasta ni una llamada
+
+    def test_fuera_de_contrato_no_cambia_estado(self):
+        orq, _ = self._orq("no soy json")
+        informe = InformeBuild("verificada")
+        orq._juicio_de_entrega("pedido", _plan_web(), _verif_ok(), informe)
+        self.assertEqual(informe.estado, "verificada")
+        self.assertTrue(any("fuera de contrato" in n for n in informe.notas))
+
+    def test_juez_consume_pocos_tokens(self):
+        orq, llm = self._orq('{"cumple": true, "confianza": "high"}')
+        orq._juicio_de_entrega("pedido", _plan_web(), _verif_ok(), InformeBuild("verificada"))
+        llamada = next(c for c in llm.llamadas if c.get("rol") == "juez")
+        self.assertEqual(llamada["max_tokens"], 400)        # presupuesto chico (los roles que escriben usan miles)
+
+
+class TestTrabajosChicos(BaseTest):
+    """Una página estática no debería disparar 'tests primero' y trabarse: eso rompía trabajos chicos."""
+    def test_web_estatica_no_fuerza_tests_primero(self):
+        self.assertFalse(_es_testeable(["index.html", "style.css"], []))      # solo assets estáticos
+        self.assertFalse(_es_testeable(["index.html"], ["logo.png"]))          # ni con assets no-código
+
+    def test_logica_si_es_testeable(self):
+        self.assertTrue(_es_testeable(["calc.py"], []))                        # lógica en el plan
+        self.assertTrue(_es_testeable(["index.html"], ["app.py"]))             # ya hay lógica en el proyecto
+        self.assertTrue(_es_testeable(["main.js"], []))
+
+    def test_vacio_sin_plan_sigue_testeable(self):
+        self.assertTrue(_es_testeable([], []))     # proyecto vacío y plan sin archivos: no bajamos la guardia
+
+
+# ======================================================================
 # MÓDULO: autotest_runner
 # ======================================================================
 """Ejecutor del autotest interno."""
@@ -47791,6 +48008,16 @@ Reply ONLY a JSON object: {"findings": [{"severity": "high|medium|low", "file": 
 A criterion is MET only if you cite evidence that proves it; without evidence it is UNKNOWN.
 Reply ONLY a JSON object: {"criteria": [{"criterion": "...", "status": "MET|NOT_MET|UNKNOWN",
 "evidence_ids": ["EV-..."]}]}""",
+    "juez": """You are the DELIVERY JUDGE: the last gate before anything is called delivered. One question only:
+does what was built meet the user's REQUEST, exactly as asked, no more and no less? Judge ONLY from the EVIDENCE
+given (each piece has an EV-... id): real build state, tests, validation, acceptance and the diff summary (which
+files changed). You run nothing, you do not read the repo and you do not invent requirements the user never asked
+for. Hard rule: you CANNOT turn a red build green — if the evidence shows failures or unfinished tasks, cumple=false.
+If something the request asked for is missing (a file, a screen, an endpoint, a concrete behavior), list it under
+"faltantes", specific and actionable. If the evidence is enough and the request is covered, cumple=true. Use high
+confidence only when the evidence is conclusive.
+Reply ONLY a JSON object: {"cumple": true|false, "faltantes": ["what is missing, concrete"],
+"evidence_ids": ["EV-..."], "confianza": "low|medium|high"}""",
 }
 
 DOCS_EN = {
@@ -51174,6 +51401,18 @@ def estado_equipo(settings) -> list:
     return salida
 
 
+def estado_juez(settings) -> dict:
+    """El 8.º agente: el JUEZ DE ENTREGA. Va aparte de los 6 trabajadores porque es el control final, no un obrero."""
+    modelo = settings.modelo_para("juez")
+    destino = destino_modelo(modelo, settings)
+    try:
+        tiene = bool(clave_de_proveedor(destino.proveedor, replace(settings, proveedor=destino.proveedor)))
+    except (TypeError, ValueError):
+        tiene = False
+    return {"rol": "juez", "activo": bool(getattr(settings, "juez", True)), "modelo": modelo,
+            "modelo_real": destino.modelo, "proveedor": destino.proveedor, "tiene_clave": tiene}
+
+
 def validar_configuracion(settings) -> list:
     """
     Revisa la config de modelos/equipo SIN tocar la red (la conectividad real la da /equipo probar). Devuelve
@@ -51339,7 +51578,8 @@ def resumen_arranque_equipo(settings) -> str:
     ind = independencia_equipo(estado)
     con_clave = sum(1 for e in estado if e["tiene_clave"])
     aviso = "" if con_clave == len(estado) else f" · {len(estado) - con_clave} sin clave"
-    return (f"{len(estado)} roles → {ind['modelos_distintos']} modelo(s)/{ind['proveedores_distintos']} prov{aviso}"
+    juez = " + juez" if getattr(settings, "juez", True) else ""
+    return (f"{len(estado)} roles{juez} → {ind['modelos_distintos']} modelo(s)/{ind['proveedores_distintos']} prov{aviso}"
             f" · conectividad NO VERIFICADA (/equipo probar)")
 
 
@@ -52284,6 +52524,47 @@ def parsear_auditoria(texto: str, evidencia: dict) -> Optional[list]:
             status = "UNKNOWN"
         salida.append({"criterion": str(c["criterion"]).strip()[:200], "status": status, "evidence_ids": ids})
     return salida
+
+
+@dataclass
+class Juicio:
+    """Veredicto del 8.º agente (JUEZ DE ENTREGA): ¿lo entregado cumple el pedido? Solo endurece, nunca mejora."""
+    cumple: bool
+    faltantes: list = field(default_factory=list)
+    evidence_ids: list = field(default_factory=list)
+    confianza: str = "low"
+    valido: bool = True
+    problema: str = ""
+
+    def texto(self) -> str:
+        if not self.valido:
+            return f"Juez de entrega: veredicto fuera de contrato ({self.problema})"
+        if self.cumple:
+            return f"Juez de entrega: CUMPLE el pedido (confianza {self.confianza})"
+        falta = "; ".join(self.faltantes[:4]) if self.faltantes else "sin detalle"
+        return f"Juez de entrega: NO CUMPLE (confianza {self.confianza}) · falta: {falta}"
+
+
+def parsear_juicio(texto: str, evidencia: Optional[dict] = None) -> Juicio:
+    """Veredicto del juez desde su JSON. Si la evidencia muestra la build roja/parcial, nunca se acepta 'cumple'."""
+    datos = extraer_json_x(texto)
+    if not isinstance(datos, dict) or not isinstance(datos.get("cumple"), bool):
+        return Juicio(False, valido=False, problema='sin JSON {"cumple": true|false}')
+    cumple = bool(datos["cumple"])
+    faltantes = _lista_str(datos.get("faltantes"))[:12]
+    conf = str(datos.get("confianza", "low")).strip().lower()
+    if conf not in _CONFIANZAS_X:
+        conf = "low"
+    ids = _lista_str(datos.get("evidence_ids"))
+    if isinstance(evidencia, dict):
+        ids = [e for e in ids if e in evidencia]
+        estado_global = str(evidencia.get("EV-ESTADO", "")).lower()
+        if cumple and re.search(r"estado por verificación real: (?:fallida|parcial|cancelada)", estado_global):
+            # Defensa en profundidad: el juez no puede convertir una build roja/parcial en 'cumple'.
+            cumple = False
+            if not faltantes:
+                faltantes = ["la verificación real no quedó en verde"]
+    return Juicio(cumple, faltantes, ids, conf, valido=True)
 
 
 def conteo_equipo_x(settings, probados: Optional[dict] = None) -> dict:
