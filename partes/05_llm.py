@@ -474,6 +474,10 @@ class LLMClient:
                 err = evento["error"]
                 mensaje = err.get("message", str(err)) if isinstance(err, dict) else str(err)
                 codigo = err.get("code") if isinstance(err, dict) else None
+                try:
+                    codigo = int(codigo)        # algunos proveedores mandan el código como string ("429")
+                except (TypeError, ValueError):
+                    pass
                 if _RE_CONTEXTO.search(mensaje or ""):
                     raise LLMError(f"Contexto excedido: {mensaje}", contexto_excedido=True)
                 if codigo is None or codigo in TRANSITORIOS:

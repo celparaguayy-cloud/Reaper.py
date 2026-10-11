@@ -2620,6 +2620,10 @@ class LLMClient:
                 err = evento["error"]
                 mensaje = err.get("message", str(err)) if isinstance(err, dict) else str(err)
                 codigo = err.get("code") if isinstance(err, dict) else None
+                try:
+                    codigo = int(codigo)        # algunos proveedores mandan el código como string ("429")
+                except (TypeError, ValueError):
+                    pass
                 if _RE_CONTEXTO.search(mensaje or ""):
                     raise LLMError(f"Contexto excedido: {mensaje}", contexto_excedido=True)
                 if codigo is None or codigo in TRANSITORIOS:
@@ -3582,10 +3586,12 @@ IGNORAR_DIRS = {
 }
 
 ARCHIVOS_SENSIBLES = {
-    ".env", ".env.local", ".env.production", ".env.development",
+    ".env", ".env.local", ".env.production", ".env.development", ".envrc",
     "id_rsa", "id_ed25519", "id_ecdsa", "id_dsa",
-    "credentials.json", "secrets.json", "secret.json",
+    "credentials.json", "secrets.json", "secret.json", "credentials",
+    "secrets.toml", "secrets.yaml", "secrets.yml", "secret.yaml", "secret.yml",
     ".netrc", ".pgpass", ".htpasswd", ".npmrc", ".pypirc", ".git-credentials",
+    ".dockercfg", ".boto", "service-account.json", "serviceaccount.json",
 }
 # Plantillas/ejemplos SIN secretos reales: se permiten (no rechazar algo inocuo por coincidencia parcial).
 _SUFIJOS_ENV_EJEMPLO = (".example", ".sample", ".template", ".dist", ".ejemplo", ".defaults")
@@ -3606,7 +3612,8 @@ def es_archivo_sensible(nombre: str) -> bool:
         return True
     if base.endswith(".pub"):                      # clave pública: no es secreto
         return False
-    if base == ".env" or base.startswith(".env."):
+    # cualquier archivo .env / .env.* / *.env / .envrc salvo las plantillas de ejemplo
+    if base == ".env" or base == ".envrc" or base.startswith(".env.") or base.endswith(".env"):
         return not any(base.endswith(suf) for suf in _SUFIJOS_ENV_EJEMPLO)
     if Path(base).suffix in _EXT_SENSIBLES:
         return True
@@ -8966,7 +8973,14 @@ def search_files(ctx: Contexto, p: dict) -> str:
         for ruta in ctx.ws.iterar(p.get("path") or ".", limite=3000):
             if filtro and not Path(ruta.name).match(filtro):
                 continue
-            if not ctx.ws.es_texto(ruta) or ruta.stat().st_size > 400_000:
+            # No seguir symlinks (podrían apuntar a .env o fuera del workspace) ni escanear archivos sensibles,
+            # ni siquiera a través de un enlace cuyo destino resuelto sea sensible (R-002).
+            if ruta.is_symlink() or not ctx.ws.es_texto(ruta) or ruta.stat().st_size > 400_000:
+                continue
+            try:
+                if es_archivo_sensible(ruta.resolve().name):
+                    continue
+            except OSError:
                 continue
             try:
                 texto = ruta.read_text(encoding="utf-8", errors="replace")
@@ -8974,7 +8988,8 @@ def search_files(ctx: Contexto, p: dict) -> str:
                 continue
             for n, linea in enumerate(texto.splitlines(), start=1):
                 if rx.search(linea):
-                    hallazgos.append(f"{ctx.ws.rel(ruta)}:{n}: {linea.strip()[:200]}")
+                    # Aun en archivos del propio usuario: no reenviar un secreto hardcodeado al modelo.
+                    hallazgos.append(redactar_secretos(f"{ctx.ws.rel(ruta)}:{n}: {linea.strip()[:200]}"))
                     if len(hallazgos) >= 80:
                         return hallazgos
         return hallazgos
@@ -14806,11 +14821,21 @@ class Orquestador:
         testeable = any(a.endswith(EXTENSIONES_TESTEABLES) for a in plan.archivos()) or any(
             a.endswith(EXTENSIONES_TESTEABLES) for a in self.ws.archivos_codigo(limite=200)) or not self.ws.archivos_codigo(limite=5)
         numero_fase = 3
+        # Proteger los tests que YA existían en el proyecto: ni el implementador ni un candidato del torneo
+        # pueden editarlos para que un bug "pase" (test gaming). Se fijan a su contenido actual y la
+        # verificación corre contra el test real, así un código roto termina FALLIDA y no "verificada".
+        for rel in self.ws.archivos_codigo(limite=800):
+            if _es_test(rel):
+                try:
+                    self._protegidos[rel] = self.ws.leer(rel)
+                except (OSError, ValueError, ErrorRuta):
+                    pass
         if self.settings.tests_primero and testeable:
             self.ui.fase(numero_fase, "Tests primero (especificación ejecutable)")
             numero_fase += 1
-            self._protegidos = self.especificar(pedido, plan, grupo)
-            informe.spec_tests = list(self._protegidos)
+            espec = self.especificar(pedido, plan, grupo)
+            self._protegidos.update(espec)
+            informe.spec_tests = list(espec)
 
         self.ui.fase(numero_fase, "Implementación" + (" · torneo" if self.settings.torneo and self.settings.candidatos > 1 else ""))
         numero_fase += 1
@@ -43616,6 +43641,41 @@ class TestForenseNoBorraExistentes(BaseTest):
             (ws.raiz / "generado_por_test.txt").write_text("basura\n", encoding="utf-8")
         self.assertFalse((ws.raiz / "generado_por_test.txt").exists())   # la basura del test se limpia
         self.assertTrue(ws.checkpoints.inicio_grupo() is not None)       # ...pero quedó en un checkpoint
+
+
+class TestNoTestGaming(BaseTest):
+    PLAN = """<plan>
+<objetivo>Arreglar resta</objetivo>
+<tarea id="1" archivos="calc.py">Hacer que resta(a,b) devuelva a-b</tarea>
+<criterios>
+- resta(5,3) == 2
+</criterios>
+</plan>"""
+
+    def test_implementador_no_puede_debilitar_un_test_existente(self):
+        # el usuario YA tiene un test que exige resta(5,3)==2; el modelo intenta editar el test para "pasar"
+        test_bueno = ("import unittest\nfrom calc import resta\n\n\nclass T(unittest.TestCase):\n"
+                      "    def test_resta(self):\n        self.assertEqual(resta(5, 3), 2)\n")
+
+        def guion(mensajes, kwargs):
+            rol = MockLLM.rol_de(mensajes)
+            if rol == "arquitecto":
+                return terminar_xml(self.PLAN)
+            if rol == "implementador":
+                # resta ROTA + intenta debilitar el test del usuario para que pase igual
+                if _turno(mensajes) == 0:
+                    return (herramienta_xml("write_to_file", path="calc.py", content="def resta(a, b):\n    return b - a\n")
+                            + herramienta_xml("write_to_file", path="tests/test_calc.py",
+                                              content="import unittest\n\n\nclass T(unittest.TestCase):\n"
+                                                      "    def test_resta(self):\n        self.assertTrue(True)\n"))
+                return terminar_xml("hecho")
+            return terminar_xml("ok")
+
+        ws = self.proyecto({"calc.py": "def resta(a, b):\n    return a - b\n", "tests/test_calc.py": test_bueno})
+        ajustes = self.ajustes(tests_primero=False, torneo=False, max_revisiones=0, lecciones=False, max_reparaciones=0)
+        informe = Orquestador(MockLLM(guion), ws, ajustes, self.ui()).construir("arreglá resta", confirmar=False)
+        self.assertNotEqual(informe.estado, "verificada")        # un código roto NO puede terminar verificado
+        self.assertEqual(ws.leer("tests/test_calc.py"), test_bueno)   # el test del usuario quedó intacto
 
 
 # ======================================================================

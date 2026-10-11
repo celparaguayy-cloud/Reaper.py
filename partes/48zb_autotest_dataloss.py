@@ -95,3 +95,38 @@ class TestForenseNoBorraExistentes(BaseTest):
             (ws.raiz / "generado_por_test.txt").write_text("basura\n", encoding="utf-8")
         self.assertFalse((ws.raiz / "generado_por_test.txt").exists())   # la basura del test se limpia
         self.assertTrue(ws.checkpoints.inicio_grupo() is not None)       # ...pero quedó en un checkpoint
+
+
+class TestNoTestGaming(BaseTest):
+    PLAN = """<plan>
+<objetivo>Arreglar resta</objetivo>
+<tarea id="1" archivos="calc.py">Hacer que resta(a,b) devuelva a-b</tarea>
+<criterios>
+- resta(5,3) == 2
+</criterios>
+</plan>"""
+
+    def test_implementador_no_puede_debilitar_un_test_existente(self):
+        # el usuario YA tiene un test que exige resta(5,3)==2; el modelo intenta editar el test para "pasar"
+        test_bueno = ("import unittest\nfrom calc import resta\n\n\nclass T(unittest.TestCase):\n"
+                      "    def test_resta(self):\n        self.assertEqual(resta(5, 3), 2)\n")
+
+        def guion(mensajes, kwargs):
+            rol = MockLLM.rol_de(mensajes)
+            if rol == "arquitecto":
+                return terminar_xml(self.PLAN)
+            if rol == "implementador":
+                # resta ROTA + intenta debilitar el test del usuario para que pase igual
+                if _turno(mensajes) == 0:
+                    return (herramienta_xml("write_to_file", path="calc.py", content="def resta(a, b):\n    return b - a\n")
+                            + herramienta_xml("write_to_file", path="tests/test_calc.py",
+                                              content="import unittest\n\n\nclass T(unittest.TestCase):\n"
+                                                      "    def test_resta(self):\n        self.assertTrue(True)\n"))
+                return terminar_xml("hecho")
+            return terminar_xml("ok")
+
+        ws = self.proyecto({"calc.py": "def resta(a, b):\n    return a - b\n", "tests/test_calc.py": test_bueno})
+        ajustes = self.ajustes(tests_primero=False, torneo=False, max_revisiones=0, lecciones=False, max_reparaciones=0)
+        informe = Orquestador(MockLLM(guion), ws, ajustes, self.ui()).construir("arreglá resta", confirmar=False)
+        self.assertNotEqual(informe.estado, "verificada")        # un código roto NO puede terminar verificado
+        self.assertEqual(ws.leer("tests/test_calc.py"), test_bueno)   # el test del usuario quedó intacto

@@ -317,7 +317,14 @@ def search_files(ctx: Contexto, p: dict) -> str:
         for ruta in ctx.ws.iterar(p.get("path") or ".", limite=3000):
             if filtro and not Path(ruta.name).match(filtro):
                 continue
-            if not ctx.ws.es_texto(ruta) or ruta.stat().st_size > 400_000:
+            # No seguir symlinks (podrían apuntar a .env o fuera del workspace) ni escanear archivos sensibles,
+            # ni siquiera a través de un enlace cuyo destino resuelto sea sensible (R-002).
+            if ruta.is_symlink() or not ctx.ws.es_texto(ruta) or ruta.stat().st_size > 400_000:
+                continue
+            try:
+                if es_archivo_sensible(ruta.resolve().name):
+                    continue
+            except OSError:
                 continue
             try:
                 texto = ruta.read_text(encoding="utf-8", errors="replace")
@@ -325,7 +332,8 @@ def search_files(ctx: Contexto, p: dict) -> str:
                 continue
             for n, linea in enumerate(texto.splitlines(), start=1):
                 if rx.search(linea):
-                    hallazgos.append(f"{ctx.ws.rel(ruta)}:{n}: {linea.strip()[:200]}")
+                    # Aun en archivos del propio usuario: no reenviar un secreto hardcodeado al modelo.
+                    hallazgos.append(redactar_secretos(f"{ctx.ws.rel(ruta)}:{n}: {linea.strip()[:200]}"))
                     if len(hallazgos) >= 80:
                         return hallazgos
         return hallazgos

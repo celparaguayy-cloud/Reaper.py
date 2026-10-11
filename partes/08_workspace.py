@@ -10,10 +10,12 @@ IGNORAR_DIRS = {
 }
 
 ARCHIVOS_SENSIBLES = {
-    ".env", ".env.local", ".env.production", ".env.development",
+    ".env", ".env.local", ".env.production", ".env.development", ".envrc",
     "id_rsa", "id_ed25519", "id_ecdsa", "id_dsa",
-    "credentials.json", "secrets.json", "secret.json",
+    "credentials.json", "secrets.json", "secret.json", "credentials",
+    "secrets.toml", "secrets.yaml", "secrets.yml", "secret.yaml", "secret.yml",
     ".netrc", ".pgpass", ".htpasswd", ".npmrc", ".pypirc", ".git-credentials",
+    ".dockercfg", ".boto", "service-account.json", "serviceaccount.json",
 }
 # Plantillas/ejemplos SIN secretos reales: se permiten (no rechazar algo inocuo por coincidencia parcial).
 _SUFIJOS_ENV_EJEMPLO = (".example", ".sample", ".template", ".dist", ".ejemplo", ".defaults")
@@ -34,7 +36,8 @@ def es_archivo_sensible(nombre: str) -> bool:
         return True
     if base.endswith(".pub"):                      # clave pública: no es secreto
         return False
-    if base == ".env" or base.startswith(".env."):
+    # cualquier archivo .env / .env.* / *.env / .envrc salvo las plantillas de ejemplo
+    if base == ".env" or base == ".envrc" or base.startswith(".env.") or base.endswith(".env"):
         return not any(base.endswith(suf) for suf in _SUFIJOS_ENV_EJEMPLO)
     if Path(base).suffix in _EXT_SENSIBLES:
         return True

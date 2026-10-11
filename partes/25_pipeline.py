@@ -795,11 +795,21 @@ class Orquestador:
         testeable = any(a.endswith(EXTENSIONES_TESTEABLES) for a in plan.archivos()) or any(
             a.endswith(EXTENSIONES_TESTEABLES) for a in self.ws.archivos_codigo(limite=200)) or not self.ws.archivos_codigo(limite=5)
         numero_fase = 3
+        # Proteger los tests que YA existían en el proyecto: ni el implementador ni un candidato del torneo
+        # pueden editarlos para que un bug "pase" (test gaming). Se fijan a su contenido actual y la
+        # verificación corre contra el test real, así un código roto termina FALLIDA y no "verificada".
+        for rel in self.ws.archivos_codigo(limite=800):
+            if _es_test(rel):
+                try:
+                    self._protegidos[rel] = self.ws.leer(rel)
+                except (OSError, ValueError, ErrorRuta):
+                    pass
         if self.settings.tests_primero and testeable:
             self.ui.fase(numero_fase, "Tests primero (especificación ejecutable)")
             numero_fase += 1
-            self._protegidos = self.especificar(pedido, plan, grupo)
-            informe.spec_tests = list(self._protegidos)
+            espec = self.especificar(pedido, plan, grupo)
+            self._protegidos.update(espec)
+            informe.spec_tests = list(espec)
 
         self.ui.fase(numero_fase, "Implementación" + (" · torneo" if self.settings.torneo and self.settings.candidatos > 1 else ""))
         numero_fase += 1
