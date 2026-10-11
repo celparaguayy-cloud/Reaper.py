@@ -1720,8 +1720,9 @@ class Settings:
     # ENDURECER el estado (verificada/validada → parcial si falta algo); nunca convierte una build roja en verde.
     juez: bool = True
     # Cuántas veces el juez puede INTERVENIR para cerrar: si al final falta algo del pedido, dispara una pasada
-    # de reparación hacia los faltantes y vuelve a juzgar. 0 = solo avisa, no interviene. Acotado para no entrar en bucle.
-    juez_max_intervenciones: int = 1
+    # de reparación hacia los faltantes y vuelve a juzgar. 0 = solo avisa, no interviene. Acotado para no entrar en
+    # bucle: insiste "hasta que se haga" pero con tope (y corta si una pasada no logra avances).
+    juez_max_intervenciones: int = 2
     proveedor: str = "openrouter"
     api_url: str = ""
 
@@ -15913,6 +15914,15 @@ class Orquestador:
             if not archivos and not creados_en_build:
                 problemas.append("SIN CAMBIOS: la tarea no modificó archivos del proyecto. "
                                  "No se puede verificar una implementación solo por el texto del modelo.")
+            # DESVÍO: cambió archivos pero NINGUNO de los que la tarea declaró (p. ej. bumpeó la versión en vez de
+            # implementar el módulo pedido). Que existan los declarados y que los tests pasen no alcanza: el trabajo
+            # tiene que estar en SUS archivos, no en otra cosa. No aplica si los declarados ya se crearon en la build.
+            tocados_declarados = [rel for rel in declarados if rel in archivos]
+            if declarados and archivos and not tocados_declarados and not creados_en_build:
+                problemas.append(
+                    "DESVÍO: la tarea declaró trabajar en " + ", ".join(declarados[:6])
+                    + " pero no tocó ninguno de esos archivos; cambió " + ", ".join(archivos[:6])
+                    + ". Implementá EXACTAMENTE lo pedido en sus archivos, no otra cosa.")
         if tests is not None and not tests.ok and conteo.reconocido:
             # Los tests de la especificación de tareas siguientes fallan a propósito: no son regresión.
             nuevos_fallos = [n for n in conteo.nombres_fallados
@@ -16078,6 +16088,14 @@ class Orquestador:
             informe.criterios_entrega = self._contrato_de_entrega(pedido)
             if informe.criterios_entrega:
                 previo["criterios_entrega"] = informe.criterios_entrega
+                # El juez MANDA: su contrato pasa a ser el criterio de aceptación de TODO el build (lo usan los
+                # tests primero, el checklist y la verificación), no solo el gate final. Así el equipo construye
+                # hacia lo que se pidió, no hacia lo que un rol interpretó.
+                fusion = list(informe.criterios_entrega) + [c for c in plan.criterios
+                                                            if c not in informe.criterios_entrega]
+                plan.criterios = fusion[:10]
+                informe.plan = plan
+                previo["plan"] = asdict(plan)
                 registro_build.guardar(previo)
                 self._mostrar_contrato(informe.criterios_entrega, plan)
         else:
@@ -41352,6 +41370,24 @@ class TestPipelinePlanYRevision(BaseTest):
         self.assertFalse(verif.ok)
         self.assertIn("SIN PROGRESO", verif.diagnostico)
         self.assertTrue(orq._verificar_tarea(tcid, ConteoTests(), set()).ok)
+
+    def test_desvio_tarea_toca_el_archivo_equivocado(self):
+        # La tarea declara b.py pero el agente cambió a.py (los dos ya existían): es un DESVÍO, no se da por hecha.
+        ws = self.proyecto({"a.py": "X = 1\n", "b.py": "Y = 1\n"})
+        orq = Orquestador(MockLLM([]), ws, self.ajustes(), self.ui())
+        orq._protegidos = {}
+        tcid = ws.checkpoints.iniciar("tarea 1")
+        ws.escribir("a.py", "X = 2\n")                       # cambió a.py, NO el declarado b.py
+        verif = orq._verificar_tarea(tcid, ConteoTests(), set(), verificar_entrega=True,
+                                     archivos_esperados=["b.py"], cid_build=tcid)
+        self.assertFalse(verif.ok)
+        self.assertIn("DESVÍO", verif.diagnostico)
+        # Si toca el archivo que declaró, la verificación pasa.
+        tcid2 = ws.checkpoints.iniciar("tarea 2")
+        ws.escribir("b.py", "Y = 2\n")
+        verif2 = orq._verificar_tarea(tcid2, ConteoTests(), set(), verificar_entrega=True,
+                                      archivos_esperados=["b.py"], cid_build=tcid2)
+        self.assertTrue(verif2.ok, verif2.diagnostico)
 
     def test_revisor_no_aprueba_una_tarea_que_rompe_tests(self):
         ws = self.proyecto({

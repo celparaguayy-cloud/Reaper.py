@@ -1392,6 +1392,15 @@ class Orquestador:
             if not archivos and not creados_en_build:
                 problemas.append("SIN CAMBIOS: la tarea no modificó archivos del proyecto. "
                                  "No se puede verificar una implementación solo por el texto del modelo.")
+            # DESVÍO: cambió archivos pero NINGUNO de los que la tarea declaró (p. ej. bumpeó la versión en vez de
+            # implementar el módulo pedido). Que existan los declarados y que los tests pasen no alcanza: el trabajo
+            # tiene que estar en SUS archivos, no en otra cosa. No aplica si los declarados ya se crearon en la build.
+            tocados_declarados = [rel for rel in declarados if rel in archivos]
+            if declarados and archivos and not tocados_declarados and not creados_en_build:
+                problemas.append(
+                    "DESVÍO: la tarea declaró trabajar en " + ", ".join(declarados[:6])
+                    + " pero no tocó ninguno de esos archivos; cambió " + ", ".join(archivos[:6])
+                    + ". Implementá EXACTAMENTE lo pedido en sus archivos, no otra cosa.")
         if tests is not None and not tests.ok and conteo.reconocido:
             # Los tests de la especificación de tareas siguientes fallan a propósito: no son regresión.
             nuevos_fallos = [n for n in conteo.nombres_fallados
@@ -1557,6 +1566,14 @@ class Orquestador:
             informe.criterios_entrega = self._contrato_de_entrega(pedido)
             if informe.criterios_entrega:
                 previo["criterios_entrega"] = informe.criterios_entrega
+                # El juez MANDA: su contrato pasa a ser el criterio de aceptación de TODO el build (lo usan los
+                # tests primero, el checklist y la verificación), no solo el gate final. Así el equipo construye
+                # hacia lo que se pidió, no hacia lo que un rol interpretó.
+                fusion = list(informe.criterios_entrega) + [c for c in plan.criterios
+                                                            if c not in informe.criterios_entrega]
+                plan.criterios = fusion[:10]
+                informe.plan = plan
+                previo["plan"] = asdict(plan)
                 registro_build.guardar(previo)
                 self._mostrar_contrato(informe.criterios_entrega, plan)
         else:

@@ -492,6 +492,24 @@ class TestPipelinePlanYRevision(BaseTest):
         self.assertIn("SIN PROGRESO", verif.diagnostico)
         self.assertTrue(orq._verificar_tarea(tcid, ConteoTests(), set()).ok)
 
+    def test_desvio_tarea_toca_el_archivo_equivocado(self):
+        # La tarea declara b.py pero el agente cambió a.py (los dos ya existían): es un DESVÍO, no se da por hecha.
+        ws = self.proyecto({"a.py": "X = 1\n", "b.py": "Y = 1\n"})
+        orq = Orquestador(MockLLM([]), ws, self.ajustes(), self.ui())
+        orq._protegidos = {}
+        tcid = ws.checkpoints.iniciar("tarea 1")
+        ws.escribir("a.py", "X = 2\n")                       # cambió a.py, NO el declarado b.py
+        verif = orq._verificar_tarea(tcid, ConteoTests(), set(), verificar_entrega=True,
+                                     archivos_esperados=["b.py"], cid_build=tcid)
+        self.assertFalse(verif.ok)
+        self.assertIn("DESVÍO", verif.diagnostico)
+        # Si toca el archivo que declaró, la verificación pasa.
+        tcid2 = ws.checkpoints.iniciar("tarea 2")
+        ws.escribir("b.py", "Y = 2\n")
+        verif2 = orq._verificar_tarea(tcid2, ConteoTests(), set(), verificar_entrega=True,
+                                      archivos_esperados=["b.py"], cid_build=tcid2)
+        self.assertTrue(verif2.ok, verif2.diagnostico)
+
     def test_revisor_no_aprueba_una_tarea_que_rompe_tests(self):
         ws = self.proyecto({
             "calc.py": "def suma(a, b):\n    return a + b\n",

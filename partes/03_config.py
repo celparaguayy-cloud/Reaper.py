@@ -216,8 +216,9 @@ class Settings:
     # ENDURECER el estado (verificada/validada → parcial si falta algo); nunca convierte una build roja en verde.
     juez: bool = True
     # Cuántas veces el juez puede INTERVENIR para cerrar: si al final falta algo del pedido, dispara una pasada
-    # de reparación hacia los faltantes y vuelve a juzgar. 0 = solo avisa, no interviene. Acotado para no entrar en bucle.
-    juez_max_intervenciones: int = 1
+    # de reparación hacia los faltantes y vuelve a juzgar. 0 = solo avisa, no interviene. Acotado para no entrar en
+    # bucle: insiste "hasta que se haga" pero con tope (y corta si una pasada no logra avances).
+    juez_max_intervenciones: int = 2
     proveedor: str = "openrouter"
     api_url: str = ""
 
