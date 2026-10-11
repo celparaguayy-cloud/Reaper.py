@@ -809,7 +809,10 @@ class Orquestador:
             f"PEDIDO DEL USUARIO:\n{pedido}\n\n"
             f"INFORME DE EXPLORACIÓN (código real):\n{recortar(exploracion, 7000)}\n\n"
             f"Comando de tests detectado: {detectado[0] if detectado else 'ninguno (habrá que crear tests)'}\n"
-            f"Armá el plan con un máximo de {self.settings.max_tareas} tareas."
+            f"Usá TANTAS tareas como el proyecto realmente necesite, hasta un máximo de {self.settings.max_tareas}. "
+            f"Un proyecto chico lleva pocas; uno grande se descompone por módulo/capa: UNA tarea por pieza coherente "
+            f"(un módulo, una pantalla, un endpoint, su test), con sus dependencias en deps= para que se ordenen bien. "
+            f"No metas medio proyecto en una sola tarea gigante ni inventes tareas de relleno."
         )
         if self.settings.tests_primero:
             tarea += ("\nLos tests se escriben ANTES de implementar a partir de tu <interfaz> y tus <criterios>: "
@@ -824,6 +827,10 @@ class Orquestador:
         if not _RE_TAREA.search(texto) and _RE_TAREA.search(res.contexto):
             texto = res.contexto + "\n" + texto
         plan = parsear_plan(texto, pedido, self.settings.max_tareas)
+        crudas = len(_RE_TAREA.findall(texto))
+        if crudas > self.settings.max_tareas:
+            self.ui.aviso(f"  El plan traía {crudas} tareas y el tope es {self.settings.max_tareas}: agrupé el resto "
+                          f"en la última. Para un proyecto grande subí el tope: /config max_tareas {min(60, crudas)}")
         if not res.ok:
             self.ui.aviso("El arquitecto no terminó limpio; uso lo que produjo.")
         motivo = plan_degenerado(plan, pedido, texto)

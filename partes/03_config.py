@@ -245,7 +245,10 @@ class Settings:
     # (torneo × pasos × reparaciones × forense) sin terminar: al vencer, la tarea queda FALLIDA, nunca "verificada".
     tiempo_max_tarea: int = 1500
     tiempo_max_build: int = 5400
-    max_tareas: int = 8
+    # Techo de tareas del plan. Es un MÁXIMO, no un objetivo: un proyecto chico usa pocas; uno grande se descompone
+    # por módulo hasta este tope. 12 por defecto para que un proyecto mediano no se trunque; subilo para uno grande
+    # (/config max_tareas 40). Al pasarse, el resto se agrupa en la última tarea y se avisa.
+    max_tareas: int = 12
     paralelo: int = 2
     qa: bool = True
 
@@ -353,7 +356,7 @@ class Settings:
         acotar("tiempo_max_tarea", 0, 86400)
         acotar("tiempo_max_build", 0, 86400)
         acotar("max_revisiones", 0, 5)
-        acotar("max_tareas", 1, 30)
+        acotar("max_tareas", 1, 60)
         acotar("paralelo", 1, 8)
         acotar("candidatos", 1, 6)
         acotar("paralelo_torneo", 1, 6)

@@ -235,3 +235,13 @@ class TestTrabajosChicos(BaseTest):
 
     def test_vacio_sin_plan_sigue_testeable(self):
         self.assertTrue(_es_testeable([], []))     # proyecto vacío y plan sin archivos: no bajamos la guardia
+
+    def test_plan_grande_no_se_trunca_con_el_tope_por_defecto(self):
+        # El tope por defecto subió para que un proyecto mediano/grande no se cram-ee en una sola tarea.
+        self.assertGreaterEqual(Settings().max_tareas, 12)
+        texto = "".join(f'<tarea id="{i}" archivos="m{i}.py">módulo {i}</tarea>' for i in range(1, 11))
+        plan = parsear_plan(texto, "proyecto grande", Settings().max_tareas)
+        self.assertEqual(len(plan.tareas), 10)                  # 10 módulos quedan como 10 tareas, no una sola
+        # Y al pasarse del tope, el resto se agrupa (no se pierde): sigue habiendo a lo sumo max_tareas.
+        muchas = "".join(f'<tarea id="{i}">t{i}</tarea>' for i in range(1, 40))
+        self.assertEqual(len(parsear_plan(muchas, "p", 12).tareas), 12)
