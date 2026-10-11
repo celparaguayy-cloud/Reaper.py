@@ -98,6 +98,7 @@ import platform
 import queue
 import random
 import re
+import secrets
 import shlex
 import shutil
 import signal
@@ -1675,6 +1676,10 @@ class Settings:
     max_llamadas_turno: int = 4
     max_reparaciones: int = 3
     max_revisiones: int = 2
+    # Plazos de pared (segundos; 0 = sin límite). Sin ellos una build con modelos lentos podía seguir HORAS
+    # (torneo × pasos × reparaciones × forense) sin terminar: al vencer, la tarea queda FALLIDA, nunca "verificada".
+    tiempo_max_tarea: int = 1500
+    tiempo_max_build: int = 5400
     max_tareas: int = 8
     paralelo: int = 2
     qa: bool = True
@@ -1780,6 +1785,8 @@ class Settings:
         acotar("max_profundidad", 0, 3)
         acotar("max_llamadas_turno", 1, 10)
         acotar("max_reparaciones", 0, 10)
+        acotar("tiempo_max_tarea", 0, 86400)
+        acotar("tiempo_max_build", 0, 86400)
         acotar("max_revisiones", 0, 5)
         acotar("max_tareas", 1, 30)
         acotar("paralelo", 1, 8)
@@ -1930,23 +1937,38 @@ OVERRIDES_PROHIBIDOS_PROYECTO = frozenset({
 })
 
 
+# Orden de permisos: un .reaper/config.json (que puede venir en un repo ajeno o escribirlo el propio agente)
+# puede pedir MÁS confirmación, nunca menos (antes podía pasar de "confirmar" a "auto" y saltear la aprobación).
+_RIGOR_MODO = {"auto": 0, "auto-edicion": 1, "confirmar": 2}
+
+
+def _override_afloja(settings: Settings, clave: str, valor) -> bool:
+    if clave == "modo":
+        return _RIGOR_MODO.get(str(valor), -1) < _RIGOR_MODO.get(settings.modo, 2)
+    if clave == "hooks":
+        return bool(valor) and not settings.hooks
+    return False
+
+
 def settings_con_local(settings: Settings, local: dict) -> Settings:
     """Copia de settings con los overrides SEGUROS de .reaper/config.json del proyecto (clave 'settings')."""
     overrides = local.get("settings") if isinstance(local, dict) else None
     if not isinstance(overrides, dict) or not overrides:
         return settings
-    seguros = {k: v for k, v in overrides.items() if k not in OVERRIDES_PROHIBIDOS_PROYECTO}
+    seguros = {k: v for k, v in overrides.items()
+               if k not in OVERRIDES_PROHIBIDOS_PROYECTO and not _override_afloja(settings, k, v)}
     combinado = settings.to_dict()
     combinado.update(seguros)
     return Settings.desde_dict(combinado)
 
 
-def overrides_proyecto_ignorados(local: dict) -> list:
+def overrides_proyecto_ignorados(local: dict, settings: Optional[Settings] = None) -> list:
     """Claves del .reaper/config.json del proyecto que se ignoran por seguridad (para avisar al usuario)."""
     overrides = local.get("settings") if isinstance(local, dict) else None
     if not isinstance(overrides, dict):
         return []
-    return [k for k in overrides if k in OVERRIDES_PROHIBIDOS_PROYECTO]
+    return [k for k, v in overrides.items() if k in OVERRIDES_PROHIBIDOS_PROYECTO
+            or (settings is not None and _override_afloja(settings, k, v))]
 
 
 def cargar_estado() -> dict:
@@ -2588,6 +2610,11 @@ class LLMClient:
                         f"{e} (después de {intentos + 1} intentos)",
                         probar_otro_modelo=True,
                     ) from e
+                plazo = globals().get("PLAZO")
+                vencido = plazo.vencido() if plazo is not None else None
+                if vencido:
+                    raise LLMError(f"{e} (no reintento: se agotó el tiempo de {vencido})",
+                                   probar_otro_modelo=False) from e
                 espera = e.espera
                 if espera is None:
                     espera = min(60.0, 2.0 * (2 ** intento)) + random.uniform(0, 1)
@@ -2636,6 +2663,8 @@ class LLMClient:
                 f"{modelo}. Exportala como variable de entorno.", probar_otro_modelo=True)
         visto_done = False
         for linea in self._transporte(destino.url, self._headers(destino), payload, self.settings.timeout):
+            if "CANCELAR" in globals() and CANCELAR.is_set():
+                raise LLMError("Cancelado por el usuario durante la respuesta del modelo.", probar_otro_modelo=False)
             evento = parsear_linea_sse(linea)
             if evento is None:
                 continue
@@ -2916,6 +2945,7 @@ class Llamada:
     params: dict = field(default_factory=dict)
     completa: bool = True
     crudo: str = ""
+    sin_cierre: frozenset = frozenset()   # parámetros largos cuya etiqueta de cierre propia NO apareció
 
 
 @dataclass
@@ -2985,7 +3015,7 @@ def _atributos(texto: str) -> dict:
     return salida
 
 
-def _extraer_params(cuerpo: str, definicion: list) -> tuple[dict, bool]:
+def _extraer_params(cuerpo: str, definicion: list, abiertos: Optional[set] = None) -> tuple[dict, bool]:
     params: dict = {}
     completa = True
     enmascarado = cuerpo
@@ -3015,6 +3045,8 @@ def _extraer_params(cuerpo: str, definicion: list) -> tuple[dict, bool]:
                 else:
                     fin_valor = fin_total = len(enmascarado)
                     completa = False
+                    if abiertos is not None:
+                        abiertos.add(nombre)
                 params[nombre] = limpiar_largo(cuerpo[ap.end():fin_valor])
                 enmascarado = (
                     enmascarado[:ap.start()]
@@ -3128,7 +3160,8 @@ def analizar(texto: str, esquemas: Esquemas) -> Analisis:
                 pos = fin
 
         definicion = esquemas.get(real, [])
-        params, completa = _extraer_params(cuerpo, definicion) if cuerpo.strip() else ({}, True)
+        abiertos: set = set()
+        params, completa = _extraer_params(cuerpo, definicion, abiertos) if cuerpo.strip() else ({}, True)
         if not completa and not autocerrada and c_encontrado:
             # Falta el cierre del parámetro (</content>) pero el de la herramienta está: el valor queda
             # delimitado por </herramienta>, así que la llamada se entiende entera.
@@ -3138,7 +3171,7 @@ def analizar(texto: str, esquemas: Esquemas) -> Analisis:
             params.setdefault(canon, valor)
         if not params and cuerpo.strip() and definicion:
             completa = completa and True
-        llamadas.append(Llamada(real, params, completa, limpio[m.start():pos]))
+        llamadas.append(Llamada(real, params, completa, limpio[m.start():pos], frozenset(abiertos)))
 
     if not llamadas:
         for m in _RE_FUNCION_LLAMA.finditer(limpio):
@@ -3164,6 +3197,31 @@ def analizar(texto: str, esquemas: Esquemas) -> Analisis:
             fuera = []
 
     return Analisis(llamadas=llamadas, texto="".join(fuera).strip(), respuesta_limpia=limpio)
+
+
+_RE_CIERRE_FINAL = re.compile(r"<\s*/\s*([A-Za-z_][\w-]*)\s*>?\s*\Z")
+
+
+def cierre_espurio(valor: str, cercanos: Iterable[str], exactos: Iterable[str] = ()) -> Optional[str]:
+    """
+    Si un parámetro largo TERMINA en una etiqueta de cierre que se parece al nombre de la herramienta o de un
+    parámetro (p. ej. `</replace_line>` en vez de `</replace_lines>`, `</contnet>`), esa etiqueta es un error
+    de formato del modelo, no contenido: se devuelve para rechazar la llamada SIN escribir nada. Antes se
+    escribía tal cual dentro del archivo (assets .css/.js rotos, sin validador que lo notara).
+    Solo se aplica a parámetros cuya etiqueta de cierre propia NO apareció (Llamada.sin_cierre): un archivo
+    bien delimitado que termina en </Context> o </path> no se toca.
+    """
+    m = _RE_CIERRE_FINAL.search(valor or "")
+    if not m:
+        return None
+    etiqueta = m.group(1).lower()
+    if etiqueta in {(n or "").lower() for n in exactos}:
+        return m.group(0).strip()
+    for nombre in cercanos:
+        nombre = (nombre or "").lower()
+        if nombre and (etiqueta == nombre or difflib.SequenceMatcher(None, etiqueta, nombre).ratio() >= 0.8):
+            return m.group(0).strip()
+    return None
 
 
 def contenido_parcial(llamada: Llamada, esquemas: Esquemas) -> Optional[tuple[str, str]]:
@@ -3688,6 +3746,10 @@ _PATRON_JSON_SECRETO = re.compile(
 
 MAX_BYTES_LECTURA = 1_000_000
 
+# El manifiesto del evaluador independiente y el diario de /construir no los edita el agente: si pudiera, bajaría
+# min_tests o borraría el evaluador entre builds (las suites del usuario quedan fuera del alcance de escritura).
+ARCHIVOS_CONTROL_REAPER = frozenset({".reaper/acceptance.json", ".reaper/build_pendiente.json"})
+
 
 class ErrorRuta(ValueError):
     pass
@@ -3787,6 +3849,9 @@ class Workspace:
                 raise ErrorRuta(f"Archivo sensible protegido: {rel}")
             if relativa.parts and relativa.parts[0] == ".git":
                 raise ErrorRuta("No se escribe dentro de .git")
+            if relativa.as_posix().lower() in ARCHIVOS_CONTROL_REAPER:
+                raise ErrorRuta(f"{relativa.as_posix()} es un archivo de control de REAPER (evaluador externo o "
+                                "diario de la build): lo administra el propietario, no el agente.")
             if destino == self.raiz:
                 raise ErrorRuta("La ruta apunta a la raíz del workspace, no a un archivo.")
         return destino
@@ -4526,6 +4591,35 @@ def entorno_seguro() -> dict:
     return env
 
 
+# Procesos hijos vivos (cada uno en su propio grupo, por start_new_session). Se registran para poder matarlos
+# si REAPER se cancela o sale: un Ctrl+C del terminal NO les llega (están en otra sesión) y quedaban huérfanos.
+_PROCESOS_VIVOS: set = set()
+_LOCK_PROCESOS = threading.Lock()
+
+
+def _matar_grupo(proceso) -> None:
+    try:
+        os.killpg(proceso.pid, signal.SIGKILL)
+    except OSError:
+        try:
+            proceso.kill()
+        except OSError:
+            pass
+
+
+def matar_procesos_vivos() -> int:
+    """Mata todos los procesos hijos registrados (idempotente). Devuelve cuántos había."""
+    with _LOCK_PROCESOS:
+        vivos = list(_PROCESOS_VIVOS)
+        _PROCESOS_VIVOS.clear()
+    for proceso in vivos:
+        _matar_grupo(proceso)
+    return len(vivos)
+
+
+atexit.register(matar_procesos_vivos)
+
+
 def ejecutar(
     cmd: Union[str, list],
     *,
@@ -4533,6 +4627,7 @@ def ejecutar(
     timeout: int = 60,
     shell: bool = False,
     entrada: Optional[str] = None,
+    env_extra: Optional[dict] = None,
 ) -> Resultado:
     etiqueta = cmd if isinstance(cmd, str) else " ".join(shlex.quote(str(c)) for c in cmd)
     inicio = time.monotonic()
@@ -4559,7 +4654,7 @@ def ejecutar(
                 stdin=subprocess.PIPE if entrada is not None else subprocess.DEVNULL,
                 stdout=f_out,
                 stderr=f_err,
-                env=entorno_seguro(),
+                env={**entorno_seguro(), **(env_extra or {})},
                 start_new_session=True,
             )
         except FileNotFoundError:
@@ -4574,19 +4669,37 @@ def ejecutar(
                 proceso.stdin.close()
             except OSError:
                 pass
+        with _LOCK_PROCESOS:
+            _PROCESOS_VIVOS.add(proceso)
         try:
-            proceso.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            try:
-                os.killpg(proceso.pid, signal.SIGKILL)
-            except OSError:
-                proceso.kill()
-            proceso.wait()
-            return Resultado(
-                False, etiqueta, 124, _cola(f_out),
-                _cola(f_err) + f"\nTiempo agotado después de {timeout}s (¿programa interactivo o servidor?).",
-                timeout=True, duracion=time.monotonic() - inicio,
-            )
+            # Espera en tramos cortos: se nota un Ctrl+C / CANCELAR enseguida, no al terminar el timeout.
+            limite = inicio + timeout
+            cancelar = globals().get("CANCELAR")
+            while True:
+                try:
+                    proceso.wait(timeout=min(0.25, max(0.01, limite - time.monotonic())))
+                    break
+                except subprocess.TimeoutExpired:
+                    pass
+                if cancelar is not None and cancelar.is_set():
+                    _matar_grupo(proceso)
+                    proceso.wait()
+                    return Resultado(False, etiqueta, 130, _cola(f_out), _cola(f_err) + "\nCancelado por el usuario.",
+                                     duracion=time.monotonic() - inicio)
+                if time.monotonic() >= limite:
+                    _matar_grupo(proceso)
+                    proceso.wait()
+                    return Resultado(
+                        False, etiqueta, 124, _cola(f_out),
+                        _cola(f_err) + f"\nTiempo agotado después de {timeout}s (¿programa interactivo o servidor?).",
+                        timeout=True, duracion=time.monotonic() - inicio,
+                    )
+        except BaseException:
+            _matar_grupo(proceso)          # Ctrl+C en el hilo principal: no dejar el hijo huérfano
+            raise
+        finally:
+            with _LOCK_PROCESOS:
+                _PROCESOS_VIVOS.discard(proceso)
         return Resultado(proceso.returncode == 0, etiqueta, proceso.returncode,
                          _cola(f_out), _cola(f_err), duracion=time.monotonic() - inicio)
     finally:
@@ -10743,6 +10856,105 @@ class Cancelado(Exception):
     pass
 
 
+class PlazoTrabajo:
+    """
+    Plazos de pared (time.monotonic) de la build y de la tarea en curso. Es global del proceso a propósito:
+    los candidatos del torneo y los subagentes corren en otros hilos y también tienen que verlo.
+    vencido() devuelve el motivo ("la tarea 3", "la build") del primer plazo vencido, o None.
+    """
+
+    def __init__(self, reloj: Callable[[], float] = time.monotonic):
+        self.reloj = reloj
+        self._pila: list = []          # (token, límite, motivo)
+        self._lock = threading.Lock()
+
+    def abrir(self, segundos: float, motivo: str) -> Optional[object]:
+        if not segundos or segundos <= 0:
+            return None
+        token = object()
+        with self._lock:
+            self._pila.append((token, self.reloj() + float(segundos), motivo))
+        return token
+
+    def cerrar(self, token: Optional[object]) -> None:
+        if token is None:
+            return
+        with self._lock:
+            self._pila = [e for e in self._pila if e[0] is not token]
+
+    @contextlib.contextmanager
+    def limitar(self, segundos: float, motivo: str):
+        token = self.abrir(segundos, motivo)
+        try:
+            yield token
+        finally:
+            self.cerrar(token)
+
+    def vencido(self) -> Optional[str]:
+        with self._lock:
+            ahora = self.reloj()
+            return next((motivo for _t, limite, motivo in self._pila if ahora >= limite), None)
+
+
+PLAZO = PlazoTrabajo()
+
+
+def ejecutar_hilos(tareas: Sequence[Callable[[], Any]], max_paralelo: int, *, gracia: float = 2.0) -> list:
+    """
+    Corre funciones en hilos DAEMON con concurrencia acotada y devuelve sus resultados en orden.
+
+    Reemplaza a ThreadPoolExecutor en el trabajo con modelos: su salida (y el `_python_exit` del intérprete)
+    hace join de los hilos, así que un Ctrl+C quedaba esperando a que terminara una llamada lenta (minutos
+    con un modelo de razonamiento). Acá el hilo principal espera en tramos cortos (interrumpibles), ante
+    Ctrl+C o CANCELAR marca la cancelación, da una gracia ACOTADA para que los hilos la vean y relanza; los
+    hilos daemon no bloquean la salida del proceso.
+    """
+    n = len(tareas)
+    resultados: list = [None] * n
+    errores: list = [None] * n
+    cupo = threading.Semaphore(max(1, int(max_paralelo)))
+
+    def trabajar(i: int) -> None:
+        try:
+            resultados[i] = tareas[i]()
+        except BaseException as e:      # se relanza en el hilo principal, en orden
+            errores[i] = e
+        finally:
+            cupo.release()
+
+    hilos: list = []
+    try:
+        for i in range(n):
+            while not cupo.acquire(timeout=0.2):
+                if CANCELAR.is_set():
+                    raise Cancelado()
+            if CANCELAR.is_set():
+                cupo.release()
+                raise Cancelado()
+            hilo = threading.Thread(target=trabajar, args=(i,), name=f"reaper-hilo-{i}", daemon=True)
+            hilos.append(hilo)
+            hilo.start()
+        for hilo in hilos:
+            while hilo.is_alive():
+                hilo.join(0.2)
+                if CANCELAR.is_set():          # cancelado desde otro hilo o la UI, no solo por Ctrl+C
+                    raise Cancelado()
+    except (KeyboardInterrupt, Cancelado):
+        CANCELAR.set()
+        matar_procesos_vivos()
+        limite = time.monotonic() + max(0.0, gracia)
+        for hilo in hilos:
+            restante = limite - time.monotonic()
+            if restante <= 0:
+                break
+            hilo.join(restante)
+        raise
+    for error in errores:
+        if error is not None:
+            raise error
+    return resultados
+
+
 @dataclass
 class ResultadoAgente:
     ok: bool
@@ -11150,6 +11362,10 @@ class Agente:
         for paso in range(1, self.max_pasos + 1):
             if CANCELAR.is_set():
                 raise Cancelado()
+            vencido = PLAZO.vencido()
+            if vencido:
+                return self._cerrar(f"Se agotó el tiempo de {vencido}: corté en el paso {paso} SIN declarar éxito. "
+                                    "Trabajo parcial: revisá /diff.", paso, "tiempo", ok=False)
             self._compactar()
             respuesta = self._llamar_con_recuperacion()
             analisis = analizar(respuesta.texto, self._esquemas)
@@ -11399,7 +11615,22 @@ class Agente:
                 and all(llamada.params.get(p.nombre) not in (None, "") for p in h.params if p.requerido):
             # El mensaje terminó normal y la llamada es la última: el modelo solo olvidó cerrar las etiquetas.
             # Se acepta (si el contenido quedó truncado, la validación real del archivo lo va a mostrar).
-            llamada = Llamada(llamada.nombre, llamada.params, True, llamada.crudo)
+            llamada = Llamada(llamada.nombre, llamada.params, True, llamada.crudo, llamada.sin_cierre)
+        if llamada.completa and llamada.sin_cierre:
+            exactos = ["tool", "invoke", "parameter", "tool_call", "tool_calls", "function_call", *REGISTRO.keys()]
+            for p in h.params:
+                valor = llamada.params.get(p.nombre)
+                if not p.largo or p.nombre not in llamada.sin_cierre or not isinstance(valor, str):
+                    continue
+                espurio = cierre_espurio(valor, [nombre, p.nombre], exactos)
+                if espurio:
+                    self.ui.resultado_herramienta(False, f"{nombre}: etiqueta de cierre inválida {espurio}")
+                    self.ctx.tropiezo("xml_invalido")
+                    return obs(
+                        f"ERROR: la llamada a {nombre} terminó con la etiqueta {espurio}, que NO es un cierre válido "
+                        f"(esperaba </{p.nombre}> y </{nombre}>). No modifiqué nada. Reenviá la llamada completa "
+                        "con las etiquetas exactas."
+                    ), True
         if not llamada.completa:
             self.ui.resultado_herramienta(False, f"{nombre}: llamada incompleta")
             self.ctx.tropiezo("llamada_incompleta")
@@ -12340,15 +12571,7 @@ def ejecutar_subagentes(
         return [correr(s, True) for s in specs]
 
     ui.tenue(f"  ⇉ {len(specs)} subagentes en paralelo (máx {limite} a la vez)")
-    ejecutor = ThreadPoolExecutor(max_workers=min(limite, len(specs)))
-    try:
-        futuros = [ejecutor.submit(correr, s, False) for s in specs]
-        return [f.result() for f in futuros]
-    except (KeyboardInterrupt, Cancelado):
-        CANCELAR.set()
-        raise
-    finally:
-        ejecutor.shutdown(wait=not CANCELAR.is_set(), cancel_futures=True)
+    return ejecutar_hilos([functools.partial(correr, s, False) for s in specs], min(limite, len(specs)))
 
 
 # ======================================================================
@@ -12729,27 +12952,25 @@ class EscritorLargo:
                 break
             fallidos: list[Simbolo] = []
             base = texto
-            with ThreadPoolExecutor(max_workers=paralelo) as ejecutor:
-                futuros = [ejecutor.submit(generar, g, base) for g in grupos]
-                for futuro in as_completed(futuros):
-                    grupo, definiciones = futuro.result()
-                    with self._lock:
-                        for s in grupo:
-                            definicion = definiciones.get(s.nombre_completo)
-                            if not definicion:
-                                errores[s.nombre_completo] = "No devolviste la definición completa de esta función."
-                                fallidos.append(s)
-                                continue
-                            nuevo, error = self._aplicar(rel, lenguaje, texto, s.nombre_completo, definicion)
-                            if error:
-                                errores[s.nombre_completo] = error
-                                fallidos.append(s)
-                                continue
-                            texto = nuevo
-                            hechos += 1
-                            escribir_archivo(rel, texto)
-                            self.ui.linea(f"      {Tema.ok}✓{C.RESET} {Tema.tenue}{s.nombre_completo} "
-                                          f"({hechos}/{total}){C.RESET}")
+            generados = ejecutar_hilos([functools.partial(generar, g, base) for g in grupos], paralelo)
+            for grupo, definiciones in generados:
+                with self._lock:
+                    for s in grupo:
+                        definicion = definiciones.get(s.nombre_completo)
+                        if not definicion:
+                            errores[s.nombre_completo] = "No devolviste la definición completa de esta función."
+                            fallidos.append(s)
+                            continue
+                        nuevo, error = self._aplicar(rel, lenguaje, texto, s.nombre_completo, definicion)
+                        if error:
+                            errores[s.nombre_completo] = error
+                            fallidos.append(s)
+                            continue
+                        texto = nuevo
+                        hechos += 1
+                        escribir_archivo(rel, texto)
+                        self.ui.linea(f"      {Tema.ok}✓{C.RESET} {Tema.tenue}{s.nombre_completo} "
+                                      f"({hechos}/{total}){C.RESET}")
             if not fallidos:
                 break
             self.ui.tenue(f"  [{self.etiqueta}] ronda {ronda + 2}: reintento {len(fallidos)} función(es) con el error real")
@@ -13103,15 +13324,8 @@ class Torneo:
                 for cand in candidatos:
                     self._correr_candidato(cand, tarea, archivos, rol, protegidos, existentes, True)
             else:
-                with ThreadPoolExecutor(max_workers=paralelo) as ejecutor:
-                    futuros = [ejecutor.submit(self._correr_candidato, cand, tarea, archivos, rol, protegidos,
-                                               existentes, False) for cand in candidatos]
-                    try:
-                        for f in futuros:
-                            f.result()
-                    except (KeyboardInterrupt, Cancelado):
-                        CANCELAR.set()
-                        raise
+                ejecutar_hilos([functools.partial(self._correr_candidato, cand, tarea, archivos, rol, protegidos,
+                                                  existentes, False) for cand in candidatos], paralelo)
             return self._decidir(candidatos, cid, protegidos)
         finally:
             for cand in candidatos:
@@ -14394,11 +14608,11 @@ def _aceptacion_error(mensaje: str) -> Resultado:
     return Resultado(False, 'aceptacion_independiente', 1, stderr=str(mensaje))
 
 
-def huella_aceptacion(ws: Workspace) -> str:
-    """Fija el manifiesto y la suite externa; cambios durante build => fallo cerrado."""
+def _manifiesto_aceptacion(ws: Workspace) -> Optional[tuple]:
+    """(bytes_crudos, spec, carpeta_suite) del manifiesto validado; None si no hay evaluador configurado."""
     cfg = ws.raiz / '.reaper' / 'acceptance.json'
     if not cfg.exists() and not cfg.is_symlink():
-        return 'sin-evaluador'
+        return None
     if cfg.is_symlink() or not cfg.is_file():
         raise ValueError('El manifiesto de aceptación no puede ser un enlace simbólico.')
     if cfg.stat().st_size > 16_384:
@@ -14411,9 +14625,9 @@ def huella_aceptacion(ws: Workspace) -> str:
     if not isinstance(spec, dict) or set(spec) - {'suite_dir', 'min_tests', 'timeout'}:
         raise ValueError('El manifiesto acepta solo suite_dir, min_tests y timeout.')
     suite_str = spec.get('suite_dir')
-    if not isinstance(suite_str, str) or not suite_str.startswith('/'):
+    if not isinstance(suite_str, str) or not os.path.isabs(os.path.expanduser(suite_str)):
         raise ValueError('suite_dir debe ser una carpeta ABSOLUTA fuera del proyecto.')
-    suite = Path(suite_str).resolve(strict=False)
+    suite = Path(os.path.expanduser(suite_str)).resolve(strict=False)
     raiz = ws.raiz.resolve()
     if os.path.commonpath((str(suite), str(raiz))) == str(raiz):
         raise ValueError('La suite independiente debe estar FUERA del proyecto editado por REAPER.')
@@ -14425,27 +14639,93 @@ def huella_aceptacion(ws: Workspace) -> str:
         raise ValueError('min_tests debe ser un entero entre 1 y 10000.')
     if isinstance(tiempo, bool) or not isinstance(tiempo, int) or not 1 <= tiempo <= 180:
         raise ValueError('timeout debe ser un entero entre 1 y 180.')
-    tests = sorted(suite.rglob('test_*.py'))
+    return raw, spec, suite
+
+
+def _archivos_suite(suite: Path) -> list:
+    """Todos los archivos de la suite externa (tests Y auxiliares), sin cachés de bytecode. Acotado."""
+    archivos = []
+    for p in sorted(suite.rglob('*')):
+        rel = p.relative_to(suite)
+        if '__pycache__' in rel.parts or p.suffix == '.pyc':
+            continue
+        if p.is_symlink():
+            raise ValueError(f'La suite independiente no admite enlaces simbólicos: {rel}')
+        if p.is_file():
+            archivos.append(p)
+            if len(archivos) > 2000:
+                raise ValueError('La suite externa tiene demasiados archivos (> 2000).')
+    return archivos
+
+
+def huella_aceptacion(ws: Workspace) -> str:
+    """
+    Fija el manifiesto y TODA la suite externa (tests y auxiliares: un helpers.py editado también cuenta);
+    cambios durante la build => fallo cerrado.
+    """
+    datos = _manifiesto_aceptacion(ws)
+    if datos is None:
+        return 'sin-evaluador'
+    raw, _spec, suite = datos
+    archivos = _archivos_suite(suite)
+    tests = [p for p in archivos if p.name.startswith('test_') and p.suffix == '.py']
     if not tests or len(tests) > 500:
         raise ValueError('La suite externa debe incluir 1 a 500 archivos test_*.py.')
-    h = hashlib.sha256(b'REAPER-810-ACCEPTANCE-V1\0' + raw)
-    for p in tests:
-        if p.is_symlink() or not p.is_file():
-            raise ValueError('Los tests independientes no admiten enlaces simbólicos.')
-        if p.stat().st_size > 1_000_000:
-            raise ValueError(f'Test externo demasiado grande: {p.name}')
+    h = hashlib.sha256(b'REAPER-810-ACCEPTANCE-V2\0' + raw)
+    total = 0
+    for p in archivos:
+        tam = p.stat().st_size
+        if tam > 1_000_000:
+            raise ValueError(f'Archivo de la suite externa demasiado grande: {p.name}')
+        total += tam
+        if total > 20_000_000:
+            raise ValueError('La suite externa supera 20 MB.')
         h.update(str(p.relative_to(suite)).encode('utf-8') + b'\0')
         h.update(p.read_bytes())
         h.update(b'\0')
     return h.hexdigest()
 
 
+def huella_aceptacion_v1(ws: Workspace) -> str:
+    """Huella de la ronda 12 (solo test_*.py). Solo para reanudar diarios creados con esa versión."""
+    datos = _manifiesto_aceptacion(ws)
+    if datos is None:
+        return 'sin-evaluador'
+    raw, _spec, suite = datos
+    h = hashlib.sha256(b'REAPER-810-ACCEPTANCE-V1\0' + raw)
+    for p in sorted(suite.rglob('test_*.py')):
+        h.update(str(p.relative_to(suite)).encode('utf-8') + b'\0')
+        h.update(p.read_bytes())
+        h.update(b'\0')
+    return h.hexdigest()
+
+
+# Runner de confianza del evaluador externo. Corre con `python -I -B`: el proyecto (editable por el agente)
+# NUNCA entra en sys.path, así un `unittest.py`/`json.py` del proyecto no puede suplantar la librería
+# estándar e imprimir un "OK" falso (antes pasaba: el gate aprobaba una suite que fallaba). El conteo sale de
+# los objetos de unittest, no de leer texto, en una línea con una marca aleatoria que llega por stdin.
+_RUNNER_ACEPTACION = r"""
+import os, sys
+sys.path[:] = [p for p in sys.path if p not in ('', '.') and os.path.abspath(p) != os.getcwd()]
+import json, unittest
+marca = sys.stdin.readline().strip()
+suite = sys.argv[1]
+r = unittest.TextTestRunner(stream=sys.stderr, verbosity=2).run(
+    unittest.TestLoader().discover(suite, pattern='test_*.py', top_level_dir=suite))
+datos = {'ran': r.testsRun, 'failures': len(r.failures), 'errors': len(r.errors), 'skipped': len(r.skipped),
+         'expected_failures': len(r.expectedFailures), 'unexpected_successes': len(r.unexpectedSuccesses)}
+sys.stdout.write('\n' + marca + json.dumps(datos) + '\n')
+sys.stdout.flush()
+sys.exit(0 if r.wasSuccessful() else 1)
+"""
+
+
 def ejecutar_aceptacion_independiente(ws: Workspace, *,
                                         huella_fijada: Optional[str] = None) -> Optional[Resultado]:
     """Devuelve None solo si NO se configuró un evaluador al inicio de la build.
 
-    Ejecuta unittest con argv real (shell=False) y muestra fallos auténticos.
-    No acepta cambiar/quitar los tests, ni resultados vacíos o con saltos completos.
+    Ejecuta la suite con el runner de confianza (argv real, sin shell, aislado del proyecto). No acepta
+    cambiar/quitar los tests, resultados vacíos, sin conteo verificable o con todo omitido.
     """
     try:
         huella_actual = huella_aceptacion(ws)
@@ -14453,22 +14733,34 @@ def ejecutar_aceptacion_independiente(ws: Workspace, *,
             return _aceptacion_error('Evaluador independiente cambiado o eliminado durante la build.')
         if huella_actual == 'sin-evaluador':
             return None
-        spec = json.loads((ws.raiz / '.reaper' / 'acceptance.json').read_text(encoding='utf-8'))
-        carpeta = str(Path(spec['suite_dir']).resolve())
-        resultado = ejecutar([sys.executable, '-m', 'unittest', 'discover',
-                             '-s', carpeta, '-p', 'test_*.py', '-v'],
-                            cwd=ws.raiz, timeout=int(spec.get('timeout', 60)), shell=False)
-        combinado = resultado.stdout + '\n' + resultado.stderr
-        m = re.search(r'\bRan\s+(\d+)\s+tests?\b', combinado)
+        _raw, spec, suite = _manifiesto_aceptacion(ws)
+        marca = 'REAPER-ACEPTACION-' + secrets.token_hex(16)
+        resultado = ejecutar([sys.executable, '-I', '-B', '-c', _RUNNER_ACEPTACION, str(suite)],
+                             cwd=ws.raiz, timeout=int(spec.get('timeout', 60)), shell=False,
+                             entrada=marca + '\n', env_extra={'REAPER_PROYECTO': str(ws.raiz)})
+        resultado.comando = f"aceptación independiente: unittest {suite}"
+        datos = None
+        for linea in reversed(resultado.stdout.splitlines()):
+            if linea.startswith(marca):
+                try:
+                    datos = json.loads(linea[len(marca):].strip())
+                except ValueError:
+                    datos = None
+                break
+        resultado.stdout = '\n'.join(l for l in resultado.stdout.splitlines() if not l.startswith(marca))
         minimo = spec.get('min_tests', 1)
-        if not m:
+        if not isinstance(datos, dict):
             resultado.ok = False
-            resultado.stderr += '\nACEPTACIÓN: falta conteo verificable de unittest.'
+            resultado.stderr += '\nACEPTACIÓN: falta conteo verificable del runner (¿se interrumpió o se cortó?).'
         else:
-            skipped = re.search(r'\bskipped\s*=\s*(\d+)', combinado)
-            xfailed = re.search(r'\bexpected failures\s*=\s*(\d+)', combinado)
-            no_ejecutados = (int(skipped.group(1)) if skipped else 0) + (int(xfailed.group(1)) if xfailed else 0)
-            efectivos = max(0, int(m.group(1)) - no_ejecutados)
+            efectivos = max(0, int(datos.get('ran', 0)) - int(datos.get('skipped', 0))
+                            - int(datos.get('expected_failures', 0)))
+            malos = int(datos.get('failures', 0)) + int(datos.get('errors', 0)) + int(datos.get('unexpected_successes', 0))
+            resultado.stderr += (f"\nACEPTACIÓN: {datos.get('ran', 0)} corridos, {efectivos} efectivos, "
+                                 f"{datos.get('failures', 0)} fallos, {datos.get('errors', 0)} errores, "
+                                 f"{datos.get('skipped', 0)} omitidos (mínimo {minimo}).")
+            if malos or resultado.codigo != 0:
+                resultado.ok = False
             if efectivos < minimo:
                 resultado.ok = False
                 resultado.stderr += (f'\nACEPTACIÓN: solo {efectivos}/{minimo} pruebas ejecutadas '
@@ -15015,6 +15307,11 @@ class Orquestador:
         elif tests is not None and not tests.ok:
             partes.append("TESTS: " + conteo.texto() + "\n" + fallos_relevantes(f"{tests.stdout}\n{tests.stderr}",
                                                                                 maximo=3, limite=5000))
+        elif tests is not None and conteo.reconocido and conteo.ejecutados == 0 and conteo.omitidos > 0:
+            # Exit 0 con TODO salteado (skip/xfail): 0 tests ejecutados no verifican nada (antes daba "verificada").
+            tests_ok = False
+            partes.append(f"TESTS: todos los tests fueron OMITIDOS ({conteo.texto()}): 0 ejecutados no prueban "
+                          "nada. Quitá los @skip / xfail o implementá lo que falta para que corran de verdad.")
         # Evaluador externo, colocado FUERA del directorio editable del proyecto.
         # Si falla, no se puede declarar la build verificada aunque el LLM diga que terminó.
         aceptacion = ejecutar_aceptacion_independiente(
@@ -15073,7 +15370,17 @@ class Orquestador:
         intentos_txt: list[str] = []
         forense_hecho = False
         informe_forense = ""
+        sin_cambios = 0
         while not verif.ok and intento < max_intentos:
+            vencido = PLAZO.vencido()
+            if vencido:
+                informe.notas.append(f"{etiqueta}: se agotó el tiempo de {vencido}; quedan fallos sin reparar.")
+                self.ui.aviso(f"  ⏱ {etiqueta}: se agotó el tiempo de {vencido}; no sigo reparando.")
+                break
+            if sin_cambios >= 2:
+                informe.notas.append(f"{etiqueta}: el reparador no cambió ningún archivo en 2 intentos seguidos.")
+                self.ui.aviso(f"  {etiqueta}: 2 intentos sin cambios reales; corto la reparación (sin avance).")
+                break
             firma = _firma_error(verif.diagnostico)
             if diagnosticos_vistos.count(firma) >= 3:
                 informe.notas.append(f"{etiqueta}: la reparación no logró avances (mismo diagnóstico repetido).")
@@ -15109,6 +15416,7 @@ class Orquestador:
                                      + "\n---\n".join(intentos_txt[-2:]))
             res = self.reparar(pedido, verif, rcid, base_fallaba, experto, contexto_intento.strip())
             intentos_txt.append(recortar(res.resumen, 1200))
+            sin_cambios = 0 if self.ws.checkpoints.diff_desde(rcid).strip() else sin_cambios + 1
             verif = verificador()
             self._mostrar_verificacion(verif)
             if verif.ok:
@@ -15320,6 +15628,16 @@ class Orquestador:
         return Verificacion(not problemas, validaciones, tests, diagnostico, archivos, conteo)
 
     def construir(self, pedido: str, confirmar: bool = True, reanudar: bool = False) -> InformeBuild:
+        with PLAZO.limitar(self.settings.tiempo_max_build, "la build"):
+            pila = list(PLAZO._pila)
+            try:
+                return self._construir(pedido, confirmar, reanudar)
+            finally:
+                # Si una excepción cortó una tarea, su plazo no debe sobrevivir a la build.
+                with PLAZO._lock:
+                    PLAZO._pila = [e for e in PLAZO._pila if e in pila]
+
+    def _construir(self, pedido: str, confirmar: bool = True, reanudar: bool = False) -> InformeBuild:
         inicio = time.monotonic()
         self._protegidos: dict[str, Optional[str]] = {}
         registro_build = RegistroBuild(self.ws)
@@ -15376,6 +15694,12 @@ class Orquestador:
                 self.ui.error("El checkpoint original ya no existe; no puedo reanudar con evidencia.")
                 return InformeBuild("cancelada")
             huella_guardada = previo.get('huella_aceptacion')
+            if huella_guardada is not None and huella_guardada != huella_actual:
+                try:
+                    if huella_guardada == huella_aceptacion_v1(self.ws):
+                        huella_guardada = None          # diario de la ronda 12: la misma suite, se migra a V2
+                except (ValueError, OSError):
+                    pass
             if huella_guardada is not None and huella_actual != huella_guardada:
                 self.ui.error('Cambió el evaluador independiente desde el checkpoint; no reanudo.')
                 return InformeBuild('cancelada')
@@ -15476,7 +15800,10 @@ class Orquestador:
             plan.tareas = orden
         # Si hay tareas verificadas, la huella del proyecto se confirmó ANTES de
         # retomarlas. No se repiten implementaciones exitosas ni sus solicitudes a IA.
+        token_tarea = None
         for i, tarea in enumerate(plan.tareas):
+            PLAZO.cerrar(token_tarea)
+            token_tarea = None
             self.ui.info(f"\n▸ Tarea {i + 1}/{len(plan.tareas)}: {recortar(tarea.descripcion.splitlines()[0], 120)}")
             if reanudar and previo["estados"].get(tarea.id) == "verificada":
                 self.ui.ok(f"Tarea {tarea.id}: conservada (verificada antes de la interrupción)")
@@ -15491,6 +15818,16 @@ class Orquestador:
                 previo["estados"][tarea.id] = "bloqueada"
                 registro_build.guardar(previo)
                 continue
+            vencido = PLAZO.vencido()
+            if vencido:
+                self.ui.aviso(f"  Tarea {tarea.id} NO iniciada: se agotó el tiempo de {vencido}.")
+                informe.tareas_fallidas.append(tarea.id)
+                informe.notas.append(f"Tarea {tarea.id}: sin iniciar (se agotó el tiempo de {vencido}); "
+                                     "retomala con /construir continuar.")
+                previo["estados"][tarea.id] = "pendiente"
+                registro_build.guardar(previo)
+                continue
+            token_tarea = PLAZO.abrir(self.settings.tiempo_max_tarea, f"la tarea {tarea.id}")
             previo["estados"][tarea.id] = "en_curso"
             previo["tarea_activa"] = tarea.id
             previo["huellas_inicio"] = registro_build.huellas()
@@ -15573,6 +15910,7 @@ class Orquestador:
             previo.pop("tcid", None)
             previo.pop("huellas_inicio", None)
             registro_build.guardar(previo)
+        PLAZO.cerrar(token_tarea)
 
         archivos = [r for r in self.ws.checkpoints.archivos_desde(grupo) if (self.ws.raiz / r).is_file()]
         hay_tests_build = any(_es_test(a) for a in archivos)
@@ -45104,6 +45442,260 @@ class TestNoTestGaming(BaseTest):
 
 
 # ======================================================================
+# MÓDULO: autotest_p0_fusion
+# ======================================================================
+"""
+Autotests P0 de la fusión 8.10 (ChatGPT ronda 12 + Claude). Cada uno reproduce un defecto confirmado antes de
+corregirlo: XML de herramienta mal cerrado que se escribía en el archivo, Ctrl+C que esperaba a una llamada lenta,
+hijos huérfanos tras Ctrl+C, falsos verdes (tests todos omitidos, gate de aceptación suplantable, manifiesto
+editable por el agente, proyecto que aflojaba el modo de permisos) y builds sin plazo de pared.
+"""
+
+
+class TestXmlMalformadoNoMuta(BaseTest):
+    def _agente(self, ws, guion):
+        ui = self.ui()
+        Agente("principal", MockLLM(guion), ws, self.ajustes(modo="auto"), ui, memoria=None,
+               mostrar_progreso=False).ejecutar("arreglá el estilo")
+        return ui.texto_registrado()
+
+    def test_cierre_de_herramienta_mal_escrito_no_se_escribe_en_el_archivo(self):
+        original = "body { color: black; }\nh1 { margin: 0; }\n"
+        ws = self.proyecto({"web/style.css": original})
+        texto = self._agente(ws, [
+            herramienta_xml("read_file", path="web/style.css"),
+            "Corrijo.\n<replace_lines><path>web/style.css</path><desde>1</desde><hasta>1</hasta>"
+            "<content>body { color: red; }\n</replace_line>",
+            terminar_xml("listo")])
+        self.assertEqual(ws.leer("web/style.css"), original)        # antes quedaba "</replace_line>" dentro
+        self.assertIn("etiqueta de cierre inválida", texto)
+
+    def test_cierre_de_parametro_mal_escrito_no_se_escribe(self):
+        original = "let a = 1;\n"
+        ws = self.proyecto({"web/script.js": original})
+        self._agente(ws, [
+            herramienta_xml("read_file", path="web/script.js"),
+            "<replace_lines><path>web/script.js</path><desde>1</desde><hasta>1</hasta>"
+            "<content>let a = 2;\n</contnet></replace_lines>",
+            terminar_xml("listo")])
+        self.assertEqual(ws.leer("web/script.js"), original)
+
+    def test_archivo_bien_delimitado_que_termina_en_etiqueta_si_se_escribe(self):
+        ws = self.proyecto({})
+        contenido = '<?xml version="1.0"?>\n<Context path="/app">\n</Context>\n'
+        self._agente(ws, [herramienta_xml("write_to_file", path="conf/context.xml", content=contenido),
+                          terminar_xml("listo")])
+        self.assertIn("</Context>", ws.leer("conf/context.xml"))    # sin falsos positivos
+
+    def test_html_sin_cierres_de_herramienta_se_sigue_aceptando(self):
+        ws = self.proyecto({})
+        self._agente(ws, ["<write_to_file><path>index.html</path><content><html><body>hola</body></html>\n",
+                          terminar_xml("listo")])
+        self.assertIn("</html>", ws.leer("index.html"))             # la tolerancia previa se conserva
+
+    def test_detector_directo(self):
+        self.assertEqual(cierre_espurio("x\n</replace_line>", ["replace_lines", "content"]), "</replace_line>")
+        self.assertIsNone(cierre_espurio("x\n</html>\n", ["write_to_file", "content"]))
+        self.assertEqual(cierre_espurio("x</tool>", [], ["tool"]), "</tool>")
+
+
+class TestCtrlCNoCuelga(BaseTest):
+    def test_hilos_se_cortan_rapido_al_cancelar(self):
+        tareas = [lambda: time.sleep(5) or 1, lambda: time.sleep(5) or 2]
+        temporizador = threading.Timer(0.3, CANCELAR.set)
+        temporizador.start()
+        inicio = time.monotonic()
+        try:
+            with self.assertRaises(Cancelado):
+                ejecutar_hilos(tareas, 2, gracia=0.2)
+        finally:
+            temporizador.cancel()
+            CANCELAR.clear()
+        self.assertLess(time.monotonic() - inicio, 2.5)              # no espera los 5 s del hilo lento
+
+    def test_hilos_devuelven_en_orden_y_relanzan_errores(self):
+        self.assertEqual(ejecutar_hilos([lambda: "a", lambda: "b", lambda: "c"], 2), ["a", "b", "c"])
+        with self.assertRaises(ValueError):
+            ejecutar_hilos([lambda: 1, lambda: (_ for _ in ()).throw(ValueError("x"))], 2)
+
+    def test_sigint_real_sale_en_plazo_acotado(self):
+        # Proceso real: dos subagentes en paralelo esperan a un modelo que tarda 30 s; Ctrl+C (SIGINT) al
+        # segundo. Antes salía recién cuando terminaba la llamada (~27 s); ahora en la gracia acotada.
+        guion = (
+            "import sys, time, importlib.util, tempfile\n"
+            "from pathlib import Path\n"
+            "spec = importlib.util.spec_from_file_location('r', sys.argv[1])\n"
+            "m = importlib.util.module_from_spec(spec); sys.modules['r'] = m; spec.loader.exec_module(m)\n"
+            "class Lento:\n"
+            "    def chat(self, mensajes, **k):\n"
+            "        time.sleep(30); return m.Respuesta(m.terminar_xml('x'), 'stop', 'lento')\n"
+            "    def __getattr__(self, n): return getattr(m.MockLLM([]), n)\n"
+            "raiz = Path(tempfile.mkdtemp()); (raiz / 'a.py').write_text('x = 1\\n')\n"
+            "s = m.Settings(); s.paralelo = 2; s.forense = False; s.lecciones = False\n"
+            "print('listo', flush=True)\n"
+            "m.ejecutar_subagentes([('explorador', 'a', ''), ('explorador', 'b', '')], Lento(), m.Workspace(raiz), s,\n"
+            "                      m.UI(silencioso=True, interactivo=False))\n")
+        script = self.dir / "sigint.py"
+        script.write_text(guion, encoding="utf-8")
+        proceso = subprocess.Popen([sys.executable, "-I", str(script), str(Path(__file__).resolve())],
+                                   stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        try:
+            self.assertEqual(proceso.stdout.readline().strip(), "listo")
+            time.sleep(1.0)
+            inicio = time.monotonic()
+            proceso.send_signal(signal.SIGINT)
+            proceso.wait(timeout=20)
+            self.assertLess(time.monotonic() - inicio, 8.0)
+        finally:
+            if proceso.poll() is None:
+                proceso.kill()
+                proceso.wait()
+            proceso.stdout.close()
+
+    def test_cancelar_mata_el_subproceso_en_curso(self):
+        resultado = {}
+        hilo = threading.Thread(target=lambda: resultado.setdefault(
+            "r", ejecutar("sleep 30", cwd=self.dir, timeout=60, shell=True)), daemon=True)
+        inicio = time.monotonic()
+        hilo.start()
+        time.sleep(0.4)
+        CANCELAR.set()
+        try:
+            hilo.join(5)
+        finally:
+            CANCELAR.clear()
+        self.assertFalse(hilo.is_alive())
+        self.assertEqual(resultado["r"].codigo, 130)
+        self.assertLess(time.monotonic() - inicio, 5)
+        self.assertEqual(matar_procesos_vivos(), 0)                  # no quedó ningún hijo registrado
+
+
+class TestFalsosVerdesFusion(BaseTest):
+    def test_tests_todos_omitidos_no_verifican(self):
+        ws = self.proyecto({
+            "app.py": "def suma(a, b):\n    return a - b\n",
+            "tests/test_app.py": "import unittest\nfrom app import suma\nclass T(unittest.TestCase):\n"
+                                 "    @unittest.skip('luego')\n    def test_suma(self):\n"
+                                 "        self.assertEqual(suma(2, 2), 4)\n"})
+        orq = Orquestador(MockLLM([]), ws, self.ajustes(forense=False, lecciones=False), self.ui())
+        verif = orq.verificar(ws.checkpoints.iniciar("x"))
+        self.assertFalse(verif.ok)
+        self.assertIn("OMITIDOS", verif.diagnostico)
+        self.assertEqual(estado_final_build(verif, InformeBuild("fallida")), "fallida")
+
+    def _gate(self, codigo: str, minimo: int = 1):
+        suite = self.dir / "evaluador"
+        suite.mkdir(parents=True, exist_ok=True)
+        (suite / "test_real.py").write_text(codigo, encoding="utf-8")
+        ws = self.proyecto({".reaper/acceptance.json": json.dumps(
+            {"suite_dir": str(suite), "min_tests": minimo, "timeout": 60})})
+        return ws, suite
+
+    def test_unittest_del_proyecto_no_suplanta_al_evaluador(self):
+        ws, _suite = self._gate("import unittest\nclass T(unittest.TestCase):\n"
+                                "    def test_falla(self):\n        self.assertEqual(1, 2)\n", minimo=3)
+        ws.escribir("unittest.py", "import sys\nsys.stderr.write('\\nRan 50 tests in 0.1s\\n\\nOK\\n')\n"
+                                   "raise SystemExit(0)\n")
+        r = ejecutar_aceptacion_independiente(ws)
+        self.assertFalse(r.ok)                                       # antes: ok=True con "Ran 50 tests ... OK"
+        self.assertIn("1 fallos", r.stderr)
+
+    def test_conteo_falso_impreso_por_el_proyecto_no_cuenta(self):
+        ws, _suite = self._gate("import unittest\nclass T(unittest.TestCase):\n"
+                                "    def test_ok(self):\n        print('Ran 99 tests'); self.assertTrue(True)\n",
+                                minimo=5)
+        r = ejecutar_aceptacion_independiente(ws)
+        self.assertFalse(r.ok)
+        self.assertIn("1/5", r.stderr)
+
+    def test_auxiliar_de_la_suite_editado_rompe_la_huella(self):
+        ws, suite = self._gate("import unittest\nfrom ayuda import X\nclass T(unittest.TestCase):\n"
+                               "    def test_ok(self):\n        self.assertEqual(X, 1)\n")
+        (suite / "ayuda.py").write_text("X = 1\n", encoding="utf-8")
+        huella = huella_aceptacion(ws)
+        self.assertTrue(ejecutar_aceptacion_independiente(ws, huella_fijada=huella).ok)
+        (suite / "ayuda.py").write_text("X = 2\n", encoding="utf-8")
+        r = ejecutar_aceptacion_independiente(ws, huella_fijada=huella)
+        self.assertFalse(r.ok)
+        self.assertIn("cambiado", r.stderr)
+
+    def test_suite_verde_real_sigue_aprobando(self):
+        ws, _suite = self._gate("import unittest, os\nclass T(unittest.TestCase):\n"
+                                "    def test_proyecto_visible(self):\n"
+                                "        self.assertTrue(os.path.isdir(os.environ['REAPER_PROYECTO']))\n")
+        r = ejecutar_aceptacion_independiente(ws)
+        self.assertTrue(r.ok, r.resumen())
+
+    def test_agente_no_puede_editar_ni_borrar_el_manifiesto(self):
+        ws = self.proyecto({".reaper/acceptance.json": json.dumps({"suite_dir": "/tmp/x", "min_tests": 10})})
+        for intento in (lambda: ws.escribir(".reaper/acceptance.json", '{"min_tests": 1}'),
+                        lambda: ws.borrar(".reaper/acceptance.json"),
+                        lambda: ws.escribir(".reaper/build_pendiente.json", "{}")):
+            with self.assertRaises(ErrorRuta):
+                intento()
+        self.assertIn('"min_tests": 10', (ws.raiz / ".reaper" / "acceptance.json").read_text(encoding="utf-8"))
+
+    def test_proyecto_no_afloja_el_modo_de_permisos(self):
+        base = Settings(modo="confirmar", hooks=False)
+        local = {"settings": {"modo": "auto", "hooks": True, "candidatos": 2}}
+        s = settings_con_local(base, local)
+        self.assertEqual(s.modo, "confirmar")
+        self.assertFalse(s.hooks)
+        self.assertEqual(s.candidatos, 2)                            # lo inocuo sí se aplica
+        self.assertEqual(set(overrides_proyecto_ignorados(local, base)), {"modo", "hooks"})
+        self.assertEqual(settings_con_local(Settings(modo="auto"), {"settings": {"modo": "confirmar"}}).modo,
+                         "confirmar")                                # endurecer sí se permite
+
+
+class TestPlazosDePared(BaseTest):
+    def test_agente_corta_al_vencer_el_plazo_sin_declarar_exito(self):
+        guion = [herramienta_xml("list_files", path=".")] * 30
+        with PLAZO.limitar(0.001, "la prueba"):
+            time.sleep(0.01)
+            res = Agente("principal", MockLLM(guion), self.proyecto({"a.py": "x=1\n"}), self.ajustes(modo="auto"),
+                         self.ui(), memoria=None, mostrar_progreso=False).ejecutar("explorá")
+        self.assertFalse(res.ok)
+        self.assertEqual(res.motivo, "tiempo")
+        self.assertIsNone(PLAZO.vencido())                           # el plazo no sobrevive a su bloque
+
+    def test_build_con_plazo_vencido_no_queda_verificada(self):
+        plan = TestBloqueoDependientes.PLAN
+
+        def guion(mensajes, kwargs):
+            rol = MockLLM.rol_de(mensajes)
+            if rol == "arquitecto":
+                return terminar_xml(plan)
+            if rol == "implementador":
+                time.sleep(1.2)                                      # un modelo lento consume el plazo
+                if _turno(mensajes) == 0:
+                    return herramienta_xml("write_to_file", path="a.py", content="def uno():\n    return 1\n")
+                return terminar_xml("hecho")
+            return terminar_xml("ok")
+
+        ws = self.proyecto({"README.md": "# dos\n"})
+        ajustes = self.ajustes(tests_primero=False, torneo=False, max_revisiones=0, lecciones=False, qa=False,
+                               max_reparaciones=1, umbral_escalada=0, tiempo_max_build=1, forense=False)
+        informe = Orquestador(MockLLM(guion), ws, ajustes, self.ui()).construir("dos módulos", confirmar=False)
+        self.assertNotEqual(informe.estado, "verificada")
+        self.assertIn("2", informe.tareas_fallidas + informe.tareas_bloqueadas)
+        self.assertTrue(any("tiempo" in n for n in informe.notas), informe.notas)
+        self.assertIsNone(PLAZO.vencido())
+
+    def test_reparacion_sin_cambios_se_corta(self):
+        ws = self.proyecto({"app.py": "def f():\n    return 1\n",
+                            "tests/test_app.py": "from app import f\n\ndef test_f():\n    assert f() == 2\n"})
+        orq = Orquestador(MockLLM([terminar_xml("no sé")] * 20), ws,
+                          self.ajustes(forense=False, lecciones=False, escalar=False), self.ui())
+        grupo = ws.checkpoints.iniciar("x")
+        verif = orq.verificar(grupo)
+        informe = InformeBuild("fallida")
+        final = orq._reparar_con_escalada("arreglá f", verif, grupo, False, informe, "final", 6,
+                                          lambda: orq.verificar(grupo))
+        self.assertFalse(final.ok)
+        self.assertTrue(any("sin cambiar" in n or "no cambió" in n for n in informe.notas), informe.notas)
+
+
+# ======================================================================
 # MÓDULO: autotest_runner
 # ======================================================================
 """Ejecutor del autotest interno."""
@@ -51096,13 +51688,13 @@ def main(argv: Optional[list] = None) -> int:
     # R-011: aplicar los overrides de .reaper/config.json del proyecto ANTES de construir el cliente, para que
     # candidatos/torneo/rpm/modelo/temperatura del proyecto manden de verdad (antes se definían y se ignoraban).
     if ws.config_local().get("settings"):
-        ignorados = overrides_proyecto_ignorados(ws.config_local())
+        ignorados = overrides_proyecto_ignorados(ws.config_local(), settings)
         settings = preparar_settings_proyecto(settings, ws, args)
         api_key = obtener_clave_api(settings) or api_key        # el proyecto pudo cambiar el modelo/proveedor
         ui.tenue("  Apliqué overrides de .reaper/config.json (settings del proyecto).")
         if ignorados:
             ui.aviso("  Ignoré claves inseguras del .reaper/config.json del proyecto (no cambian a dónde van "
-                     f"tus credenciales ni la red): {', '.join(sorted(ignorados))}.")
+                     "tus credenciales, la red ni aflojan tus permisos): " + ", ".join(sorted(ignorados)) + ".")
 
     llm = LLMClient(api_key, settings)
     llm.on_evento = lambda texto: ui.tenue(f"  ↻ {texto}")

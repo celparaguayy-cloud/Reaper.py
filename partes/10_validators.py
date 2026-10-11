@@ -74,6 +74,35 @@ def entorno_seguro() -> dict:
     return env
 
 
+# Procesos hijos vivos (cada uno en su propio grupo, por start_new_session). Se registran para poder matarlos
+# si REAPER se cancela o sale: un Ctrl+C del terminal NO les llega (están en otra sesión) y quedaban huérfanos.
+_PROCESOS_VIVOS: set = set()
+_LOCK_PROCESOS = threading.Lock()
+
+
+def _matar_grupo(proceso) -> None:
+    try:
+        os.killpg(proceso.pid, signal.SIGKILL)
+    except OSError:
+        try:
+            proceso.kill()
+        except OSError:
+            pass
+
+
+def matar_procesos_vivos() -> int:
+    """Mata todos los procesos hijos registrados (idempotente). Devuelve cuántos había."""
+    with _LOCK_PROCESOS:
+        vivos = list(_PROCESOS_VIVOS)
+        _PROCESOS_VIVOS.clear()
+    for proceso in vivos:
+        _matar_grupo(proceso)
+    return len(vivos)
+
+
+atexit.register(matar_procesos_vivos)
+
+
 def ejecutar(
     cmd: Union[str, list],
     *,
@@ -81,6 +110,7 @@ def ejecutar(
     timeout: int = 60,
     shell: bool = False,
     entrada: Optional[str] = None,
+    env_extra: Optional[dict] = None,
 ) -> Resultado:
     etiqueta = cmd if isinstance(cmd, str) else " ".join(shlex.quote(str(c)) for c in cmd)
     inicio = time.monotonic()
@@ -107,7 +137,7 @@ def ejecutar(
                 stdin=subprocess.PIPE if entrada is not None else subprocess.DEVNULL,
                 stdout=f_out,
                 stderr=f_err,
-                env=entorno_seguro(),
+                env={**entorno_seguro(), **(env_extra or {})},
                 start_new_session=True,
             )
         except FileNotFoundError:
@@ -122,19 +152,37 @@ def ejecutar(
                 proceso.stdin.close()
             except OSError:
                 pass
+        with _LOCK_PROCESOS:
+            _PROCESOS_VIVOS.add(proceso)
         try:
-            proceso.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            try:
-                os.killpg(proceso.pid, signal.SIGKILL)
-            except OSError:
-                proceso.kill()
-            proceso.wait()
-            return Resultado(
-                False, etiqueta, 124, _cola(f_out),
-                _cola(f_err) + f"\nTiempo agotado después de {timeout}s (¿programa interactivo o servidor?).",
-                timeout=True, duracion=time.monotonic() - inicio,
-            )
+            # Espera en tramos cortos: se nota un Ctrl+C / CANCELAR enseguida, no al terminar el timeout.
+            limite = inicio + timeout
+            cancelar = globals().get("CANCELAR")
+            while True:
+                try:
+                    proceso.wait(timeout=min(0.25, max(0.01, limite - time.monotonic())))
+                    break
+                except subprocess.TimeoutExpired:
+                    pass
+                if cancelar is not None and cancelar.is_set():
+                    _matar_grupo(proceso)
+                    proceso.wait()
+                    return Resultado(False, etiqueta, 130, _cola(f_out), _cola(f_err) + "\nCancelado por el usuario.",
+                                     duracion=time.monotonic() - inicio)
+                if time.monotonic() >= limite:
+                    _matar_grupo(proceso)
+                    proceso.wait()
+                    return Resultado(
+                        False, etiqueta, 124, _cola(f_out),
+                        _cola(f_err) + f"\nTiempo agotado después de {timeout}s (¿programa interactivo o servidor?).",
+                        timeout=True, duracion=time.monotonic() - inicio,
+                    )
+        except BaseException:
+            _matar_grupo(proceso)          # Ctrl+C en el hilo principal: no dejar el hijo huérfano
+            raise
+        finally:
+            with _LOCK_PROCESOS:
+                _PROCESOS_VIVOS.discard(proceso)
         return Resultado(proceso.returncode == 0, etiqueta, proceso.returncode,
                          _cola(f_out), _cola(f_err), duracion=time.monotonic() - inicio)
     finally:

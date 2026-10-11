@@ -233,6 +233,10 @@ class Settings:
     max_llamadas_turno: int = 4
     max_reparaciones: int = 3
     max_revisiones: int = 2
+    # Plazos de pared (segundos; 0 = sin límite). Sin ellos una build con modelos lentos podía seguir HORAS
+    # (torneo × pasos × reparaciones × forense) sin terminar: al vencer, la tarea queda FALLIDA, nunca "verificada".
+    tiempo_max_tarea: int = 1500
+    tiempo_max_build: int = 5400
     max_tareas: int = 8
     paralelo: int = 2
     qa: bool = True
@@ -338,6 +342,8 @@ class Settings:
         acotar("max_profundidad", 0, 3)
         acotar("max_llamadas_turno", 1, 10)
         acotar("max_reparaciones", 0, 10)
+        acotar("tiempo_max_tarea", 0, 86400)
+        acotar("tiempo_max_build", 0, 86400)
         acotar("max_revisiones", 0, 5)
         acotar("max_tareas", 1, 30)
         acotar("paralelo", 1, 8)
@@ -488,23 +494,38 @@ OVERRIDES_PROHIBIDOS_PROYECTO = frozenset({
 })
 
 
+# Orden de permisos: un .reaper/config.json (que puede venir en un repo ajeno o escribirlo el propio agente)
+# puede pedir MÁS confirmación, nunca menos (antes podía pasar de "confirmar" a "auto" y saltear la aprobación).
+_RIGOR_MODO = {"auto": 0, "auto-edicion": 1, "confirmar": 2}
+
+
+def _override_afloja(settings: Settings, clave: str, valor) -> bool:
+    if clave == "modo":
+        return _RIGOR_MODO.get(str(valor), -1) < _RIGOR_MODO.get(settings.modo, 2)
+    if clave == "hooks":
+        return bool(valor) and not settings.hooks
+    return False
+
+
 def settings_con_local(settings: Settings, local: dict) -> Settings:
     """Copia de settings con los overrides SEGUROS de .reaper/config.json del proyecto (clave 'settings')."""
     overrides = local.get("settings") if isinstance(local, dict) else None
     if not isinstance(overrides, dict) or not overrides:
         return settings
-    seguros = {k: v for k, v in overrides.items() if k not in OVERRIDES_PROHIBIDOS_PROYECTO}
+    seguros = {k: v for k, v in overrides.items()
+               if k not in OVERRIDES_PROHIBIDOS_PROYECTO and not _override_afloja(settings, k, v)}
     combinado = settings.to_dict()
     combinado.update(seguros)
     return Settings.desde_dict(combinado)
 
 
-def overrides_proyecto_ignorados(local: dict) -> list:
+def overrides_proyecto_ignorados(local: dict, settings: Optional[Settings] = None) -> list:
     """Claves del .reaper/config.json del proyecto que se ignoran por seguridad (para avisar al usuario)."""
     overrides = local.get("settings") if isinstance(local, dict) else None
     if not isinstance(overrides, dict):
         return []
-    return [k for k in overrides if k in OVERRIDES_PROHIBIDOS_PROYECTO]
+    return [k for k, v in overrides.items() if k in OVERRIDES_PROHIBIDOS_PROYECTO
+            or (settings is not None and _override_afloja(settings, k, v))]
 
 
 def cargar_estado() -> dict:

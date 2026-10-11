@@ -428,6 +428,11 @@ class LLMClient:
                         f"{e} (después de {intentos + 1} intentos)",
                         probar_otro_modelo=True,
                     ) from e
+                plazo = globals().get("PLAZO")
+                vencido = plazo.vencido() if plazo is not None else None
+                if vencido:
+                    raise LLMError(f"{e} (no reintento: se agotó el tiempo de {vencido})",
+                                   probar_otro_modelo=False) from e
                 espera = e.espera
                 if espera is None:
                     espera = min(60.0, 2.0 * (2 ** intento)) + random.uniform(0, 1)
@@ -476,6 +481,8 @@ class LLMClient:
                 f"{modelo}. Exportala como variable de entorno.", probar_otro_modelo=True)
         visto_done = False
         for linea in self._transporte(destino.url, self._headers(destino), payload, self.settings.timeout):
+            if "CANCELAR" in globals() and CANCELAR.is_set():
+                raise LLMError("Cancelado por el usuario durante la respuesta del modelo.", probar_otro_modelo=False)
             evento = parsear_linea_sse(linea)
             if evento is None:
                 continue

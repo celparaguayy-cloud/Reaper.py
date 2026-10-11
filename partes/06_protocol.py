@@ -91,6 +91,7 @@ class Llamada:
     params: dict = field(default_factory=dict)
     completa: bool = True
     crudo: str = ""
+    sin_cierre: frozenset = frozenset()   # parámetros largos cuya etiqueta de cierre propia NO apareció
 
 
 @dataclass
@@ -160,7 +161,7 @@ def _atributos(texto: str) -> dict:
     return salida
 
 
-def _extraer_params(cuerpo: str, definicion: list) -> tuple[dict, bool]:
+def _extraer_params(cuerpo: str, definicion: list, abiertos: Optional[set] = None) -> tuple[dict, bool]:
     params: dict = {}
     completa = True
     enmascarado = cuerpo
@@ -190,6 +191,8 @@ def _extraer_params(cuerpo: str, definicion: list) -> tuple[dict, bool]:
                 else:
                     fin_valor = fin_total = len(enmascarado)
                     completa = False
+                    if abiertos is not None:
+                        abiertos.add(nombre)
                 params[nombre] = limpiar_largo(cuerpo[ap.end():fin_valor])
                 enmascarado = (
                     enmascarado[:ap.start()]
@@ -303,7 +306,8 @@ def analizar(texto: str, esquemas: Esquemas) -> Analisis:
                 pos = fin
 
         definicion = esquemas.get(real, [])
-        params, completa = _extraer_params(cuerpo, definicion) if cuerpo.strip() else ({}, True)
+        abiertos: set = set()
+        params, completa = _extraer_params(cuerpo, definicion, abiertos) if cuerpo.strip() else ({}, True)
         if not completa and not autocerrada and c_encontrado:
             # Falta el cierre del parámetro (</content>) pero el de la herramienta está: el valor queda
             # delimitado por </herramienta>, así que la llamada se entiende entera.
@@ -313,7 +317,7 @@ def analizar(texto: str, esquemas: Esquemas) -> Analisis:
             params.setdefault(canon, valor)
         if not params and cuerpo.strip() and definicion:
             completa = completa and True
-        llamadas.append(Llamada(real, params, completa, limpio[m.start():pos]))
+        llamadas.append(Llamada(real, params, completa, limpio[m.start():pos], frozenset(abiertos)))
 
     if not llamadas:
         for m in _RE_FUNCION_LLAMA.finditer(limpio):
@@ -339,6 +343,31 @@ def analizar(texto: str, esquemas: Esquemas) -> Analisis:
             fuera = []
 
     return Analisis(llamadas=llamadas, texto="".join(fuera).strip(), respuesta_limpia=limpio)
+
+
+_RE_CIERRE_FINAL = re.compile(r"<\s*/\s*([A-Za-z_][\w-]*)\s*>?\s*\Z")
+
+
+def cierre_espurio(valor: str, cercanos: Iterable[str], exactos: Iterable[str] = ()) -> Optional[str]:
+    """
+    Si un parámetro largo TERMINA en una etiqueta de cierre que se parece al nombre de la herramienta o de un
+    parámetro (p. ej. `</replace_line>` en vez de `</replace_lines>`, `</contnet>`), esa etiqueta es un error
+    de formato del modelo, no contenido: se devuelve para rechazar la llamada SIN escribir nada. Antes se
+    escribía tal cual dentro del archivo (assets .css/.js rotos, sin validador que lo notara).
+    Solo se aplica a parámetros cuya etiqueta de cierre propia NO apareció (Llamada.sin_cierre): un archivo
+    bien delimitado que termina en </Context> o </path> no se toca.
+    """
+    m = _RE_CIERRE_FINAL.search(valor or "")
+    if not m:
+        return None
+    etiqueta = m.group(1).lower()
+    if etiqueta in {(n or "").lower() for n in exactos}:
+        return m.group(0).strip()
+    for nombre in cercanos:
+        nombre = (nombre or "").lower()
+        if nombre and (etiqueta == nombre or difflib.SequenceMatcher(None, etiqueta, nombre).ratio() >= 0.8):
+            return m.group(0).strip()
+    return None
 
 
 def contenido_parcial(llamada: Llamada, esquemas: Esquemas) -> Optional[tuple[str, str]]:

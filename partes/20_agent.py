@@ -64,6 +64,105 @@ class Cancelado(Exception):
     pass
 
 
+class PlazoTrabajo:
+    """
+    Plazos de pared (time.monotonic) de la build y de la tarea en curso. Es global del proceso a propósito:
+    los candidatos del torneo y los subagentes corren en otros hilos y también tienen que verlo.
+    vencido() devuelve el motivo ("la tarea 3", "la build") del primer plazo vencido, o None.
+    """
+
+    def __init__(self, reloj: Callable[[], float] = time.monotonic):
+        self.reloj = reloj
+        self._pila: list = []          # (token, límite, motivo)
+        self._lock = threading.Lock()
+
+    def abrir(self, segundos: float, motivo: str) -> Optional[object]:
+        if not segundos or segundos <= 0:
+            return None
+        token = object()
+        with self._lock:
+            self._pila.append((token, self.reloj() + float(segundos), motivo))
+        return token
+
+    def cerrar(self, token: Optional[object]) -> None:
+        if token is None:
+            return
+        with self._lock:
+            self._pila = [e for e in self._pila if e[0] is not token]
+
+    @contextlib.contextmanager
+    def limitar(self, segundos: float, motivo: str):
+        token = self.abrir(segundos, motivo)
+        try:
+            yield token
+        finally:
+            self.cerrar(token)
+
+    def vencido(self) -> Optional[str]:
+        with self._lock:
+            ahora = self.reloj()
+            return next((motivo for _t, limite, motivo in self._pila if ahora >= limite), None)
+
+
+PLAZO = PlazoTrabajo()
+
+
+def ejecutar_hilos(tareas: Sequence[Callable[[], Any]], max_paralelo: int, *, gracia: float = 2.0) -> list:
+    """
+    Corre funciones en hilos DAEMON con concurrencia acotada y devuelve sus resultados en orden.
+
+    Reemplaza a ThreadPoolExecutor en el trabajo con modelos: su salida (y el `_python_exit` del intérprete)
+    hace join de los hilos, así que un Ctrl+C quedaba esperando a que terminara una llamada lenta (minutos
+    con un modelo de razonamiento). Acá el hilo principal espera en tramos cortos (interrumpibles), ante
+    Ctrl+C o CANCELAR marca la cancelación, da una gracia ACOTADA para que los hilos la vean y relanza; los
+    hilos daemon no bloquean la salida del proceso.
+    """
+    n = len(tareas)
+    resultados: list = [None] * n
+    errores: list = [None] * n
+    cupo = threading.Semaphore(max(1, int(max_paralelo)))
+
+    def trabajar(i: int) -> None:
+        try:
+            resultados[i] = tareas[i]()
+        except BaseException as e:      # se relanza en el hilo principal, en orden
+            errores[i] = e
+        finally:
+            cupo.release()
+
+    hilos: list = []
+    try:
+        for i in range(n):
+            while not cupo.acquire(timeout=0.2):
+                if CANCELAR.is_set():
+                    raise Cancelado()
+            if CANCELAR.is_set():
+                cupo.release()
+                raise Cancelado()
+            hilo = threading.Thread(target=trabajar, args=(i,), name=f"reaper-hilo-{i}", daemon=True)
+            hilos.append(hilo)
+            hilo.start()
+        for hilo in hilos:
+            while hilo.is_alive():
+                hilo.join(0.2)
+                if CANCELAR.is_set():          # cancelado desde otro hilo o la UI, no solo por Ctrl+C
+                    raise Cancelado()
+    except (KeyboardInterrupt, Cancelado):
+        CANCELAR.set()
+        matar_procesos_vivos()
+        limite = time.monotonic() + max(0.0, gracia)
+        for hilo in hilos:
+            restante = limite - time.monotonic()
+            if restante <= 0:
+                break
+            hilo.join(restante)
+        raise
+    for error in errores:
+        if error is not None:
+            raise error
+    return resultados
+
+
 @dataclass
 class ResultadoAgente:
     ok: bool
@@ -471,6 +570,10 @@ class Agente:
         for paso in range(1, self.max_pasos + 1):
             if CANCELAR.is_set():
                 raise Cancelado()
+            vencido = PLAZO.vencido()
+            if vencido:
+                return self._cerrar(f"Se agotó el tiempo de {vencido}: corté en el paso {paso} SIN declarar éxito. "
+                                    "Trabajo parcial: revisá /diff.", paso, "tiempo", ok=False)
             self._compactar()
             respuesta = self._llamar_con_recuperacion()
             analisis = analizar(respuesta.texto, self._esquemas)
@@ -720,7 +823,22 @@ class Agente:
                 and all(llamada.params.get(p.nombre) not in (None, "") for p in h.params if p.requerido):
             # El mensaje terminó normal y la llamada es la última: el modelo solo olvidó cerrar las etiquetas.
             # Se acepta (si el contenido quedó truncado, la validación real del archivo lo va a mostrar).
-            llamada = Llamada(llamada.nombre, llamada.params, True, llamada.crudo)
+            llamada = Llamada(llamada.nombre, llamada.params, True, llamada.crudo, llamada.sin_cierre)
+        if llamada.completa and llamada.sin_cierre:
+            exactos = ["tool", "invoke", "parameter", "tool_call", "tool_calls", "function_call", *REGISTRO.keys()]
+            for p in h.params:
+                valor = llamada.params.get(p.nombre)
+                if not p.largo or p.nombre not in llamada.sin_cierre or not isinstance(valor, str):
+                    continue
+                espurio = cierre_espurio(valor, [nombre, p.nombre], exactos)
+                if espurio:
+                    self.ui.resultado_herramienta(False, f"{nombre}: etiqueta de cierre inválida {espurio}")
+                    self.ctx.tropiezo("xml_invalido")
+                    return obs(
+                        f"ERROR: la llamada a {nombre} terminó con la etiqueta {espurio}, que NO es un cierre válido "
+                        f"(esperaba </{p.nombre}> y </{nombre}>). No modifiqué nada. Reenviá la llamada completa "
+                        "con las etiquetas exactas."
+                    ), True
         if not llamada.completa:
             self.ui.resultado_herramienta(False, f"{nombre}: llamada incompleta")
             self.ctx.tropiezo("llamada_incompleta")
@@ -1661,12 +1779,4 @@ def ejecutar_subagentes(
         return [correr(s, True) for s in specs]
 
     ui.tenue(f"  ⇉ {len(specs)} subagentes en paralelo (máx {limite} a la vez)")
-    ejecutor = ThreadPoolExecutor(max_workers=min(limite, len(specs)))
-    try:
-        futuros = [ejecutor.submit(correr, s, False) for s in specs]
-        return [f.result() for f in futuros]
-    except (KeyboardInterrupt, Cancelado):
-        CANCELAR.set()
-        raise
-    finally:
-        ejecutor.shutdown(wait=not CANCELAR.is_set(), cancel_futures=True)
+    return ejecutar_hilos([functools.partial(correr, s, False) for s in specs], min(limite, len(specs)))

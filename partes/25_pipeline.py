@@ -196,11 +196,11 @@ def _aceptacion_error(mensaje: str) -> Resultado:
     return Resultado(False, 'aceptacion_independiente', 1, stderr=str(mensaje))
 
 
-def huella_aceptacion(ws: Workspace) -> str:
-    """Fija el manifiesto y la suite externa; cambios durante build => fallo cerrado."""
+def _manifiesto_aceptacion(ws: Workspace) -> Optional[tuple]:
+    """(bytes_crudos, spec, carpeta_suite) del manifiesto validado; None si no hay evaluador configurado."""
     cfg = ws.raiz / '.reaper' / 'acceptance.json'
     if not cfg.exists() and not cfg.is_symlink():
-        return 'sin-evaluador'
+        return None
     if cfg.is_symlink() or not cfg.is_file():
         raise ValueError('El manifiesto de aceptación no puede ser un enlace simbólico.')
     if cfg.stat().st_size > 16_384:
@@ -213,9 +213,9 @@ def huella_aceptacion(ws: Workspace) -> str:
     if not isinstance(spec, dict) or set(spec) - {'suite_dir', 'min_tests', 'timeout'}:
         raise ValueError('El manifiesto acepta solo suite_dir, min_tests y timeout.')
     suite_str = spec.get('suite_dir')
-    if not isinstance(suite_str, str) or not suite_str.startswith('/'):
+    if not isinstance(suite_str, str) or not os.path.isabs(os.path.expanduser(suite_str)):
         raise ValueError('suite_dir debe ser una carpeta ABSOLUTA fuera del proyecto.')
-    suite = Path(suite_str).resolve(strict=False)
+    suite = Path(os.path.expanduser(suite_str)).resolve(strict=False)
     raiz = ws.raiz.resolve()
     if os.path.commonpath((str(suite), str(raiz))) == str(raiz):
         raise ValueError('La suite independiente debe estar FUERA del proyecto editado por REAPER.')
@@ -227,27 +227,93 @@ def huella_aceptacion(ws: Workspace) -> str:
         raise ValueError('min_tests debe ser un entero entre 1 y 10000.')
     if isinstance(tiempo, bool) or not isinstance(tiempo, int) or not 1 <= tiempo <= 180:
         raise ValueError('timeout debe ser un entero entre 1 y 180.')
-    tests = sorted(suite.rglob('test_*.py'))
+    return raw, spec, suite
+
+
+def _archivos_suite(suite: Path) -> list:
+    """Todos los archivos de la suite externa (tests Y auxiliares), sin cachés de bytecode. Acotado."""
+    archivos = []
+    for p in sorted(suite.rglob('*')):
+        rel = p.relative_to(suite)
+        if '__pycache__' in rel.parts or p.suffix == '.pyc':
+            continue
+        if p.is_symlink():
+            raise ValueError(f'La suite independiente no admite enlaces simbólicos: {rel}')
+        if p.is_file():
+            archivos.append(p)
+            if len(archivos) > 2000:
+                raise ValueError('La suite externa tiene demasiados archivos (> 2000).')
+    return archivos
+
+
+def huella_aceptacion(ws: Workspace) -> str:
+    """
+    Fija el manifiesto y TODA la suite externa (tests y auxiliares: un helpers.py editado también cuenta);
+    cambios durante la build => fallo cerrado.
+    """
+    datos = _manifiesto_aceptacion(ws)
+    if datos is None:
+        return 'sin-evaluador'
+    raw, _spec, suite = datos
+    archivos = _archivos_suite(suite)
+    tests = [p for p in archivos if p.name.startswith('test_') and p.suffix == '.py']
     if not tests or len(tests) > 500:
         raise ValueError('La suite externa debe incluir 1 a 500 archivos test_*.py.')
-    h = hashlib.sha256(b'REAPER-810-ACCEPTANCE-V1\0' + raw)
-    for p in tests:
-        if p.is_symlink() or not p.is_file():
-            raise ValueError('Los tests independientes no admiten enlaces simbólicos.')
-        if p.stat().st_size > 1_000_000:
-            raise ValueError(f'Test externo demasiado grande: {p.name}')
+    h = hashlib.sha256(b'REAPER-810-ACCEPTANCE-V2\0' + raw)
+    total = 0
+    for p in archivos:
+        tam = p.stat().st_size
+        if tam > 1_000_000:
+            raise ValueError(f'Archivo de la suite externa demasiado grande: {p.name}')
+        total += tam
+        if total > 20_000_000:
+            raise ValueError('La suite externa supera 20 MB.')
         h.update(str(p.relative_to(suite)).encode('utf-8') + b'\0')
         h.update(p.read_bytes())
         h.update(b'\0')
     return h.hexdigest()
 
 
+def huella_aceptacion_v1(ws: Workspace) -> str:
+    """Huella de la ronda 12 (solo test_*.py). Solo para reanudar diarios creados con esa versión."""
+    datos = _manifiesto_aceptacion(ws)
+    if datos is None:
+        return 'sin-evaluador'
+    raw, _spec, suite = datos
+    h = hashlib.sha256(b'REAPER-810-ACCEPTANCE-V1\0' + raw)
+    for p in sorted(suite.rglob('test_*.py')):
+        h.update(str(p.relative_to(suite)).encode('utf-8') + b'\0')
+        h.update(p.read_bytes())
+        h.update(b'\0')
+    return h.hexdigest()
+
+
+# Runner de confianza del evaluador externo. Corre con `python -I -B`: el proyecto (editable por el agente)
+# NUNCA entra en sys.path, así un `unittest.py`/`json.py` del proyecto no puede suplantar la librería
+# estándar e imprimir un "OK" falso (antes pasaba: el gate aprobaba una suite que fallaba). El conteo sale de
+# los objetos de unittest, no de leer texto, en una línea con una marca aleatoria que llega por stdin.
+_RUNNER_ACEPTACION = r"""
+import os, sys
+sys.path[:] = [p for p in sys.path if p not in ('', '.') and os.path.abspath(p) != os.getcwd()]
+import json, unittest
+marca = sys.stdin.readline().strip()
+suite = sys.argv[1]
+r = unittest.TextTestRunner(stream=sys.stderr, verbosity=2).run(
+    unittest.TestLoader().discover(suite, pattern='test_*.py', top_level_dir=suite))
+datos = {'ran': r.testsRun, 'failures': len(r.failures), 'errors': len(r.errors), 'skipped': len(r.skipped),
+         'expected_failures': len(r.expectedFailures), 'unexpected_successes': len(r.unexpectedSuccesses)}
+sys.stdout.write('\n' + marca + json.dumps(datos) + '\n')
+sys.stdout.flush()
+sys.exit(0 if r.wasSuccessful() else 1)
+"""
+
+
 def ejecutar_aceptacion_independiente(ws: Workspace, *,
                                         huella_fijada: Optional[str] = None) -> Optional[Resultado]:
     """Devuelve None solo si NO se configuró un evaluador al inicio de la build.
 
-    Ejecuta unittest con argv real (shell=False) y muestra fallos auténticos.
-    No acepta cambiar/quitar los tests, ni resultados vacíos o con saltos completos.
+    Ejecuta la suite con el runner de confianza (argv real, sin shell, aislado del proyecto). No acepta
+    cambiar/quitar los tests, resultados vacíos, sin conteo verificable o con todo omitido.
     """
     try:
         huella_actual = huella_aceptacion(ws)
@@ -255,22 +321,34 @@ def ejecutar_aceptacion_independiente(ws: Workspace, *,
             return _aceptacion_error('Evaluador independiente cambiado o eliminado durante la build.')
         if huella_actual == 'sin-evaluador':
             return None
-        spec = json.loads((ws.raiz / '.reaper' / 'acceptance.json').read_text(encoding='utf-8'))
-        carpeta = str(Path(spec['suite_dir']).resolve())
-        resultado = ejecutar([sys.executable, '-m', 'unittest', 'discover',
-                             '-s', carpeta, '-p', 'test_*.py', '-v'],
-                            cwd=ws.raiz, timeout=int(spec.get('timeout', 60)), shell=False)
-        combinado = resultado.stdout + '\n' + resultado.stderr
-        m = re.search(r'\bRan\s+(\d+)\s+tests?\b', combinado)
+        _raw, spec, suite = _manifiesto_aceptacion(ws)
+        marca = 'REAPER-ACEPTACION-' + secrets.token_hex(16)
+        resultado = ejecutar([sys.executable, '-I', '-B', '-c', _RUNNER_ACEPTACION, str(suite)],
+                             cwd=ws.raiz, timeout=int(spec.get('timeout', 60)), shell=False,
+                             entrada=marca + '\n', env_extra={'REAPER_PROYECTO': str(ws.raiz)})
+        resultado.comando = f"aceptación independiente: unittest {suite}"
+        datos = None
+        for linea in reversed(resultado.stdout.splitlines()):
+            if linea.startswith(marca):
+                try:
+                    datos = json.loads(linea[len(marca):].strip())
+                except ValueError:
+                    datos = None
+                break
+        resultado.stdout = '\n'.join(l for l in resultado.stdout.splitlines() if not l.startswith(marca))
         minimo = spec.get('min_tests', 1)
-        if not m:
+        if not isinstance(datos, dict):
             resultado.ok = False
-            resultado.stderr += '\nACEPTACIÓN: falta conteo verificable de unittest.'
+            resultado.stderr += '\nACEPTACIÓN: falta conteo verificable del runner (¿se interrumpió o se cortó?).'
         else:
-            skipped = re.search(r'\bskipped\s*=\s*(\d+)', combinado)
-            xfailed = re.search(r'\bexpected failures\s*=\s*(\d+)', combinado)
-            no_ejecutados = (int(skipped.group(1)) if skipped else 0) + (int(xfailed.group(1)) if xfailed else 0)
-            efectivos = max(0, int(m.group(1)) - no_ejecutados)
+            efectivos = max(0, int(datos.get('ran', 0)) - int(datos.get('skipped', 0))
+                            - int(datos.get('expected_failures', 0)))
+            malos = int(datos.get('failures', 0)) + int(datos.get('errors', 0)) + int(datos.get('unexpected_successes', 0))
+            resultado.stderr += (f"\nACEPTACIÓN: {datos.get('ran', 0)} corridos, {efectivos} efectivos, "
+                                 f"{datos.get('failures', 0)} fallos, {datos.get('errors', 0)} errores, "
+                                 f"{datos.get('skipped', 0)} omitidos (mínimo {minimo}).")
+            if malos or resultado.codigo != 0:
+                resultado.ok = False
             if efectivos < minimo:
                 resultado.ok = False
                 resultado.stderr += (f'\nACEPTACIÓN: solo {efectivos}/{minimo} pruebas ejecutadas '
@@ -817,6 +895,11 @@ class Orquestador:
         elif tests is not None and not tests.ok:
             partes.append("TESTS: " + conteo.texto() + "\n" + fallos_relevantes(f"{tests.stdout}\n{tests.stderr}",
                                                                                 maximo=3, limite=5000))
+        elif tests is not None and conteo.reconocido and conteo.ejecutados == 0 and conteo.omitidos > 0:
+            # Exit 0 con TODO salteado (skip/xfail): 0 tests ejecutados no verifican nada (antes daba "verificada").
+            tests_ok = False
+            partes.append(f"TESTS: todos los tests fueron OMITIDOS ({conteo.texto()}): 0 ejecutados no prueban "
+                          "nada. Quitá los @skip / xfail o implementá lo que falta para que corran de verdad.")
         # Evaluador externo, colocado FUERA del directorio editable del proyecto.
         # Si falla, no se puede declarar la build verificada aunque el LLM diga que terminó.
         aceptacion = ejecutar_aceptacion_independiente(
@@ -875,7 +958,17 @@ class Orquestador:
         intentos_txt: list[str] = []
         forense_hecho = False
         informe_forense = ""
+        sin_cambios = 0
         while not verif.ok and intento < max_intentos:
+            vencido = PLAZO.vencido()
+            if vencido:
+                informe.notas.append(f"{etiqueta}: se agotó el tiempo de {vencido}; quedan fallos sin reparar.")
+                self.ui.aviso(f"  ⏱ {etiqueta}: se agotó el tiempo de {vencido}; no sigo reparando.")
+                break
+            if sin_cambios >= 2:
+                informe.notas.append(f"{etiqueta}: el reparador no cambió ningún archivo en 2 intentos seguidos.")
+                self.ui.aviso(f"  {etiqueta}: 2 intentos sin cambios reales; corto la reparación (sin avance).")
+                break
             firma = _firma_error(verif.diagnostico)
             if diagnosticos_vistos.count(firma) >= 3:
                 informe.notas.append(f"{etiqueta}: la reparación no logró avances (mismo diagnóstico repetido).")
@@ -911,6 +1004,7 @@ class Orquestador:
                                      + "\n---\n".join(intentos_txt[-2:]))
             res = self.reparar(pedido, verif, rcid, base_fallaba, experto, contexto_intento.strip())
             intentos_txt.append(recortar(res.resumen, 1200))
+            sin_cambios = 0 if self.ws.checkpoints.diff_desde(rcid).strip() else sin_cambios + 1
             verif = verificador()
             self._mostrar_verificacion(verif)
             if verif.ok:
@@ -1122,6 +1216,16 @@ class Orquestador:
         return Verificacion(not problemas, validaciones, tests, diagnostico, archivos, conteo)
 
     def construir(self, pedido: str, confirmar: bool = True, reanudar: bool = False) -> InformeBuild:
+        with PLAZO.limitar(self.settings.tiempo_max_build, "la build"):
+            pila = list(PLAZO._pila)
+            try:
+                return self._construir(pedido, confirmar, reanudar)
+            finally:
+                # Si una excepción cortó una tarea, su plazo no debe sobrevivir a la build.
+                with PLAZO._lock:
+                    PLAZO._pila = [e for e in PLAZO._pila if e in pila]
+
+    def _construir(self, pedido: str, confirmar: bool = True, reanudar: bool = False) -> InformeBuild:
         inicio = time.monotonic()
         self._protegidos: dict[str, Optional[str]] = {}
         registro_build = RegistroBuild(self.ws)
@@ -1178,6 +1282,12 @@ class Orquestador:
                 self.ui.error("El checkpoint original ya no existe; no puedo reanudar con evidencia.")
                 return InformeBuild("cancelada")
             huella_guardada = previo.get('huella_aceptacion')
+            if huella_guardada is not None and huella_guardada != huella_actual:
+                try:
+                    if huella_guardada == huella_aceptacion_v1(self.ws):
+                        huella_guardada = None          # diario de la ronda 12: la misma suite, se migra a V2
+                except (ValueError, OSError):
+                    pass
             if huella_guardada is not None and huella_actual != huella_guardada:
                 self.ui.error('Cambió el evaluador independiente desde el checkpoint; no reanudo.')
                 return InformeBuild('cancelada')
@@ -1278,7 +1388,10 @@ class Orquestador:
             plan.tareas = orden
         # Si hay tareas verificadas, la huella del proyecto se confirmó ANTES de
         # retomarlas. No se repiten implementaciones exitosas ni sus solicitudes a IA.
+        token_tarea = None
         for i, tarea in enumerate(plan.tareas):
+            PLAZO.cerrar(token_tarea)
+            token_tarea = None
             self.ui.info(f"\n▸ Tarea {i + 1}/{len(plan.tareas)}: {recortar(tarea.descripcion.splitlines()[0], 120)}")
             if reanudar and previo["estados"].get(tarea.id) == "verificada":
                 self.ui.ok(f"Tarea {tarea.id}: conservada (verificada antes de la interrupción)")
@@ -1293,6 +1406,16 @@ class Orquestador:
                 previo["estados"][tarea.id] = "bloqueada"
                 registro_build.guardar(previo)
                 continue
+            vencido = PLAZO.vencido()
+            if vencido:
+                self.ui.aviso(f"  Tarea {tarea.id} NO iniciada: se agotó el tiempo de {vencido}.")
+                informe.tareas_fallidas.append(tarea.id)
+                informe.notas.append(f"Tarea {tarea.id}: sin iniciar (se agotó el tiempo de {vencido}); "
+                                     "retomala con /construir continuar.")
+                previo["estados"][tarea.id] = "pendiente"
+                registro_build.guardar(previo)
+                continue
+            token_tarea = PLAZO.abrir(self.settings.tiempo_max_tarea, f"la tarea {tarea.id}")
             previo["estados"][tarea.id] = "en_curso"
             previo["tarea_activa"] = tarea.id
             previo["huellas_inicio"] = registro_build.huellas()
@@ -1375,6 +1498,7 @@ class Orquestador:
             previo.pop("tcid", None)
             previo.pop("huellas_inicio", None)
             registro_build.guardar(previo)
+        PLAZO.cerrar(token_tarea)
 
         archivos = [r for r in self.ws.checkpoints.archivos_desde(grupo) if (self.ws.raiz / r).is_file()]
         hay_tests_build = any(_es_test(a) for a in archivos)

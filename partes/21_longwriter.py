@@ -373,27 +373,25 @@ class EscritorLargo:
                 break
             fallidos: list[Simbolo] = []
             base = texto
-            with ThreadPoolExecutor(max_workers=paralelo) as ejecutor:
-                futuros = [ejecutor.submit(generar, g, base) for g in grupos]
-                for futuro in as_completed(futuros):
-                    grupo, definiciones = futuro.result()
-                    with self._lock:
-                        for s in grupo:
-                            definicion = definiciones.get(s.nombre_completo)
-                            if not definicion:
-                                errores[s.nombre_completo] = "No devolviste la definición completa de esta función."
-                                fallidos.append(s)
-                                continue
-                            nuevo, error = self._aplicar(rel, lenguaje, texto, s.nombre_completo, definicion)
-                            if error:
-                                errores[s.nombre_completo] = error
-                                fallidos.append(s)
-                                continue
-                            texto = nuevo
-                            hechos += 1
-                            escribir_archivo(rel, texto)
-                            self.ui.linea(f"      {Tema.ok}✓{C.RESET} {Tema.tenue}{s.nombre_completo} "
-                                          f"({hechos}/{total}){C.RESET}")
+            generados = ejecutar_hilos([functools.partial(generar, g, base) for g in grupos], paralelo)
+            for grupo, definiciones in generados:
+                with self._lock:
+                    for s in grupo:
+                        definicion = definiciones.get(s.nombre_completo)
+                        if not definicion:
+                            errores[s.nombre_completo] = "No devolviste la definición completa de esta función."
+                            fallidos.append(s)
+                            continue
+                        nuevo, error = self._aplicar(rel, lenguaje, texto, s.nombre_completo, definicion)
+                        if error:
+                            errores[s.nombre_completo] = error
+                            fallidos.append(s)
+                            continue
+                        texto = nuevo
+                        hechos += 1
+                        escribir_archivo(rel, texto)
+                        self.ui.linea(f"      {Tema.ok}✓{C.RESET} {Tema.tenue}{s.nombre_completo} "
+                                      f"({hechos}/{total}){C.RESET}")
             if not fallidos:
                 break
             self.ui.tenue(f"  [{self.etiqueta}] ronda {ronda + 2}: reintento {len(fallidos)} función(es) con el error real")

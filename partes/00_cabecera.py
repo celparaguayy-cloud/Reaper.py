@@ -98,6 +98,7 @@ import platform
 import queue
 import random
 import re
+import secrets
 import shlex
 import shutil
 import signal

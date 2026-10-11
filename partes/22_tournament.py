@@ -195,15 +195,8 @@ class Torneo:
                 for cand in candidatos:
                     self._correr_candidato(cand, tarea, archivos, rol, protegidos, existentes, True)
             else:
-                with ThreadPoolExecutor(max_workers=paralelo) as ejecutor:
-                    futuros = [ejecutor.submit(self._correr_candidato, cand, tarea, archivos, rol, protegidos,
-                                               existentes, False) for cand in candidatos]
-                    try:
-                        for f in futuros:
-                            f.result()
-                    except (KeyboardInterrupt, Cancelado):
-                        CANCELAR.set()
-                        raise
+                ejecutar_hilos([functools.partial(self._correr_candidato, cand, tarea, archivos, rol, protegidos,
+                                                  existentes, False) for cand in candidatos], paralelo)
             return self._decidir(candidatos, cid, protegidos)
         finally:
             for cand in candidatos:

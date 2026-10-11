@@ -85,6 +85,10 @@ _PATRON_JSON_SECRETO = re.compile(
 
 MAX_BYTES_LECTURA = 1_000_000
 
+# El manifiesto del evaluador independiente y el diario de /construir no los edita el agente: si pudiera, bajaría
+# min_tests o borraría el evaluador entre builds (las suites del usuario quedan fuera del alcance de escritura).
+ARCHIVOS_CONTROL_REAPER = frozenset({".reaper/acceptance.json", ".reaper/build_pendiente.json"})
+
 
 class ErrorRuta(ValueError):
     pass
@@ -184,6 +188,9 @@ class Workspace:
                 raise ErrorRuta(f"Archivo sensible protegido: {rel}")
             if relativa.parts and relativa.parts[0] == ".git":
                 raise ErrorRuta("No se escribe dentro de .git")
+            if relativa.as_posix().lower() in ARCHIVOS_CONTROL_REAPER:
+                raise ErrorRuta(f"{relativa.as_posix()} es un archivo de control de REAPER (evaluador externo o "
+                                "diario de la build): lo administra el propietario, no el agente.")
             if destino == self.raiz:
                 raise ErrorRuta("La ruta apunta a la raíz del workspace, no a un archivo.")
         return destino
