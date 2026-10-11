@@ -14937,6 +14937,23 @@ def _diffstat(diff: str) -> str:
     return "\n".join(f"  {a}  +{m} -{n}" for a, (m, n) in stats.items())
 
 
+def _resumen_diff(diff: str) -> str:
+    """Total compacto del diff para el cierre: 'N archivo(s) · +X −Y'. Vacío si no hubo cambios."""
+    archivos = mas = menos = 0
+    actual = None
+    for linea in (diff or "").splitlines():
+        if linea.startswith("+++ b/"):
+            actual = True
+            archivos += 1
+        elif actual and linea.startswith("+") and not linea.startswith("+++"):
+            mas += 1
+        elif actual and linea.startswith("-") and not linea.startswith("---"):
+            menos += 1
+    if not archivos:
+        return ""
+    return f"{archivos} archivo(s) · +{mas} −{menos}"
+
+
 def _es_test(rel: str) -> bool:
     return any(fnmatch.fnmatch(rel, p) for p in PATRONES_TESTS)
 
@@ -15915,6 +15932,7 @@ class Orquestador:
         if [t.id for t in orden] != [t.id for t in plan.tareas]:
             self.ui.tenue("  Orden por dependencias: " + " → ".join(t.id for t in orden))
             plan.tareas = orden
+        self._checklist_plan(plan, grafo)
         # Si hay tareas verificadas, la huella del proyecto se confirmó ANTES de
         # retomarlas. No se repiten implementaciones exitosas ni sus solicitudes a IA.
         token_tarea = None
@@ -16135,39 +16153,58 @@ class Orquestador:
             self.ui.aviso(f"No pude guardar el informe: {e}")
             return None
 
+    def _checklist_plan(self, plan: Plan, grafo: "GrafoTareas") -> None:
+        """Checklist del plan antes de implementar: se ve de un vistazo qué se va a hacer y en qué orden."""
+        if len(plan.tareas) <= 1:
+            return
+        ancho = max(24, min(ancho_terminal(), 100) - 26)
+        lineas = []
+        for t in plan.tareas:
+            desc = recortar(t.descripcion.splitlines()[0], ancho)
+            deps = grafo.dependencias(t.id)
+            cola = f"  {Tema.tenue}← {', '.join(deps)}{C.RESET}" if deps else ""
+            lineas.append(f"{Tema.tenue}○{C.RESET} {C.BOLD}{t.id}{C.RESET} {desc}{cola}")
+        self.ui.caja(lineas, titulo=f"Plan · {len(plan.tareas)} tareas", color=C.ESCAMA)
+
     def _mostrar_cierre(self, informe: InformeBuild) -> None:
-        if informe.estado == "verificada":
-            self.ui.titulo("✓ BUILD VERIFICADA (validadores + tests reales)")
-        elif informe.estado == "validada":
-            self.ui.titulo("✓ BUILD VALIDADA (validadores OK, sin tests que correr)")
-        elif informe.estado == "parcial":
-            self.ui.titulo("◐ BUILD PARCIAL (lo hecho pasa, pero faltan tareas del plan)")
-            self.ui.aviso(f"  fallidas: {', '.join(informe.tareas_fallidas) or '—'} · "
-                          f"bloqueadas: {', '.join(informe.tareas_bloqueadas)}. "
-                          "Una nueva /construir requerirá verificar lo ya hecho.")
-        else:
-            self.ui.titulo("✗ BUILD FALLIDA")
+        insignias = {
+            "verificada": ("✓", "BUILD VERIFICADA", "validadores + tests reales", Tema.ok),
+            "validada": ("✓", "BUILD VALIDADA", "validadores OK, sin tests que correr", Tema.ok),
+            "parcial": ("◐", "BUILD PARCIAL", "lo hecho pasa; faltan tareas del plan", Tema.aviso),
+            "cancelada": ("•", "BUILD CANCELADA", "no se tocó ningún archivo", Tema.tenue),
+            "fallida": ("✗", "BUILD FALLIDA", "quedaron fallos sin resolver", Tema.error),
+        }
+        glifo, titulo, subt, color = insignias.get(informe.estado, insignias["fallida"])
         diff = self.ws.checkpoints.diff_desde(informe.cid) if informe.cid else ""
-        if diff:
-            self.ui.linea(_diffstat(diff))
-        datos = [f"duración {formatear_duracion(informe.segundos)}"]
-        if informe.spec_tests:
-            datos.append(f"{len(informe.spec_tests)} archivo(s) de tests previos")
+        datos = [formatear_duracion(informe.segundos)]
+        resumen = _resumen_diff(diff)
+        if resumen:
+            datos.append(resumen)
         torneos = sum(1 for _, modo, _g in informe.torneos if modo == "torneo")
         if torneos:
             datos.append(f"{torneos} torneo(s)")
         if informe.escaladas:
             datos.append(f"{informe.escaladas} escalada(s)")
+        if informe.spec_tests:
+            datos.append(f"{len(informe.spec_tests)} tests previos")
         if informe.lecciones:
             datos.append(f"{len(informe.lecciones)} lección(es)")
-        self.ui.tenue("  " + " · ".join(datos))
+        lineas = [f"{color}{subt}{C.RESET}", f"{Tema.tenue}{' · '.join(datos)}{C.RESET}"]
+        if informe.estado == "parcial":
+            lineas.append(f"{Tema.aviso}fallidas: {', '.join(informe.tareas_fallidas) or '—'} · "
+                          f"bloqueadas: {', '.join(informe.tareas_bloqueadas) or '—'}{C.RESET}")
         if informe.commit:
-            self.ui.ok(f"guardada en git: {informe.commit[:10]} (rama {self.settings.rama_git})")
+            lineas.append(f"{Tema.ok}git {informe.commit[:10]} · rama {self.settings.rama_git}{C.RESET}")
+        self.ui.linea("")
+        self.ui.caja(lineas, titulo=f"{glifo} {titulo}", color=color)
+        detalle = _diffstat(diff)
+        if detalle:
+            self.ui.tenue(detalle)
         for nota in informe.notas:
             self.ui.aviso(f"  • {nota}")
         if informe.ruta_informe:
             self.ui.tenue(f"  informe: {informe.ruta_informe}")
-        self.ui.tenue("  /diff para ver los cambios · /deshacer revierte TODA la build\n")
+        self.ui.tenue("  /diff ver cambios · /deshacer revierte toda la build\n")
 
     def revisar_proyecto(self, foco: str = "") -> str:
         archivos = [a for a in self.ws.archivos_codigo(limite=400)
@@ -46084,6 +46121,41 @@ class TestHallazgosTermux(BaseTest):
         self.assertFalse(requisito_disponible("python3:modulo_que_no_existe_xyz"))
         self.assertTrue(requisito_disponible("python3:json"))
         self.assertIn("gem install minitest", instruccion_requisito("ruby:minitest"))
+
+
+class TestFlujoConstruirUI(BaseTest):
+    def test_resumen_diff_compacto(self):
+        diff = ("--- a/app.py\n+++ b/app.py\n@@\n+uno\n+dos\n-viejo\n"
+                "--- a/web.js\n+++ b/web.js\n@@\n+x\n")
+        self.assertEqual(_resumen_diff(diff), "2 archivo(s) · +3 −1")
+        self.assertEqual(_resumen_diff(""), "")
+
+    def test_cierre_en_caja_con_insignia(self):
+        ws = self.proyecto({"a.py": "x = 1\n"})
+        orq = Orquestador(MockLLM([]), ws, self.ajustes(), self.ui())
+        informe = InformeBuild("verificada", segundos=12.3, commit="a1b2c3d4e5")
+        orq._mostrar_cierre(informe)
+        texto = orq.ui.texto_registrado()
+        self.assertIn("BUILD VERIFICADA", texto)
+        self.assertIn("╭", texto)                       # va en caja
+        caja = [l for l in texto.splitlines() if l and l[0] in "╭│╰"]
+        self.assertEqual(len({ancho_visible(l) for l in caja}), 1)   # alineada
+        informe_mal = InformeBuild("fallida", segundos=1.0)
+        orq2 = Orquestador(MockLLM([]), ws, self.ajustes(), self.ui())
+        orq2._mostrar_cierre(informe_mal)
+        self.assertIn("BUILD FALLIDA", orq2.ui.texto_registrado())
+
+    def test_checklist_del_plan_lista_las_tareas(self):
+        plan = parsear_plan('<plan>\n<objetivo>x</objetivo>\n'
+                            '<tarea id="1" archivos="a.py">Crear a.py</tarea>\n'
+                            '<tarea id="2" archivos="b.py" deps="1">Crear b.py</tarea>\n</plan>', 'dos archivos')
+        ws = self.proyecto()
+        orq = Orquestador(MockLLM([]), ws, self.ajustes(), self.ui())
+        orq._checklist_plan(plan, GrafoTareas(plan.tareas))
+        texto = orq.ui.texto_registrado()
+        self.assertIn("Plan · 2 tareas", texto)
+        self.assertIn("Crear a.py", texto)
+        self.assertIn("← 1", texto)                      # la tarea 2 depende de la 1
 
 
 # ======================================================================

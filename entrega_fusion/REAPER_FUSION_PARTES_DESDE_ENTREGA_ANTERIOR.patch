@@ -1177,7 +1177,7 @@ index 476ec69..3057f65 100644
          self.ui.linea(f"{Tema.acento}⇪ escalada:{C.RESET} {Tema.tenue}consulto a {self.modelo} "
                        f"(la verificación falló {self.settings.umbral_escalada} veces){C.RESET}")
 diff --git a/partes/25_pipeline.py b/partes/25_pipeline.py
-index 9e610a4..e3fe63e 100644
+index 9e610a4..dcb0ee8 100644
 --- a/partes/25_pipeline.py
 +++ b/partes/25_pipeline.py
 @@ -178,13 +178,218 @@ def verificacion_peor(despues: "Verificacion", antes: "Verificacion") -> bool:
@@ -1434,7 +1434,31 @@ index 9e610a4..e3fe63e 100644
  def _diffstat(diff: str) -> str:
      stats: dict[str, list[int]] = {}
      actual = None
-@@ -248,6 +465,214 @@ def _es_de_especificacion(nombre_test: str, protegidos: dict) -> bool:
+@@ -233,6 +450,23 @@ def _diffstat(diff: str) -> str:
+     return "\n".join(f"  {a}  +{m} -{n}" for a, (m, n) in stats.items())
+ 
+ 
++def _resumen_diff(diff: str) -> str:
++    """Total compacto del diff para el cierre: 'N archivo(s) · +X −Y'. Vacío si no hubo cambios."""
++    archivos = mas = menos = 0
++    actual = None
++    for linea in (diff or "").splitlines():
++        if linea.startswith("+++ b/"):
++            actual = True
++            archivos += 1
++        elif actual and linea.startswith("+") and not linea.startswith("+++"):
++            mas += 1
++        elif actual and linea.startswith("-") and not linea.startswith("---"):
++            menos += 1
++    if not archivos:
++        return ""
++    return f"{archivos} archivo(s) · +{mas} −{menos}"
++
++
+ def _es_test(rel: str) -> bool:
+     return any(fnmatch.fnmatch(rel, p) for p in PATRONES_TESTS)
+ 
+@@ -248,6 +482,214 @@ def _es_de_especificacion(nombre_test: str, protegidos: dict) -> bool:
      return False
  
  
@@ -1649,7 +1673,7 @@ index 9e610a4..e3fe63e 100644
  class Orquestador:
      def __init__(self, llm, ws: Workspace, settings: Settings, ui: UI):
          self.llm = llm
-@@ -257,6 +682,7 @@ class Orquestador:
+@@ -257,6 +699,7 @@ class Orquestador:
          self.memoria = MemoriaLecciones(ws) if settings.lecciones else None
          self.escalador = Escalador(llm, settings, ui)
          self._protegidos: dict[str, Optional[str]] = {}
@@ -1657,7 +1681,7 @@ index 9e610a4..e3fe63e 100644
  
      def _sub(self, rol: str, tarea: str, cid: Optional[int], archivos: str = "", titulo: str = "",
               **opciones) -> ResultadoAgente:
-@@ -461,7 +887,8 @@ class Orquestador:
+@@ -461,7 +904,8 @@ class Orquestador:
              return True, "(revisión omitida: el revisor no respondió; la validación real pasa)"
          aprobado, claro = veredicto(res.resumen)
          if not claro:
@@ -1667,7 +1691,7 @@ index 9e610a4..e3fe63e 100644
          if aprobado and validacion and not validacion.startswith(("OK", "sin validadores")):
              self.ui.aviso("  El revisor aprobó, pero la validación real falla: lo tomo como CAMBIOS.")
              return False, ("VEREDICTO: CAMBIOS\n1. La validación automática falla (corregilo antes que nada):\n"
-@@ -497,10 +924,24 @@ class Orquestador:
+@@ -497,10 +941,24 @@ class Orquestador:
          elif tests is not None and not tests.ok:
              partes.append("TESTS: " + conteo.texto() + "\n" + fallos_relevantes(f"{tests.stdout}\n{tests.stderr}",
                                                                                  maximo=3, limite=5000))
@@ -1693,7 +1717,7 @@ index 9e610a4..e3fe63e 100644
  
      def reparar(self, pedido: str, verif: Verificacion, cid: int, base_fallaba: bool,
                  diagnostico_experto: str = "", contexto: str = "") -> ResultadoAgente:
-@@ -546,7 +987,17 @@ class Orquestador:
+@@ -546,7 +1004,17 @@ class Orquestador:
          intentos_txt: list[str] = []
          forense_hecho = False
          informe_forense = ""
@@ -1711,7 +1735,7 @@ index 9e610a4..e3fe63e 100644
              firma = _firma_error(verif.diagnostico)
              if diagnosticos_vistos.count(firma) >= 3:
                  informe.notas.append(f"{etiqueta}: la reparación no logró avances (mismo diagnóstico repetido).")
-@@ -582,6 +1033,7 @@ class Orquestador:
+@@ -582,6 +1050,7 @@ class Orquestador:
                                       + "\n---\n".join(intentos_txt[-2:]))
              res = self.reparar(pedido, verif, rcid, base_fallaba, experto, contexto_intento.strip())
              intentos_txt.append(recortar(res.resumen, 1200))
@@ -1719,7 +1743,7 @@ index 9e610a4..e3fe63e 100644
              verif = verificador()
              self._mostrar_verificacion(verif)
              if verif.ok:
-@@ -659,6 +1111,8 @@ class Orquestador:
+@@ -659,6 +1128,8 @@ class Orquestador:
              "EV-TESTS": (verif.conteo.texto() if verif.conteo.reconocido else
                           ("sin suite de tests" if verif.tests is None else f"exit {verif.tests.codigo}")),
              "EV-VALID": resumen_validacion(verif.validaciones, limite=1500),
@@ -1728,7 +1752,7 @@ index 9e610a4..e3fe63e 100644
              "EV-DIFF": _diffstat(diff) or "(sin cambios)",
          }
          bloque = "\n".join(f"{k}: {v}" for k, v in evidencia.items())
-@@ -733,7 +1187,10 @@ class Orquestador:
+@@ -733,7 +1204,10 @@ class Orquestador:
          return ruta
  
      def _verificar_tarea(self, tcid: int, antes: ConteoTests, nombres_antes: set,
@@ -1740,7 +1764,7 @@ index 9e610a4..e3fe63e 100644
          """
          Una tarea intermedia no necesita que pasen TODOS los tests (los de tareas
          siguientes todavía fallan): alcanza con validadores OK y que no se rompa
-@@ -743,7 +1200,31 @@ class Orquestador:
+@@ -743,7 +1217,31 @@ class Orquestador:
          validaciones = validar_archivos(self.ws, archivos)
          tests = ejecutar_tests(self.ws, timeout=self.settings.tests_timeout, completo=True)
          conteo = conteo_de_resultado(tests)
@@ -1773,7 +1797,7 @@ index 9e610a4..e3fe63e 100644
          if tests is not None and not tests.ok and conteo.reconocido:
              # Los tests de la especificación de tareas siguientes fallan a propósito: no son regresión.
              nuevos_fallos = [n for n in conteo.nombres_fallados
-@@ -776,40 +1257,167 @@ class Orquestador:
+@@ -776,40 +1274,167 @@ class Orquestador:
              diagnostico = anexar_pistas(diagnostico, 2)
          return Verificacion(not problemas, validaciones, tests, diagnostico, archivos, conteo)
  
@@ -1958,10 +1982,11 @@ index 9e610a4..e3fe63e 100644
  
          self.ui.fase(numero_fase, "Implementación" + (" · torneo" if self.settings.torneo and self.settings.candidatos > 1 else ""))
          numero_fase += 1
-@@ -820,8 +1428,16 @@ class Orquestador:
+@@ -820,8 +1445,17 @@ class Orquestador:
          if [t.id for t in orden] != [t.id for t in plan.tareas]:
              self.ui.tenue("  Orden por dependencias: " + " → ".join(t.id for t in orden))
              plan.tareas = orden
++        self._checklist_plan(plan, grafo)
 +        # Si hay tareas verificadas, la huella del proyecto se confirmó ANTES de
 +        # retomarlas. No se repiten implementaciones exitosas ni sus solicitudes a IA.
 +        token_tarea = None
@@ -1975,13 +2000,13 @@ index 9e610a4..e3fe63e 100644
              rotas = [d for d in grafo.dependencias(tarea.id)
                       if d in informe.tareas_fallidas or d in informe.tareas_bloqueadas]
              if rotas:
-@@ -829,24 +1445,49 @@ class Orquestador:
+@@ -829,24 +1463,49 @@ class Orquestador:
                  self.ui.aviso(f"  Tarea {tarea.id} BLOQUEADA: depende de {', '.join(rotas)}, que no pasó su verificación.")
                  informe.tareas_bloqueadas.append(tarea.id)
                  informe.notas.append(f"Tarea {tarea.id}: bloqueada (depende de {', '.join(rotas)}).")
 +                previo["estados"][tarea.id] = "bloqueada"
 +                registro_build.guardar(previo)
-+                continue
+                 continue
 +            vencido = PLAZO.vencido()
 +            if vencido:
 +                self.ui.aviso(f"  Tarea {tarea.id} NO iniciada: se agotó el tiempo de {vencido}.")
@@ -1990,7 +2015,7 @@ index 9e610a4..e3fe63e 100644
 +                                     "retomala con /construir continuar.")
 +                previo["estados"][tarea.id] = "pendiente"
 +                registro_build.guardar(previo)
-                 continue
++                continue
 +            token_tarea = PLAZO.abrir(self.settings.tiempo_max_tarea, f"la tarea {tarea.id}")
 +            previo["estados"][tarea.id] = "en_curso"
 +            previo["tarea_activa"] = tarea.id
@@ -2027,7 +2052,7 @@ index 9e610a4..e3fe63e 100644
                      contexto=f"TAREA EN CURSO (#{tarea.id}): {tarea.descripcion}",
                  )
                  if not verif_tarea.ok:
-@@ -858,6 +1499,11 @@ class Orquestador:
+@@ -858,6 +1517,11 @@ class Orquestador:
                  # terminaba "aprobando" igual): el problema ya está diagnosticado por los tests.
                  self.ui.aviso(f"  No paso la tarea {tarea.id} al revisor: su verificación real falla.")
                  informe.notas.append(f"Tarea {tarea.id}: sin revisión porque la verificación real falla.")
@@ -2039,7 +2064,7 @@ index 9e610a4..e3fe63e 100644
                  continue
  
              for ronda in range(self.settings.max_revisiones):
-@@ -875,6 +1521,30 @@ class Orquestador:
+@@ -875,6 +1539,30 @@ class Orquestador:
                      break
                  self.implementar(pedido, plan, i, exploracion, tcid, correcciones=revision,
                                   protegidos=self._protegidos)
@@ -2070,7 +2095,7 @@ index 9e610a4..e3fe63e 100644
  
          archivos = [r for r in self.ws.checkpoints.archivos_desde(grupo) if (self.ws.raiz / r).is_file()]
          hay_tests_build = any(_es_test(a) for a in archivos)
-@@ -896,12 +1566,12 @@ class Orquestador:
+@@ -896,12 +1584,12 @@ class Orquestador:
  
          informe.archivos = verif.archivos
          informe.tests = verif.tests
@@ -2088,7 +2113,7 @@ index 9e610a4..e3fe63e 100644
              if self.settings.git_snapshots and es_repo_git(self.ws):
                  try:
                      informe.commit = snapshot_build(self.ws, self.settings.rama_git,
-@@ -912,6 +1582,10 @@ class Orquestador:
+@@ -912,6 +1600,10 @@ class Orquestador:
              self.ui.fase(numero_fase + 1, "Auditoría REAPER X (seguridad defensiva · entrega · supervisor)")
              self._auditoria_x(pedido, plan, verif, informe)
          informe.segundos = time.monotonic() - inicio
@@ -2099,7 +2124,7 @@ index 9e610a4..e3fe63e 100644
          informe.ruta_informe = self._guardar_informe(pedido, informe)
          self._mostrar_cierre(informe)
          return informe
-@@ -932,6 +1606,12 @@ class Orquestador:
+@@ -932,6 +1624,12 @@ class Orquestador:
          else:
              self.ui.error(f"tests: fallaron ({verif.conteo.texto() if verif.conteo.reconocido else verif.tests.comando})")
              self.ui.tenue(recortar(fallos_relevantes(verif.tests.stdout + "\n" + verif.tests.stderr, 2, 1500), 1500))
@@ -2112,7 +2137,7 @@ index 9e610a4..e3fe63e 100644
  
      def _guardar_informe(self, pedido: str, informe: InformeBuild) -> Optional[Path]:
          try:
-@@ -944,6 +1624,13 @@ class Orquestador:
+@@ -944,6 +1642,13 @@ class Orquestador:
                  f"## Plan\n```\n{informe.plan.como_texto() if informe.plan else '-'}\n```\n\n"
                  f"## Archivos\n```\n{_diffstat(diff) or '-'}\n```\n\n"
                  f"## Tests\n```\n{tests}\n```\n\n"
@@ -2126,7 +2151,7 @@ index 9e610a4..e3fe63e 100644
                  + ("## Especificación (tests escritos antes de implementar)\n" + "\n".join(f"- {t}" for t in informe.spec_tests) + "\n\n"
                     if informe.spec_tests else "")
                  + (f"## Escaladas al modelo fuerte\n{informe.escaladas}\n\n" if informe.escaladas else "")
-@@ -953,7 +1640,9 @@ class Orquestador:
+@@ -953,44 +1658,66 @@ class Orquestador:
                  + ("## Notas\n" + "\n".join(f"- {n}" for n in informe.notas) + "\n" if informe.notas else "")
              )
              ruta = self.ws.raiz / ".reaper" / "informes" / f"build_{datetime.now():%Y%m%d_%H%M%S}.md"
@@ -2137,16 +2162,81 @@ index 9e610a4..e3fe63e 100644
              return ruta
          except OSError as e:
              self.ui.aviso(f"No pude guardar el informe: {e}")
-@@ -967,7 +1656,8 @@ class Orquestador:
-         elif informe.estado == "parcial":
-             self.ui.titulo("◐ BUILD PARCIAL (lo hecho pasa, pero faltan tareas del plan)")
-             self.ui.aviso(f"  fallidas: {', '.join(informe.tareas_fallidas) or '—'} · "
+             return None
+ 
++    def _checklist_plan(self, plan: Plan, grafo: "GrafoTareas") -> None:
++        """Checklist del plan antes de implementar: se ve de un vistazo qué se va a hacer y en qué orden."""
++        if len(plan.tareas) <= 1:
++            return
++        ancho = max(24, min(ancho_terminal(), 100) - 26)
++        lineas = []
++        for t in plan.tareas:
++            desc = recortar(t.descripcion.splitlines()[0], ancho)
++            deps = grafo.dependencias(t.id)
++            cola = f"  {Tema.tenue}← {', '.join(deps)}{C.RESET}" if deps else ""
++            lineas.append(f"{Tema.tenue}○{C.RESET} {C.BOLD}{t.id}{C.RESET} {desc}{cola}")
++        self.ui.caja(lineas, titulo=f"Plan · {len(plan.tareas)} tareas", color=C.ESCAMA)
++
+     def _mostrar_cierre(self, informe: InformeBuild) -> None:
+-        if informe.estado == "verificada":
+-            self.ui.titulo("✓ BUILD VERIFICADA (validadores + tests reales)")
+-        elif informe.estado == "validada":
+-            self.ui.titulo("✓ BUILD VALIDADA (validadores OK, sin tests que correr)")
+-        elif informe.estado == "parcial":
+-            self.ui.titulo("◐ BUILD PARCIAL (lo hecho pasa, pero faltan tareas del plan)")
+-            self.ui.aviso(f"  fallidas: {', '.join(informe.tareas_fallidas) or '—'} · "
 -                          f"bloqueadas: {', '.join(informe.tareas_bloqueadas)}  → /construir de nuevo retoma")
-+                          f"bloqueadas: {', '.join(informe.tareas_bloqueadas)}. "
-+                          "Una nueva /construir requerirá verificar lo ya hecho.")
-         else:
-             self.ui.titulo("✗ BUILD FALLIDA")
+-        else:
+-            self.ui.titulo("✗ BUILD FALLIDA")
++        insignias = {
++            "verificada": ("✓", "BUILD VERIFICADA", "validadores + tests reales", Tema.ok),
++            "validada": ("✓", "BUILD VALIDADA", "validadores OK, sin tests que correr", Tema.ok),
++            "parcial": ("◐", "BUILD PARCIAL", "lo hecho pasa; faltan tareas del plan", Tema.aviso),
++            "cancelada": ("•", "BUILD CANCELADA", "no se tocó ningún archivo", Tema.tenue),
++            "fallida": ("✗", "BUILD FALLIDA", "quedaron fallos sin resolver", Tema.error),
++        }
++        glifo, titulo, subt, color = insignias.get(informe.estado, insignias["fallida"])
          diff = self.ws.checkpoints.diff_desde(informe.cid) if informe.cid else ""
+-        if diff:
+-            self.ui.linea(_diffstat(diff))
+-        datos = [f"duración {formatear_duracion(informe.segundos)}"]
+-        if informe.spec_tests:
+-            datos.append(f"{len(informe.spec_tests)} archivo(s) de tests previos")
++        datos = [formatear_duracion(informe.segundos)]
++        resumen = _resumen_diff(diff)
++        if resumen:
++            datos.append(resumen)
+         torneos = sum(1 for _, modo, _g in informe.torneos if modo == "torneo")
+         if torneos:
+             datos.append(f"{torneos} torneo(s)")
+         if informe.escaladas:
+             datos.append(f"{informe.escaladas} escalada(s)")
++        if informe.spec_tests:
++            datos.append(f"{len(informe.spec_tests)} tests previos")
+         if informe.lecciones:
+             datos.append(f"{len(informe.lecciones)} lección(es)")
+-        self.ui.tenue("  " + " · ".join(datos))
++        lineas = [f"{color}{subt}{C.RESET}", f"{Tema.tenue}{' · '.join(datos)}{C.RESET}"]
++        if informe.estado == "parcial":
++            lineas.append(f"{Tema.aviso}fallidas: {', '.join(informe.tareas_fallidas) or '—'} · "
++                          f"bloqueadas: {', '.join(informe.tareas_bloqueadas) or '—'}{C.RESET}")
+         if informe.commit:
+-            self.ui.ok(f"guardada en git: {informe.commit[:10]} (rama {self.settings.rama_git})")
++            lineas.append(f"{Tema.ok}git {informe.commit[:10]} · rama {self.settings.rama_git}{C.RESET}")
++        self.ui.linea("")
++        self.ui.caja(lineas, titulo=f"{glifo} {titulo}", color=color)
++        detalle = _diffstat(diff)
++        if detalle:
++            self.ui.tenue(detalle)
+         for nota in informe.notas:
+             self.ui.aviso(f"  • {nota}")
+         if informe.ruta_informe:
+             self.ui.tenue(f"  informe: {informe.ruta_informe}")
+-        self.ui.tenue("  /diff para ver los cambios · /deshacer revierte TODA la build\n")
++        self.ui.tenue("  /diff ver cambios · /deshacer revierte toda la build\n")
+ 
+     def revisar_proyecto(self, foco: str = "") -> str:
+         archivos = [a for a in self.ws.archivos_codigo(limite=400)
 diff --git a/partes/26_plantillas.py b/partes/26_plantillas.py
 index c585ca5..bba9247 100644
 --- a/partes/26_plantillas.py
@@ -3424,10 +3514,10 @@ index 0b566f3..3f91fb2 100644
 +        self.assertIn('incompleto', app.ui.texto_registrado())
 diff --git a/partes/48zc_autotest_p0_fusion.py b/partes/48zc_autotest_p0_fusion.py
 new file mode 100644
-index 0000000..d859285
+index 0000000..4a394e4
 --- /dev/null
 +++ b/partes/48zc_autotest_p0_fusion.py
-@@ -0,0 +1,422 @@
+@@ -0,0 +1,457 @@
 +"""
 +Autotests P0 de la fusión 8.10 (ChatGPT ronda 12 + Claude). Cada uno reproduce un defecto confirmado antes de
 +corregirlo: XML de herramienta mal cerrado que se escribía en el archivo, Ctrl+C que esperaba a una llamada lenta,
@@ -3850,6 +3940,41 @@ index 0000000..d859285
 +        self.assertFalse(requisito_disponible("python3:modulo_que_no_existe_xyz"))
 +        self.assertTrue(requisito_disponible("python3:json"))
 +        self.assertIn("gem install minitest", instruccion_requisito("ruby:minitest"))
++
++
++class TestFlujoConstruirUI(BaseTest):
++    def test_resumen_diff_compacto(self):
++        diff = ("--- a/app.py\n+++ b/app.py\n@@\n+uno\n+dos\n-viejo\n"
++                "--- a/web.js\n+++ b/web.js\n@@\n+x\n")
++        self.assertEqual(_resumen_diff(diff), "2 archivo(s) · +3 −1")
++        self.assertEqual(_resumen_diff(""), "")
++
++    def test_cierre_en_caja_con_insignia(self):
++        ws = self.proyecto({"a.py": "x = 1\n"})
++        orq = Orquestador(MockLLM([]), ws, self.ajustes(), self.ui())
++        informe = InformeBuild("verificada", segundos=12.3, commit="a1b2c3d4e5")
++        orq._mostrar_cierre(informe)
++        texto = orq.ui.texto_registrado()
++        self.assertIn("BUILD VERIFICADA", texto)
++        self.assertIn("╭", texto)                       # va en caja
++        caja = [l for l in texto.splitlines() if l and l[0] in "╭│╰"]
++        self.assertEqual(len({ancho_visible(l) for l in caja}), 1)   # alineada
++        informe_mal = InformeBuild("fallida", segundos=1.0)
++        orq2 = Orquestador(MockLLM([]), ws, self.ajustes(), self.ui())
++        orq2._mostrar_cierre(informe_mal)
++        self.assertIn("BUILD FALLIDA", orq2.ui.texto_registrado())
++
++    def test_checklist_del_plan_lista_las_tareas(self):
++        plan = parsear_plan('<plan>\n<objetivo>x</objetivo>\n'
++                            '<tarea id="1" archivos="a.py">Crear a.py</tarea>\n'
++                            '<tarea id="2" archivos="b.py" deps="1">Crear b.py</tarea>\n</plan>', 'dos archivos')
++        ws = self.proyecto()
++        orq = Orquestador(MockLLM([]), ws, self.ajustes(), self.ui())
++        orq._checklist_plan(plan, GrafoTareas(plan.tareas))
++        texto = orq.ui.texto_registrado()
++        self.assertIn("Plan · 2 tareas", texto)
++        self.assertIn("Crear a.py", texto)
++        self.assertIn("← 1", texto)                      # la tarea 2 depende de la 1
 diff --git a/partes/49_autotest_runner.py b/partes/49_autotest_runner.py
 index 6d0d408..02a88e9 100644
 --- a/partes/49_autotest_runner.py
