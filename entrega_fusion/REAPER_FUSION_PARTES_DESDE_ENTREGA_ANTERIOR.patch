@@ -173,7 +173,7 @@ index 4210bef..782455c 100644
      except (OSError, ValueError):
          return False
 diff --git a/partes/03_config.py b/partes/03_config.py
-index 9f76627..33332f3 100644
+index 9f76627..010b644 100644
 --- a/partes/03_config.py
 +++ b/partes/03_config.py
 @@ -69,10 +69,14 @@ PROVEEDORES = {
@@ -297,27 +297,35 @@ index 9f76627..33332f3 100644
      proveedor: str = "openrouter"
      api_url: str = ""
  
-@@ -169,6 +241,10 @@ class Settings:
+@@ -169,7 +241,14 @@ class Settings:
      max_llamadas_turno: int = 4
      max_reparaciones: int = 3
      max_revisiones: int = 2
+-    max_tareas: int = 8
 +    # Plazos de pared (segundos; 0 = sin límite). Sin ellos una build con modelos lentos podía seguir HORAS
 +    # (torneo × pasos × reparaciones × forense) sin terminar: al vencer, la tarea queda FALLIDA, nunca "verificada".
 +    tiempo_max_tarea: int = 1500
 +    tiempo_max_build: int = 5400
-     max_tareas: int = 8
++    # Techo de tareas del plan. Es un MÁXIMO, no un objetivo: un proyecto chico usa pocas; uno grande se descompone
++    # por módulo hasta este tope. 12 por defecto para que un proyecto mediano no se trunque; subilo para uno grande
++    # (/config max_tareas 40). Al pasarse, el resto se agrupa en la última tarea y se avisa.
++    max_tareas: int = 12
      paralelo: int = 2
      qa: bool = True
-@@ -274,6 +350,8 @@ class Settings:
+ 
+@@ -274,8 +353,10 @@ class Settings:
          acotar("max_profundidad", 0, 3)
          acotar("max_llamadas_turno", 1, 10)
          acotar("max_reparaciones", 0, 10)
 +        acotar("tiempo_max_tarea", 0, 86400)
 +        acotar("tiempo_max_build", 0, 86400)
          acotar("max_revisiones", 0, 5)
-         acotar("max_tareas", 1, 30)
+-        acotar("max_tareas", 1, 30)
++        acotar("max_tareas", 1, 60)
          acotar("paralelo", 1, 8)
-@@ -322,9 +400,11 @@ class Settings:
+         acotar("candidatos", 1, 6)
+         acotar("paralelo_torneo", 1, 6)
+@@ -322,9 +403,11 @@ class Settings:
  
  PERFILES = {
      "gratis": {
@@ -331,7 +339,7 @@ index 9f76627..33332f3 100644
      },
      "rapido": {
          "descripcion": "sin torneo ni tests previos: un intento por tarea (barato y veloz)",
-@@ -370,6 +450,11 @@ def cargar_settings(ruta: Optional[Path] = None) -> Settings:
+@@ -370,6 +453,11 @@ def cargar_settings(ruta: Optional[Path] = None) -> Settings:
          except (OSError, ValueError, TypeError):
              settings = Settings()
  
@@ -343,7 +351,7 @@ index 9f76627..33332f3 100644
      if os.getenv("MODEL_NAME"):
          settings.modelo = resolver_modelo(os.environ["MODEL_NAME"])
      if os.getenv("REAPER_MODO") in MODOS:
-@@ -381,6 +466,27 @@ def cargar_settings(ruta: Optional[Path] = None) -> Settings:
+@@ -381,6 +469,27 @@ def cargar_settings(ruta: Optional[Path] = None) -> Settings:
      return settings.validar()
  
  
@@ -371,7 +379,7 @@ index 9f76627..33332f3 100644
  def guardar_settings(settings: Settings, ruta: Optional[Path] = None) -> None:
      ruta = ruta or CONFIG_FILE
      ruta.parent.mkdir(parents=True, exist_ok=True)
-@@ -389,16 +495,47 @@ def guardar_settings(settings: Settings, ruta: Optional[Path] = None) -> None:
+@@ -389,16 +498,47 @@ def guardar_settings(settings: Settings, ruta: Optional[Path] = None) -> None:
      os.replace(tmp, ruta)
  
  
@@ -2185,7 +2193,7 @@ index 4eba772..e986b98 100644
                  (self.ws.raiz / rel).unlink()
                  self.restaurados.append(f"{rel} (creado por los tests, borrado)")
 diff --git a/partes/25_pipeline.py b/partes/25_pipeline.py
-index ad78b6b..d21b2f5 100644
+index ad78b6b..e807ee2 100644
 --- a/partes/25_pipeline.py
 +++ b/partes/25_pipeline.py
 @@ -40,6 +40,39 @@ _RE_VEREDICTO = re.compile(r"VEREDICTO\s*:?\s*\**\s*(APROBADO|CAMBIOS|RECHAZADO)
@@ -2776,7 +2784,30 @@ index ad78b6b..d21b2f5 100644
          informe = "\n\n".join(
              f"### Informe explorador {i}\n{r.resumen}" for i, r in enumerate(resultados, start=1)
          )
-@@ -431,17 +932,23 @@ class Orquestador:
+@@ -308,7 +809,10 @@ class Orquestador:
+             f"PEDIDO DEL USUARIO:\n{pedido}\n\n"
+             f"INFORME DE EXPLORACIÓN (código real):\n{recortar(exploracion, 7000)}\n\n"
+             f"Comando de tests detectado: {detectado[0] if detectado else 'ninguno (habrá que crear tests)'}\n"
+-            f"Armá el plan con un máximo de {self.settings.max_tareas} tareas."
++            f"Usá TANTAS tareas como el proyecto realmente necesite, hasta un máximo de {self.settings.max_tareas}. "
++            f"Un proyecto chico lleva pocas; uno grande se descompone por módulo/capa: UNA tarea por pieza coherente "
++            f"(un módulo, una pantalla, un endpoint, su test), con sus dependencias en deps= para que se ordenen bien. "
++            f"No metas medio proyecto en una sola tarea gigante ni inventes tareas de relleno."
+         )
+         if self.settings.tests_primero:
+             tarea += ("\nLos tests se escriben ANTES de implementar a partir de tu <interfaz> y tus <criterios>: "
+@@ -323,6 +827,10 @@ class Orquestador:
+         if not _RE_TAREA.search(texto) and _RE_TAREA.search(res.contexto):
+             texto = res.contexto + "\n" + texto
+         plan = parsear_plan(texto, pedido, self.settings.max_tareas)
++        crudas = len(_RE_TAREA.findall(texto))
++        if crudas > self.settings.max_tareas:
++            self.ui.aviso(f"  El plan traía {crudas} tareas y el tope es {self.settings.max_tareas}: agrupé el resto "
++                          f"en la última. Para un proyecto grande subí el tope: /config max_tareas {min(60, crudas)}")
+         if not res.ok:
+             self.ui.aviso("El arquitecto no terminó limpio; uso lo que produjo.")
+         motivo = plan_degenerado(plan, pedido, texto)
+@@ -431,17 +939,23 @@ class Orquestador:
              f"Validación automática de los archivos cambiados: {validacion}\n\n"
              "Leé los archivos completos si necesitás contexto. Empezá tu informe con la línea VEREDICTO."
          )
@@ -2803,7 +2834,7 @@ index ad78b6b..d21b2f5 100644
          detectado = detectar_comando_tests(self.ws)
          criterios = "\n".join(f"- {c}" for c in plan.criterios) or "- (derivalos del pedido)"
          texto = (
-@@ -452,7 +959,7 @@ class Orquestador:
+@@ -452,7 +966,7 @@ class Orquestador:
              "Escribí (o completá) tests automáticos que verifiquen los criterios y corrélos con run_tests. "
              "Reportá el resultado REAL."
          )
@@ -2812,7 +2843,7 @@ index ad78b6b..d21b2f5 100644
  
      def verificar(self, cid: int) -> Verificacion:
          archivos = [r for r in self.ws.checkpoints.archivos_desde(cid) if (self.ws.raiz / r).is_file()]
-@@ -462,13 +969,32 @@ class Orquestador:
+@@ -462,13 +976,32 @@ class Orquestador:
          malos = fallos(validaciones)
          tests_ok = tests is None or tests.ok
          partes = [r.resumen(2500) for r in malos]
@@ -2847,7 +2878,7 @@ index ad78b6b..d21b2f5 100644
  
      def reparar(self, pedido: str, verif: Verificacion, cid: int, base_fallaba: bool,
                  diagnostico_experto: str = "", contexto: str = "") -> ResultadoAgente:
-@@ -485,7 +1011,8 @@ class Orquestador:
+@@ -485,7 +1018,8 @@ class Orquestador:
          if diagnostico_experto:
              texto = tarea_con_diagnostico(texto, diagnostico_experto)
          protegidos = set(self._protegidos)
@@ -2857,7 +2888,7 @@ index ad78b6b..d21b2f5 100644
                                                                                      if diagnostico_experto else ""),
                           protegidos=protegidos)
  
-@@ -513,7 +1040,17 @@ class Orquestador:
+@@ -513,7 +1047,17 @@ class Orquestador:
          intentos_txt: list[str] = []
          forense_hecho = False
          informe_forense = ""
@@ -2875,7 +2906,7 @@ index ad78b6b..d21b2f5 100644
              firma = _firma_error(verif.diagnostico)
              if diagnosticos_vistos.count(firma) >= 3:
                  informe.notas.append(f"{etiqueta}: la reparación no logró avances (mismo diagnóstico repetido).")
-@@ -549,6 +1086,7 @@ class Orquestador:
+@@ -549,6 +1093,7 @@ class Orquestador:
                                       + "\n---\n".join(intentos_txt[-2:]))
              res = self.reparar(pedido, verif, rcid, base_fallaba, experto, contexto_intento.strip())
              intentos_txt.append(recortar(res.resumen, 1200))
@@ -2883,7 +2914,7 @@ index ad78b6b..d21b2f5 100644
              verif = verificador()
              self._mostrar_verificacion(verif)
              if verif.ok:
-@@ -566,6 +1104,204 @@ class Orquestador:
+@@ -566,6 +1111,204 @@ class Orquestador:
                  verif = antes
          return verif
  
@@ -3088,7 +3119,7 @@ index ad78b6b..d21b2f5 100644
      # ------------------------------------------------------------ flujos
      def _mostrar_plan(self, plan: Plan) -> None:
          self.ui.titulo("PLAN")
-@@ -575,7 +1311,19 @@ class Orquestador:
+@@ -575,7 +1318,19 @@ class Orquestador:
          self.ui.fase(1, "Exploración")
          exploracion = self.explorar(pedido)
          self.ui.fase(2, "Arquitectura")
@@ -3109,7 +3140,7 @@ index ad78b6b..d21b2f5 100644
          for _ in range(3):
              self._mostrar_plan(plan)
              if not confirmar or self.ui.confirmar("¿Aprobás el plan y arrancamos?", defecto=True):
-@@ -599,7 +1347,10 @@ class Orquestador:
+@@ -599,7 +1354,10 @@ class Orquestador:
          return ruta
  
      def _verificar_tarea(self, tcid: int, antes: ConteoTests, nombres_antes: set,
@@ -3121,7 +3152,7 @@ index ad78b6b..d21b2f5 100644
          """
          Una tarea intermedia no necesita que pasen TODOS los tests (los de tareas
          siguientes todavía fallan): alcanza con validadores OK y que no se rompa
-@@ -609,7 +1360,31 @@ class Orquestador:
+@@ -609,7 +1367,31 @@ class Orquestador:
          validaciones = validar_archivos(self.ws, archivos)
          tests = ejecutar_tests(self.ws, timeout=self.settings.tests_timeout, completo=True)
          conteo = conteo_de_resultado(tests)
@@ -3154,7 +3185,7 @@ index ad78b6b..d21b2f5 100644
          if tests is not None and not tests.ok and conteo.reconocido:
              # Los tests de la especificación de tareas siguientes fallan a propósito: no son regresión.
              nuevos_fallos = [n for n in conteo.nombres_fallados
-@@ -642,30 +1417,177 @@ class Orquestador:
+@@ -642,30 +1424,177 @@ class Orquestador:
              diagnostico = anexar_pistas(diagnostico, 2)
          return Verificacion(not problemas, validaciones, tests, diagnostico, archivos, conteo)
  
@@ -3344,7 +3375,7 @@ index ad78b6b..d21b2f5 100644
  
          self.ui.fase(numero_fase, "Implementación" + (" · torneo" if self.settings.torneo and self.settings.candidatos > 1 else ""))
          numero_fase += 1
-@@ -676,35 +1598,83 @@ class Orquestador:
+@@ -676,35 +1605,83 @@ class Orquestador:
          if [t.id for t in orden] != [t.id for t in plan.tareas]:
              self.ui.tenue("  Orden por dependencias: " + " → ".join(t.id for t in orden))
              plan.tareas = orden
@@ -3430,7 +3461,7 @@ index ad78b6b..d21b2f5 100644
                  continue
  
              for ronda in range(self.settings.max_revisiones):
-@@ -722,6 +1692,30 @@ class Orquestador:
+@@ -722,6 +1699,30 @@ class Orquestador:
                      break
                  self.implementar(pedido, plan, i, exploracion, tcid, correcciones=revision,
                                   protegidos=self._protegidos)
@@ -3461,7 +3492,7 @@ index ad78b6b..d21b2f5 100644
  
          archivos = [r for r in self.ws.checkpoints.archivos_desde(grupo) if (self.ws.raiz / r).is_file()]
          hay_tests_build = any(_es_test(a) for a in archivos)
-@@ -734,21 +1728,40 @@ class Orquestador:
+@@ -734,21 +1735,40 @@ class Orquestador:
          self.ui.fase(numero_fase, "Verificación real")
          verif = self.verificar(grupo)
          self._mostrar_verificacion(verif)
@@ -3506,7 +3537,7 @@ index ad78b6b..d21b2f5 100644
          informe.ruta_informe = self._guardar_informe(pedido, informe)
          self._mostrar_cierre(informe)
          return informe
-@@ -769,6 +1782,12 @@ class Orquestador:
+@@ -769,6 +1789,12 @@ class Orquestador:
          else:
              self.ui.error(f"tests: fallaron ({verif.conteo.texto() if verif.conteo.reconocido else verif.tests.comando})")
              self.ui.tenue(recortar(fallos_relevantes(verif.tests.stdout + "\n" + verif.tests.stderr, 2, 1500), 1500))
@@ -3519,7 +3550,7 @@ index ad78b6b..d21b2f5 100644
  
      def _guardar_informe(self, pedido: str, informe: InformeBuild) -> Optional[Path]:
          try:
-@@ -781,7 +1800,14 @@ class Orquestador:
+@@ -781,7 +1807,14 @@ class Orquestador:
                  f"## Plan\n```\n{informe.plan.como_texto() if informe.plan else '-'}\n```\n\n"
                  f"## Archivos\n```\n{_diffstat(diff) or '-'}\n```\n\n"
                  f"## Tests\n```\n{tests}\n```\n\n"
@@ -3535,7 +3566,7 @@ index ad78b6b..d21b2f5 100644
                     if informe.spec_tests else "")
                  + (f"## Escaladas al modelo fuerte\n{informe.escaladas}\n\n" if informe.escaladas else "")
                  + ("## Lecciones aprendidas\n" + "\n".join(f"- {l}" for l in informe.lecciones) + "\n\n" if informe.lecciones else "")
-@@ -790,40 +1816,69 @@ class Orquestador:
+@@ -790,40 +1823,69 @@ class Orquestador:
                  + ("## Notas\n" + "\n".join(f"- {n}" for n in informe.notas) + "\n" if informe.notas else "")
              )
              ruta = self.ws.raiz / ".reaper" / "informes" / f"build_{datetime.now():%Y%m%d_%H%M%S}.md"
@@ -7211,10 +7242,10 @@ index 0000000..43841a9
 +        self.assertNotEqual(app.settings.modelo, "")
 diff --git a/partes/48ze_autotest_juez.py b/partes/48ze_autotest_juez.py
 new file mode 100644
-index 0000000..ace4fb1
+index 0000000..3eb1692
 --- /dev/null
 +++ b/partes/48ze_autotest_juez.py
-@@ -0,0 +1,237 @@
+@@ -0,0 +1,247 @@
 +"""
 +Autotests del 8.º agente: el JUEZ DE ENTREGA. Al cerrar /construir compara lo entregado contra el PEDIDO y
 +SOLO endurece el estado (verde → parcial); nunca convierte una build roja en verde. Entrada compacta + veredicto
@@ -7452,6 +7483,16 @@ index 0000000..ace4fb1
 +
 +    def test_vacio_sin_plan_sigue_testeable(self):
 +        self.assertTrue(_es_testeable([], []))     # proyecto vacío y plan sin archivos: no bajamos la guardia
++
++    def test_plan_grande_no_se_trunca_con_el_tope_por_defecto(self):
++        # El tope por defecto subió para que un proyecto mediano/grande no se cram-ee en una sola tarea.
++        self.assertGreaterEqual(Settings().max_tareas, 12)
++        texto = "".join(f'<tarea id="{i}" archivos="m{i}.py">módulo {i}</tarea>' for i in range(1, 11))
++        plan = parsear_plan(texto, "proyecto grande", Settings().max_tareas)
++        self.assertEqual(len(plan.tareas), 10)                  # 10 módulos quedan como 10 tareas, no una sola
++        # Y al pasarse del tope, el resto se agrupa (no se pierde): sigue habiendo a lo sumo max_tareas.
++        muchas = "".join(f'<tarea id="{i}">t{i}</tarea>' for i in range(1, 40))
++        self.assertEqual(len(parsear_plan(muchas, "p", 12).tareas), 12)
 diff --git a/partes/49_autotest_runner.py b/partes/49_autotest_runner.py
 index 541aee7..02a88e9 100644
 --- a/partes/49_autotest_runner.py

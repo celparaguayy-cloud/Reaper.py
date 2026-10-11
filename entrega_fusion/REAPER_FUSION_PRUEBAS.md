@@ -226,3 +226,20 @@ intervención (`_debe_intervenir_juez`: cumple / confianza baja / sin faltantes 
 juicio), un `/construir` completo donde el juez detecta un módulo faltante, interviene, el reparador lo agrega,
 re-verifica y cierra en verde, y el caso cupo=0 (solo avisa, no interviene, queda parcial). Regresión: 953 tests OK
 en Python 3.11.15 / 3.12.3 / 3.13.14.
+
+## 11. Escala: proyectos grandes sin truncar el plan
+
+El andamiaje para proyectos grandes ya existía (mapa de archivos relevantes por tarea, subagentes por tarea,
+TaskGraph por dependencias, reanudación entre sesiones, compactación de contexto, el juez como contrato). El límite
+artificial era el **techo de tareas**: estaba en 8 y, al pasarse, el resto se agrupaba en UNA tarea gigante
+inimplementable — un proyecto grande se truncaba en silencio.
+
+Cambios (el modelo lo elige el usuario; esto es lo que NO depende del modelo):
+- `max_tareas` por defecto 8 → **12**, tope 30 → **60**: un proyecto mediano/grande se descompone de verdad; chico
+  sigue usando pocas (es un máximo, no un objetivo).
+- El arquitecto recibe guía explícita: usar tantas tareas como el proyecto necesite, **descomponer por módulo/capa**
+  (una tarea por pieza coherente con sus `deps=`), sin meter medio proyecto en una tarea ni inventar relleno.
+- Aviso visible si el plan supera el tope (agrupa el resto y sugiere `/config max_tareas N`), en vez de truncar callado.
+
+Cobertura: `TestTrabajosChicos.test_plan_grande_no_se_trunca_con_el_tope_por_defecto`. Honesto: esto sube el TECHO
+de escala; que un proyecto grande salga BIEN sigue dependiendo del modelo que se elija.

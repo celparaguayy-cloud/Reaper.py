@@ -1744,7 +1744,10 @@ class Settings:
     # (torneo × pasos × reparaciones × forense) sin terminar: al vencer, la tarea queda FALLIDA, nunca "verificada".
     tiempo_max_tarea: int = 1500
     tiempo_max_build: int = 5400
-    max_tareas: int = 8
+    # Techo de tareas del plan. Es un MÁXIMO, no un objetivo: un proyecto chico usa pocas; uno grande se descompone
+    # por módulo hasta este tope. 12 por defecto para que un proyecto mediano no se trunque; subilo para uno grande
+    # (/config max_tareas 40). Al pasarse, el resto se agrupa en la última tarea y se avisa.
+    max_tareas: int = 12
     paralelo: int = 2
     qa: bool = True
 
@@ -1852,7 +1855,7 @@ class Settings:
         acotar("tiempo_max_tarea", 0, 86400)
         acotar("tiempo_max_build", 0, 86400)
         acotar("max_revisiones", 0, 5)
-        acotar("max_tareas", 1, 30)
+        acotar("max_tareas", 1, 60)
         acotar("paralelo", 1, 8)
         acotar("candidatos", 1, 6)
         acotar("paralelo_torneo", 1, 6)
@@ -15322,7 +15325,10 @@ class Orquestador:
             f"PEDIDO DEL USUARIO:\n{pedido}\n\n"
             f"INFORME DE EXPLORACIÓN (código real):\n{recortar(exploracion, 7000)}\n\n"
             f"Comando de tests detectado: {detectado[0] if detectado else 'ninguno (habrá que crear tests)'}\n"
-            f"Armá el plan con un máximo de {self.settings.max_tareas} tareas."
+            f"Usá TANTAS tareas como el proyecto realmente necesite, hasta un máximo de {self.settings.max_tareas}. "
+            f"Un proyecto chico lleva pocas; uno grande se descompone por módulo/capa: UNA tarea por pieza coherente "
+            f"(un módulo, una pantalla, un endpoint, su test), con sus dependencias en deps= para que se ordenen bien. "
+            f"No metas medio proyecto en una sola tarea gigante ni inventes tareas de relleno."
         )
         if self.settings.tests_primero:
             tarea += ("\nLos tests se escriben ANTES de implementar a partir de tu <interfaz> y tus <criterios>: "
@@ -15337,6 +15343,10 @@ class Orquestador:
         if not _RE_TAREA.search(texto) and _RE_TAREA.search(res.contexto):
             texto = res.contexto + "\n" + texto
         plan = parsear_plan(texto, pedido, self.settings.max_tareas)
+        crudas = len(_RE_TAREA.findall(texto))
+        if crudas > self.settings.max_tareas:
+            self.ui.aviso(f"  El plan traía {crudas} tareas y el tope es {self.settings.max_tareas}: agrupé el resto "
+                          f"en la última. Para un proyecto grande subí el tope: /config max_tareas {min(60, crudas)}")
         if not res.ok:
             self.ui.aviso("El arquitecto no terminó limpio; uso lo que produjo.")
         motivo = plan_degenerado(plan, pedido, texto)
@@ -46780,6 +46790,16 @@ class TestTrabajosChicos(BaseTest):
 
     def test_vacio_sin_plan_sigue_testeable(self):
         self.assertTrue(_es_testeable([], []))     # proyecto vacío y plan sin archivos: no bajamos la guardia
+
+    def test_plan_grande_no_se_trunca_con_el_tope_por_defecto(self):
+        # El tope por defecto subió para que un proyecto mediano/grande no se cram-ee en una sola tarea.
+        self.assertGreaterEqual(Settings().max_tareas, 12)
+        texto = "".join(f'<tarea id="{i}" archivos="m{i}.py">módulo {i}</tarea>' for i in range(1, 11))
+        plan = parsear_plan(texto, "proyecto grande", Settings().max_tareas)
+        self.assertEqual(len(plan.tareas), 10)                  # 10 módulos quedan como 10 tareas, no una sola
+        # Y al pasarse del tope, el resto se agrupa (no se pierde): sigue habiendo a lo sumo max_tareas.
+        muchas = "".join(f'<tarea id="{i}">t{i}</tarea>' for i in range(1, 40))
+        self.assertEqual(len(parsear_plan(muchas, "p", 12).tareas), 12)
 
 
 # ======================================================================
