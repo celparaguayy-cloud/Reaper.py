@@ -387,3 +387,29 @@ class TestOpenRouterRealTareaSinArchivos(BaseTest):
     def test_si_la_suite_falla_no_se_regala_nada(self):
         informe = self._construir(tests_pasan=False)                    # sumar resta: la suite falla
         self.assertFalse(informe.ok)
+
+
+class TestOpenRouterRealJsonSinNombre(BaseTest):
+    def test_argumentos_json_sin_nombre_se_infieren_si_son_inequivocos(self):
+        # Build real 5: nemotron mandó {"items": [...]} (args de update_todo, sin el nombre) 3 veces → "sin herramientas".
+        texto = '{\n  "items": [\n    "[x] Crear estructura",\n    "[ ] Escribir tests"\n  ]\n}'
+        a = analizar(texto, esquemas())
+        self.assertEqual([l.nombre for l in a.llamadas], ["update_todo"])
+        self.assertEqual(a.llamadas[0].params["items"], "[x] Crear estructura\n[ ] Escribir tests")
+
+    def test_ambiguos_y_cierres_anticipados_no_se_adivinan(self):
+        for texto in ('{"path": "app.py"}',                                       # lo usan muchas herramientas
+                      '{"result": "listo, todo implementado"}',                   # nunca cerrar por inferencia
+                      '{"result": "He creado los archivos", "files": ["a.py"]}'):  # un "ya lo hice" anticipado
+            self.assertEqual(analizar(texto, esquemas()).llamadas, [], texto)
+
+    def test_lista_que_marca_hecho_un_archivo_inexistente_se_denuncia(self):
+        ws = self.proyecto({"gastos/__init__.py": ""})
+        ctx = self.contexto(ws)
+        salida = self.herramienta(ctx, "update_todo",
+                                  items="[x] Implementar dataclass Gasto en gastos/modelos.py\n[ ] Escribir tests")
+        self.assertIn("NO existe", salida)
+        self.assertIn("gastos/modelos.py", salida)
+        ws.escribir("gastos/modelos.py", "class Gasto:\n    pass\n")
+        salida = self.herramienta(ctx, "update_todo", items="[x] Implementar gastos/modelos.py")
+        self.assertNotIn("NO existe", salida)                            # ahora sí existe: sin queja

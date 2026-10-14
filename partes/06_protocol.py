@@ -245,8 +245,15 @@ def _params_json(args) -> dict:
             return {}
     if not isinstance(args, dict):
         return {}
-    return {_canonico_param(k): v if isinstance(v, str) else json.dumps(v, ensure_ascii=False)
-            for k, v in args.items()}
+    salida = {}
+    for k, v in args.items():
+        if isinstance(v, str):
+            salida[_canonico_param(k)] = v
+        elif isinstance(v, list) and all(isinstance(x, str) for x in v):
+            salida[_canonico_param(k)] = "\n".join(v)       # {"items": ["[x] a", "[ ] b"]} → una por línea
+        else:
+            salida[_canonico_param(k)] = json.dumps(v, ensure_ascii=False)
+    return salida
 
 
 _RE_FUNCION_LLAMA = re.compile(r"<\s*function\s*=\s*([A-Za-z_][\w-]*)\s*>(.*?)(?:<\s*/\s*function\s*>|\Z)", re.S | re.I)
@@ -339,6 +346,22 @@ def analizar(texto: str, esquemas: Esquemas) -> Analisis:
                 args = {k: v for k, v in obj.items() if k not in ("tool", "name", "herramienta")}
             real = ALIAS_HERRAMIENTAS.get(nombre.lower(), nombre.lower())
             llamadas.append(Llamada(real, _params_json(args), True, json.dumps(obj, ensure_ascii=False)))
+        if llamadas:
+            fuera = []
+
+    if not llamadas:
+        # Modelos entrenados con "tool calling" nativo a veces mandan SOLO los argumentos en JSON, sin el nombre
+        # (prueba real: nemotron mandó {"items": [...]} tres veces y REAPER lo trató como "sin herramientas").
+        # Se infiere la herramienta solo si UNA ÚNICA tiene todas esas claves; ambiguos ({"path": ...}) no se
+        # adivinan, y attempt_completion nunca se infiere (un "ya terminé" anticipado no cierra nada).
+        for obj in _objetos_json(limpio):
+            if obj.keys() & {"tool", "name", "herramienta"}:
+                continue
+            claves = {_canonico_param(k) for k in obj}
+            candidatas = [n for n, ps in esquemas.items() if claves and claves <= {p for p, _ in ps}]
+            if len(candidatas) == 1 and candidatas[0] != "attempt_completion":
+                llamadas.append(Llamada(candidatas[0], _params_json(obj), True,
+                                        json.dumps(obj, ensure_ascii=False)))
         if llamadas:
             fuera = []
 

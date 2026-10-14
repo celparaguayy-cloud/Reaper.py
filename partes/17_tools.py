@@ -764,6 +764,22 @@ def update_todo(ctx: Contexto, p: dict) -> str:
         marca = {"x": "✓", ">": "▸"}.get(estado, "○")
         ctx.ui.tenue(f"      {marca} {texto}")
     hechos = sum(1 for e, _ in items if e == "x")
+    # Una lista NO es trabajo (prueba real: "[x] Implementar dataclass Gasto en gastos/modelos.py" tres veces, sin
+    # haber creado el archivo). Si un ítem "hecho" nombra un archivo que no existe, se le dice al modelo.
+    inventados = []
+    for estado, texto in items:
+        if estado != "x":
+            continue
+        for ruta in re.findall(r"[\w./-]+\.(?:py|js|mjs|ts|html|css|json|md|txt|sh|go|rs|rb|toml|ya?ml)\b", texto):
+            try:
+                if not ctx.ws.existe(ruta[2:] if ruta.startswith("./") else ruta):
+                    inventados.append(ruta)
+            except (ErrorRuta, OSError, ValueError):
+                continue
+    if inventados:
+        return (f"Lista actualizada: {hechos}/{len(items)} hechas. OJO: marcaste como HECHO trabajo sobre "
+                f"{', '.join(sorted(set(inventados))[:6])}, que NO existe en el proyecto. Una lista no es trabajo: "
+                "creá esos archivos con write_to_file y recién después marcalos [x].")
     return f"Lista actualizada: {hechos}/{len(items)} hechas."
 
 

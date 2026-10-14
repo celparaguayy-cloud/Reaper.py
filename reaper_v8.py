@@ -3244,8 +3244,15 @@ def _params_json(args) -> dict:
             return {}
     if not isinstance(args, dict):
         return {}
-    return {_canonico_param(k): v if isinstance(v, str) else json.dumps(v, ensure_ascii=False)
-            for k, v in args.items()}
+    salida = {}
+    for k, v in args.items():
+        if isinstance(v, str):
+            salida[_canonico_param(k)] = v
+        elif isinstance(v, list) and all(isinstance(x, str) for x in v):
+            salida[_canonico_param(k)] = "\n".join(v)       # {"items": ["[x] a", "[ ] b"]} → una por línea
+        else:
+            salida[_canonico_param(k)] = json.dumps(v, ensure_ascii=False)
+    return salida
 
 
 _RE_FUNCION_LLAMA = re.compile(r"<\s*function\s*=\s*([A-Za-z_][\w-]*)\s*>(.*?)(?:<\s*/\s*function\s*>|\Z)", re.S | re.I)
@@ -3338,6 +3345,22 @@ def analizar(texto: str, esquemas: Esquemas) -> Analisis:
                 args = {k: v for k, v in obj.items() if k not in ("tool", "name", "herramienta")}
             real = ALIAS_HERRAMIENTAS.get(nombre.lower(), nombre.lower())
             llamadas.append(Llamada(real, _params_json(args), True, json.dumps(obj, ensure_ascii=False)))
+        if llamadas:
+            fuera = []
+
+    if not llamadas:
+        # Modelos entrenados con "tool calling" nativo a veces mandan SOLO los argumentos en JSON, sin el nombre
+        # (prueba real: nemotron mandó {"items": [...]} tres veces y REAPER lo trató como "sin herramientas").
+        # Se infiere la herramienta solo si UNA ÚNICA tiene todas esas claves; ambiguos ({"path": ...}) no se
+        # adivinan, y attempt_completion nunca se infiere (un "ya terminé" anticipado no cierra nada).
+        for obj in _objetos_json(limpio):
+            if obj.keys() & {"tool", "name", "herramienta"}:
+                continue
+            claves = {_canonico_param(k) for k in obj}
+            candidatas = [n for n, ps in esquemas.items() if claves and claves <= {p for p, _ in ps}]
+            if len(candidatas) == 1 and candidatas[0] != "attempt_completion":
+                llamadas.append(Llamada(candidatas[0], _params_json(obj), True,
+                                        json.dumps(obj, ensure_ascii=False)))
         if llamadas:
             fuera = []
 
@@ -9808,6 +9831,22 @@ def update_todo(ctx: Contexto, p: dict) -> str:
         marca = {"x": "✓", ">": "▸"}.get(estado, "○")
         ctx.ui.tenue(f"      {marca} {texto}")
     hechos = sum(1 for e, _ in items if e == "x")
+    # Una lista NO es trabajo (prueba real: "[x] Implementar dataclass Gasto en gastos/modelos.py" tres veces, sin
+    # haber creado el archivo). Si un ítem "hecho" nombra un archivo que no existe, se le dice al modelo.
+    inventados = []
+    for estado, texto in items:
+        if estado != "x":
+            continue
+        for ruta in re.findall(r"[\w./-]+\.(?:py|js|mjs|ts|html|css|json|md|txt|sh|go|rs|rb|toml|ya?ml)\b", texto):
+            try:
+                if not ctx.ws.existe(ruta[2:] if ruta.startswith("./") else ruta):
+                    inventados.append(ruta)
+            except (ErrorRuta, OSError, ValueError):
+                continue
+    if inventados:
+        return (f"Lista actualizada: {hechos}/{len(items)} hechas. OJO: marcaste como HECHO trabajo sobre "
+                f"{', '.join(sorted(set(inventados))[:6])}, que NO existe en el proyecto. Una lista no es trabajo: "
+                "creá esos archivos con write_to_file y recién después marcalos [x].")
     return f"Lista actualizada: {hechos}/{len(items)} hechas."
 
 
@@ -48677,6 +48716,32 @@ class TestOpenRouterRealTareaSinArchivos(BaseTest):
     def test_si_la_suite_falla_no_se_regala_nada(self):
         informe = self._construir(tests_pasan=False)                    # sumar resta: la suite falla
         self.assertFalse(informe.ok)
+
+
+class TestOpenRouterRealJsonSinNombre(BaseTest):
+    def test_argumentos_json_sin_nombre_se_infieren_si_son_inequivocos(self):
+        # Build real 5: nemotron mandó {"items": [...]} (args de update_todo, sin el nombre) 3 veces → "sin herramientas".
+        texto = '{\n  "items": [\n    "[x] Crear estructura",\n    "[ ] Escribir tests"\n  ]\n}'
+        a = analizar(texto, esquemas())
+        self.assertEqual([l.nombre for l in a.llamadas], ["update_todo"])
+        self.assertEqual(a.llamadas[0].params["items"], "[x] Crear estructura\n[ ] Escribir tests")
+
+    def test_ambiguos_y_cierres_anticipados_no_se_adivinan(self):
+        for texto in ('{"path": "app.py"}',                                       # lo usan muchas herramientas
+                      '{"result": "listo, todo implementado"}',                   # nunca cerrar por inferencia
+                      '{"result": "He creado los archivos", "files": ["a.py"]}'):  # un "ya lo hice" anticipado
+            self.assertEqual(analizar(texto, esquemas()).llamadas, [], texto)
+
+    def test_lista_que_marca_hecho_un_archivo_inexistente_se_denuncia(self):
+        ws = self.proyecto({"gastos/__init__.py": ""})
+        ctx = self.contexto(ws)
+        salida = self.herramienta(ctx, "update_todo",
+                                  items="[x] Implementar dataclass Gasto en gastos/modelos.py\n[ ] Escribir tests")
+        self.assertIn("NO existe", salida)
+        self.assertIn("gastos/modelos.py", salida)
+        ws.escribir("gastos/modelos.py", "class Gasto:\n    pass\n")
+        salida = self.herramienta(ctx, "update_todo", items="[x] Implementar gastos/modelos.py")
+        self.assertNotIn("NO existe", salida)                            # ahora sí existe: sin queja
 
 
 # ======================================================================
