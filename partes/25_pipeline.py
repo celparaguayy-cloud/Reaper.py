@@ -1333,14 +1333,19 @@ class Orquestador:
         return torneo.correr(texto, archivos=", ".join(tarea.archivos), titulo=titulo,
                              n=self.settings.candidatos if usar_torneo else 1, protegidos=protegidos, cid=cid)
 
-    def revisar(self, pedido: str, tarea: Tarea, diff: str, cid: int) -> tuple[bool, str]:
+    def revisar(self, pedido: str, tarea: Tarea, diff: str, cid: int, tests_reales: str = "") -> tuple[bool, str]:
         rels = self.ws.checkpoints.archivos_desde(cid)
         validacion = resumen_validacion(validar_archivos(self.ws, rels), limite=1500)
+        # El revisor es de solo lectura: sin el resultado real de los tests intentaba correrlos él mismo
+        # (logs reales: 15 pedidos de execute_command rechazados = turnos de modelo perdidos).
+        evidencia = (f"Tests reales (ya los corrió REAPER, no hace falta ejecutarlos): {tests_reales}\n\n"
+                     if tests_reales else "")
         texto = (
             f"PEDIDO ORIGINAL:\n{pedido}\n\n"
             f"TAREA REVISADA (#{tarea.id}):\n{tarea.descripcion}\n\n"
             f"DIFF REAL DE LOS CAMBIOS:\n```diff\n{recortar(diff, 12000)}\n```\n\n"
             f"Validación automática de los archivos cambiados: {validacion}\n\n"
+            f"{evidencia}"
             "Leé los archivos completos si necesitás contexto. Empezá tu informe con la línea VEREDICTO."
         )
         res = self._sub_opcional("revisor", texto, cid, titulo=f"revisa el diff de la tarea {tarea.id}")
@@ -2278,7 +2283,10 @@ class Orquestador:
                 if not diff.strip():
                     informe.notas.append(f"Tarea {tarea.id}: sin cambios en archivos.")
                     break
-                aprobado, revision = self.revisar(pedido, tarea, diff, tcid)
+                conteo_tarea = getattr(verif_tarea, "conteo", None)
+                aprobado, revision = self.revisar(
+                    pedido, tarea, diff, tcid,
+                    tests_reales=conteo_tarea.texto() if conteo_tarea is not None and conteo_tarea.reconocido else "")
                 if aprobado:
                     self.ui.ok(f"Revisor aprobó la tarea {tarea.id}")
                     break

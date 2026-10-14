@@ -397,6 +397,14 @@ class TestOpenRouterRealJsonSinNombre(BaseTest):
         self.assertEqual([l.nombre for l in a.llamadas], ["update_todo"])
         self.assertEqual(a.llamadas[0].params["items"], "[x] Crear estructura\n[ ] Escribir tests")
 
+    def test_listado_alucinado_no_se_toma_como_pedido(self):
+        # Logs reales (builds 3, 4 y 5): 6 veces el modelo inventó un listado de archivos con forma de "items".
+        texto = ('{\n  "items": [\n    {"type": "file", "path": "conversor/__init__.py"},\n'
+                 '    {"type": "file", "path": "conversor/__main__.py"}\n  ]\n}')
+        self.assertEqual(analizar(texto, esquemas()).llamadas, [])
+        self.assertEqual([l.nombre for l in analizar('{"path": ".", "recursive": true}', esquemas()).llamadas],
+                         ["list_files"])                                  # plano e inequívoco: sí
+
     def test_ambiguos_y_cierres_anticipados_no_se_adivinan(self):
         for texto in ('{"path": "app.py"}',                                       # lo usan muchas herramientas
                       '{"result": "listo, todo implementado"}',                   # nunca cerrar por inferencia
@@ -413,3 +421,55 @@ class TestOpenRouterRealJsonSinNombre(BaseTest):
         ws.escribir("gastos/modelos.py", "class Gasto:\n    pass\n")
         salida = self.herramienta(ctx, "update_todo", items="[x] Implementar gastos/modelos.py")
         self.assertNotIn("NO existe", salida)                            # ahora sí existe: sin queja
+
+
+class TestOpenRouterRealRevisorSoloLectura(BaseTest):
+    def _agente(self, rol, respuestas):
+        return Agente(rol, MockLLM(respuestas), self.proyecto({"app.py": "x = 1\n"}), self.ajustes(), self.ui(),
+                      memoria=None, mostrar_progreso=False)
+
+    def test_revisor_que_pide_ejecutar_recibe_una_explicacion_util(self):
+        # Logs reales: el revisor pidió execute_command 15 veces; solo recibía "no disponible" y reintentaba.
+        ag = self._agente("revisor", [])
+        salida, _ = ag._ejecutar_herramienta(Llamada("execute_command", {"command": "python -m app"}, True, ""), {})
+        self.assertIn("SOLO LECTURA", salida)
+        self.assertIn("ya los corrió REAPER", salida)
+
+    def test_rol_con_run_tests_recibe_la_herramienta_correcta(self):
+        ag = self._agente("especificador", [])
+        salida, _ = ag._ejecutar_herramienta(Llamada("execute_command", {"command": "python -m unittest"}, True, ""), {})
+        self.assertIn("usá run_tests", salida)
+
+    def test_el_revisor_recibe_el_resultado_real_de_los_tests(self):
+        vistos = []
+
+        def guion(mensajes, kw):
+            vistos.append(mensajes[-1]["content"])
+            return terminar_xml("VEREDICTO: APROBADO\\nTodo bien.")
+
+        ws = self.proyecto({"app.py": "x = 1\n"})
+        orq = Orquestador(MockLLM(guion), ws, self.ajustes(), self.ui())
+        cid = ws.checkpoints.iniciar("t")
+        ws.escribir("app.py", "x = 2\n")
+        orq.revisar("pedido", Tarea("1", "cambiar x", ["app.py"]), ws.checkpoints.diff_desde(cid), cid,
+                    tests_reales="26 pasaron (unittest)")
+        self.assertIn("Tests reales (ya los corrió REAPER", vistos[0])
+        self.assertIn("26 pasaron", vistos[0])
+
+
+class TestOpenRouterRealMensajeCierre(BaseTest):
+    def test_cierre_sin_respaldo_no_dice_no_completo_completado(self):
+        # Builds reales: "✗ no completó (completado)" aparecía cuando el agente SÍ terminaba pero su informe
+        # afirmaba más de lo que la evidencia sostenía.
+        def guion(m, k):
+            if _turno(m) == 0:
+                return herramienta_xml("write_to_file", path="app.py", content="def f():\n    return 1\n")
+            return terminar_xml("Listo: app.py es 100% correcto, sin errores y listo para producción.")
+
+        ui = self.ui()
+        res = ejecutar_subagentes([("implementador", "creá app.py con f()", "app.py", "prueba", {})],
+                                  MockLLM(guion), self.proyecto(), self.ajustes(), ui, profundidad=1)[0]
+        self.assertFalse(res.ok)
+        texto = ui.texto_registrado()
+        self.assertNotIn("no completó (completado)", texto)
+        self.assertIn("terminó, pero su cierre no quedó respaldado", texto)

@@ -357,8 +357,12 @@ def analizar(texto: str, esquemas: Esquemas) -> Analisis:
         for obj in _objetos_json(limpio):
             if obj.keys() & {"tool", "name", "herramienta"}:
                 continue
+            # Valores planos (texto, número, lista de textos). Con objetos anidados es casi siempre un RESULTADO
+            # inventado (logs reales: {"items": [{"type": "file", "path": ...}]} = un listado alucinado), no un pedido.
+            planos = all(isinstance(v, (str, int, float, bool)) or
+                         (isinstance(v, list) and all(isinstance(x, str) for x in v)) for v in obj.values())
             claves = {_canonico_param(k) for k in obj}
-            candidatas = [n for n, ps in esquemas.items() if claves and claves <= {p for p, _ in ps}]
+            candidatas = [n for n, ps in esquemas.items() if planos and claves and claves <= {p for p, _ in ps}]
             if len(candidatas) == 1 and candidatas[0] != "attempt_completion":
                 llamadas.append(Llamada(candidatas[0], _params_json(obj), True,
                                         json.dumps(obj, ensure_ascii=False)))

@@ -818,7 +818,16 @@ class Agente:
         if h is None or nombre not in self.rol.herramientas:
             disponibles = ", ".join(self.rol.herramientas)
             self.ui.resultado_herramienta(False, f"herramienta no disponible: {nombre}")
-            return obs(f"ERROR: '{nombre}' no existe o no está disponible para tu rol. Disponibles: {disponibles}"), True
+            pista = ""
+            if nombre in ("execute_command", "run_command", "run_python", "bash", "shell", "terminal", "run_tests"):
+                # Logs reales: el revisor pidió execute_command 15 veces (hasta 6 seguidas) sin entender el "no".
+                if "run_tests" in self.rol.herramientas and nombre != "run_tests":
+                    pista = " Para correr los tests usá run_tests."
+                elif self.rol.solo_lectura:
+                    pista = (" Tu rol es de SOLO LECTURA y no ejecuta comandos: los tests y validadores reales ya los "
+                             "corrió REAPER (el resultado está en tu pedido). Revisá leyendo el código y respondé.")
+            return obs(f"ERROR: '{nombre}' no existe o no está disponible para tu rol.{pista} "
+                       f"Disponibles: {disponibles}"), True
         if not llamada.completa and self._finish_actual != "length" and llamada is self._ultima_llamada \
                 and all(llamada.params.get(p.nombre) not in (None, "") for p in h.params if p.requerido):
             # El mensaje terminó normal y la llamada es la última: el modelo solo olvidó cerrar las etiquetas.
@@ -1772,7 +1781,15 @@ def ejecutar_subagentes(
             raise
         except Exception as e:
             res = ResultadoAgente(False, f"{type(e).__name__}: {e}", sorted(agente.ctx.cambios), 0, "error", rol)
-        ui.agente(agente.etiqueta, ("✓ terminó" if res.ok else f"✗ no completó ({res.motivo})") + f" · {res.pasos} pasos")
+        if res.ok:
+            estado = "✓ terminó"
+        elif res.motivo == "completado":
+            # Terminó, pero su cierre no quedó respaldado (afirmación sin evidencia o archivos que no validan). Antes
+            # decía "✗ no completó (completado)": contradictorio (visto 2 veces en las builds reales).
+            estado = "⚠ terminó, pero su cierre no quedó respaldado por evidencia"
+        else:
+            estado = f"✗ no completó ({res.motivo})"
+        ui.agente(agente.etiqueta, estado + f" · {res.pasos} pasos")
         return res
 
     if not paralelo:
