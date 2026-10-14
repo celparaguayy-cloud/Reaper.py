@@ -575,6 +575,47 @@ class TestJuezRealidad(BaseTest):
         self.assertTrue(admisiones_web('function f() { throw new Error("Not implemented"); }\n'))
         self.assertEqual(admisiones_web('const URL = "https://x.com/api"; // sirve los datos reales\n'), [])
 
+    PLAN_JUEGO = """<plan>
+<objetivo>Juego de la serpiente</objetivo>
+<interfaz>
+- juego.js: export function mover(serpiente, direccion); export function crecer(serpiente)
+</interfaz>
+<tarea id="1" archivos="juego.js">Lógica pura del juego.</tarea>
+</plan>"""
+
+    def test_examen_marca_funcion_js_del_plan_vacia(self):
+        fuente = ("export function mover(serpiente, direccion) {\n  // TODO\n}\n"
+                  "export function crecer(serpiente) { return [...serpiente, serpiente.at(-1)]; }\n"
+                  "function noop() {}\n")                                    # vacía pero NO pedida: no se marca
+        ws, grupo = self._build({"juego.js": fuente})
+        hallazgos = examen_de_realidad(ws, grupo, parsear_plan(self.PLAN_JUEGO, "serpiente"))
+        self.assertEqual(len(hallazgos), 1, hallazgos)
+        self.assertIn("juego.js:1", hallazgos[0])
+        self.assertIn("`mover`", hallazgos[0])
+
+    def test_tests_js_sin_valor(self):
+        fuente = ("import { test } from 'node:test';\nimport assert from 'node:assert/strict';\n"
+                  "test('mueve', () => { assert.deepEqual(mover([[1, 1]], 'der'), [[2, 1]]); });\n"
+                  "test('vacío', () => {});\n"
+                  "test('siempre pasa', () => { assert.ok(true); assert.equal(1, 1); });\n"
+                  "test('con ayudante', () => { verificarMovimiento(mover, 'arriba'); });\n"
+                  "test('tira', () => { assert.throws(() => mover(null)); });\n")
+        self.assertEqual([(n, l) for n, l, _d in tests_js_sin_valor(fuente)], [("vacío", 4), ("siempre pasa", 5)])
+        ws, grupo = self._build({"tests/juego.test.mjs": fuente})
+        hallazgos = examen_de_realidad(ws, grupo, None)
+        self.assertEqual(len(hallazgos), 2, hallazgos)
+        self.assertTrue(all(h.startswith("TEST SIN VALOR en tests/juego.test.mjs::") for h in hallazgos))
+
+    def test_tests_js_de_las_plantillas_tienen_valor(self):
+        revisados = 0
+        for nombre, plantilla in PLANTILLAS.items():
+            for rel, contenido in plantilla.archivos.items():
+                if isinstance(contenido, str) and _es_test(rel) and rel.endswith(("js", "ts")):
+                    revisados += 1
+                    with self.subTest(plantilla=nombre, archivo=rel):
+                        self.assertEqual(tests_js_sin_valor(contenido), [])
+        self.assertGreater(revisados, 5)
+
     def test_veredicto_determinista_no_gasta_tokens(self):
         ws, grupo = self._build({"app.py": "def sumar(a, b):\n    pass\n"})
         llm = MockLLM(lambda m, k: '{"cumple": true, "confianza": "high"}')

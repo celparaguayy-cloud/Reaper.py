@@ -227,6 +227,16 @@ def contar_tests(salida: str, codigo: Optional[int] = None) -> ConteoTests:
         except (ValueError, IndexError):
             conteo = None
         if conteo is not None:
+            if parser in (_pytest, _unittest):
+                # Suite mixta (backend Python + frontend con node --test, ver detectar_comando_tests): se suman las
+                # dos. Antes solo se contaba la de Python y un "5 passed" escondía que los tests de JS fallaban.
+                js = _tap(texto)
+                if js is not None:
+                    conteo.pasados += js.pasados
+                    conteo.fallados += js.fallados
+                    conteo.omitidos += js.omitidos
+                    conteo.nombres_fallados = (conteo.nombres_fallados + js.nombres_fallados)[:50]
+                    conteo.fuente = f"{conteo.fuente} + {js.fuente}"
             if codigo not in (None, 0) and conteo.ok and conteo.total and not conteo.fallados:
                 # El runner dijo que todo pasó pero salió con error (p. ej. crash al final): cuenta como error.
                 conteo.errores += 1

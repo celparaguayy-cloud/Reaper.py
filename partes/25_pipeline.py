@@ -313,7 +313,7 @@ _RE_ADMITE_SIMULACION = re.compile(
     r"|(?:respuesta|n[uú]mero|mensaje|c[oó]digo|resultado)s?\s+(?:simulad|fictici|inventad|falsos?\b|de\s+ejemplo"
     r"|hardcode|harcode)"
     r"|valor(?:es)?\s+(?:simulad|fictici|inventad)"
-    r"|(?:fake|dummy|mock(?:ed)?|simulated)\s+(?:data|response|number|result|value)s?"
+    r"|(?:fake|mock(?:ed)?|simulated)\s+(?:data|response|number|result|value)s?|dummy\s+(?:data|response)s?"
     r"|esto\s+es\s+(?:una\s+)?(?:simulaci[oó]n|un\s+mock|un\s+placeholder|provisional)"
     r"|simula(?:mos)?\s+(?:la\s+|el\s+|una\s+|un\s+)?(?:llamada|respuesta|api|petici[oó]n|request|env[ií]o|consulta"
     r"|descarga|conexi[oó]n|servidor|backend|base\s+de\s+datos|pago|sms|scrap)"
@@ -399,6 +399,82 @@ def admisiones_web(fuente: str, permitidas: set = frozenset()) -> list:
     return sorted(salida)
 
 
+_RE_FUNCION_JS_VACIA = re.compile(
+    r"function\s*\*?\s+([A-Za-z_$][\w$]*)\s*\([^)]*\)\s*\{\s*\}"
+    r"|(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?(?:function\s*)?\([^)]*\)\s*(?:=>\s*)?\{\s*\}"
+    r"|^[ \t]*(?:async\s+)?([A-Za-z_$][\w$]*)\s*\([^)]*\)\s*\{\s*\}", re.M)
+_NO_SON_METODOS_JS = {"if", "for", "while", "switch", "catch", "function", "with", "return", "constructor"}
+
+
+def stubs_js(fuente: str) -> list:
+    """[(nombre, linea)] de funciones JS/TS con cuerpo vacío (o solo comentarios). Los comentarios se borran
+    conservando los saltos de línea para que el número de línea siga siendo el real."""
+    sin_comentarios = _RE_COMENTARIO_WEB.sub(lambda m: "\n" * m.group(0).count("\n"), fuente)
+    salida = []
+    for m in _RE_FUNCION_JS_VACIA.finditer(sin_comentarios):
+        nombre = m.group(1) or m.group(2) or m.group(3)
+        if nombre and nombre not in _NO_SON_METODOS_JS:
+            salida.append((nombre, sin_comentarios.count("\n", 0, m.start()) + 1))
+    return salida
+
+
+_RE_TEST_JS_INICIO = re.compile(r"\b(?:test|it)\s*\(\s*(['\"`])(.+?)\1\s*,", re.S)
+_RE_ALGUNA_VERIFICACION_JS = re.compile(r"assert|expect|should|verific|comprob|check|throws|rejects|fail\(", re.I)
+_RE_ASSERT_JS = re.compile(r"\b(?:assert(?:\.\w+)?|expect)\s*\(")
+_RE_ASSERT_TAUTOLOGICO = re.compile(
+    r"^(?:assert(?:\.ok)?\(\s*(?:true|1|!0|!!1)\s*[,)]"
+    r"|expect\(\s*(true|1|null|undefined|(['\"])\w*\2|\d+)\s*\)\.(?:toBe|toEqual|toStrictEqual)\(\s*\1\s*\)"
+    r"|expect\(\s*true\s*\)\.toBeTruthy\(\s*\))")
+_RE_ASSERT_IGUALES = re.compile(r"^assert\.(?:equal|strictEqual|deepEqual|deepStrictEqual)\(\s*([^,()]+?)\s*,\s*([^,()]+?)\s*[,)]")
+
+
+def _cuerpo_js(texto: str, desde: int) -> str:
+    """Texto del bloque { ... } que empieza en la primera llave desde `desde` (llaves balanceadas; los strings
+    simples se saltean). '' si no cierra."""
+    inicio = texto.find("{", desde)
+    if inicio < 0:
+        return ""
+    nivel, i, comilla = 0, inicio, ""
+    while i < len(texto):
+        c = texto[i]
+        if comilla:
+            if c == "\\":
+                i += 2
+                continue
+            if c == comilla:
+                comilla = ""
+        elif c in "'\"`":
+            comilla = c
+        elif c == "{":
+            nivel += 1
+        elif c == "}":
+            nivel -= 1
+            if nivel == 0:
+                return texto[inicio + 1:i]
+        i += 1
+    return ""
+
+
+def tests_js_sin_valor(fuente: str) -> list:
+    """[(nombre, linea, detalle)] de tests de JS (node:test, jest, vitest, mocha) que no prueban nada: sin ninguna
+    verificación, o con verificaciones que siempre pasan (assert.ok(true), assert.equal(1, 1),
+    expect(true).toBe(true)). Conservador: si llama a algo que parezca verificar, no lo marca."""
+    texto = _RE_COMENTARIO_WEB.sub(lambda m: "\n" * m.group(0).count("\n"), fuente)
+    salida = []
+    for m in _RE_TEST_JS_INICIO.finditer(texto):
+        cuerpo = _cuerpo_js(texto, m.end())
+        linea = texto.count("\n", 0, m.start()) + 1
+        nombre = m.group(2).strip()[:60]
+        if not cuerpo.strip() or not _RE_ALGUNA_VERIFICACION_JS.search(cuerpo):
+            salida.append((nombre, linea, "el test no verifica nada (ni assert ni expect)"))
+            continue
+        asserts = [cuerpo[a.start():] for a in _RE_ASSERT_JS.finditer(cuerpo)]
+        if asserts and all(_RE_ASSERT_TAUTOLOGICO.match(a) or ((g := _RE_ASSERT_IGUALES.match(a)) is not None
+                                                                and g.group(1) == g.group(2)) for a in asserts):
+            salida.append((nombre, linea, "todas sus verificaciones pasan siempre (comparan algo consigo mismo)"))
+    return salida
+
+
 _LLAMADAS_IO_REAL = ("httpx", "requests", "urllib", "urlopen", "socket", "aiohttp", "http", "subprocess", "popen",
             "run", "open", "connect", "fetch", "get", "post", "session", "curl", "sqlite3", "psycopg", "execute")
 _RE_PIDE_DATOS_REALES = re.compile(
@@ -463,6 +539,7 @@ def examen_de_realidad(ws, cid_build: Optional[int], plan=None, pedido: str = ""
     if plan is not None:
         texto = (getattr(plan, "interfaz", "") or "") + "\n" + "\n".join(t.descripcion for t in plan.tareas)
         declaradas = set(re.findall(r"\bdef\s+([A-Za-z_]\w*)", texto))
+        declaradas |= set(re.findall(r"\bfunction\*?\s+([A-Za-z_$][\w$]*)", texto))   # interfaz de JS
         # Funciones cuyo CONTEXTO en el plan pide datos reales (traer de la web, SMS, una API, un número…):
         # si las fabrican con random en vez de traerlas, es simulación. Se mira la línea de cada `def` declarado.
         for linea in texto.splitlines():
@@ -483,7 +560,14 @@ def examen_de_realidad(ws, cid_build: Optional[int], plan=None, pedido: str = ""
         except OSError:
             continue
         if es_web:
-            if not _es_test(rel):
+            if _es_test(rel):
+                for nombre, linea, detalle in tests_js_sin_valor(fuente)[:3]:
+                    hallazgos.append(f"TEST SIN VALOR en {rel}::{nombre} (línea {linea}): {detalle}")
+            else:
+                for nombre, linea in stubs_js(fuente):
+                    if nombre in declaradas:
+                        hallazgos.append(f"SIMULACIÓN en {rel}:{linea}: `{nombre}` quedó vacía ({{ }}): existe pero "
+                                         "no hace nada.")
                 for linea, frase in admisiones_web(fuente, permitidas):
                     hallazgos.append(f"SIMULACIÓN CONFESADA en {rel}:{linea}: «{recortar(frase, 80)}»: el código "
                                      "admite ser provisional/ficticio, no lo real que se pidió.")

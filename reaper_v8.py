@@ -6108,33 +6108,37 @@ def detectar_comando_tests(ws: Workspace, completo: bool = False) -> Optional[tu
         or any(raiz.glob("test_*.py"))
         or any(raiz.glob("*_test.py"))
     )
+    js = tests_node(raiz) if shutil.which("node") else []
+    tiene_npm_test = _script_npm_test(raiz)
     if hay_tests_py:
         if importlib.util.find_spec("pytest") is not None:
             # completo: además de no cortar en el primer fallo, seguir aunque un archivo de tests no se pueda
             # importar (p. ej. tests de un módulo que una tarea POSTERIOR va a crear). Sin esto pytest aborta en
             # la colección, corre 0 tests, y el torneo/la verificación por tarea no ven ningún progreso real.
             corte = " --continue-on-collection-errors" if completo else " -x"
-            return f"{py} -m pytest -q{corte} --tb=short -p no:cacheprovider", "pytest"
-        for carpeta in ("tests", "test"):
-            if (raiz / carpeta).is_dir():
-                if (raiz / carpeta / "__init__.py").is_file():
-                    return f"{py} -m unittest discover -s {carpeta} -t .", "unittest"
-                return f"{py} -m unittest discover -s {carpeta}", "unittest"
-        return f"{py} -m unittest discover", "unittest"
+            comando, nombre = f"{py} -m pytest -q{corte} --tb=short -p no:cacheprovider", "pytest"
+        else:
+            comando, nombre = f"{py} -m unittest discover", "unittest"
+            for carpeta in ("tests", "test"):
+                if (raiz / carpeta).is_dir():
+                    tope = " -t ." if (raiz / carpeta / "__init__.py").is_file() else ""
+                    comando = f"{py} -m unittest discover -s {carpeta}{tope}"
+                    break
+        es_test_py = re.compile(r"^(?:test_.*|.*_test)\.py$")
+        if js and not tiene_npm_test and any(es_test_py.match(p.name) for d in ("tests", "test", ".")
+                                            for p in ((raiz / d).rglob("*.py") if d != "." else raiz.glob("*.py"))):
+            # Proyecto mixto (backend Python + JS con node:test): se corren LAS DOS suites siempre y sale con el
+            # primer código de error. Antes solo corría la de Python y los tests de JS nunca se ejecutaban.
+            node = "node --test " + " ".join(shlex.quote(ws.rel(p)) for p in js)
+            return (f"{comando}; __py=$?; {node}; __js=$?; [ $__py -ne 0 ] && exit $__py; exit $__js",
+                    f"{nombre} + node --test")
+        return comando, nombre
 
-    paquete = raiz / "package.json"
-    if paquete.is_file():
-        try:
-            datos = json.loads(paquete.read_text(encoding="utf-8"))
-            script = (datos.get("scripts") or {}).get("test")
-            if script and "no test specified" not in script and shutil.which("npm"):
-                return "npm test --silent", "npm test"
-        except (OSError, ValueError):
-            pass
-    if shutil.which("node") and any((raiz / d).is_dir() for d in ("tests", "test")):
-        js = [p for d in ("tests", "test") for p in (raiz / d).glob("*.test.*js")]
-        if js:
-            return "node --test " + " ".join(shlex.quote(ws.rel(p)) for p in sorted(js)), "node --test"
+    if tiene_npm_test and shutil.which("npm"):
+        return "npm test --silent", "npm test"
+    if js:
+        return "node --test " + " ".join(shlex.quote(ws.rel(p)) for p in js), "node --test"
+
     if (raiz / "go.mod").is_file() and shutil.which("go"):
         return "go test ./...", "go test"
     if (raiz / "Cargo.toml").is_file() and shutil.which("cargo"):
@@ -6147,6 +6151,33 @@ def detectar_comando_tests(ws: Workspace, completo: bool = False) -> Optional[tu
         except OSError:
             pass
     return _detectar_tests_otros(raiz)
+
+
+def _script_npm_test(raiz: Path) -> bool:
+    """¿package.json tiene un script "test" de verdad (no el "no test specified" de npm init)?"""
+    try:
+        datos = json.loads((raiz / "package.json").read_text(encoding="utf-8"))
+        script = (datos.get("scripts") or {}).get("test") if isinstance(datos, dict) else None
+    except (OSError, ValueError):
+        return False
+    return bool(isinstance(script, str) and script.strip() and "no test specified" not in script)
+
+
+# Nombres que node --test reconoce como archivo de tests (y los que los modelos usan): juego.test.mjs,
+# juego.spec.js, test_juego.mjs, juego_test.mjs, juego-test.js. Antes solo tests/*.test.*js del primer nivel.
+_RE_TEST_JS = re.compile(r"^(?:.+[._-](?:test|spec)|test[_-].+)\.(?:m|c)?js$")
+
+
+def tests_node(raiz: Path) -> list:
+    """Archivos de tests de JS para node --test: en tests/ y test/ (recursivo) y los *.test.*js de la raíz."""
+    encontrados = set()
+    for carpeta in ("tests", "test", "__tests__"):
+        base = raiz / carpeta
+        if base.is_dir():
+            encontrados.update(p for p in base.rglob("*.*js") if _RE_TEST_JS.match(p.name)
+                               and "node_modules" not in p.parts and p.is_file())
+    encontrados.update(p for p in raiz.glob("*.*js") if _RE_TEST_JS.match(p.name) and p.is_file())
+    return sorted(encontrados)
 
 
 def _detectar_tests_otros(raiz: Path) -> Optional[tuple[str, str]]:
@@ -6441,6 +6472,16 @@ def contar_tests(salida: str, codigo: Optional[int] = None) -> ConteoTests:
         except (ValueError, IndexError):
             conteo = None
         if conteo is not None:
+            if parser in (_pytest, _unittest):
+                # Suite mixta (backend Python + frontend con node --test, ver detectar_comando_tests): se suman las
+                # dos. Antes solo se contaba la de Python y un "5 passed" escondía que los tests de JS fallaban.
+                js = _tap(texto)
+                if js is not None:
+                    conteo.pasados += js.pasados
+                    conteo.fallados += js.fallados
+                    conteo.omitidos += js.omitidos
+                    conteo.nombres_fallados = (conteo.nombres_fallados + js.nombres_fallados)[:50]
+                    conteo.fuente = f"{conteo.fuente} + {js.fuente}"
             if codigo not in (None, 0) and conteo.ok and conteo.total and not conteo.fallados:
                 # El runner dijo que todo pasó pero salió con error (p. ej. crash al final): cuenta como error.
                 conteo.errores += 1
@@ -15109,7 +15150,7 @@ _RE_ADMITE_SIMULACION = re.compile(
     r"|(?:respuesta|n[uú]mero|mensaje|c[oó]digo|resultado)s?\s+(?:simulad|fictici|inventad|falsos?\b|de\s+ejemplo"
     r"|hardcode|harcode)"
     r"|valor(?:es)?\s+(?:simulad|fictici|inventad)"
-    r"|(?:fake|dummy|mock(?:ed)?|simulated)\s+(?:data|response|number|result|value)s?"
+    r"|(?:fake|mock(?:ed)?|simulated)\s+(?:data|response|number|result|value)s?|dummy\s+(?:data|response)s?"
     r"|esto\s+es\s+(?:una\s+)?(?:simulaci[oó]n|un\s+mock|un\s+placeholder|provisional)"
     r"|simula(?:mos)?\s+(?:la\s+|el\s+|una\s+|un\s+)?(?:llamada|respuesta|api|petici[oó]n|request|env[ií]o|consulta"
     r"|descarga|conexi[oó]n|servidor|backend|base\s+de\s+datos|pago|sms|scrap)"
@@ -15195,6 +15236,82 @@ def admisiones_web(fuente: str, permitidas: set = frozenset()) -> list:
     return sorted(salida)
 
 
+_RE_FUNCION_JS_VACIA = re.compile(
+    r"function\s*\*?\s+([A-Za-z_$][\w$]*)\s*\([^)]*\)\s*\{\s*\}"
+    r"|(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?(?:function\s*)?\([^)]*\)\s*(?:=>\s*)?\{\s*\}"
+    r"|^[ \t]*(?:async\s+)?([A-Za-z_$][\w$]*)\s*\([^)]*\)\s*\{\s*\}", re.M)
+_NO_SON_METODOS_JS = {"if", "for", "while", "switch", "catch", "function", "with", "return", "constructor"}
+
+
+def stubs_js(fuente: str) -> list:
+    """[(nombre, linea)] de funciones JS/TS con cuerpo vacío (o solo comentarios). Los comentarios se borran
+    conservando los saltos de línea para que el número de línea siga siendo el real."""
+    sin_comentarios = _RE_COMENTARIO_WEB.sub(lambda m: "\n" * m.group(0).count("\n"), fuente)
+    salida = []
+    for m in _RE_FUNCION_JS_VACIA.finditer(sin_comentarios):
+        nombre = m.group(1) or m.group(2) or m.group(3)
+        if nombre and nombre not in _NO_SON_METODOS_JS:
+            salida.append((nombre, sin_comentarios.count("\n", 0, m.start()) + 1))
+    return salida
+
+
+_RE_TEST_JS_INICIO = re.compile(r"\b(?:test|it)\s*\(\s*(['\"`])(.+?)\1\s*,", re.S)
+_RE_ALGUNA_VERIFICACION_JS = re.compile(r"assert|expect|should|verific|comprob|check|throws|rejects|fail\(", re.I)
+_RE_ASSERT_JS = re.compile(r"\b(?:assert(?:\.\w+)?|expect)\s*\(")
+_RE_ASSERT_TAUTOLOGICO = re.compile(
+    r"^(?:assert(?:\.ok)?\(\s*(?:true|1|!0|!!1)\s*[,)]"
+    r"|expect\(\s*(true|1|null|undefined|(['\"])\w*\2|\d+)\s*\)\.(?:toBe|toEqual|toStrictEqual)\(\s*\1\s*\)"
+    r"|expect\(\s*true\s*\)\.toBeTruthy\(\s*\))")
+_RE_ASSERT_IGUALES = re.compile(r"^assert\.(?:equal|strictEqual|deepEqual|deepStrictEqual)\(\s*([^,()]+?)\s*,\s*([^,()]+?)\s*[,)]")
+
+
+def _cuerpo_js(texto: str, desde: int) -> str:
+    """Texto del bloque { ... } que empieza en la primera llave desde `desde` (llaves balanceadas; los strings
+    simples se saltean). '' si no cierra."""
+    inicio = texto.find("{", desde)
+    if inicio < 0:
+        return ""
+    nivel, i, comilla = 0, inicio, ""
+    while i < len(texto):
+        c = texto[i]
+        if comilla:
+            if c == "\\":
+                i += 2
+                continue
+            if c == comilla:
+                comilla = ""
+        elif c in "'\"`":
+            comilla = c
+        elif c == "{":
+            nivel += 1
+        elif c == "}":
+            nivel -= 1
+            if nivel == 0:
+                return texto[inicio + 1:i]
+        i += 1
+    return ""
+
+
+def tests_js_sin_valor(fuente: str) -> list:
+    """[(nombre, linea, detalle)] de tests de JS (node:test, jest, vitest, mocha) que no prueban nada: sin ninguna
+    verificación, o con verificaciones que siempre pasan (assert.ok(true), assert.equal(1, 1),
+    expect(true).toBe(true)). Conservador: si llama a algo que parezca verificar, no lo marca."""
+    texto = _RE_COMENTARIO_WEB.sub(lambda m: "\n" * m.group(0).count("\n"), fuente)
+    salida = []
+    for m in _RE_TEST_JS_INICIO.finditer(texto):
+        cuerpo = _cuerpo_js(texto, m.end())
+        linea = texto.count("\n", 0, m.start()) + 1
+        nombre = m.group(2).strip()[:60]
+        if not cuerpo.strip() or not _RE_ALGUNA_VERIFICACION_JS.search(cuerpo):
+            salida.append((nombre, linea, "el test no verifica nada (ni assert ni expect)"))
+            continue
+        asserts = [cuerpo[a.start():] for a in _RE_ASSERT_JS.finditer(cuerpo)]
+        if asserts and all(_RE_ASSERT_TAUTOLOGICO.match(a) or ((g := _RE_ASSERT_IGUALES.match(a)) is not None
+                                                                and g.group(1) == g.group(2)) for a in asserts):
+            salida.append((nombre, linea, "todas sus verificaciones pasan siempre (comparan algo consigo mismo)"))
+    return salida
+
+
 _LLAMADAS_IO_REAL = ("httpx", "requests", "urllib", "urlopen", "socket", "aiohttp", "http", "subprocess", "popen",
             "run", "open", "connect", "fetch", "get", "post", "session", "curl", "sqlite3", "psycopg", "execute")
 _RE_PIDE_DATOS_REALES = re.compile(
@@ -15259,6 +15376,7 @@ def examen_de_realidad(ws, cid_build: Optional[int], plan=None, pedido: str = ""
     if plan is not None:
         texto = (getattr(plan, "interfaz", "") or "") + "\n" + "\n".join(t.descripcion for t in plan.tareas)
         declaradas = set(re.findall(r"\bdef\s+([A-Za-z_]\w*)", texto))
+        declaradas |= set(re.findall(r"\bfunction\*?\s+([A-Za-z_$][\w$]*)", texto))   # interfaz de JS
         # Funciones cuyo CONTEXTO en el plan pide datos reales (traer de la web, SMS, una API, un número…):
         # si las fabrican con random en vez de traerlas, es simulación. Se mira la línea de cada `def` declarado.
         for linea in texto.splitlines():
@@ -15279,7 +15397,14 @@ def examen_de_realidad(ws, cid_build: Optional[int], plan=None, pedido: str = ""
         except OSError:
             continue
         if es_web:
-            if not _es_test(rel):
+            if _es_test(rel):
+                for nombre, linea, detalle in tests_js_sin_valor(fuente)[:3]:
+                    hallazgos.append(f"TEST SIN VALOR en {rel}::{nombre} (línea {linea}): {detalle}")
+            else:
+                for nombre, linea in stubs_js(fuente):
+                    if nombre in declaradas:
+                        hallazgos.append(f"SIMULACIÓN en {rel}:{linea}: `{nombre}` quedó vacía ({{ }}): existe pero "
+                                         "no hace nada.")
                 for linea, frase in admisiones_web(fuente, permitidas):
                     hallazgos.append(f"SIMULACIÓN CONFESADA en {rel}:{linea}: «{recortar(frase, 80)}»: el código "
                                      "admite ser provisional/ficticio, no lo real que se pidió.")
@@ -48288,6 +48413,47 @@ class TestJuezRealidad(BaseTest):
         self.assertTrue(admisiones_web('function f() { throw new Error("Not implemented"); }\n'))
         self.assertEqual(admisiones_web('const URL = "https://x.com/api"; // sirve los datos reales\n'), [])
 
+    PLAN_JUEGO = """<plan>
+<objetivo>Juego de la serpiente</objetivo>
+<interfaz>
+- juego.js: export function mover(serpiente, direccion); export function crecer(serpiente)
+</interfaz>
+<tarea id="1" archivos="juego.js">Lógica pura del juego.</tarea>
+</plan>"""
+
+    def test_examen_marca_funcion_js_del_plan_vacia(self):
+        fuente = ("export function mover(serpiente, direccion) {\n  // TODO\n}\n"
+                  "export function crecer(serpiente) { return [...serpiente, serpiente.at(-1)]; }\n"
+                  "function noop() {}\n")                                    # vacía pero NO pedida: no se marca
+        ws, grupo = self._build({"juego.js": fuente})
+        hallazgos = examen_de_realidad(ws, grupo, parsear_plan(self.PLAN_JUEGO, "serpiente"))
+        self.assertEqual(len(hallazgos), 1, hallazgos)
+        self.assertIn("juego.js:1", hallazgos[0])
+        self.assertIn("`mover`", hallazgos[0])
+
+    def test_tests_js_sin_valor(self):
+        fuente = ("import { test } from 'node:test';\nimport assert from 'node:assert/strict';\n"
+                  "test('mueve', () => { assert.deepEqual(mover([[1, 1]], 'der'), [[2, 1]]); });\n"
+                  "test('vacío', () => {});\n"
+                  "test('siempre pasa', () => { assert.ok(true); assert.equal(1, 1); });\n"
+                  "test('con ayudante', () => { verificarMovimiento(mover, 'arriba'); });\n"
+                  "test('tira', () => { assert.throws(() => mover(null)); });\n")
+        self.assertEqual([(n, l) for n, l, _d in tests_js_sin_valor(fuente)], [("vacío", 4), ("siempre pasa", 5)])
+        ws, grupo = self._build({"tests/juego.test.mjs": fuente})
+        hallazgos = examen_de_realidad(ws, grupo, None)
+        self.assertEqual(len(hallazgos), 2, hallazgos)
+        self.assertTrue(all(h.startswith("TEST SIN VALOR en tests/juego.test.mjs::") for h in hallazgos))
+
+    def test_tests_js_de_las_plantillas_tienen_valor(self):
+        revisados = 0
+        for nombre, plantilla in PLANTILLAS.items():
+            for rel, contenido in plantilla.archivos.items():
+                if isinstance(contenido, str) and _es_test(rel) and rel.endswith(("js", "ts")):
+                    revisados += 1
+                    with self.subTest(plantilla=nombre, archivo=rel):
+                        self.assertEqual(tests_js_sin_valor(contenido), [])
+        self.assertGreater(revisados, 5)
+
     def test_veredicto_determinista_no_gasta_tokens(self):
         ws, grupo = self._build({"app.py": "def sumar(a, b):\n    pass\n"})
         llm = MockLLM(lambda m, k: '{"cumple": true, "confianza": "high"}')
@@ -49180,6 +49346,42 @@ class TestBundleSinNombresPisados(BaseTest):
                 contador[nodo.name] += 1
         repetidos = sorted(n for n, k in contador.items() if k > 1 and n not in self.EXTENSIONES_A_PROPOSITO)
         self.assertEqual(repetidos, [])
+
+
+class TestSuitesMixtasYNombresJs(BaseTest):
+    TEST_PY_OK = "import unittest\n\nclass T(unittest.TestCase):\n    def test_a(self):\n        self.assertEqual(1 + 1, 2)\n"
+    TEST_JS_OK = "import { test } from 'node:test';\nimport assert from 'node:assert';\ntest('suma', () => assert.equal(1 + 1, 2));\n"
+    TEST_JS_MAL = "import { test } from 'node:test';\nimport assert from 'node:assert';\ntest('resta', () => assert.equal(1 - 1, 5));\n"
+
+    def test_nombres_de_tests_js_que_usan_los_modelos(self):
+        ws = self.proyecto({"tests/unidad/juego.spec.mjs": "", "tests/test_juego.mjs": "", "tests/juego_test.js": "",
+                            "tests/ayuda.js": "", "juego.test.mjs": "", "juego.js": "",
+                            "tests/node_modules/x/a.test.js": ""})
+        nombres = [ws.rel(p) for p in tests_node(ws.raiz)]
+        self.assertEqual(nombres, ["juego.test.mjs", "tests/juego_test.js", "tests/test_juego.mjs",
+                                   "tests/unidad/juego.spec.mjs"])                 # ni ayuda.js ni node_modules
+
+    def test_proyecto_mixto_corre_las_dos_suites(self):
+        if not shutil.which("node"):
+            self.skipTest("node no está instalado")
+        ws = self.proyecto({"tests/test_api.py": self.TEST_PY_OK, "tests/app.test.mjs": self.TEST_JS_MAL})
+        comando, nombre = detectar_comando_tests(ws)
+        self.assertIn("node --test", comando)
+        self.assertIn("+ node --test", nombre)
+        r = ejecutar_tests(ws, timeout=120)
+        self.assertFalse(r.ok)                                                  # antes: verde (solo corría Python)
+        conteo = conteo_de_resultado(r)
+        self.assertEqual((conteo.pasados, conteo.fallados), (1, 1))
+        ws.escribir("tests/app.test.mjs", self.TEST_JS_OK)
+        r = ejecutar_tests(ws, timeout=120)
+        self.assertTrue(r.ok, r.stdout + r.stderr)
+        self.assertEqual(conteo_de_resultado(r).pasados, 2)
+
+    def test_solo_python_no_cambia(self):
+        ws = self.proyecto({"tests/test_api.py": self.TEST_PY_OK})
+        comando, nombre = detectar_comando_tests(ws)
+        self.assertNotIn("node", comando)
+        self.assertIn(nombre, ("pytest", "unittest"))
 
 
 # ======================================================================

@@ -78,3 +78,39 @@ class TestBundleSinNombresPisados(BaseTest):
                 contador[nodo.name] += 1
         repetidos = sorted(n for n, k in contador.items() if k > 1 and n not in self.EXTENSIONES_A_PROPOSITO)
         self.assertEqual(repetidos, [])
+
+
+class TestSuitesMixtasYNombresJs(BaseTest):
+    TEST_PY_OK = "import unittest\n\nclass T(unittest.TestCase):\n    def test_a(self):\n        self.assertEqual(1 + 1, 2)\n"
+    TEST_JS_OK = "import { test } from 'node:test';\nimport assert from 'node:assert';\ntest('suma', () => assert.equal(1 + 1, 2));\n"
+    TEST_JS_MAL = "import { test } from 'node:test';\nimport assert from 'node:assert';\ntest('resta', () => assert.equal(1 - 1, 5));\n"
+
+    def test_nombres_de_tests_js_que_usan_los_modelos(self):
+        ws = self.proyecto({"tests/unidad/juego.spec.mjs": "", "tests/test_juego.mjs": "", "tests/juego_test.js": "",
+                            "tests/ayuda.js": "", "juego.test.mjs": "", "juego.js": "",
+                            "tests/node_modules/x/a.test.js": ""})
+        nombres = [ws.rel(p) for p in tests_node(ws.raiz)]
+        self.assertEqual(nombres, ["juego.test.mjs", "tests/juego_test.js", "tests/test_juego.mjs",
+                                   "tests/unidad/juego.spec.mjs"])                 # ni ayuda.js ni node_modules
+
+    def test_proyecto_mixto_corre_las_dos_suites(self):
+        if not shutil.which("node"):
+            self.skipTest("node no está instalado")
+        ws = self.proyecto({"tests/test_api.py": self.TEST_PY_OK, "tests/app.test.mjs": self.TEST_JS_MAL})
+        comando, nombre = detectar_comando_tests(ws)
+        self.assertIn("node --test", comando)
+        self.assertIn("+ node --test", nombre)
+        r = ejecutar_tests(ws, timeout=120)
+        self.assertFalse(r.ok)                                                  # antes: verde (solo corría Python)
+        conteo = conteo_de_resultado(r)
+        self.assertEqual((conteo.pasados, conteo.fallados), (1, 1))
+        ws.escribir("tests/app.test.mjs", self.TEST_JS_OK)
+        r = ejecutar_tests(ws, timeout=120)
+        self.assertTrue(r.ok, r.stdout + r.stderr)
+        self.assertEqual(conteo_de_resultado(r).pasados, 2)
+
+    def test_solo_python_no_cambia(self):
+        ws = self.proyecto({"tests/test_api.py": self.TEST_PY_OK})
+        comando, nombre = detectar_comando_tests(ws)
+        self.assertNotIn("node", comando)
+        self.assertIn(nombre, ("pytest", "unittest"))

@@ -1416,33 +1416,37 @@ def detectar_comando_tests(ws: Workspace, completo: bool = False) -> Optional[tu
         or any(raiz.glob("test_*.py"))
         or any(raiz.glob("*_test.py"))
     )
+    js = tests_node(raiz) if shutil.which("node") else []
+    tiene_npm_test = _script_npm_test(raiz)
     if hay_tests_py:
         if importlib.util.find_spec("pytest") is not None:
             # completo: además de no cortar en el primer fallo, seguir aunque un archivo de tests no se pueda
             # importar (p. ej. tests de un módulo que una tarea POSTERIOR va a crear). Sin esto pytest aborta en
             # la colección, corre 0 tests, y el torneo/la verificación por tarea no ven ningún progreso real.
             corte = " --continue-on-collection-errors" if completo else " -x"
-            return f"{py} -m pytest -q{corte} --tb=short -p no:cacheprovider", "pytest"
-        for carpeta in ("tests", "test"):
-            if (raiz / carpeta).is_dir():
-                if (raiz / carpeta / "__init__.py").is_file():
-                    return f"{py} -m unittest discover -s {carpeta} -t .", "unittest"
-                return f"{py} -m unittest discover -s {carpeta}", "unittest"
-        return f"{py} -m unittest discover", "unittest"
+            comando, nombre = f"{py} -m pytest -q{corte} --tb=short -p no:cacheprovider", "pytest"
+        else:
+            comando, nombre = f"{py} -m unittest discover", "unittest"
+            for carpeta in ("tests", "test"):
+                if (raiz / carpeta).is_dir():
+                    tope = " -t ." if (raiz / carpeta / "__init__.py").is_file() else ""
+                    comando = f"{py} -m unittest discover -s {carpeta}{tope}"
+                    break
+        es_test_py = re.compile(r"^(?:test_.*|.*_test)\.py$")
+        if js and not tiene_npm_test and any(es_test_py.match(p.name) for d in ("tests", "test", ".")
+                                            for p in ((raiz / d).rglob("*.py") if d != "." else raiz.glob("*.py"))):
+            # Proyecto mixto (backend Python + JS con node:test): se corren LAS DOS suites siempre y sale con el
+            # primer código de error. Antes solo corría la de Python y los tests de JS nunca se ejecutaban.
+            node = "node --test " + " ".join(shlex.quote(ws.rel(p)) for p in js)
+            return (f"{comando}; __py=$?; {node}; __js=$?; [ $__py -ne 0 ] && exit $__py; exit $__js",
+                    f"{nombre} + node --test")
+        return comando, nombre
 
-    paquete = raiz / "package.json"
-    if paquete.is_file():
-        try:
-            datos = json.loads(paquete.read_text(encoding="utf-8"))
-            script = (datos.get("scripts") or {}).get("test")
-            if script and "no test specified" not in script and shutil.which("npm"):
-                return "npm test --silent", "npm test"
-        except (OSError, ValueError):
-            pass
-    if shutil.which("node") and any((raiz / d).is_dir() for d in ("tests", "test")):
-        js = [p for d in ("tests", "test") for p in (raiz / d).glob("*.test.*js")]
-        if js:
-            return "node --test " + " ".join(shlex.quote(ws.rel(p)) for p in sorted(js)), "node --test"
+    if tiene_npm_test and shutil.which("npm"):
+        return "npm test --silent", "npm test"
+    if js:
+        return "node --test " + " ".join(shlex.quote(ws.rel(p)) for p in js), "node --test"
+
     if (raiz / "go.mod").is_file() and shutil.which("go"):
         return "go test ./...", "go test"
     if (raiz / "Cargo.toml").is_file() and shutil.which("cargo"):
@@ -1455,6 +1459,33 @@ def detectar_comando_tests(ws: Workspace, completo: bool = False) -> Optional[tu
         except OSError:
             pass
     return _detectar_tests_otros(raiz)
+
+
+def _script_npm_test(raiz: Path) -> bool:
+    """¿package.json tiene un script "test" de verdad (no el "no test specified" de npm init)?"""
+    try:
+        datos = json.loads((raiz / "package.json").read_text(encoding="utf-8"))
+        script = (datos.get("scripts") or {}).get("test") if isinstance(datos, dict) else None
+    except (OSError, ValueError):
+        return False
+    return bool(isinstance(script, str) and script.strip() and "no test specified" not in script)
+
+
+# Nombres que node --test reconoce como archivo de tests (y los que los modelos usan): juego.test.mjs,
+# juego.spec.js, test_juego.mjs, juego_test.mjs, juego-test.js. Antes solo tests/*.test.*js del primer nivel.
+_RE_TEST_JS = re.compile(r"^(?:.+[._-](?:test|spec)|test[_-].+)\.(?:m|c)?js$")
+
+
+def tests_node(raiz: Path) -> list:
+    """Archivos de tests de JS para node --test: en tests/ y test/ (recursivo) y los *.test.*js de la raíz."""
+    encontrados = set()
+    for carpeta in ("tests", "test", "__tests__"):
+        base = raiz / carpeta
+        if base.is_dir():
+            encontrados.update(p for p in base.rglob("*.*js") if _RE_TEST_JS.match(p.name)
+                               and "node_modules" not in p.parts and p.is_file())
+    encontrados.update(p for p in raiz.glob("*.*js") if _RE_TEST_JS.match(p.name) and p.is_file())
+    return sorted(encontrados)
 
 
 def _detectar_tests_otros(raiz: Path) -> Optional[tuple[str, str]]:
