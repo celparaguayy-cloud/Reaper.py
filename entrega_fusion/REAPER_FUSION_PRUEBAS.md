@@ -389,3 +389,37 @@ legítimo no se marca, con red real no se marca, confesión en código, y el det
 
 Regresión: **1010 tests OK** en Python 3.11/3.12/3.13. Smoke CLI: 0 fallas. Lint sin hallazgos nuevos.
 NO VERIFICADO con modelos reales: medir falsos positivos con builds reales queda para el uso en el teléfono.
+
+## 18. Primera prueba con un modelo REAL (OpenRouter, solo modelos `:free`)
+
+Hasta acá todo se probaba con MockLLM. Con una clave de OpenRouter del usuario se corrieron builds reales de
+`/construir` usando **solo modelos gratis** (gasto de la cuenta: USD 6,94519608 antes y después → **$0**).
+La clave vivió solo en una carpeta temporal fuera del repo (nunca en el repo ni en commits) y se borra al terminar las pruebas.
+
+Configuración aislada (`REAPER_HOME` temporal): principal `nvidia/nemotron-3-super-120b-a12b:free`, juez
+`poolside/laguna-xs-2.1:free`, respaldos `cohere/north-mini-code:free`, `poolside/laguna-*`, `google/gemma-4-31b-it:free`,
+tope de costo 0,01. Pedido: conversor de temperaturas (paquete, CLI `python -m conversor 100 C F`, tests).
+
+Estado del pool gratis ese día (sondeo directo, pedido mínimo): solo nemotron-3-super respondía bien; laguna-s,
+gemma-4 → 429 "rate-limited upstream"; nemotron-ultra → 503; inkling → 403 "only available on agentic harnesses";
+`openrouter/free` → ruteó a un modelo de 2,6B que devolvió vacío.
+
+| # | Bug encontrado en la corrida real | Evidencia | Arreglo |
+|---|---|---|---|
+| 1 | El perfil `gratis` apuntaba a `dolphin…:free`, **que ya no existe**; el modelo y el "fuerte" por defecto son pagos | catálogo: `dolphin…:free` NO EXISTE | Elige del **catálogo real** (público, $0, caché 12 h); sin red, un modelo fijo que existe. 403 "only available on…" se retira como 404 |
+| 2 | "verificación: UNVERIFIED" en una respuesta sin archivos ("Respondé OK") | salida real | No se muestra si no hubo cambios |
+| 3 | 429 del pool gratis: 4 reintentos (~35 s) al MISMO modelo, JSON crudo cortado | log build 1 | Mensaje legible; con alternativa, salto inmediato |
+| 4 | El **plan ordenaba simular**: "esqueletos que lanzan NotImplementedError", "`__main__` que imprima TODO"; y tareas de "solo correr los tests" | plan build 2 | El arquitecto lo prohíbe; el juez (0 tokens) hace replanificar; las meta-tareas se quitan |
+| 5 | Modelo de razonamiento sin salida (`finish=length`) con los pedidos cortos del juez (~350 tokens) | log build 2 | Con alternativa se cambia y desde ahí los pedidos cortos llevan margen + razonamiento corto; sin alternativa, 1 reintento ampliado |
+| 6 | Tarea cuyo trabajo ya hizo otra: "SIN PROGRESO: **no terminó**" (falso: terminó, 7 tests pasaban) → 3 reparaciones sin nada que arreglar → fallida y dependientes BLOQUEADAS | log build 2 | "Terminó sin cambios" pasa si la verificación real lo confirma (en vivo, build 3: tareas 2, 3 y 4 pasaron así) |
+| 7 | Meta-tarea con archivo fantasma `correr_tests`: el reparador **creó un archivo** para "cumplir" | build 3 | Detección de meta-tareas ampliada ("Ejecutar el conjunto de pruebas…") |
+| 8 | Tests de la especificación que **pasan sin que exista el código** ("el CLI falla" pasa si el módulo no existe) | build 3: 3 pasaban antes de implementar | En proyecto nuevo, el especificador los ajusta una vez |
+| 9 | Hueco funcional que nadie probó: el CLI acepta `F K` pero falla ("Unsupported conversion") | prueba independiente | No es de orquestación: es calidad del modelo; queda documentado |
+
+Verificación independiente del código generado en la build 3 (fuera de REAPER): `python -m conversor 100 C F` →
+`212.0`; `32 F C` → `0.0`; `0 C K` → `273.15`; `-300 C F` → error por stderr y exit 1; 15 tests OK. **Es código
+real**, no simulado. Hueco: F↔K no implementado (punto 9).
+
+Tests: `partes/48zg_autotest_openrouter_real.py` (21). Contra el código anterior: 19 fallan; los 2 que pasan
+son guardas de "no excederse" (en proyecto existente no se toca; no se reintenta infinito).
+Regresión: **1031 tests OK** en Python 3.11/3.12/3.13. Smoke CLI: 0 fallas. Lint sin hallazgos nuevos.

@@ -149,3 +149,23 @@ escribió la build se perdió con `/diagnostico` (esa escritura no tenía checkp
 **Alcance:** se reparó REAPER. La funcionalidad de `script_whatsapp` (números para registrar WhatsApp sacados de
 páginas públicas) no se construye ni se repara. Tests: `TestBuildReal*` (15). Regresión 1005 tests OK en Python
 3.11/3.12/3.13.
+
+## 11. Primera prueba con modelo REAL (OpenRouter `:free`, $0)
+
+Detalle completo, con evidencia, en `REAPER_FUSION_PRUEBAS.md` §18. Resumen de los 8 bugs de REAPER que solo
+aparecieron con un modelo real (todos arreglados, 21 tests nuevos, 19 fallan con el código anterior):
+
+1. Perfil `gratis` → modelo retirado (`dolphin…:free`). Ahora: catálogo real de OpenRouter + modelo fijo vigente.
+2. `UNVERIFIED` mostrado en respuestas sin cambios.
+3. 429 del pool gratis: reintentos inútiles al mismo modelo y JSON crudo. Ahora salto inmediato y mensaje legible.
+4. **El plan ordenaba simular** (esqueletos/NotImplementedError/TODO) y metía tareas de "solo correr tests".
+5. Modelos de razonamiento sin salida en pedidos cortos (juez ~350 tokens).
+6. Tarea ya hecha por otra → falso "SIN PROGRESO: no terminó" → bucle de reparaciones → dependientes bloqueadas.
+   **Es el mismo patrón del informe de script_whatsapp** ("tarea 1 fallida, 2-5 bloqueadas").
+7. Meta-tarea con archivo fantasma: el reparador creó un archivo para "cumplir".
+8. Tests de especificación que pasan sin código (no discriminan).
+
+**A auditar:** (a) que el aviso de "tests que pasan sin código" no moleste en proyectos con código parcial; (b) que
+`_RE_TAREA_SIMULADA` no marque tareas legítimas de tests ("mockear la red en los tests" no está en la regex, a
+propósito); (c) el margen de razonamiento con modelos PAGOS (sube el tope a 2048 solo después de ver un corte).
+Regresión 1031 tests OK en Python 3.11/3.12/3.13.

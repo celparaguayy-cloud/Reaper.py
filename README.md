@@ -17,7 +17,7 @@
 
 ![versión](https://img.shields.io/badge/versión-8.10-8b5cf6?style=flat-square)
 ![python](https://img.shields.io/badge/python-3.11_→_3.14-3776ab?style=flat-square&logo=python&logoColor=white)
-![autotests](https://img.shields.io/badge/autotests-1010_OK-2ea44f?style=flat-square)
+![autotests](https://img.shields.io/badge/autotests-1031_OK-2ea44f?style=flat-square)
 ![juez](https://img.shields.io/badge/juez-motor_central-a855f7?style=flat-square)
 ![plataforma](https://img.shields.io/badge/Termux_·_Android-sin_root-10b981?style=flat-square&logo=android&logoColor=white)
 ![distribución](https://img.shields.io/badge/distribución-1_archivo-f59e0b?style=flat-square)
@@ -44,7 +44,7 @@ Su obsesión es la **honestidad**: no declara una build "verificada" sin tests r
 lo entregado **sea lo que pediste, funcione de verdad y no rompa lo que ya tenías**.
 
 > [!NOTE]
-> Proyecto **experimental**. El andamiaje está cubierto por **1010 autotests**; la calidad del código que
+> Proyecto **experimental**. El andamiaje está cubierto por **1031 autotests**; la calidad del código que
 > produzca depende del modelo que le conectes. Lee **[Estado honesto](#estado)** antes de esperar magia.
 
 ---
@@ -293,6 +293,16 @@ verificación**, no la opinión de un modelo: un "terminé" sin pruebas no alcan
 
 ## 🆕 Novedades
 
+**Probado con un modelo REAL (OpenRouter, modelos gratis, $0)**
+
+- 🆓 El perfil `gratis` elige de los modelos gratis que OpenRouter ofrece **hoy** (antes apuntaba a uno retirado).
+- ⏩ Si un modelo gratis está saturado (429), pasa enseguida al siguiente en vez de esperar ~35 s.
+- 🧠 Los modelos "que piensan" ya no se quedan sin respuesta en los pedidos cortos del juez.
+- 🚫 El plan ya no puede ordenar **esqueletos ni `NotImplementedError`**: el juez lo hace replanificar, y las
+  tareas de "solo correr los tests" (que terminaban creando archivos fantasma) se quitan.
+- 🔓 Una tarea cuyo trabajo ya hizo otra ya no queda en un bucle de reparaciones sin salida ni bloquea al resto.
+- 🧪 Si un test de la especificación pasa **sin que exista el código**, se manda a corregir: no prueba nada.
+
 **Reparado con una corrida real que falló en Termux**
 
 - 🩹 `/diagnostico <archivo>` ya no puede pisar tu código (antes `/diagnostico app.py` lo reemplazaba por el reporte).
@@ -326,12 +336,17 @@ verificación**, no la opinión de un modelo: un "terminé" sin pruebas no alcan
 > [!IMPORTANT]
 > Lo que **sí** está verificado y lo que **no**, sin maquillaje.
 
-- ✅ **1010 autotests OK** en Python **3.11, 3.12 y 3.13** (y en un Termux real con 3.14 en una versión
+- ✅ **1031 autotests OK** en Python **3.11, 3.12 y 3.13** (y en un Termux real con 3.14 en una versión
   anterior). Prueban la **orquestación** de forma determinista: ediciones y procesos reales, parseo de tests,
   gates de honestidad, Ctrl+C, plazos de pared y el juez (contrato, cierre, desvío, preservación, arranque,
   examen de realidad, armado del equipo). La red de modelos se simula con un **MockLLM**.
-- ⚠️ **No verificado con modelos reales** en este repo (sin claves): la **calidad del código** depende del
-  modelo que conectes. El andamiaje sube el piso; no inventa capacidad que el modelo no tenga.
+- ✅ **Probado con un modelo real** (OpenRouter, `nemotron-3-super` gratis): una build real dejó código real
+  (verificado aparte: conversiones correctas, errores por stderr, 15 tests OK). Esa prueba encontró 8 bugs de
+  REAPER, ya arreglados con su test. Ver `entrega_fusion/REAPER_FUSION_PRUEBAS.md` §18. Que una build con todos
+  los arreglos llegue al cierre con modelos gratis todavía está **en prueba**.
+- ⚠️ **Los modelos gratis son inestables**: el día de la prueba la mayoría daba 429/503/403. REAPER los esquiva,
+  pero una build puede tardar o no completarse. La **calidad del código** depende del modelo que conectes; el
+  andamiaje sube el piso, no inventa capacidad que el modelo no tenga.
 - ⚠️ **Proyectos grandes**: el andamiaje de escala existe (mapa de relevantes, subagentes por tarea, grafo de
   dependencias, reanudación entre sesiones, compactación de contexto). Que salga **bien** depende del modelo.
 - ⚠️ **Lo que el juez no puede hacer**: no convierte un modelo débil en uno fuerte. Lo que sí garantiza es que
