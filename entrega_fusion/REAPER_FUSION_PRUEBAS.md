@@ -520,3 +520,43 @@ la de `afirma_verificacion`: 2 tests rojos). De ahí salió el test guardián.
 Tests: +16. Medido contra el código anterior: 12 fallan por el bug que cubren, 2 son guardas de precisión sobre
 las plantillas (fallan porque la función no existía) y 2 son guardas de no-regresión que ya pasaban. Regresión: **1060 tests OK** en Python
 3.10/3.11/3.12/3.13. Lint (pyflakes/ruff, errores reales): sin hallazgos.
+
+## 19. Proyectos grandes por etapas (`/grande`) y un bug de `/construir continuar` que destapó
+
+**Pedido del usuario:** "que sea capaz de crear proyectos grandes". Antes, un `/construir` metía todo en UN plan de
+hasta `max_tareas` (12; máx. 60) y un plazo de pared de 90 min; lo que sobraba se amontonaba en la última tarea.
+
+**Qué se agregó (`partes/76_grande.py`):** plan maestro (visión, arquitectura, etapas con archivos/interfaz/
+criterios/dependencias) validado sin tokens (formato, ciclos, dependencias inexistentes, etapas que planean
+simular o que solo corren pruebas, tope `max_etapas`); una build completa por etapa en orden de dependencias;
+reintento único retomando la MISMA build; parada si una etapa no queda verificada (nada se construye encima);
+estado en `.reaper/proyecto_grande.json` y `/grande continuar`; integración final (verificación real de todo el
+proyecto desde el primer checkpoint + juez contra el pedido ORIGINAL + una build de integración acotada si falta
+algo); informe `.reaper/informes/proyecto_grande_*.md`. Comando `/grande`, flag `--grande`, capítulo del manual y
+proyecto "grande" en `pruebas_fusion/prueba_real.py`.
+
+**Garantía nueva:** el pedido de cada etapa lo arma REAPER con texto que escribió el modelo. Lo que AUTORIZA
+(reescribir archivos previos, aceptar "datos de ejemplo") sale de `Orquestador.pedido_usuario`, nunca de ese texto.
+
+**Cómo se probó (NO VERIFICADO con un modelo real):** un modelo simulado que escribe código de verdad construye un
+gestor de biblioteca en 3 etapas (SQLite → préstamos → CLI); los tests del proyecto corren de verdad en cada etapa.
+También por la CLI real (`main(["--grande", ...])`): exit 0, 5 tests del proyecto en verde y la app generada
+funciona (`python -m biblioteca agregar/prestar/listar`, rechaza prestar dos veces).
+
+**Bugs que encontró la simulación:**
+
+| Bug | Dónde | Evidencia | Arreglo |
+|---|---|---|---|
+| Al retomar una build, la suite roja **por esa misma build** se tomaba como "ya fallaba antes de empezar": la tarea re-ejecutada quedaba **VERIFICADA con su propio test en rojo**, cada `/construir continuar` la "conservaba" y la build no se podía arreglar nunca (ni con el modelo ya corregido) | `/construir` (existía antes) | Mismo escenario, código anterior: 2.ª corrida "verificada", 3.ª con el modelo corregido "fallida"; código nuevo: "fallida" y luego "verificada" | El diario guarda `base_fallaba` y `fallaban_al_inicio` al empezar; al re-ejecutar una tarea fallida o cortada solo se toleran los fallos previos a la build y los de tests declarados por OTRAS tareas |
+| El estado de `/grande` quedaba JSON inválido | mío (nuevo) | `redactar_secretos` sobre el JSON serializado cambiaba `"tokens": 63043` por `[REDACTADO]` | Se redactan los textos, no el JSON; campo renombrado |
+| Plan con más tareas que el tope: la tarea agrupada **perdía sus dependencias** y podía correr aunque fallara una de la que dependía | `/construir` (existía antes) | test directo | Conserva las dependencias externas al grupo |
+| "Datos de ejemplo" que el usuario **pidió** hacía replanificar | `/construir` | test directo | `problemas_del_plan` mira el pedido |
+| El test guardián de globales contaba `App.cmd_x = …` como redefinición de `App` | mío (ronda anterior) | falso positivo | Solo cuenta nombres y tuplas |
+
+Tests: +15 (de `/grande` y de la reanudación; el de reanudación falla con el código anterior). Regresión:
+**1075 tests OK** en Python 3.10/3.11/3.12/3.13. Lint (pyflakes/ruff, errores reales): sin hallazgos.
+
+**A auditar:** (a) con modelos gratis, una etapa puede quedar a medias por límites de uso: `/grande continuar` la
+retoma, pero cada etapa gasta lo de una build entera; (b) la integración usa el juez con un diffstat de TODO el
+proyecto: en proyectos muy grandes conviene revisar que el contrato no quede genérico; (c) `MAX_INTENTOS_ETAPA = 4`.
+

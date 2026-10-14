@@ -190,3 +190,19 @@ puede definirse dos veces (salvo `_PARSERS`, que se extiende a propósito).
 dice "con datos de ejemplo" apaga la detección de "datos de ejemplo" en todo el proyecto; (b) la suite mixta usa
 `;` y `$?` de shell (POSIX), revisar en Termux; (c) `scripts_html_incoherentes` sigue solo un nivel de imports.
 Regresión 1060 tests OK en Python 3.10/3.11/3.12/3.13.
+
+## 13. Proyectos grandes: `/grande` (NO VERIFICADO con un modelo real)
+
+Detalle en `REAPER_FUSION_PRUEBAS.md` §19. `partes/76_grande.py`: plan maestro por etapas → un `/construir` completo
+por etapa → si una etapa no queda verificada se retoma una vez y se frena (no se construye encima) → integración
+final contra el pedido ORIGINAL. Estado en `.reaper/proyecto_grande.json`, `/grande continuar`, `--grande`.
+
+Bug de `/construir` (existía antes) que destapó: al retomar, una tarea re-ejecutada quedaba VERIFICADA con su propio
+test en rojo (la suite roja por la misma build se tomaba como "ya fallaba antes") y la build no se podía arreglar.
+Ahora el diario guarda el estado inicial de la suite. También: la tarea agrupada al pasarse del tope perdía sus
+dependencias.
+
+**A auditar:** que `pedido_usuario` (lo que autoriza reescrituras y "datos de ejemplo") se use en todo lugar que
+autoriza algo; `fallos_tolerables_al_reintentar` con suites que no nombran el archivo del test en el nombre.
+Regresión 1075 tests OK en Python 3.10/3.11/3.12/3.13.
+

@@ -17,7 +17,7 @@
 
 ![versión](https://img.shields.io/badge/versión-8.10-8b5cf6?style=flat-square)
 ![python](https://img.shields.io/badge/python-3.11_→_3.14-3776ab?style=flat-square&logo=python&logoColor=white)
-![autotests](https://img.shields.io/badge/autotests-1060_OK-2ea44f?style=flat-square)
+![autotests](https://img.shields.io/badge/autotests-1075_OK-2ea44f?style=flat-square)
 ![juez](https://img.shields.io/badge/juez-motor_central-a855f7?style=flat-square)
 ![plataforma](https://img.shields.io/badge/Termux_·_Android-sin_root-10b981?style=flat-square&logo=android&logoColor=white)
 ![distribución](https://img.shields.io/badge/distribución-1_archivo-f59e0b?style=flat-square)
@@ -44,7 +44,7 @@ Su obsesión es la **honestidad**: no declara una build "verificada" sin tests r
 lo entregado **sea lo que pediste, funcione de verdad y no rompa lo que ya tenías**.
 
 > [!NOTE]
-> Proyecto **experimental**. El andamiaje está cubierto por **1060 autotests**; la calidad del código que
+> Proyecto **experimental**. El andamiaje está cubierto por **1075 autotests**; la calidad del código que
 > produzca depende del modelo que le conectes. Lee **[Estado honesto](#estado)** antes de esperar magia.
 
 ---
@@ -89,7 +89,8 @@ lo entregado **sea lo que pediste, funcione de verdad y no rompa lo que ya tení
 | 🤖 **Equipo de 8 agentes** | 6 roles + respaldo entre modelos + el **8.º: el juez**. |
 | 🧪 **Tests primero** | especificación ejecutable antes de implementar (cuando el proyecto lo amerita). |
 | 🏆 **Torneo por tarea** | varios implementadores compiten en copias aisladas; gana el que pasa más tests. |
-| 🧭 **Grafo de tareas** | ordena por dependencias y descompone proyectos grandes por módulo (hasta 60 tareas). |
+| 🏗️ **Proyectos grandes por etapas** | `/grande`: plan maestro en etapas; cada una es un `/construir` verificado, nada se construye sobre una etapa rota, se retoma donde quedó y cierra con una integración contra tu pedido original. |
+| 🧭 **Grafo de tareas** | ordena por dependencias y descompone cada build por módulo (hasta 60 tareas). |
 | 🔁 **Reparación con escalada** | ante un fallo que se repite, sube a un modelo más fuerte. |
 | 🔌 **Multi-proveedor** | ruteo por modelo a distintos endpoints/claves (OpenRouter, Groq, Gemini, NVIDIA…). |
 | ✅ **Sin falsos verdes** | ✓ solo con `exit 0` y tests reales; **0 tests ≠ éxito**; "tests pasan" con 0 cambios ≠ hecho. |
@@ -167,11 +168,17 @@ $ reaper --proyecto ~/mi_app
 ❯ /equipo juez        estado + qué roles reasignaría en la próxima build y por qué
 ```
 
-**Paso 4 · Proyectos grandes: dale más espacio al plan (opcional)**
+**Paso 4 · Proyectos grandes: por etapas (opcional)**
+
+Si el proyecto no entra en un solo plan (backend + base de datos + web + reportes…), usá `/grande`: arma un plan
+maestro por etapas y construye una por vez, verificando cada una.
 
 ```text
-❯ /config max_tareas 30           tope de tareas del plan (máx. 60)
-❯ /config juez_max_intervenciones 2
+❯ /grande un sistema para un almacén: stock, ventas, clientes, reportes, API JSON y una web para el celular
+❯ /grande estado                  qué etapas están verificadas y por qué paró la última
+❯ /grande continuar               sigue donde quedó (aunque se haya cortado a mitad)
+❯ /config max_etapas 15           tope de etapas (2 a 30); cada etapa hasta max_tareas tareas
+❯ /config max_tareas 30           tope de tareas por build (máx. 60)
 ```
 
 **Paso 5 · Construí**
@@ -293,6 +300,17 @@ verificación**, no la opinión de un modelo: un "terminé" sin pruebas no alcan
 
 ## 🆕 Novedades
 
+**Proyectos grandes: `/grande` (o `reaper --grande "..."`)**
+
+- 🏗️ Un plan maestro divide el pedido en **etapas** (archivos, interfaz que deja para las siguientes, criterios) y
+  cada etapa se construye con un `/construir` completo: tests, juez, preservación, examen de realidad, arranque.
+- 🧱 Si una etapa no queda verificada se retoma una vez y, si sigue mal, **se frena**: no se construye encima de
+  algo roto. `/grande continuar` sigue donde quedó (aunque se haya cortado a mitad de una etapa).
+- 🧩 Al final, **integración**: verificación real de todo el proyecto y el juez contra **tu pedido original**; si
+  falta algo, una build acotada lo completa.
+- ⚠️ Probado de punta a punta con un modelo **simulado** que escribe código real (3 etapas, CLI incluida); **todavía
+  no con un modelo real** (ver Estado honesto).
+
 **Probado con un modelo REAL (OpenRouter, modelos gratis, $0)**
 
 - 🆓 El perfil `gratis` elige de los modelos gratis que OpenRouter ofrece **hoy** (antes apuntaba a uno retirado).
@@ -336,7 +354,7 @@ verificación**, no la opinión de un modelo: un "terminé" sin pruebas no alcan
 > [!IMPORTANT]
 > Lo que **sí** está verificado y lo que **no**, sin maquillaje.
 
-- ✅ **1060 autotests OK** en Python **3.10, 3.11, 3.12 y 3.13** (y en un Termux real con 3.14 en una versión
+- ✅ **1075 autotests OK** en Python **3.10, 3.11, 3.12 y 3.13** (y en un Termux real con 3.14 en una versión
   anterior). Prueban la **orquestación** de forma determinista: ediciones y procesos reales, parseo de tests,
   gates de honestidad, Ctrl+C, plazos de pared y el juez (contrato, cierre, desvío, preservación, arranque,
   examen de realidad, armado del equipo). La red de modelos se simula con un **MockLLM**.
@@ -353,8 +371,11 @@ verificación**, no la opinión de un modelo: un "terminé" sin pruebas no alcan
 - ⚠️ **Los modelos gratis son inestables**: el día de la prueba la mayoría daba 429/503/403. REAPER los esquiva,
   pero una build puede tardar o no completarse. La **calidad del código** depende del modelo que conectes; el
   andamiaje sube el piso, no inventa capacidad que el modelo no tenga.
-- ⚠️ **Proyectos grandes**: el andamiaje de escala existe (mapa de relevantes, subagentes por tarea, grafo de
-  dependencias, reanudación entre sesiones, compactación de contexto). Que salga **bien** depende del modelo.
+- ⚠️ **Proyectos grandes**: `/grande` los parte en etapas verificadas, retoma donde quedó y no construye sobre
+  una etapa rota. Está probado con un modelo **simulado** que escribe código real, **no todavía con un modelo
+  real**: la calidad de cada etapa sigue dependiendo del modelo. Con modelos gratis, contá con muchas
+  llamadas (cada etapa es una build entera) y con que los límites de uso pueden cortar a mitad: por eso
+  existe `/grande continuar`.
 - ⚠️ **Lo que el juez no puede hacer**: no convierte un modelo débil en uno fuerte. Lo que sí garantiza es que
   un resultado incompleto, simulado o que no arranca **no se te entregue como terminado**.
 
@@ -381,13 +402,14 @@ Fácil de leer y mantener por módulos; se distribuye como **un archivo** que co
 </details>
 
 <details>
-<summary><b>🧰 Comandos (hay 64; muestra)</b></summary>
+<summary><b>🧰 Comandos (hay 82; muestra)</b></summary>
 
 <br>
 
 | Comando | Qué hace |
 |---|---|
 | `/construir <pedido>` | equipo → contrato → plan → tests → torneo → verifica (tests + arranque) → realidad → juez |
+| `/grande <pedido>` · `estado` · `continuar` | proyecto grande: plan maestro por etapas, un `/construir` verificado por etapa, integración final |
 | `/plan <pedido>` | solo exploración + plan (se guarda en `.reaper/planes`) |
 | `/continuar` · `/pendiente` | reanuda una build grande entre sesiones |
 | `/equipo` · `/equipo probar` | ruteo de los 8 agentes · prueba real de conectividad |
