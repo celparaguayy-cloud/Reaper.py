@@ -48860,7 +48860,7 @@ class TestOpenRouterRealPerfilGratisProbado(BaseTest):
         self.assertEqual(vivos, ["b/ok:free", "d/ok:free"])               # en orden y corta al llegar a 2
 
     def test_perfil_gratis_con_clave_prueba_y_elige_los_vivos(self):
-        os.environ["OPENROUTER_API_KEY"] = "sk-or-v1-solo-para-test"
+        os.environ["OPENROUTER_API_KEY"] = "sk-or-v1-0123456789abcdef0123"
         g = globals()
         original = g["catalogo_free_openrouter"]
         g["catalogo_free_openrouter"] = lambda: ["a/403:free", "b/ok:free", "c/ok:free"]
