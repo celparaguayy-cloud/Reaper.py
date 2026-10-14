@@ -2462,10 +2462,10 @@ index 4eba772..e986b98 100644
                  (self.ws.raiz / rel).unlink()
                  self.restaurados.append(f"{rel} (creado por los tests, borrado)")
 diff --git a/partes/25_pipeline.py b/partes/25_pipeline.py
-index ad78b6b..d161b20 100644
+index ad78b6b..60858c8 100644
 --- a/partes/25_pipeline.py
 +++ b/partes/25_pipeline.py
-@@ -40,6 +40,410 @@ _RE_VEREDICTO = re.compile(r"VEREDICTO\s*:?\s*\**\s*(APROBADO|CAMBIOS|RECHAZADO)
+@@ -40,6 +40,419 @@ _RE_VEREDICTO = re.compile(r"VEREDICTO\s*:?\s*\**\s*(APROBADO|CAMBIOS|RECHAZADO)
  EXTENSIONES_TESTEABLES = (".py", ".js", ".mjs", ".cjs", ".ts")
  
  
@@ -2550,9 +2550,14 @@ index ad78b6b..d161b20 100644
 +# Tareas que PLANEAN simular (prueba real con OpenRouter: la tarea 1 decía "crear core.py con esqueletos que
 +# lanzan NotImplementedError y un __main__ que imprima TODO"). De ahí salían las entregas de mentira.
 +_RE_TAREA_SIMULADA = re.compile(
-+    r"esqueleto|skeleton|\bstubs?\b|placeholder|marcador(?:es)?\s+de\s+posici|NotImplementedError|\bTODO\b|"
++    r"esqueleto|skeleton|\bstubs?\b|placeholder|marcador(?:es)?\s+de\s+posici|NotImplementedError|"
 +    r"implement\w*\s+(?:m[aá]s\s+)?(?:tarde|despu[eé]s|later)|datos?\s+de\s+ejemplo|datos?\s+fictici",
 +    re.IGNORECASE)
++# El marcador de programador va en MAYÚSCULAS y aparte: con IGNORECASE marcaba la palabra "todo" ("verificar que
++# todo funciona"), un falso positivo que en la prueba real hizo replanificar sin motivo.
++_RE_TODO = re.compile(r"\b(?:TODO|FIXME)\b")
++# Viñetas o numeración al principio ("- ejecutar las pruebas", "2) Correr los tests"): el modelo real las usa.
++_RE_VINETA = re.compile(r"^\s*(?:[-*•·]+|\d+[.)])\s*")
 +# Tareas que solo "corren las pruebas": no entregan archivos y REAPER ya verifica después de cada tarea.
 +_RE_META_TAREA = re.compile(
 +    r"^\s*(?:ejecut|corr[eé]|run\b|verific|valid|comprob|lanz)\w*\s+(?:que\s+)?"
@@ -2566,20 +2571,24 @@ index ad78b6b..d161b20 100644
 +    salida = []
 +    for tarea in getattr(plan, "tareas", []) or []:
 +        texto = tarea.descripcion or ""
-+        m = _RE_TAREA_SIMULADA.search(texto)
++        m = _RE_TAREA_SIMULADA.search(texto) or _RE_TODO.search(texto)
 +        if m:
 +            salida.append(f"la tarea {tarea.id} planea una simulación («{m.group(0)}»): tiene que implementar "
 +                          "el código real y completo, sin esqueletos ni placeholders")
-+        if _RE_META_TAREA.search(texto.splitlines()[0] if texto else ""):
++        if _es_meta_tarea(texto):
 +            salida.append(f"la tarea {tarea.id} solo corre/verifica pruebas: REAPER ya lo hace después de cada "
 +                          "tarea; quitala o fusionala con una tarea que cree archivos")
 +    return salida
 +
 +
++def _es_meta_tarea(descripcion: str) -> bool:
++    primera = (descripcion or "").strip().splitlines()[0] if (descripcion or "").strip() else ""
++    return bool(_RE_META_TAREA.search(_RE_VINETA.sub("", primera, count=1)))
++
++
 +def quitar_meta_tareas(plan) -> list:
 +    """Saca del plan las tareas que solo corren pruebas (y sus ids de las deps de las demás). → ids quitados."""
-+    quitadas = [t.id for t in plan.tareas if _RE_META_TAREA.search((t.descripcion or "").splitlines()[0]
-+                                                                    if t.descripcion else "")]
++    quitadas = [t.id for t in plan.tareas if _es_meta_tarea(t.descripcion)]
 +    if quitadas and len(quitadas) < len(plan.tareas):
 +        plan.tareas = [t for t in plan.tareas if t.id not in quitadas]
 +        for t in plan.tareas:
@@ -2876,7 +2885,7 @@ index ad78b6b..d161b20 100644
  @dataclass
  class Tarea:
      id: str
-@@ -178,13 +582,218 @@ def verificacion_peor(despues: "Verificacion", antes: "Verificacion") -> bool:
+@@ -178,13 +591,218 @@ def verificacion_peor(despues: "Verificacion", antes: "Verificacion") -> bool:
  
  
  def veredicto(informe: str) -> tuple[bool, bool]:
@@ -3097,7 +3106,7 @@ index ad78b6b..d161b20 100644
  @dataclass
  class Verificacion:
      ok: bool
-@@ -193,6 +802,7 @@ class Verificacion:
+@@ -193,6 +811,7 @@ class Verificacion:
      diagnostico: str
      archivos: list
      conteo: ConteoTests = field(default_factory=ConteoTests)
@@ -3105,7 +3114,7 @@ index ad78b6b..d161b20 100644
  
  
  @dataclass
-@@ -201,6 +811,7 @@ class InformeBuild:
+@@ -201,6 +820,7 @@ class InformeBuild:
      plan: Optional[Plan] = None
      archivos: list = field(default_factory=list)
      tests: Optional[Resultado] = None
@@ -3113,7 +3122,7 @@ index ad78b6b..d161b20 100644
      diagnostico: str = ""
      cid: Optional[int] = None
      ruta_informe: Optional[Path] = None
-@@ -211,12 +822,32 @@ class InformeBuild:
+@@ -211,12 +831,32 @@ class InformeBuild:
      commit: Optional[str] = None
      spec_tests: list = field(default_factory=list)
      segundos: float = 0.0
@@ -3146,7 +3155,7 @@ index ad78b6b..d161b20 100644
  def _diffstat(diff: str) -> str:
      stats: dict[str, list[int]] = {}
      actual = None
-@@ -231,6 +862,23 @@ def _diffstat(diff: str) -> str:
+@@ -231,6 +871,23 @@ def _diffstat(diff: str) -> str:
      return "\n".join(f"  {a}  +{m} -{n}" for a, (m, n) in stats.items())
  
  
@@ -3170,7 +3179,7 @@ index ad78b6b..d161b20 100644
  def _es_test(rel: str) -> bool:
      return any(fnmatch.fnmatch(rel, p) for p in PATRONES_TESTS)
  
-@@ -246,6 +894,214 @@ def _es_de_especificacion(nombre_test: str, protegidos: dict) -> bool:
+@@ -246,6 +903,214 @@ def _es_de_especificacion(nombre_test: str, protegidos: dict) -> bool:
      return False
  
  
@@ -3385,7 +3394,7 @@ index ad78b6b..d161b20 100644
  class Orquestador:
      def __init__(self, llm, ws: Workspace, settings: Settings, ui: UI):
          self.llm = llm
-@@ -255,6 +1111,7 @@ class Orquestador:
+@@ -255,6 +1120,7 @@ class Orquestador:
          self.memoria = MemoriaLecciones(ws) if settings.lecciones else None
          self.escalador = Escalador(llm, settings, ui)
          self._protegidos: dict[str, Optional[str]] = {}
@@ -3393,7 +3402,7 @@ index ad78b6b..d161b20 100644
  
      def _sub(self, rol: str, tarea: str, cid: Optional[int], archivos: str = "", titulo: str = "",
               **opciones) -> ResultadoAgente:
-@@ -264,6 +1121,20 @@ class Orquestador:
+@@ -264,6 +1130,20 @@ class Orquestador:
              profundidad=1, cid_inicio=cid,
          )[0]
  
@@ -3414,7 +3423,7 @@ index ad78b6b..d161b20 100644
      # ------------------------------------------------------------ fases
      def explorar(self, pedido: str) -> str:
          archivos = self.ws.archivos_codigo(limite=500)
-@@ -296,7 +1167,13 @@ class Orquestador:
+@@ -296,7 +1176,13 @@ class Orquestador:
                  "cómo se ejecuta y se prueba el proyecto",
                  {"memoria": self.memoria},
              ))
@@ -3429,7 +3438,7 @@ index ad78b6b..d161b20 100644
          informe = "\n\n".join(
              f"### Informe explorador {i}\n{r.resumen}" for i, r in enumerate(resultados, start=1)
          )
-@@ -308,7 +1185,10 @@ class Orquestador:
+@@ -308,7 +1194,10 @@ class Orquestador:
              f"PEDIDO DEL USUARIO:\n{pedido}\n\n"
              f"INFORME DE EXPLORACIÓN (código real):\n{recortar(exploracion, 7000)}\n\n"
              f"Comando de tests detectado: {detectado[0] if detectado else 'ninguno (habrá que crear tests)'}\n"
@@ -3441,7 +3450,7 @@ index ad78b6b..d161b20 100644
          )
          if self.settings.tests_primero:
              tarea += ("\nLos tests se escriben ANTES de implementar a partir de tu <interfaz> y tus <criterios>: "
-@@ -323,6 +1203,10 @@ class Orquestador:
+@@ -323,6 +1212,10 @@ class Orquestador:
          if not _RE_TAREA.search(texto) and _RE_TAREA.search(res.contexto):
              texto = res.contexto + "\n" + texto
          plan = parsear_plan(texto, pedido, self.settings.max_tareas)
@@ -3452,7 +3461,7 @@ index ad78b6b..d161b20 100644
          if not res.ok:
              self.ui.aviso("El arquitecto no terminó limpio; uso lo que produjo.")
          motivo = plan_degenerado(plan, pedido, texto)
-@@ -378,6 +1262,25 @@ class Orquestador:
+@@ -378,6 +1271,25 @@ class Orquestador:
                  return {}
          r = ejecutar_tests(self.ws, timeout=self.settings.tests_timeout, completo=True)
          conteo = conteo_de_resultado(r)
@@ -3478,7 +3487,7 @@ index ad78b6b..d161b20 100644
          if r is not None and conteo.reconocido:
              if conteo.ok and conteo.pasados:
                  self.ui.aviso(f"  Ojo: la especificación ya pasa entera ({conteo.texto()}); quizá la función ya existía.")
-@@ -431,17 +1334,23 @@ class Orquestador:
+@@ -431,17 +1343,23 @@ class Orquestador:
              f"Validación automática de los archivos cambiados: {validacion}\n\n"
              "Leé los archivos completos si necesitás contexto. Empezá tu informe con la línea VEREDICTO."
          )
@@ -3505,7 +3514,7 @@ index ad78b6b..d161b20 100644
          detectado = detectar_comando_tests(self.ws)
          criterios = "\n".join(f"- {c}" for c in plan.criterios) or "- (derivalos del pedido)"
          texto = (
-@@ -452,7 +1361,7 @@ class Orquestador:
+@@ -452,7 +1370,7 @@ class Orquestador:
              "Escribí (o completá) tests automáticos que verifiquen los criterios y corrélos con run_tests. "
              "Reportá el resultado REAL."
          )
@@ -3514,7 +3523,7 @@ index ad78b6b..d161b20 100644
  
      def verificar(self, cid: int) -> Verificacion:
          archivos = [r for r in self.ws.checkpoints.archivos_desde(cid) if (self.ws.raiz / r).is_file()]
-@@ -462,13 +1371,35 @@ class Orquestador:
+@@ -462,13 +1380,35 @@ class Orquestador:
          malos = fallos(validaciones)
          tests_ok = tests is None or tests.ok
          partes = [r.resumen(2500) for r in malos]
@@ -3552,7 +3561,7 @@ index ad78b6b..d161b20 100644
  
      def reparar(self, pedido: str, verif: Verificacion, cid: int, base_fallaba: bool,
                  diagnostico_experto: str = "", contexto: str = "") -> ResultadoAgente:
-@@ -485,7 +1416,8 @@ class Orquestador:
+@@ -485,7 +1425,8 @@ class Orquestador:
          if diagnostico_experto:
              texto = tarea_con_diagnostico(texto, diagnostico_experto)
          protegidos = set(self._protegidos)
@@ -3562,7 +3571,7 @@ index ad78b6b..d161b20 100644
                                                                                      if diagnostico_experto else ""),
                           protegidos=protegidos)
  
-@@ -513,7 +1445,17 @@ class Orquestador:
+@@ -513,7 +1454,17 @@ class Orquestador:
          intentos_txt: list[str] = []
          forense_hecho = False
          informe_forense = ""
@@ -3580,7 +3589,7 @@ index ad78b6b..d161b20 100644
              firma = _firma_error(verif.diagnostico)
              if diagnosticos_vistos.count(firma) >= 3:
                  informe.notas.append(f"{etiqueta}: la reparación no logró avances (mismo diagnóstico repetido).")
-@@ -549,6 +1491,7 @@ class Orquestador:
+@@ -549,6 +1500,7 @@ class Orquestador:
                                       + "\n---\n".join(intentos_txt[-2:]))
              res = self.reparar(pedido, verif, rcid, base_fallaba, experto, contexto_intento.strip())
              intentos_txt.append(recortar(res.resumen, 1200))
@@ -3588,7 +3597,7 @@ index ad78b6b..d161b20 100644
              verif = verificador()
              self._mostrar_verificacion(verif)
              if verif.ok:
-@@ -566,6 +1509,221 @@ class Orquestador:
+@@ -566,6 +1518,221 @@ class Orquestador:
                  verif = antes
          return verif
  
@@ -3810,7 +3819,7 @@ index ad78b6b..d161b20 100644
      # ------------------------------------------------------------ flujos
      def _mostrar_plan(self, plan: Plan) -> None:
          self.ui.titulo("PLAN")
-@@ -575,10 +1733,47 @@ class Orquestador:
+@@ -575,10 +1742,47 @@ class Orquestador:
          self.ui.fase(1, "Exploración")
          exploracion = self.explorar(pedido)
          self.ui.fase(2, "Arquitectura")
@@ -3860,7 +3869,7 @@ index ad78b6b..d161b20 100644
                  return plan, exploracion
              feedback = self.ui.preguntar("¿Qué cambiarías del plan? (Enter vacío = cancelar)")
              if not feedback:
-@@ -598,8 +1793,64 @@ class Orquestador:
+@@ -598,8 +1802,64 @@ class Orquestador:
          ))
          return ruta
  
@@ -3926,7 +3935,7 @@ index ad78b6b..d161b20 100644
          """
          Una tarea intermedia no necesita que pasen TODOS los tests (los de tareas
          siguientes todavía fallan): alcanza con validadores OK y que no se rompa
-@@ -609,7 +1860,46 @@ class Orquestador:
+@@ -609,7 +1869,46 @@ class Orquestador:
          validaciones = validar_archivos(self.ws, archivos)
          tests = ejecutar_tests(self.ws, timeout=self.settings.tests_timeout, completo=True)
          conteo = conteo_de_resultado(tests)
@@ -3974,7 +3983,7 @@ index ad78b6b..d161b20 100644
          if tests is not None and not tests.ok and conteo.reconocido:
              # Los tests de la especificación de tareas siguientes fallan a propósito: no son regresión.
              nuevos_fallos = [n for n in conteo.nombres_fallados
-@@ -629,7 +1919,9 @@ class Orquestador:
+@@ -629,7 +1928,9 @@ class Orquestador:
          if exigir_progreso and not problemas:
              # El implementador NO terminó (límite de pasos, error...). "No romper nada" no alcanza:
              # tiene que haber cambios reales y, si hay tests fallando, alguno más tiene que pasar.
@@ -3985,7 +3994,7 @@ index ad78b6b..d161b20 100644
                  problemas.append("SIN PROGRESO: el implementador no terminó y no cambió ningún archivo.")
              elif tests is not None and not tests.ok and conteo.reconocido and conteo.pasados <= antes.pasados:
                  problemas.append(
-@@ -642,30 +1934,225 @@ class Orquestador:
+@@ -642,30 +1943,225 @@ class Orquestador:
              diagnostico = anexar_pistas(diagnostico, 2)
          return Verificacion(not problemas, validaciones, tests, diagnostico, archivos, conteo)
  
@@ -4225,7 +4234,7 @@ index ad78b6b..d161b20 100644
  
          self.ui.fase(numero_fase, "Implementación" + (" · torneo" if self.settings.torneo and self.settings.candidatos > 1 else ""))
          numero_fase += 1
-@@ -676,35 +2163,99 @@ class Orquestador:
+@@ -676,35 +2172,99 @@ class Orquestador:
          if [t.id for t in orden] != [t.id for t in plan.tareas]:
              self.ui.tenue("  Orden por dependencias: " + " → ".join(t.id for t in orden))
              plan.tareas = orden
@@ -4331,7 +4340,7 @@ index ad78b6b..d161b20 100644
                  continue
  
              for ronda in range(self.settings.max_revisiones):
-@@ -722,6 +2273,31 @@ class Orquestador:
+@@ -722,6 +2282,31 @@ class Orquestador:
                      break
                  self.implementar(pedido, plan, i, exploracion, tcid, correcciones=revision,
                                   protegidos=self._protegidos)
@@ -4363,7 +4372,7 @@ index ad78b6b..d161b20 100644
  
          archivos = [r for r in self.ws.checkpoints.archivos_desde(grupo) if (self.ws.raiz / r).is_file()]
          hay_tests_build = any(_es_test(a) for a in archivos)
-@@ -734,21 +2310,42 @@ class Orquestador:
+@@ -734,21 +2319,42 @@ class Orquestador:
          self.ui.fase(numero_fase, "Verificación real")
          verif = self.verificar(grupo)
          self._mostrar_verificacion(verif)
@@ -4410,7 +4419,7 @@ index ad78b6b..d161b20 100644
          informe.ruta_informe = self._guardar_informe(pedido, informe)
          self._mostrar_cierre(informe)
          return informe
-@@ -769,19 +2366,51 @@ class Orquestador:
+@@ -769,19 +2375,51 @@ class Orquestador:
          else:
              self.ui.error(f"tests: fallaron ({verif.conteo.texto() if verif.conteo.reconocido else verif.tests.comando})")
              self.ui.tenue(recortar(fallos_relevantes(verif.tests.stdout + "\n" + verif.tests.stderr, 2, 1500), 1500))
@@ -4464,7 +4473,7 @@ index ad78b6b..d161b20 100644
                     if informe.spec_tests else "")
                  + (f"## Escaladas al modelo fuerte\n{informe.escaladas}\n\n" if informe.escaladas else "")
                  + ("## Lecciones aprendidas\n" + "\n".join(f"- {l}" for l in informe.lecciones) + "\n\n" if informe.lecciones else "")
-@@ -790,40 +2419,77 @@ class Orquestador:
+@@ -790,40 +2428,77 @@ class Orquestador:
                  + ("## Notas\n" + "\n".join(f"- {n}" for n in informe.notas) + "\n" if informe.notas else "")
              )
              ruta = self.ws.raiz / ".reaper" / "informes" / f"build_{datetime.now():%Y%m%d_%H%M%S}.md"
@@ -9219,10 +9228,10 @@ index 0000000..dc02ba1
 +        self.assertNotIn("verificación: UNVERIFIED", texto)
 diff --git a/partes/48zg_autotest_openrouter_real.py b/partes/48zg_autotest_openrouter_real.py
 new file mode 100644
-index 0000000..034bdad
+index 0000000..8368513
 --- /dev/null
 +++ b/partes/48zg_autotest_openrouter_real.py
-@@ -0,0 +1,331 @@
+@@ -0,0 +1,345 @@
 +"""
 +Autotests de regresión de la PRUEBA REAL con OpenRouter (modelos :free, octubre 2026). Lo que apareció con un
 +modelo de verdad y no con el MockLLM:
@@ -9338,6 +9347,20 @@ index 0000000..034bdad
 +        for real in ("Validar el formulario de login en app.py", "Verificar las entradas del usuario",
 +                     "Escribir pruebas unitarias en tests/test_core.py", "Ejecutar la migración de la base"):
 +            self.assertFalse(_RE_META_TAREA.search(real), real)
++
++    def test_falsos_positivos_y_vinetas_de_la_prueba_real(self):
++        # Build real 4: "verificar que todo funciona" se marcó como simulación por la palabra "todo", y
++        # "- ejecutar las pruebas…" (sin archivos) no se detectó como meta-tarea por el guion de viñeta.
++        plan = self._plan("- ejecutar las pruebas para verificar que todo funciona: usar python -m unittest",
++                          "Implementar todos los endpoints de la API en app.py",
++                          "2) Correr los tests", "Agregar validación; dejar un TODO para el caché")
++        problemas = problemas_del_plan(plan)
++        self.assertFalse(any("la tarea 2" in p for p in problemas))      # "todos" no es TODO
++        self.assertFalse(any("la tarea 1 planea una simulación" in p for p in problemas))
++        self.assertTrue(any(p.startswith("la tarea 1 solo corre") for p in problemas))
++        self.assertTrue(any(p.startswith("la tarea 3 solo corre") for p in problemas))
++        self.assertTrue(any("la tarea 4 planea una simulación («TODO»)" in p for p in problemas))
++        self.assertEqual(quitar_meta_tareas(plan), ["1", "3"])
 +
 +    def test_quitar_meta_tareas_limpia_dependencias(self):
 +        plan = self._plan("Implementar sumar en core.py", "Correr los tests y verificar", "Agregar restar")

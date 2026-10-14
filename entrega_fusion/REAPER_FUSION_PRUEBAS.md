@@ -420,6 +420,8 @@ Verificación independiente del código generado en la build 3 (fuera de REAPER)
 `212.0`; `32 F C` → `0.0`; `0 C K` → `273.15`; `-300 C F` → error por stderr y exit 1; 15 tests OK. **Es código
 real**, no simulado. Hueco: F↔K no implementado (punto 9).
 
-Tests: `partes/48zg_autotest_openrouter_real.py` (21). Contra el código anterior: 19 fallan; los 2 que pasan
+**Build 4 (con los arreglos):** el juez detectó el plan con problemas y lo hizo replanificar EN VIVO, y la especificación salió sin tests vacíos (0 pasaron, 2 con error). También mostró dos fallos de mi propio arreglo, ya corregidos: «todo» ("verificar que todo funciona") se tomaba como el marcador TODO, y una meta-tarea escrita como viñeta ("- ejecutar las pruebas…") no se detectaba.
+
+Tests: `partes/48zg_autotest_openrouter_real.py` (22). Contra el código anterior: 19 fallan; los 2 que pasan
 son guardas de "no excederse" (en proyecto existente no se toca; no se reintenta infinito).
-Regresión: **1031 tests OK** en Python 3.11/3.12/3.13. Smoke CLI: 0 fallas. Lint sin hallazgos nuevos.
+Regresión: **1032 tests OK** en Python 3.11/3.12/3.13. Smoke CLI: 0 fallas. Lint sin hallazgos nuevos.
