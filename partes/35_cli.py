@@ -389,7 +389,12 @@ class App:
             detalle.append("con escalada")
         self.ui.tenue("  " + " · ".join(detalle))
         claim = getattr(self.principal, "_ultimo_claim", None)
-        if claim is not None and claim.nivel and claim.nivel != "BEHAVIOR_VERIFIED":
+        if claim is not None and claim.nivel == "UNVERIFIED" and res.cambios:
+            # "UNVERIFIED" en gris pasaba de largo (y en inglés): cambió archivos y NADA lo respalda. Que se vea.
+            self.ui.aviso(f"  ⚠ SIN VERIFICAR: cambió {len(res.cambios)} archivo(s) pero ninguna prueba real lo "
+                          "respalda. No lo tomes como terminado: /tests para probarlo, o /construir para que el "
+                          "juez lo verifique.")
+        elif claim is not None and claim.nivel and claim.nivel != "BEHAVIOR_VERIFIED":
             self.ui.tenue(f"  verificación: {claim.nivel}" + (f" — {recortar(claim.motivo, 120)}" if claim.motivo else ""))
         if not res.ok:
             self.ui.aviso(f"  (terminó con estado: {res.motivo})")
@@ -1809,15 +1814,25 @@ class App:
         texto = diagnostico_texto(self.settings)
         self.ui.linea(texto)
         destino = arg.strip()
-        if destino:
-            try:
-                ruta = self.ws.ruta(destino, escribir=True)
-                escritura_atomica(ruta, texto + "\n")
-                self.ui.ok(f"diagnóstico guardado en {ruta} (sin claves; seguro para compartir)")
-            except (ErrorRuta, OSError) as e:
-                self.ui.error(str(e))
-        else:
+        if not destino:
             self.ui.tenue("  Guardalo para compartir: /diagnostico diagnostico.txt (se redactan los secretos)")
+            return
+        try:
+            ruta = self.ws.ruta(destino, escribir=True)
+            if not ruta.suffix:
+                ruta = ruta.with_suffix(".txt")
+            # Caso real (script_whatsapp): `/diagnostico app.py` reemplazó el código del usuario por este reporte y
+            # el proyecto dejó de compilar. El reporte NUNCA pisa un archivo existente ni se escribe en un archivo de
+            # código (sin checkpoint no hay /deshacer): se guarda aparte, en .reaper/, y se avisa.
+            if ruta.exists() or ruta.suffix.lower() not in (".txt", ".md", ".log"):
+                motivo = "ya existe" if ruta.exists() else "no es un archivo de texto"
+                self.ui.aviso(f"  {destino} {motivo}: no lo toco. /diagnostico no analiza archivos, describe tu "
+                              "REAPER (para revisar código: /validar <archivo> o /tests).")
+                ruta = self.ws.raiz / ".reaper" / f"diagnostico_{datetime.now():%Y%m%d_%H%M%S}.txt"
+            escritura_atomica(ruta, texto + "\n")
+            self.ui.ok(f"diagnóstico guardado en {ruta} (sin claves; seguro para compartir)")
+        except (ErrorRuta, OSError) as e:
+            self.ui.error(str(e))
 
     def cmd_instalar(self, arg: str) -> None:
         instalar_lanzador(self.ui)

@@ -96,6 +96,48 @@ def resumen_preservacion(ws, cid_build: Optional[int]) -> str:
     return "; ".join(partes)
 
 
+# Intención EXPLÍCITA de reemplazar un archivo (en el pedido o en la tarea). Solo palabras fuertes: "eliminar
+# espacios" o "borrar duplicados" describen lógica, no reescribir el archivo.
+_RE_REEMPLAZO = re.compile(r"\b(?:reemplaz\w*|reescrib\w*|rehac\w*|sustitu\w*|desde\s+cero|"
+                           r"replac\w*|rewrit\w*|from\s+scratch)\b", re.IGNORECASE)
+# Para que el PEDIDO autorice por sí solo una reescritura hace falta intención de archivo ENTERO: "reemplazá
+# print por logging" es una edición chica y no habilita a borrar el 60 % de app.py.
+_RE_REESCRITURA_PEDIDA = re.compile(r"\b(?:reescrib\w*|rehac\w*|desde\s+cero|de\s+cero|rewrit\w*|"
+                                    r"from\s+scratch)\b", re.IGNORECASE)
+
+
+def _primera_linea_util(diagnostico: str, limite: int = 200) -> str:
+    """El motivo de un fallo en una línea, para pantalla y notas. Saltea el eco del comando ("$ ...", "exit code")
+    para mostrar el error en sí. Antes la nota decía solo "quedó con fallos de verificación" y el motivo real
+    (p. ej. REESCRITURA DESTRUCTIVA) no llegaba ni al usuario ni al informe."""
+    for linea in (diagnostico or "").splitlines():
+        texto = linea.strip()
+        if not texto or texto.startswith(("$ ", "exit code", "STDOUT:", "STDERR:", "Hay fallos REALES")):
+            continue
+        return recortar(texto, limite)
+    return "sin detalle"
+
+
+def reemplazos_del_plan(ws, plan) -> dict:
+    """Archivos que YA EXISTEN y que una tarea del plan dice que va a reemplazar → líneas que tienen hoy.
+
+    Determinista, 0 tokens. Sirve para avisar ANTES de aprobar el plan (caso real: el plan decía "Reemplazar la
+    funcionalidad actual" y se llevó puesto un app.py de 204 líneas que el pedido no mencionaba)."""
+    salida: dict = {}
+    for tarea in getattr(plan, "tareas", []) or []:
+        if not _RE_REEMPLAZO.search(tarea.descripcion or ""):
+            continue
+        for rel in tarea.archivos:
+            if not isinstance(rel, str) or rel in salida:
+                continue
+            try:
+                if ws.existe(rel) and (ws.raiz / rel).is_file():
+                    salida[rel] = sum(1 for l in ws.leer(rel).splitlines() if l.strip())
+            except (OSError, ValueError, ErrorRuta):
+                continue
+    return salida
+
+
 _RE_MAIN_SCRIPT = re.compile(r"""__name__\s*==\s*['"]__main__['"]""")
 _RE_CLI_SCRIPT = re.compile(r"\b(argparse|ArgumentParser|click|typer|sys\.argv|fire\.Fire)\b")
 # Solo cuentan fallas de CARGA: el código ni siquiera se pudo importar. Un ValueError por recibir '--help'
@@ -650,6 +692,9 @@ class InformeBuild:
     intervenciones_juez: int = 0                           # cuántas veces el juez tuvo que intervenir para cerrar
     tokens_juez: int = 0                                   # lo que gastó el juez en ESTA build (estimado)
     tokens_build: int = 0                                  # lo que gastó la build entera (para comparar)
+    motivos_fallo: dict = field(default_factory=dict)      # tarea → por qué quedó fallida (el error REAL, no "falló")
+    restaurados: list = field(default_factory=list)        # archivos previos que PRESERVAR devolvió a su estado
+    reemplazos_autorizados: list = field(default_factory=list)  # archivos previos que el usuario autorizó reescribir
 
     @property
     def ok(self) -> bool:
@@ -1545,9 +1590,20 @@ class Orquestador:
                 plan = self.planificar(pedido_plan, exploracion,
                                        "Observaciones del supervisor:\n" + "\n".join(f"- {r}" for r in dictamen.reasons),
                                        plan)
+        self._plan_confirmado = False
         for _ in range(3):
             self._mostrar_plan(plan)
-            if not confirmar or self.ui.confirmar("¿Aprobás el plan y arrancamos?", defecto=True):
+            reemplazos = reemplazos_del_plan(self.ws, plan)
+            if reemplazos:
+                # Que se vea ANTES de aprobar: el plan va a reemplazar código que ya existe.
+                self.ui.aviso("  ⚠ Este plan dice que REEMPLAZA código que ya existe: "
+                              + ", ".join(f"{rel} ({n} líneas)" for rel, n in list(reemplazos.items())[:6]))
+                self.ui.tenue("    Si no querés perderlo, respondé que no y pedí hacerlo en archivos nuevos "
+                              "(o en otra carpeta: reaper --proyecto ~/otra_carpeta).")
+            if not confirmar:
+                return plan, exploracion
+            if self.ui.confirmar("¿Aprobás el plan y arrancamos?", defecto=True):
+                self._plan_confirmado = True
                 return plan, exploracion
             feedback = self.ui.preguntar("¿Qué cambiarías del plan? (Enter vacío = cancelar)")
             if not feedback:
@@ -1566,6 +1622,59 @@ class Orquestador:
             f"## Exploración\n{exploracion}\n\n## Respuesta del arquitecto\n{plan.texto}\n"
         ))
         return ruta
+
+    def _violaciones_preservar(self, tcid: int, cid_build: Optional[int], declarados: list) -> list:
+        """PRESERVAR TRABAJO PREVIO: en una actualización, lo que ya existía ANTES de esta build no se borra ni se
+        reescribe por accidente. Agregar está bien; borrar un archivo previo que la tarea no declaró, o perder buena
+        parte de su contenido, no. Los archivos creados en esta misma build no cuentan (se construyen unos sobre
+        otros) y las ediciones chicas (un import, una línea) pasan. Un archivo declarado cuyo reemplazo se AUTORIZÓ
+        (lo pidió el usuario o aprobó un plan que lo anunciaba) se puede reescribir. → [(rel, mensaje)]."""
+        if cid_build is None:
+            return []
+        autorizados = getattr(self, "_reemplazos_autorizados", set())
+        salida = []
+        for rel in self.ws.checkpoints.archivos_desde(tcid):
+            if self.ws.checkpoints.original(rel, cid_build) is None:
+                continue                               # nació en esta actualización
+            antes_tarea = self.ws.checkpoints.original(rel, tcid)
+            if antes_tarea is None:
+                continue
+            declarado = rel in declarados
+            if declarado and rel in autorizados:
+                continue
+            ruta = self.ws.raiz / rel
+            if not ruta.is_file():
+                if not declarado:
+                    salida.append((rel, f"BORRÓ TRABAJO PREVIO: eliminó {rel}, que ya existía antes de esta "
+                                        f"actualización y la tarea no lo pedía. Restauralo."))
+                continue
+            borradas, total = _lineas_borradas(antes_tarea, ruta.read_text(encoding="utf-8", errors="replace"))
+            if not total:
+                continue
+            fraccion = borradas / total
+            if (not declarado and borradas >= 3 and fraccion >= 0.2) or \
+                    (declarado and borradas >= 8 and fraccion >= 0.6):
+                tipo = "REESCRITURA DESTRUCTIVA" if declarado else "MODIFICÓ TRABAJO PREVIO"
+                salida.append((rel, f"{tipo}: borró {borradas} de {total} líneas ({fraccion:.0%}) que ya había en "
+                                    f"{rel} antes de esta actualización. Extendé el archivo sin perder lo que ya "
+                                    f"hacía."))
+        return salida
+
+    def _restaurar_trabajo_previo(self, tcid: int, cid_build: Optional[int], declarados: list) -> list:
+        """Si una tarea TERMINA rechazada por PRESERVAR, el daño no se queda en disco: cada archivo previo que
+        borró o vació vuelve a como estaba antes de la tarea. Antes el rechazo frenaba la tarea pero el app.py
+        reescrito quedaba igual (el trabajo previo solo se recuperaba con /deshacer). → archivos restaurados."""
+        restaurados = []
+        for rel, _mensaje in self._violaciones_preservar(tcid, cid_build, declarados):
+            contenido = self.ws.checkpoints.original(rel, tcid)
+            if contenido is None or rel in restaurados:
+                continue
+            try:
+                self.ws.escribir(rel, contenido)
+                restaurados.append(rel)
+            except (OSError, ValueError, ErrorRuta) as e:
+                self.ui.aviso(f"  No pude restaurar {rel}: {e}. Recuperalo con /deshacer.")
+        return restaurados
 
     def _verificar_tarea(self, tcid: int, antes: ConteoTests, nombres_antes: set,
                          exigir_progreso: bool = False, verificar_entrega: bool = False,
@@ -1619,31 +1728,7 @@ class Orquestador:
             # reescribe por accidente. Agregar está bien; borrar un archivo previo que la tarea no declaró, o perder
             # buena parte de su contenido, no. Los archivos creados en esta misma build no cuentan (se construyen
             # unos sobre otros). Ediciones chicas (un import, una línea) pasan.
-            if cid_build is not None:
-                for rel in self.ws.checkpoints.archivos_desde(tcid):
-                    if self.ws.checkpoints.original(rel, cid_build) is None:
-                        continue                               # nació en esta actualización
-                    antes_tarea = self.ws.checkpoints.original(rel, tcid)
-                    if antes_tarea is None:
-                        continue
-                    declarado = rel in declarados
-                    ruta = self.ws.raiz / rel
-                    if not ruta.is_file():
-                        if not declarado:
-                            problemas.append(f"BORRÓ TRABAJO PREVIO: eliminó {rel}, que ya existía antes de esta "
-                                             f"actualización y la tarea no lo pedía. Restauralo.")
-                        continue
-                    borradas, total = _lineas_borradas(antes_tarea, ruta.read_text(encoding="utf-8",
-                                                                                    errors="replace"))
-                    if not total:
-                        continue
-                    fraccion = borradas / total
-                    if (not declarado and borradas >= 3 and fraccion >= 0.2) or \
-                            (declarado and borradas >= 8 and fraccion >= 0.6):
-                        tipo = "REESCRITURA DESTRUCTIVA" if declarado else "MODIFICÓ TRABAJO PREVIO"
-                        problemas.append(
-                            f"{tipo}: borró {borradas} de {total} líneas ({fraccion:.0%}) que ya había en {rel} antes "
-                            f"de esta actualización. Extendé el archivo sin perder lo que ya hacía.")
+            problemas.extend(mensaje for _rel, mensaje in self._violaciones_preservar(tcid, cid_build, declarados))
         if tests is not None and not tests.ok and conteo.reconocido:
             # Los tests de la especificación de tareas siguientes fallan a propósito: no son regresión.
             nuevos_fallos = [n for n in conteo.nombres_fallados
@@ -1828,9 +1913,20 @@ class Orquestador:
                       "tests_primero": bool(self.settings.tests_primero),
                       "huella_aceptacion": huella_actual}
             self._huella_aceptacion = huella_actual
+            # ¿Quién autoriza reescribir un archivo que ya existía? Vos: pidiéndolo, o aprobando un plan que lo
+            # anunciaba (el aviso sale antes de aprobar). Sin eso, PRESERVAR lo protege. Antes no había forma: hasta
+            # un "reescribí app.py desde cero" terminaba en REESCRITURA DESTRUCTIVA y tarea fallida.
+            reemplazos = reemplazos_del_plan(self.ws, plan)
+            if reemplazos and (getattr(self, "_plan_confirmado", False) or _RE_REESCRITURA_PEDIDA.search(pedido)):
+                previo["reemplazos_autorizados"] = sorted(reemplazos)
+            elif reemplazos:
+                self.ui.aviso("  El plan quiere reemplazar " + ", ".join(sorted(reemplazos)[:6]) + " pero no lo "
+                              "pediste ni aprobaste el plan: se protegen (no se pierde lo que ya tenías).")
             registro_build.guardar(previo)
+        self._reemplazos_autorizados = set(previo.get("reemplazos_autorizados", []))
 
-        informe = InformeBuild("fallida", plan=plan, cid=grupo)
+        informe = InformeBuild("fallida", plan=plan, cid=grupo,
+                               reemplazos_autorizados=sorted(self._reemplazos_autorizados))
 
         # Motor central: el juez fija el CONTRATO (criterios del pedido) antes de construir. En reanudación se
         # reutiliza el que ya quedó en el diario: no se gasta otra llamada.
@@ -1948,6 +2044,7 @@ class Orquestador:
                                                  archivos_planeados=planeados_despues, cid_build=grupo)
             if not verif_tarea.ok:
                 self.ui.aviso(f"  La tarea {tarea.id} no pasó su verificación: la reparo con el error real.")
+                self.ui.tenue(f"    motivo: {_primera_linea_util(verif_tarea.diagnostico)}")
                 verif_tarea = self._reparar_con_escalada(
                     pedido, verif_tarea, grupo, base_fallaba, informe, f"tarea {tarea.id}",
                     max(1, self.settings.umbral_escalada + 1),
@@ -1958,8 +2055,17 @@ class Orquestador:
                     contexto=f"TAREA EN CURSO (#{tarea.id}): {tarea.descripcion}",
                 )
                 if not verif_tarea.ok:
-                    informe.notas.append(f"Tarea {tarea.id}: quedó con fallos de verificación.")
+                    motivo = _primera_linea_util(verif_tarea.diagnostico)
+                    informe.notas.append(f"Tarea {tarea.id}: quedó con fallos de verificación → {motivo}")
+                    informe.motivos_fallo[tarea.id] = recortar(verif_tarea.diagnostico, 1500)
                     informe.tareas_fallidas.append(tarea.id)
+                    restaurados = self._restaurar_trabajo_previo(tcid, grupo, tarea.archivos)
+                    if restaurados:
+                        informe.restaurados.extend(r for r in restaurados if r not in informe.restaurados)
+                        self.ui.aviso(f"  PRESERVAR: devolví a como estaban {', '.join(restaurados)} "
+                                      "(la tarea fallida los había borrado o reescrito).")
+                        informe.notas.append(f"Tarea {tarea.id}: se restauró el trabajo previo en "
+                                             f"{', '.join(restaurados)}.")
 
             if not verif_tarea.ok and self.settings.max_revisiones:
                 # Revisar código que no pasa su verificación no tiene sentido (y un revisor de 24B
@@ -2006,6 +2112,7 @@ class Orquestador:
                 previo["estados"][tarea.id] = "fallida"
                 if tarea.id not in informe.tareas_fallidas:
                     informe.tareas_fallidas.append(tarea.id)
+                informe.motivos_fallo.setdefault(tarea.id, recortar(verif_post.diagnostico, 1500))
                 informe.notas.append(f"Tarea {tarea.id}: falla tras revisión; verificación final pendiente.")
             previo.pop("tarea_activa", None)
             previo.pop("tcid", None)
@@ -2091,9 +2198,22 @@ class Orquestador:
         try:
             diff = self.ws.checkpoints.diff_desde(informe.cid) if informe.cid else ""
             tests = informe.tests.resumen(4000) if informe.tests else "sin suite de tests"
+            # Sin versión ni motivos, un informe no deja reconstruir qué pasó (caso script_whatsapp: no se podía
+            # saber qué REAPER corrió ni por qué falló la tarea 1). Ahora quedan escritos.
+            entorno = "Termux/Android" if es_termux() else platform.system()
+            juez = ""
+            if getattr(self.settings, "juez", True):
+                juez = "## Juez de entrega\n"
+                if informe.criterios_entrega:
+                    juez += "Contrato:\n" + "\n".join(f"- {c}" for c in informe.criterios_entrega) + "\n"
+                juez += f"Veredicto: {informe.juicio.texto() if informe.juicio is not None else 'sin veredicto'}\n"
+                juez += (f"Intervenciones: {informe.intervenciones_juez} · tokens del juez: "
+                         f"~{informe.tokens_juez} de ~{informe.tokens_build}\n\n")
+            motivos = "".join(f"### Tarea {tid}\n```\n{texto}\n```\n" for tid, texto in informe.motivos_fallo.items())
             contenido = (
                 f"# Build REAPER — {informe.estado.upper()}\n\n"
-                f"Fecha: {datetime.now():%Y-%m-%d %H:%M} · duración: {formatear_duracion(informe.segundos)}\n\n"
+                f"Fecha: {datetime.now():%Y-%m-%d %H:%M} · duración: {formatear_duracion(informe.segundos)}\n"
+                f"Versión: REAPER {__version__} · Python {sys.version.split()[0]} · {entorno}\n\n"
                 f"## Pedido\n{pedido}\n\n"
                 f"## Plan\n```\n{informe.plan.como_texto() if informe.plan else '-'}\n```\n\n"
                 f"## Archivos\n```\n{_diffstat(diff) or '-'}\n```\n\n"
@@ -2105,6 +2225,12 @@ class Orquestador:
                    + ("\n" if informe.tareas_fallidas and informe.tareas_bloqueadas else "")
                    + "\n".join(f"- Bloqueada: {t}" for t in informe.tareas_bloqueadas)
                    + "\n\n" if (informe.tareas_fallidas or informe.tareas_bloqueadas) else "")
+                + (f"## Por qué fallaron las tareas\n{motivos}\n" if motivos else "")
+                + ("## Trabajo previo restaurado (PRESERVAR)\n" + "\n".join(f"- {r}" for r in informe.restaurados)
+                   + "\n\n" if informe.restaurados else "")
+                + ("## Reemplazos autorizados\n" + "\n".join(f"- {r}" for r in informe.reemplazos_autorizados)
+                   + "\n\n" if informe.reemplazos_autorizados else "")
+                + juez
                 + ("## Especificación (tests escritos antes de implementar)\n" + "\n".join(f"- {t}" for t in informe.spec_tests) + "\n\n"
                    if informe.spec_tests else "")
                 + (f"## Escaladas al modelo fuerte\n{informe.escaladas}\n\n" if informe.escaladas else "")

@@ -238,6 +238,64 @@ class TestDoctor(BaseTest):
         diagnostico_sistema(ui, self.ajustes(proveedor="ollama"))
         self.assertIn("DOCTOR REAPER", ui.texto_registrado())
 
+    def _sin_variable(self, variable: str):
+        previa = os.environ.pop(variable, None)
+        self.addCleanup(lambda: os.environ.__setitem__(variable, previa) if previa is not None
+                        else os.environ.pop(variable, None))
+
+    def test_clave_faltante_dice_a_que_servidor_va_y_como_guardarla(self):
+        # Caso real de Termux: proveedor 'openai' apuntado a nano-gpt.com, sin clave. Antes decía solo
+        # "falta OPENAI_API_KEY" y la tabla cortaba el arreglo a la mitad.
+        self._sin_variable("OPENAI_API_KEY")
+        ajustes = self.ajustes(proveedor="openai", api_url="https://nano-gpt.com/api/v1/chat/completions")
+        chequeo = _chequeo_clave(ajustes)
+        self.assertFalse(chequeo.ok)
+        self.assertTrue(chequeo.critico)
+        self.assertIn("nano-gpt.com", chequeo.detalle)
+        self.assertIn(".clave_openai", chequeo.arreglo)
+        self.assertIn("export OPENAI_API_KEY=", chequeo.ayuda)
+        ui = self.ui()
+        diagnostico_sistema(ui, ajustes)
+        salida = ui.texto_registrado()
+        self.assertIn("chmod 600", salida)               # el arreglo completo, no recortado por la tabla
+        self.assertIn(".clave_openai", salida)
+        # Con la clave guardada en el archivo del proveedor, queda OK y la clave nunca se muestra.
+        (BASE_DIR / ".clave_openai").write_text("sk-secreto-de-prueba-123", encoding="utf-8")
+        chequeo = _chequeo_clave(ajustes)
+        self.assertTrue(chequeo.ok)
+        self.assertIn("configurada (nano-gpt.com)", chequeo.detalle)
+        self.assertNotIn("secreto", chequeo.detalle + chequeo.arreglo + chequeo.ayuda)
+
+    def test_clave_heredada_sin_duenio_sugiere_declararla(self):
+        self._sin_variable("OPENAI_API_KEY")
+        self._sin_variable("REAPER_CLAVE_PROVEEDOR")
+        (BASE_DIR / ".clave").write_text("sk-vieja", encoding="utf-8")
+        chequeo = _chequeo_clave(self.ajustes(proveedor="openai"))
+        self.assertFalse(chequeo.ok)
+        self.assertIn("echo openai >", chequeo.ayuda)
+        self.assertIn(".clave_proveedor", chequeo.ayuda)
+        self.assertNotIn("sk-vieja", chequeo.ayuda)
+
+    def test_comando_sin_version_no_muestra_el_error_como_version(self):
+        # termux-notification no tiene --version: contesta "getopt: unrecognized option" y antes salía ✓ con ese texto.
+        binarios = self.dir / "bin"
+        binarios.mkdir()
+        for nombre, guion in (("sinversion", "echo \"getopt: unrecognized option '--version'\" >&2; exit 1"),
+                              ("usoexit0", "echo 'usage: usoexit0 [opciones]'; exit 0"),
+                              ("converso", "echo 'converso 1.2.3'; exit 0")):
+            ruta = binarios / nombre
+            # En Termux no hay /bin/sh: el intérprete sale del PATH ($PREFIX/bin/sh).
+            ruta.write_text(f"#!{shutil.which('sh') or '/bin/sh'}\n{guion}\n", encoding="utf-8")
+            ruta.chmod(0o755)
+        previo = os.environ.get("PATH", "")
+        os.environ["PATH"] = f"{binarios}{os.pathsep}{previo}"
+        self.addCleanup(lambda: os.environ.__setitem__("PATH", previo))
+        for nombre in ("sinversion", "usoexit0"):
+            chequeo = _chequeo_comando(nombre, nombre, "prueba")
+            self.assertTrue(chequeo.ok)
+            self.assertEqual(chequeo.detalle, str(binarios / nombre))
+        self.assertEqual(_chequeo_comando("converso", "converso", "prueba").detalle, "converso 1.2.3")
+
     def test_instalar_lanzador(self):
         casa = self.dir / "casa"
         casa.mkdir()

@@ -232,6 +232,19 @@ PISTAS: list[Pista] = [
     Pista(r"error: externally-managed-environment",
           "pip se niega a instalar en el Python del sistema: usá un venv (`python3 -m venv .venv`) o "
           "`pip install --user`.", "pip"),
+    # Antes que la pista genérica de compilación: en un teléfono, "instalá clang y reintentá" lleva al mismo
+    # proceso matado por falta de memoria (caso real: grpcio en Termux terminó con signal 9).
+    Pista(r"SIGKILL|\bsignal 9\b|se[ñn]al 9|exit code:? -9\b|exit status -9|^\s*Killed\s*$|"
+          r"Killed signal terminated|unable to execute command: Killed",
+          "El sistema mató el proceso (señal 9). En Android casi siempre es falta de memoria (compilar un paquete "
+          "nativo, varios procesos a la vez). No lo reintentes igual: buscá una versión precompilada "
+          "(`pkg search <nombre>`), una alternativa sin compilación o usá la API HTTP del servicio con "
+          "urllib en vez de su SDK.", "pip"),
+    Pista(r"(?:Building|Failed building|building) wheel for grpcio|grpcio.*(?:error|failed)|"
+          r"No module named 'grpc'",
+          "grpcio no tiene ruedas precompiladas para Termux: pip lo compila en C++ (lento y con mucha memoria; "
+          "suele morir con señal 9). Si el proyecto no lo necesita sí o sí, evitalo: casi todos los servicios "
+          "tienen API REST que se usa con urllib/httpx sin gRPC.", "pip"),
     Pista(r"Failed building wheel for (\w+)|error: command '(?:gcc|clang)' failed",
           "El paquete necesita compilarse. En Termux: `pkg install clang make pkg-config` (y libs como "
           "libxml2, libjpeg-turbo según el paquete) o buscá una alternativa pura en Python.", "pip"),

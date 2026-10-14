@@ -16,11 +16,52 @@ class Chequeo:
     detalle: str
     arreglo: str = ""
     critico: bool = False
+    ayuda: str = ""          # explicación completa (la tabla recorta "cómo arreglarlo"); se imprime debajo si falla
 
 
 def es_termux() -> bool:
     return "com.termux" in os.getenv("PREFIX", "") or bool(os.getenv("TERMUX_VERSION")) \
         or os.path.isdir("/data/data/com.termux")
+
+
+_RE_SIN_VERSION = re.compile(r"unrecognized option|invalid option|illegal option|unknown option|^usage:",
+                             re.IGNORECASE | re.MULTILINE)
+
+
+def _ruta_corta(ruta: Path) -> str:
+    """~/reaper en vez de /data/data/com.termux/files/home/reaper: más fácil de copiar en el teléfono."""
+    try:
+        return "~/" + ruta.relative_to(Path.home()).as_posix()
+    except ValueError:
+        return str(ruta)
+
+
+def _chequeo_clave(settings: Settings) -> Chequeo:
+    """Clave del proveedor activo. Dice A QUÉ SERVIDOR va (un api_url propio, p. ej. nano-gpt.com, usa la variable
+    del proveedor 'openai' y eso confunde) y cómo dejarla guardada sin que se pierda al cerrar Termux.
+    Nunca muestra la clave."""
+    variable = settings.variable_clave()
+    if not variable:
+        return Chequeo("clave API", True, "no hace falta")
+    try:
+        host = urllib.parse.urlparse(settings.url_api()).hostname or ""
+    except ValueError:
+        host = ""
+    propio = PROVEEDORES.get(settings.proveedor, {}).get("url", "")
+    destino = f" ({host})" if host and host not in propio else ""
+    if obtener_clave_api(settings):
+        return Chequeo("clave API", True, f"{variable} configurada{destino}")
+    archivo = _ruta_corta(BASE_DIR / f".clave_{settings.proveedor}")
+    arreglo = f"printf %s 'TU_KEY' > {archivo}"
+    para = f"la clave de {host}" if host else f"la clave de {settings.proveedor}"
+    ayuda = [f"Guardá {para} (queda guardada aunque cierres Termux):",
+             f"  printf %s 'TU_KEY' > {archivo} && chmod 600 {archivo}",
+             f"o solo para esta sesión:  export {variable}='TU_KEY'"]
+    if (BASE_DIR / ".clave").is_file() and not _duenio_clave_legacy():
+        # Una clave vieja en ~/reaper/.clave sin dueño declarado no se usa (aislamiento por proveedor).
+        ayuda.append(f"Si tu clave ya está en {_ruta_corta(BASE_DIR / '.clave')} y es {para}: "
+                     f"echo {settings.proveedor} > {_ruta_corta(BASE_DIR / '.clave_proveedor')}")
+    return Chequeo("clave API", False, f"falta {variable}{destino}", arreglo, True, "\n".join(ayuda))
 
 
 def _chequeo_comando(nombre: str, paquete: str, para: str, critico: bool = False) -> Chequeo:
@@ -29,7 +70,11 @@ def _chequeo_comando(nombre: str, paquete: str, para: str, critico: bool = False
         version = ""
         try:
             salida = subprocess.run([nombre, "--version"], capture_output=True, text=True, timeout=8)
-            version = (salida.stdout or salida.stderr).strip().splitlines()[0][:60] if (salida.stdout or salida.stderr) else ""
+            texto = (salida.stdout or salida.stderr or "").strip()
+            # Herramientas sin --version (termux-notification) contestan con un error de getopt: eso no es la
+            # versión. Solo se muestra lo que salió con exit 0 y no parece un mensaje de uso; si no, la ruta.
+            if salida.returncode == 0 and texto and not _RE_SIN_VERSION.search(texto):
+                version = texto.splitlines()[0][:60]
         except (OSError, subprocess.TimeoutExpired, IndexError):
             version = ""
         return Chequeo(nombre, True, version or ruta)
@@ -87,11 +132,7 @@ def chequeos_sistema(settings: Settings) -> list[Chequeo]:
     chequeos.append(Chequeo("python", version >= (3, 9), f"{sys.version.split()[0]} ({sys.executable})",
                             "pkg upgrade python", version < (3, 9)))
     chequeos.append(Chequeo("sistema", True, "Termux en Android" if es_termux() else f"{platform.system()} {platform.machine()}"))
-    variable = settings.variable_clave()
-    clave = obtener_clave_api(settings)
-    chequeos.append(Chequeo("clave API", bool(clave), (f"{variable} configurada" if clave and variable else
-                                                        ("no hace falta" if not variable else f"falta {variable}")),
-                            f'export {variable}="tu_key"  (agregalo a ~/.bashrc)' if not clave else "", not clave))
+    chequeos.append(_chequeo_clave(settings))
     chequeos.append(_chequeo_red(settings.url_api()))
     chequeos.append(_chequeo_modulo("httpx", "streaming más robusto; sin él se usa urllib"))
     chequeos.append(_chequeo_modulo("pyflakes", "nombres indefinidos más precisos (REAPER tiene un detector propio)"))
@@ -144,6 +185,11 @@ def diagnostico_sistema(ui: UI, settings: Settings, llm=None, probar_modelo: boo
     criticos = [c for c in chequeos if c.critico and not c.ok]
     if criticos:
         ui.error(f"{len(criticos)} problema(s) crítico(s): REAPER no va a poder trabajar hasta arreglarlos.")
+        for c in criticos:
+            # La tabla recorta la columna del arreglo: acá va entero, listo para copiar.
+            ui.info(f"  {c.nombre}:")
+            for linea in (c.ayuda or c.arreglo).splitlines():
+                ui.info(f"    {linea}")
         return False
     opcionales = [c for c in chequeos if not c.ok]
     if opcionales:

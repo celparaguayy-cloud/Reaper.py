@@ -42,10 +42,31 @@ class Resultado:
     archivo: str = ""
     duracion: float = 0.0
 
+    def senal(self) -> str:
+        """Si el proceso no terminó solo sino que lo MATÓ una señal (código negativo, o 128+N vía bash), cuál fue.
+        En Android un SIGKILL suele venir del sistema por falta de memoria (p. ej. compilando grpcio con pip):
+        un "exit -9" pelado no le dice nada ni al modelo ni al usuario."""
+        if self.timeout or self.omitido:
+            return ""
+        numero = -self.codigo if self.codigo < 0 else (self.codigo - 128 if self.codigo in (137, 143) else 0)
+        if not numero:
+            return ""
+        try:
+            nombre = signal.Signals(numero).name
+        except ValueError:
+            nombre = f"señal {numero}"
+        if numero == getattr(signal, "SIGKILL", 9):
+            return (f"{nombre} (señal {numero}): el sistema MATÓ el proceso. En Android casi siempre es falta de "
+                    "memoria; no es un error del código. No lo reintentes igual.")
+        return f"{nombre} (señal {numero}): el proceso fue terminado desde afuera."
+
     def resumen(self, limite: int = 4000) -> str:
         partes = [f"$ {self.comando}", f"exit code: {self.codigo}"]
         if self.timeout:
             partes.append("estado: TIMEOUT")
+        senal = self.senal()
+        if senal:
+            partes.append(f"estado: {senal}")
         if self.stdout.strip():
             partes.append("STDOUT:\n" + recortar(self.stdout.strip(), limite))
         if self.stderr.strip():
@@ -57,6 +78,9 @@ class Resultado:
             return f"↷ {self.comando}: {(self.stdout or self.stderr).strip()[:120]}"
         if self.ok:
             return f"✓ {self.comando}"
+        senal = self.senal()
+        if senal:
+            return f"✗ {self.comando}: {senal.split(':')[0]}: {senal.split(':', 1)[1].strip()[:120]}"
         detalle = (self.stderr or self.stdout).strip().splitlines()
         return f"✗ {self.comando}: {detalle[-1][:160] if detalle else 'exit ' + str(self.codigo)}"
 
