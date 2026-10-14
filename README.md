@@ -17,7 +17,7 @@
 
 ![versión](https://img.shields.io/badge/versión-8.10-8b5cf6?style=flat-square)
 ![python](https://img.shields.io/badge/python-3.11_→_3.14-3776ab?style=flat-square&logo=python&logoColor=white)
-![autotests](https://img.shields.io/badge/autotests-1044_OK-2ea44f?style=flat-square)
+![autotests](https://img.shields.io/badge/autotests-1060_OK-2ea44f?style=flat-square)
 ![juez](https://img.shields.io/badge/juez-motor_central-a855f7?style=flat-square)
 ![plataforma](https://img.shields.io/badge/Termux_·_Android-sin_root-10b981?style=flat-square&logo=android&logoColor=white)
 ![distribución](https://img.shields.io/badge/distribución-1_archivo-f59e0b?style=flat-square)
@@ -44,7 +44,7 @@ Su obsesión es la **honestidad**: no declara una build "verificada" sin tests r
 lo entregado **sea lo que pediste, funcione de verdad y no rompa lo que ya tenías**.
 
 > [!NOTE]
-> Proyecto **experimental**. El andamiaje está cubierto por **1044 autotests**; la calidad del código que
+> Proyecto **experimental**. El andamiaje está cubierto por **1060 autotests**; la calidad del código que
 > produzca depende del modelo que le conectes. Lee **[Estado honesto](#estado)** antes de esperar magia.
 
 ---
@@ -336,7 +336,7 @@ verificación**, no la opinión de un modelo: un "terminé" sin pruebas no alcan
 > [!IMPORTANT]
 > Lo que **sí** está verificado y lo que **no**, sin maquillaje.
 
-- ✅ **1044 autotests OK** en Python **3.11, 3.12 y 3.13** (y en un Termux real con 3.14 en una versión
+- ✅ **1060 autotests OK** en Python **3.10, 3.11, 3.12 y 3.13** (y en un Termux real con 3.14 en una versión
   anterior). Prueban la **orquestación** de forma determinista: ediciones y procesos reales, parseo de tests,
   gates de honestidad, Ctrl+C, plazos de pared y el juez (contrato, cierre, desvío, preservación, arranque,
   examen de realidad, armado del equipo). La red de modelos se simula con un **MockLLM**.
@@ -344,7 +344,9 @@ verificación**, no la opinión de un modelo: un "terminé" sin pruebas no alcan
   **✓ VERIFICADA** (15 tests reales; el juez dijo CUMPLE gastando el 0,5 % de la build) y el código funciona
   (verificado aparte). Un proyecto más grande (gestor de gastos: SQLite, CSV, CLI con 6 subcomandos, 622 líneas)
   también terminó **✓ VERIFICADA**. Las pruebas reales encontraron **10 bugs de REAPER** (y 2 fallos en mis propios
-  arreglos), todos corregidos con su test. Ver `entrega_fusion/REAPER_FUSION_PRUEBAS.md` §18.
+  arreglos), todos corregidos con su test. Una revisión posterior **sin API** encontró 5 huecos más (p. ej.
+  en proyectos con tests de Python y JS, los de JS nunca corrían) y 3 fallos más de mis arreglos (el examen de
+  realidad marcaba comentarios legítimos como simulación). Ver `entrega_fusion/REAPER_FUSION_PRUEBAS.md` §18.
 - ⚠️ **"Verificada" no es "perfecta"**: significa que pasa los tests que existen y el contrato del juez. En el
   gestor de gastos quedó un error de lógica que ningún test cubría (el presupuesto mensual sumaba otros meses).
   Cuanto más explícito sea tu pedido, más lo cubren el contrato y los tests.

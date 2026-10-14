@@ -175,3 +175,18 @@ argumentos JSON de `update_todo` y marca [x] archivos que no existen), ambos arr
 grande (gestor de gastos, 622 líneas) terminó VERIFICADO, pero la prueba independiente encontró un error de lógica
 que ningún test cubría (presupuesto mensual que suma otros meses): **a auditar** cómo hacer que el contrato del juez
 y la especificación capturen restricciones semánticas implícitas ("mensual") sin inventar requisitos.
+
+## 12. Revisión sin API (NO VERIFICADO con un modelo real)
+
+Detalle en `REAPER_FUSION_PRUEBAS.md` §18.d. **Fallos de mis arreglos anteriores:** (1) el examen de realidad marcaba
+como simulación 8 de 8 comentarios legítimos y bajaba builds sanas a PARCIAL; (2) `_IO_REAL` pisaba la de Test
+Intelligence; (3) el sondeo de modelos gratis podía colgarse minutos. **Huecos de REAPER:** (4) en proyectos con
+tests de Python y JS los de JS nunca corrían; (5) solo se reconocían `tests/*.test.*js`; (6) `<script>` sin
+`type="module"` cargando un módulo y `onclick` a funciones de módulo (página rota con build verde); (7) el examen
+de realidad no miraba JS; (8) `_LOCK_PROCESOS` unía dos locks. Test guardián nuevo: ningún global del bundle
+puede definirse dos veces (salvo `_PARSERS`, que se extiende a propósito).
+
+**A auditar:** (a) la lista de familias que el pedido puede habilitar (`ejemplo`, `simulacion`): un pedido que
+dice "con datos de ejemplo" apaga la detección de "datos de ejemplo" en todo el proyecto; (b) la suite mixta usa
+`;` y `$?` de shell (POSIX), revisar en Termux; (c) `scripts_html_incoherentes` sigue solo un nivel de imports.
+Regresión 1060 tests OK en Python 3.10/3.11/3.12/3.13.

@@ -489,3 +489,34 @@ Tests: +5 (todos fallan con el código anterior). Regresión: **1042 tests OK** 
   rol sigue en un modelo de OpenRouter que puede ser pago.
 
 Tests: +2 (fallan con el código anterior). Regresión: **1044 tests OK** en Python 3.11/3.12/3.13.
+
+### 18.d Revisión sin API: huecos que habrían dado verdes falsos en el juego, la web y el script
+
+La clave no estaba disponible en esta sesión: **nada de esta sección se corrió contra un modelo real** (NO
+VERIFICADO con la API). Lo que sigue se encontró revisando el código con los tres pedidos de
+`pruebas_fusion/prueba_real.py` en mente y se probó con casos reales de `node`/`python`, no con un navegador.
+
+**Fallos en mis propios arreglos anteriores (3):**
+
+| Fallo | Evidencia | Arreglo |
+|---|---|---|
+| El examen de realidad marcaba como "simulación confesada" **8 de 8 comentarios legítimos** ("No hardcodear la ruta", "Simulación de la gravedad en cada frame", "In production you should set DEBUG to False", "Por ahora usamos SQLite", "datos de ejemplo" pedidos por el usuario…) y eso bajaba a PARCIAL builds sanas | prueba directa con los 8 comentarios | Solo frases inequívocas; ignora las negadas ("Evitamos valores hardcodeados") y lo que el **pedido** pide a propósito ("3 recetas de ejemplo", "--simular"), mirando el pedido y nunca el plan. Medido con código real: 7 coincidencias en 637 archivos de la stdlib de Python (se quitó "dummy value", un centinela legítimo; "not implemented yet" de urllib es una confesión de verdad) y **0 en 1223 archivos JS** de npm |
+| `_IO_REAL` del examen de realidad **pisaba** la lista homónima de Test Intelligence (todo es un solo archivo) | análisis del AST del bundle | Renombrada; test guardián que prohíbe globales duplicados |
+| `free_que_responden` (sondeo de `/perfil gratis` y de `prueba_real.py`) podía quedarse **minutos** con un `:free` saturado: sin alternativa, reintentaba con Retry-After | lectura de `_con_reintentos` | `chat(..., reintentos=0)` en los sondeos, sin tocar la configuración del usuario |
+
+En esta misma ronda, la suite atrapó **antes del commit** otro choque de nombres mío (`_RE_NEGACION` nueva pisaba
+la de `afirma_verificacion`: 2 tests rojos). De ahí salió el test guardián.
+
+**Huecos de REAPER (5):**
+
+| Hueco | Qué pasaba | Arreglo |
+|---|---|---|
+| Proyecto con tests de Python **y** de JS | Solo corría la suite de Python: los tests de JS **nunca se ejecutaban** y la build podía salir verde con ellos fallando | Corren las dos, se suman los conteos y sale con el primer código de error |
+| Nombres de tests JS | Solo `tests/*.test.*js` del primer nivel: `juego.spec.mjs`, `test_juego.mjs`, subcarpetas o `*.test.mjs` en la raíz no corrían | Se reconocen los nombres que acepta `node --test` (sin `node_modules`) |
+| Errores que solo aparecen en el navegador | `<script src="juego.js">` sin `type="module"` con `export` adentro (SyntaxError) y `onclick="reiniciar()"` con `reiniciar` dentro de un módulo (ReferenceError): node --test pasa, la página no anda | Error de validación `scripts-html` con la línea y el arreglo. Las 12 plantillas web propias no se marcan |
+| Examen de realidad ciego a JS | Funciones del plan vacías, tests sin asserts o con `assert.ok(true)`, y comentarios "por ahora devolvemos datos fijos" solo se miraban en Python | Mismo examen para JS/TS/HTML. Ningún test JS de las plantillas se marca |
+| `_LOCK_PROCESOS` | Dos locks distintos (procesos de validación y procesos en segundo plano) eran el mismo objeto | Renombrado |
+
+Tests: +16. Medido contra el código anterior: 12 fallan por el bug que cubren, 2 son guardas de precisión sobre
+las plantillas (fallan porque la función no existía) y 2 son guardas de no-regresión que ya pasaban. Regresión: **1060 tests OK** en Python
+3.10/3.11/3.12/3.13. Lint (pyflakes/ruff, errores reales): sin hallazgos.
