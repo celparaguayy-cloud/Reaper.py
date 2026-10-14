@@ -534,7 +534,7 @@ index c81c7a1..eea21de 100644
          prov = settings.proveedor if settings.proveedor in PROVEEDORES else "openrouter"
      # el proveedor activo respeta el override de api_url; los demás usan su endpoint fijo
 diff --git a/partes/05_llm.py b/partes/05_llm.py
-index 499b0ce..7c6f8af 100644
+index 499b0ce..1164aa5 100644
 --- a/partes/05_llm.py
 +++ b/partes/05_llm.py
 @@ -12,19 +12,23 @@ except ImportError:  # pragma: no cover - depende del entorno
@@ -727,7 +727,18 @@ index 499b0ce..7c6f8af 100644
  
      # ------------------------------------------------------------ API
      def chat(
-@@ -259,6 +340,7 @@ class LLMClient:
+@@ -250,7 +331,10 @@ class LLMClient:
+         on_progress: Optional[Callable[[int], None]] = None,
+         rol: str = "",
+         sin_respaldo: bool = False,
++        reintentos: Optional[int] = None,
+     ) -> Respuesta:
++        """`reintentos` pisa settings.reintentos solo para esta llamada: los SONDEOS (¿este modelo responde?) usan 0
++        para no quedarse minutos esperando a un :free saturado que igual se va a descartar."""
+         self._verificar_presupuesto()
+         principal = resolver_modelo(modelo or self.settings.modelo)
+         candidatos = [principal]
+@@ -259,6 +343,7 @@ class LLMClient:
                  respaldo = resolver_modelo(respaldo)
                  if respaldo and respaldo not in candidatos:
                      candidatos.append(respaldo)
@@ -735,17 +746,17 @@ index 499b0ce..7c6f8af 100644
  
          # Privacidad estricta (Ω §4.3 / R-001): ÚNICO punto de egreso. Deny-by-default cuando el destino es
          # externo. Se bloquea ANTES de serializar/enviar (0 llamadas de red). chat_simple, subagentes,
-@@ -286,7 +368,8 @@ class LLMClient:
+@@ -286,7 +371,8 @@ class LLMClient:
          for n, candidato in enumerate(orden):
              try:
                  respuesta = self._con_reintentos(
 -                    candidato, mensajes, temperatura, max_tokens, stop, on_progress
 +                    candidato, mensajes, temperatura, max_tokens, stop, on_progress,
-+                    hay_alternativa=n + 1 < len(orden),
++                    hay_alternativa=n + 1 < len(orden), reintentos=reintentos,
                  )
                  self.disyuntor.exito(candidato)
                  if candidato != principal:
-@@ -333,10 +416,16 @@ class LLMClient:
+@@ -333,10 +419,16 @@ class LLMClient:
      def _payload(self, modelo, mensajes, temperatura, max_tokens, stop, proveedor=None) -> dict:
          info = info_modelo(modelo)
          proveedor = proveedor or self._destino(modelo).proveedor
@@ -764,7 +775,7 @@ index 499b0ce..7c6f8af 100644
              "messages": mensajes,
              "temperature": self.settings.temperatura if temperatura is None else temperatura,
              "max_tokens": presupuesto.respuesta_posible(mensajes),
-@@ -344,36 +433,86 @@ class LLMClient:
+@@ -344,36 +436,86 @@ class LLMClient:
          }
          if proveedor == "openrouter":
              payload["usage"] = {"include": True}
@@ -778,10 +789,11 @@ index 499b0ce..7c6f8af 100644
  
 -    def _con_reintentos(self, modelo, mensajes, temperatura, max_tokens, stop, on_progress):
 +    def _con_reintentos(self, modelo, mensajes, temperatura, max_tokens, stop, on_progress,
-+                        hay_alternativa: bool = False):
++                        hay_alternativa: bool = False, reintentos: Optional[int] = None):
          payload = self._payload(modelo, mensajes, temperatura, max_tokens, stop, self._destino(modelo).proveedor)
-         intentos = max(0, int(self.settings.reintentos))
+-        intentos = max(0, int(self.settings.reintentos))
 -        for intento in range(intentos + 1):
++        intentos = max(0, int(self.settings.reintentos if reintentos is None else reintentos))
 +        vacias = 0
 +        ampliado = False
 +        cancelado = (lambda: CANCELAR.is_set()) if "CANCELAR" in globals() else None
@@ -855,7 +867,7 @@ index 499b0ce..7c6f8af 100644
      def _headers(self, destino: Optional["DestinoModelo"] = None) -> dict:
          proveedor = destino.proveedor if destino is not None else self.settings.proveedor
          clave = self._clave_de(destino) if destino is not None else self.api_key
-@@ -388,6 +527,7 @@ class LLMClient:
+@@ -388,6 +530,7 @@ class LLMClient:
      def _una_vez(self, modelo: str, payload: dict, on_progress) -> Respuesta:
          partes: list[str] = []
          total = 0
@@ -863,7 +875,7 @@ index 499b0ce..7c6f8af 100644
          finish = None
          inicio = time.monotonic()
          primer = 0.0
-@@ -398,17 +538,25 @@ class LLMClient:
+@@ -398,17 +541,25 @@ class LLMClient:
              raise LLMError(
                  f"falta la clave del proveedor '{destino.proveedor}' (variable {destino.clave_env}) para el modelo "
                  f"{modelo}. Exportala como variable de entorno.", probar_otro_modelo=True)
@@ -889,7 +901,7 @@ index 499b0ce..7c6f8af 100644
                  if _RE_CONTEXTO.search(mensaje or ""):
                      raise LLMError(f"Contexto excedido: {mensaje}", contexto_excedido=True)
                  if codigo is None or codigo in TRANSITORIOS:
-@@ -424,6 +572,9 @@ class LLMClient:
+@@ -424,6 +575,9 @@ class LLMClient:
              for choice in evento.get("choices") or []:
                  delta = choice.get("delta") or choice.get("message") or {}
                  contenido = delta.get("content")
@@ -899,7 +911,7 @@ index 499b0ce..7c6f8af 100644
                  if contenido:
                      if not primer:
                          primer = time.monotonic() - inicio
-@@ -442,8 +593,18 @@ class LLMClient:
+@@ -442,8 +596,18 @@ class LLMClient:
              por.segundos += duracion
  
          texto = "".join(partes)
@@ -1298,7 +1310,7 @@ index 473dc36..bf7642d 100644
                      aplicados.append(c.rel)
              except (ErrorRuta, OSError):
 diff --git a/partes/10_validators.py b/partes/10_validators.py
-index b59a923..60597e7 100644
+index b59a923..ccd2e33 100644
 --- a/partes/10_validators.py
 +++ b/partes/10_validators.py
 @@ -19,7 +19,12 @@ try:
@@ -1512,7 +1524,7 @@ index b59a923..60597e7 100644
  
  
  # ==================================================================
-@@ -819,6 +915,10 @@ _SCRIPT_HTML = re.compile(r"<script(?![^>]*\bsrc\s*=)([^>]*)>(.*?)</script\s*>",
+@@ -819,28 +915,121 @@ _SCRIPT_HTML = re.compile(r"<script(?![^>]*\bsrc\s*=)([^>]*)>(.*?)</script\s*>",
  _RECURSOS_HTML = re.compile(r"""<(?:script|link|img|source)\b[^>]*?\b(?:src|href)\s*=\s*["']([^"'#?]+)""", re.I)
  
  
@@ -1520,29 +1532,127 @@ index b59a923..60597e7 100644
 +_RAICES_WEB = ("public", "static", "web", "www", "assets", "dist", "build", "frontend")
 +
 +
++def _resolver_recurso_html(ws: Workspace, ruta: Path, destino: str) -> Optional[Path]:
++    """Archivo local al que apunta un src/href del HTML; None si no existe."""
++    if destino.startswith("/"):
++        # Una URL absoluta la resuelve el SERVIDOR desde su raíz web, que no siempre es la del proyecto:
++        # con web/index.html y "/script.js" el archivo real es web/script.js. Antes se buscaba solo en la raíz
++        # del proyecto, se marcaba como faltante y el reparador "arreglaba" rutas y servidor hasta romper "/".
++        limpio = destino.lstrip("/")
++        candidatos = [ws.raiz / limpio, ruta.parent / limpio] + [ws.raiz / d / limpio for d in _RAICES_WEB]
++    else:
++        candidatos = [ruta.parent / destino]
++    return next((c for c in candidatos if c.exists()), None)
++
++
++def _es_externo(destino: str) -> bool:
++    return not destino or bool(re.match(r"^(https?:|//|data:|mailto:|tel:|javascript:|\{\{|\$\{)", destino))
++
++
  def recursos_html_faltantes(ws: Workspace, ruta: Path, texto: str) -> list[str]:
      faltan = []
      for m in _RECURSOS_HTML.finditer(texto):
-@@ -826,10 +926,15 @@ def recursos_html_faltantes(ws: Workspace, ruta: Path, texto: str) -> list[str]:
-         if not destino or re.match(r"^(https?:|//|data:|mailto:|tel:|javascript:|\{\{|\$\{)", destino):
+         destino = m.group(1).strip()
+-        if not destino or re.match(r"^(https?:|//|data:|mailto:|tel:|javascript:|\{\{|\$\{)", destino):
++        if _es_externo(destino):
              continue
-         if destino.startswith("/"):
+-        if destino.startswith("/"):
 -            candidato = ws.raiz / destino.lstrip("/")
-+            # Una URL absoluta la resuelve el SERVIDOR desde su raíz web, que no siempre es la del proyecto:
-+            # con web/index.html y "/script.js" el archivo real es web/script.js. Antes se buscaba solo en la raíz
-+            # del proyecto, se marcaba como faltante y el reparador "arreglaba" rutas y servidor hasta romper "/".
-+            limpio = destino.lstrip("/")
-+            candidatos = [ws.raiz / limpio, ruta.parent / limpio] + [ws.raiz / d / limpio for d in _RAICES_WEB]
-+            existe = any(c.exists() for c in candidatos)
-         else:
+-        else:
 -            candidato = ruta.parent / destino
 -        if not candidato.exists():
-+            existe = (ruta.parent / destino).exists()
++        existe = _resolver_recurso_html(ws, ruta, destino) is not None
 +        if not existe:
              linea = texto.count("\n", 0, m.start()) + 1
              faltan.append(f"línea {linea}: referencia a '{destino}' que no existe")
      return faltan
-@@ -1106,6 +1211,94 @@ def validar_proyecto(ws: Workspace, rels: list[str]) -> list[Resultado]:
+ 
+ 
++_SCRIPT_SRC_HTML = re.compile(r"<script\b([^>]*?)\bsrc\s*=\s*[\"']([^\"'#?]+)[\"']([^>]*)>", re.I)
++_RE_ES_MODULO = re.compile(r"^\s*(?:export\s+(?:default\b|async\b|function\b|class\b|const\b|let\b|var\b|\{|\*)"
++                           r"|import\s+(?:[\w$*{]|[\"']))", re.M)
++_RE_HANDLER_INLINE = re.compile(r"\son[a-z]+\s*=\s*[\"']\s*(?:return\s+)?([A-Za-z_$][\w$]*)\s*\(", re.I)
++
++
++def _sin_comentarios_js(texto: str) -> str:
++    texto = re.sub(r"/\*.*?\*/", "", texto, flags=re.S)
++    return re.sub(r"(^|[^:\"'\\])//[^\n]*", r"\1", texto)
++
++
++def scripts_html_incoherentes(ws: Workspace, ruta: Path, texto: str) -> list[str]:
++    """Errores que SOLO aparecen en el navegador (node --test pasa igual), típicos de modelos flojos:
++    - <script src="juego.js"> SIN type="module" y juego.js usa import/export → "SyntaxError: Unexpected token
++      'export'" y la página no hace nada;
++    - onclick="reiniciar()" con reiniciar definida solo dentro de un módulo → "ReferenceError: reiniciar is not
++      defined" (lo de un módulo no es global)."""
++    problemas = []
++    modulos, clasicos = [], []                                         # (texto) de cada script, según cómo se carga
++    for m in _SCRIPT_SRC_HTML.finditer(texto):
++        atributos, destino = (m.group(1) + " " + m.group(3)).lower(), m.group(2).strip()
++        if _es_externo(destino):
++            continue
++        archivo = _resolver_recurso_html(ws, ruta, destino)
++        if archivo is None or not archivo.is_file():
++            continue                                                   # eso ya lo informa recursos-html
++        try:
++            codigo = _sin_comentarios_js(archivo.read_text(encoding="utf-8", errors="replace"))
++        except OSError:
++            continue
++        es_modulo = bool(re.search(r"type\s*=\s*[\"']?module", atributos))
++        if es_modulo:
++            modulos.append(codigo)
++            for imp in _RE_IMPORT_JS.finditer(codigo):                 # un nivel de imports: también son módulos
++                dep = _resolver_js(archivo.parent, imp.group("ruta") or imp.group("req") or "")
++                if dep is not None and dep.suffix != ".json":
++                    try:
++                        modulos.append(_sin_comentarios_js(dep.read_text(encoding="utf-8", errors="replace")))
++                    except OSError:
++                        pass
++        else:
++            clasicos.append(codigo)
++            if _RE_ES_MODULO.search(codigo):
++                linea = texto.count("\n", 0, m.start()) + 1
++                problemas.append(f"línea {linea}: <script src=\"{destino}\"> se carga SIN type=\"module\" pero "
++                                 f"{destino} usa import/export: en el navegador da \"SyntaxError: Unexpected token "
++                                 f"'export'\" y no corre nada. Usá <script type=\"module\" src=\"{destino}\">.")
++    for m in _SCRIPT_HTML.finditer(texto):
++        (modulos if re.search(r"type\s*=\s*[\"']?module", m.group(1).lower()) else clasicos).append(m.group(2))
++    todo = "\n".join(modulos + clasicos)
++    if re.search(r"Object\.assign\(\s*(?:window|globalThis|self)\b", todo):
++        return problemas                                               # expone funciones en bloque: no adivinamos
++    vistos = set()
++    for m in _RE_HANDLER_INLINE.finditer(texto):
++        nombre = m.group(1)
++        if nombre in vistos:
++            continue
++        vistos.add(nombre)
++        definicion = re.compile(rf"(?:function\s*\*?\s+{re.escape(nombre)}\b|(?:const|let|var|class)\s+"
++                                rf"{re.escape(nombre)}\b)")
++        expuesta = re.compile(rf"(?:window|globalThis|self)\s*(?:\.\s*{re.escape(nombre)}|\[\s*[\"']"
++                              rf"{re.escape(nombre)}[\"']\s*\])\s*=")
++        if any(definicion.search(c) for c in modulos) and not any(definicion.search(c) for c in clasicos) \
++                and not expuesta.search(todo):
++            linea = texto.count("\n", 0, m.start()) + 1
++            problemas.append(f"línea {linea}: el HTML llama a {nombre}() desde un atributo on…=\"\", pero "
++                             f"{nombre} está definida dentro de un módulo (type=\"module\") y no es global: en el "
++                             f"navegador da \"ReferenceError: {nombre} is not defined\". Usá addEventListener en el "
++                             f"módulo (o window.{nombre} = {nombre}).")
++    return problemas
++
++
+ def _validar_html(ws: Workspace, ruta: Path, rel: str) -> list[Resultado]:
+     texto = ruta.read_text(encoding="utf-8", errors="replace")
+     resultados = []
+     faltan = recursos_html_faltantes(ws, ruta, texto)
+     if faltan:
+         resultados.append(Resultado(False, f"recursos-html {rel}", 1, stderr="\n".join(faltan), archivo=rel))
++    incoherentes = scripts_html_incoherentes(ws, ruta, texto)
++    if incoherentes:
++        resultados.append(Resultado(False, f"scripts-html {rel}", 1, stderr="\n".join(incoherentes), archivo=rel))
+     if not shutil.which("node"):
+         return resultados
+     for numero, m in enumerate(_SCRIPT_HTML.finditer(texto), start=1):
+@@ -1106,6 +1295,94 @@ def validar_proyecto(ws: Workspace, rels: list[str]) -> list[Resultado]:
      return salida
  
  
@@ -1637,19 +1747,101 @@ index b59a923..60597e7 100644
  def fallos(resultados: list[Resultado]) -> list[Resultado]:
      return [r for r in resultados if not r.ok]
  
-@@ -1141,7 +1334,10 @@ def detectar_comando_tests(ws: Workspace, completo: bool = False) -> Optional[tu
+@@ -1139,30 +1416,37 @@ def detectar_comando_tests(ws: Workspace, completo: bool = False) -> Optional[tu
+         or any(raiz.glob("test_*.py"))
+         or any(raiz.glob("*_test.py"))
      )
++    js = tests_node(raiz) if shutil.which("node") else []
++    tiene_npm_test = _script_npm_test(raiz)
      if hay_tests_py:
          if importlib.util.find_spec("pytest") is not None:
 -            corte = "" if completo else " -x"
+-            return f"{py} -m pytest -q{corte} --tb=short -p no:cacheprovider", "pytest"
+-        for carpeta in ("tests", "test"):
+-            if (raiz / carpeta).is_dir():
+-                if (raiz / carpeta / "__init__.py").is_file():
+-                    return f"{py} -m unittest discover -s {carpeta} -t .", "unittest"
+-                return f"{py} -m unittest discover -s {carpeta}", "unittest"
+-        return f"{py} -m unittest discover", "unittest"
+-
+-    paquete = raiz / "package.json"
+-    if paquete.is_file():
+-        try:
+-            datos = json.loads(paquete.read_text(encoding="utf-8"))
+-            script = (datos.get("scripts") or {}).get("test")
+-            if script and "no test specified" not in script and shutil.which("npm"):
+-                return "npm test --silent", "npm test"
+-        except (OSError, ValueError):
+-            pass
+-    if shutil.which("node") and any((raiz / d).is_dir() for d in ("tests", "test")):
+-        js = [p for d in ("tests", "test") for p in (raiz / d).glob("*.test.*js")]
+-        if js:
+-            return "node --test " + " ".join(shlex.quote(ws.rel(p)) for p in sorted(js)), "node --test"
 +            # completo: además de no cortar en el primer fallo, seguir aunque un archivo de tests no se pueda
 +            # importar (p. ej. tests de un módulo que una tarea POSTERIOR va a crear). Sin esto pytest aborta en
 +            # la colección, corre 0 tests, y el torneo/la verificación por tarea no ven ningún progreso real.
 +            corte = " --continue-on-collection-errors" if completo else " -x"
-             return f"{py} -m pytest -q{corte} --tb=short -p no:cacheprovider", "pytest"
-         for carpeta in ("tests", "test"):
-             if (raiz / carpeta).is_dir():
-@@ -1212,7 +1408,12 @@ def ejecutar_tests(ws: Workspace, timeout: int = 300, completo: bool = False) ->
++            comando, nombre = f"{py} -m pytest -q{corte} --tb=short -p no:cacheprovider", "pytest"
++        else:
++            comando, nombre = f"{py} -m unittest discover", "unittest"
++            for carpeta in ("tests", "test"):
++                if (raiz / carpeta).is_dir():
++                    tope = " -t ." if (raiz / carpeta / "__init__.py").is_file() else ""
++                    comando = f"{py} -m unittest discover -s {carpeta}{tope}"
++                    break
++        es_test_py = re.compile(r"^(?:test_.*|.*_test)\.py$")
++        if js and not tiene_npm_test and any(es_test_py.match(p.name) for d in ("tests", "test", ".")
++                                            for p in ((raiz / d).rglob("*.py") if d != "." else raiz.glob("*.py"))):
++            # Proyecto mixto (backend Python + JS con node:test): se corren LAS DOS suites siempre y sale con el
++            # primer código de error. Antes solo corría la de Python y los tests de JS nunca se ejecutaban.
++            node = "node --test " + " ".join(shlex.quote(ws.rel(p)) for p in js)
++            return (f"{comando}; __py=$?; {node}; __js=$?; [ $__py -ne 0 ] && exit $__py; exit $__js",
++                    f"{nombre} + node --test")
++        return comando, nombre
++
++    if tiene_npm_test and shutil.which("npm"):
++        return "npm test --silent", "npm test"
++    if js:
++        return "node --test " + " ".join(shlex.quote(ws.rel(p)) for p in js), "node --test"
++
+     if (raiz / "go.mod").is_file() and shutil.which("go"):
+         return "go test ./...", "go test"
+     if (raiz / "Cargo.toml").is_file() and shutil.which("cargo"):
+@@ -1177,6 +1461,33 @@ def detectar_comando_tests(ws: Workspace, completo: bool = False) -> Optional[tu
+     return _detectar_tests_otros(raiz)
+ 
+ 
++def _script_npm_test(raiz: Path) -> bool:
++    """¿package.json tiene un script "test" de verdad (no el "no test specified" de npm init)?"""
++    try:
++        datos = json.loads((raiz / "package.json").read_text(encoding="utf-8"))
++        script = (datos.get("scripts") or {}).get("test") if isinstance(datos, dict) else None
++    except (OSError, ValueError):
++        return False
++    return bool(isinstance(script, str) and script.strip() and "no test specified" not in script)
++
++
++# Nombres que node --test reconoce como archivo de tests (y los que los modelos usan): juego.test.mjs,
++# juego.spec.js, test_juego.mjs, juego_test.mjs, juego-test.js. Antes solo tests/*.test.*js del primer nivel.
++_RE_TEST_JS = re.compile(r"^(?:.+[._-](?:test|spec)|test[_-].+)\.(?:m|c)?js$")
++
++
++def tests_node(raiz: Path) -> list:
++    """Archivos de tests de JS para node --test: en tests/ y test/ (recursivo) y los *.test.*js de la raíz."""
++    encontrados = set()
++    for carpeta in ("tests", "test", "__tests__"):
++        base = raiz / carpeta
++        if base.is_dir():
++            encontrados.update(p for p in base.rglob("*.*js") if _RE_TEST_JS.match(p.name)
++                               and "node_modules" not in p.parts and p.is_file())
++    encontrados.update(p for p in raiz.glob("*.*js") if _RE_TEST_JS.match(p.name) and p.is_file())
++    return sorted(encontrados)
++
++
+ def _detectar_tests_otros(raiz: Path) -> Optional[tuple[str, str]]:
+     """Ruby (minitest), Perl (prove), PHP (phpunit o runner propio), Bash y Java sin build tool."""
+     if shutil.which("ruby"):
+@@ -1212,7 +1523,12 @@ def ejecutar_tests(ws: Workspace, timeout: int = 300, completo: bool = False) ->
      comando, _nombre = detectado
      r = ejecutar(comando, cwd=ws.raiz, timeout=timeout, shell=True)
      combinado = r.stdout + r.stderr
@@ -1664,7 +1856,7 @@ index b59a923..60597e7 100644
          r.stdout = "No se encontraron tests para ejecutar. " + r.stdout
      return r
 diff --git a/partes/11_testparse.py b/partes/11_testparse.py
-index 173408e..e5bea77 100644
+index 173408e..455def7 100644
 --- a/partes/11_testparse.py
 +++ b/partes/11_testparse.py
 @@ -71,7 +71,10 @@ _RE_CARGO_FALLO = re.compile(r"^test (\S+) \.\.\. FAILED", re.M)
@@ -1679,6 +1871,23 @@ index 173408e..e5bea77 100644
                and re.search(r"\bin\s+[\d.]+s", l) and not l.lstrip().startswith("test result:")]  # cargo
      if not lineas:
          if "no tests ran" in salida.lower():
+@@ -224,6 +227,16 @@ def contar_tests(salida: str, codigo: Optional[int] = None) -> ConteoTests:
+         except (ValueError, IndexError):
+             conteo = None
+         if conteo is not None:
++            if parser in (_pytest, _unittest):
++                # Suite mixta (backend Python + frontend con node --test, ver detectar_comando_tests): se suman las
++                # dos. Antes solo se contaba la de Python y un "5 passed" escondía que los tests de JS fallaban.
++                js = _tap(texto)
++                if js is not None:
++                    conteo.pasados += js.pasados
++                    conteo.fallados += js.fallados
++                    conteo.omitidos += js.omitidos
++                    conteo.nombres_fallados = (conteo.nombres_fallados + js.nombres_fallados)[:50]
++                    conteo.fuente = f"{conteo.fuente} + {js.fuente}"
+             if codigo not in (None, 0) and conteo.ok and conteo.total and not conteo.fallados:
+                 # El runner dijo que todo pasó pero salió con error (p. ej. crash al final): cuenta como error.
+                 conteo.errores += 1
 diff --git a/partes/12_autofix.py b/partes/12_autofix.py
 index 21073cb..fbc15e5 100644
 --- a/partes/12_autofix.py
@@ -2557,10 +2766,10 @@ index 4eba772..e986b98 100644
                  (self.ws.raiz / rel).unlink()
                  self.restaurados.append(f"{rel} (creado por los tests, borrado)")
 diff --git a/partes/25_pipeline.py b/partes/25_pipeline.py
-index ad78b6b..77c545b 100644
+index ad78b6b..c8dba43 100644
 --- a/partes/25_pipeline.py
 +++ b/partes/25_pipeline.py
-@@ -40,6 +40,419 @@ _RE_VEREDICTO = re.compile(r"VEREDICTO\s*:?\s*\**\s*(APROBADO|CAMBIOS|RECHAZADO)
+@@ -40,6 +40,583 @@ _RE_VEREDICTO = re.compile(r"VEREDICTO\s*:?\s*\**\s*(APROBADO|CAMBIOS|RECHAZADO)
  EXTENSIONES_TESTEABLES = (".py", ".js", ".mjs", ".cjs", ".ts")
  
  
@@ -2821,39 +3030,185 @@ index ad78b6b..77c545b 100644
 +# El modelo ADMITE que lo que escribió es provisional/ficticio. Frases muy específicas (no palabras sueltas) para
 +# no marcar código legítimo: un comentario que dice "en una implementación real llamaríamos a la API" o un string
 +# "número de ejemplo" es una simulación confesada. Caso real: get_free_number devolvía "+1555" + dígitos al azar.
++# Lo que NO es confesión (falsos positivos reales, ver PRUEBAS §18.d): "No hardcodear la ruta", "Evitamos valores
++# hardcodeados", "Simulación de la gravedad en cada frame", "In production you should set DEBUG to False", "En
++# producción debería usarse HTTPS", "Por ahora usamos SQLite", "En producción habría que poner un proxy".
++_COND_ES = (r"(?:ir|usar|conectar|llamar|consultar|traer|enviar|descargar|leer|recibir|pedir|integrar|"
++            r"reemplazar|scrapear)[ií]a(?:mos|n)?|obtendr[ií]a(?:mos|n)?|har[ií]a(?:mos|n)?")
 +_RE_ADMITE_SIMULACION = re.compile(
 +    r"en\s+(?:una\s+|la\s+)?(?:implementaci[oó]n|versi[oó]n|app|aplicaci[oó]n)\s+real"
-+    r"|in\s+a\s+real\s+(?:implementation|app)|in\s+production\s+(?:you|we|this)"
-+    r"|en\s+producci[oó]n\s+(?:ir[ií]a|usar[ií]a|se\s+|conectar[ií]a|habr[ií]a|deber[ií]a|llamar[ií]a)"
-+    r"|por\s+ahora\s+(?:devolv|retorn|simul|us|dev)"
-+    r"|datos?\s+(?:de\s+ejemplo|simulad|fictici|dummy|de\s+prueba\s+fals)"
-+    r"|(?:respuesta|valor(?:es)?|n[uú]mero|mensaje|c[oó]digo)\s+(?:simulad|fictici|de\s+ejemplo|hardcode)"
++    r"|in\s+a\s+real\s+(?:implementation|app|application|world\s+app)"
++    r"|in\s+production,?\s+(?:you|we|this|it|one)\s+would"
++    r"|en\s+producci[oó]n,?\s+(?:se\s+|esto\s+se\s+)?(?:" + _COND_ES + r")"
++    r"|por\s+ahora\s+(?:se\s+)?(?:devolv|retorn|simul|invent|fing)"
++    r"|de\s+momento\s+(?:se\s+)?(?:devolv|retorn|simul|invent|fing)"
++    r"|datos?\s+(?:de\s+ejemplo|simulad|fictici|inventad|dummy|falsos|de\s+prueba\s+fals)"
++    r"|(?:respuesta|n[uú]mero|mensaje|c[oó]digo|resultado)s?\s+(?:simulad|fictici|inventad|falsos?\b|de\s+ejemplo"
++    r"|hardcode|harcode)"
++    r"|valor(?:es)?\s+(?:simulad|fictici|inventad)"
++    r"|(?:fake|mock(?:ed)?|simulated)\s+(?:data|response|number|result|value)s?|dummy\s+(?:data|response)s?"
 +    r"|esto\s+es\s+(?:una\s+)?(?:simulaci[oó]n|un\s+mock|un\s+placeholder|provisional)"
-+    r"|simulaci[oó]n\s+de\s+(?:la|el|los|las|un)"
-+    r"|(?:har[dt]cod|harcod)\w*"
-+    r"|reemplaz\w*\s+(?:esto|con\s+la\s+real|por\s+la\s+real|en\s+producci)"
++    r"|simula(?:mos)?\s+(?:la\s+|el\s+|una\s+|un\s+)?(?:llamada|respuesta|api|petici[oó]n|request|env[ií]o|consulta"
++    r"|descarga|conexi[oó]n|servidor|backend|base\s+de\s+datos|pago|sms|scrap)"
++    r"|har[dt]?cod\w*\s+(?:por\s+ahora|temporalmente|de\s+momento|for\s+now|temporarily)"
++    r"|placeholder\s+(?:value|data|response|implementation)|(?:mock|stub)\s+for\s+now"
++    r"|reemplaz\w*\s+(?:esto\s+(?:por|con)|con\s+la\s+real|por\s+la\s+real|en\s+producci)"
 +    r"|pendiente\s+de\s+implementar|falta\s+implementar|sin\s+implementar\s+(?:a[uú]n|todav)"
 +    r"|not\s+implemented\s+yet|implement\s+(?:this|me)\s+later",
 +    re.IGNORECASE)
++# Negación justo antes de la frase ("Evitamos valores hardcodeados", "sin datos simulados"): no es confesión.
++_RE_NEGACION_CONFESION = re.compile(r"^(?:no|sin|nunca|ni|evit\w*|avoid\w*|never|not|without|don'?t|nada)$", re.IGNORECASE)
++# Familias que el PEDIDO puede pedir a propósito: "3 recetas de ejemplo", "--simular (no mueve, solo muestra)".
++_FAMILIAS_PERMITIBLES = {
++    "ejemplo": (re.compile(r"ejemplo|example|sample|semilla|seed|demo", re.IGNORECASE),
++                re.compile(r"ejemplo|example|sample", re.IGNORECASE)),
++    "simulacion": (re.compile(r"simul|dry.?run|mock|fake|fictici|dummy", re.IGNORECASE),
++                   re.compile(r"simul|mock|fake|fictici|dummy", re.IGNORECASE)),
++}
 +
 +
-+def admisiones_de_simulacion(fuente: str) -> list:
-+    """[(linea, frase)] de comentarios o textos que CONFIESAN que el código es provisional/ficticio. Usa tokenize
-+    para ver comentarios y strings reales (0 tokens de modelo). Precisión alta: solo frases inequívocas."""
++def familias_pedidas(pedido: str) -> set:
++    """Familias de 'confesión' que el PEDIDO del usuario pide a propósito (y sin negar: "no quiero datos simulados"
++    NO habilita nada). Solo se mira el pedido, nunca el plan: el plan lo escribe el modelo."""
++    salida = set()
++    for familia, (en_pedido, _en_frase) in _FAMILIAS_PERMITIBLES.items():
++        for m in en_pedido.finditer(pedido or ""):
++            previas = re.findall(r"[\w']+", pedido[max(0, m.start() - 40):m.start()])[-4:]   # "sin datos de ejemplo"
++            if not any(_RE_NEGACION_CONFESION.match(p) for p in previas):
++                salida.add(familia)
++                break
++    return salida
++
++
++def _confesiones_en_texto(texto: str, permitidas: set = frozenset()) -> list:
++    """Frases de confesión en un comentario o string, descartando las negadas y las de familias permitidas."""
 +    salida = []
++    for m in _RE_ADMITE_SIMULACION.finditer(texto):
++        previas = re.findall(r"[\w']+", texto[max(0, m.start() - 30):m.start()])[-2:]
++        if any(_RE_NEGACION_CONFESION.match(p) for p in previas):
++            continue
++        frase = m.group(0).strip()
++        if any(_FAMILIAS_PERMITIBLES[f][1].search(frase) for f in permitidas if f in _FAMILIAS_PERMITIBLES):
++            continue
++        salida.append(frase)
++    return salida
++
++
++def admisiones_de_simulacion(fuente: str, permitidas: set = frozenset()) -> list:
++    """[(linea, frase)] de comentarios o textos que CONFIESAN que el código es provisional/ficticio. Usa tokenize
++    para ver comentarios y strings reales (0 tokens de modelo). Precisión alta: solo frases inequívocas.
++    `permitidas`: familias que el pedido pidió a propósito (ver familias_pedidas)."""
++    salida = []
++    tipos = {tokenize.COMMENT, tokenize.STRING}
++    if hasattr(tokenize, "FSTRING_MIDDLE"):                            # Python 3.12+: el texto de un f-string
++        tipos.add(tokenize.FSTRING_MIDDLE)
 +    try:
-+        tokens = tokenize.generate_tokens(io.StringIO(fuente).readline)
-+        for tok in tokens:
-+            if tok.type in (tokenize.COMMENT, tokenize.STRING):
-+                m = _RE_ADMITE_SIMULACION.search(tok.string)
-+                if m:
-+                    salida.append((tok.start[0], m.group(0).strip()))
++        for tok in tokenize.generate_tokens(io.StringIO(fuente).readline):
++            if tok.type in tipos:
++                for frase in _confesiones_en_texto(tok.string, permitidas)[:1]:
++                    salida.append((tok.start[0], frase))
 +    except (tokenize.TokenError, IndentationError, SyntaxError, ValueError):
 +        pass
 +    return salida
 +
 +
-+_IO_REAL = ("httpx", "requests", "urllib", "urlopen", "socket", "aiohttp", "http", "subprocess", "popen",
++# JS/TS/HTML: no hay tokenize, pero los comentarios se reconocen bien con regex (// y /* */ y <!-- -->). Un
++# `//` dentro de un string (una URL) puede colarse como "comentario"; no importa: una URL no confiesa nada.
++EXTENSIONES_WEB = (".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx", ".html", ".htm", ".vue", ".svelte")
++_RE_COMENTARIO_WEB = re.compile(r"/\*[\s\S]*?\*/|<!--[\s\S]*?-->|(?<![:\\])//[^\n]*")
++_RE_JS_NO_IMPLEMENTADO = re.compile(
++    r"throw\s+new\s+Error\(\s*['\"`]\s*(?:not\s+implemented|no\s+implementad|sin\s+implementar|todo\b)",
++    re.IGNORECASE)
++
++
++def admisiones_web(fuente: str, permitidas: set = frozenset()) -> list:
++    """[(linea, frase)] de confesiones en comentarios de JS/TS/HTML y de `throw new Error("not implemented")`."""
++    salida = []
++    for m in _RE_COMENTARIO_WEB.finditer(fuente):
++        for frase in _confesiones_en_texto(m.group(0), permitidas)[:1]:
++            salida.append((fuente.count("\n", 0, m.start()) + 1, frase))
++    for m in _RE_JS_NO_IMPLEMENTADO.finditer(fuente):
++        salida.append((fuente.count("\n", 0, m.start()) + 1, m.group(0).strip()))
++    return sorted(salida)
++
++
++_RE_FUNCION_JS_VACIA = re.compile(
++    r"function\s*\*?\s+([A-Za-z_$][\w$]*)\s*\([^)]*\)\s*\{\s*\}"
++    r"|(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?(?:function\s*)?\([^)]*\)\s*(?:=>\s*)?\{\s*\}"
++    r"|^[ \t]*(?:async\s+)?([A-Za-z_$][\w$]*)\s*\([^)]*\)\s*\{\s*\}", re.M)
++_NO_SON_METODOS_JS = {"if", "for", "while", "switch", "catch", "function", "with", "return", "constructor"}
++
++
++def stubs_js(fuente: str) -> list:
++    """[(nombre, linea)] de funciones JS/TS con cuerpo vacío (o solo comentarios). Los comentarios se borran
++    conservando los saltos de línea para que el número de línea siga siendo el real."""
++    sin_comentarios = _RE_COMENTARIO_WEB.sub(lambda m: "\n" * m.group(0).count("\n"), fuente)
++    salida = []
++    for m in _RE_FUNCION_JS_VACIA.finditer(sin_comentarios):
++        nombre = m.group(1) or m.group(2) or m.group(3)
++        if nombre and nombre not in _NO_SON_METODOS_JS:
++            salida.append((nombre, sin_comentarios.count("\n", 0, m.start()) + 1))
++    return salida
++
++
++_RE_TEST_JS_INICIO = re.compile(r"\b(?:test|it)\s*\(\s*(['\"`])(.+?)\1\s*,", re.S)
++_RE_ALGUNA_VERIFICACION_JS = re.compile(r"assert|expect|should|verific|comprob|check|throws|rejects|fail\(", re.I)
++_RE_ASSERT_JS = re.compile(r"\b(?:assert(?:\.\w+)?|expect)\s*\(")
++_RE_ASSERT_TAUTOLOGICO = re.compile(
++    r"^(?:assert(?:\.ok)?\(\s*(?:true|1|!0|!!1)\s*[,)]"
++    r"|expect\(\s*(true|1|null|undefined|(['\"])\w*\2|\d+)\s*\)\.(?:toBe|toEqual|toStrictEqual)\(\s*\1\s*\)"
++    r"|expect\(\s*true\s*\)\.toBeTruthy\(\s*\))")
++_RE_ASSERT_IGUALES = re.compile(r"^assert\.(?:equal|strictEqual|deepEqual|deepStrictEqual)\(\s*([^,()]+?)\s*,\s*([^,()]+?)\s*[,)]")
++
++
++def _cuerpo_js(texto: str, desde: int) -> str:
++    """Texto del bloque { ... } que empieza en la primera llave desde `desde` (llaves balanceadas; los strings
++    simples se saltean). '' si no cierra."""
++    inicio = texto.find("{", desde)
++    if inicio < 0:
++        return ""
++    nivel, i, comilla = 0, inicio, ""
++    while i < len(texto):
++        c = texto[i]
++        if comilla:
++            if c == "\\":
++                i += 2
++                continue
++            if c == comilla:
++                comilla = ""
++        elif c in "'\"`":
++            comilla = c
++        elif c == "{":
++            nivel += 1
++        elif c == "}":
++            nivel -= 1
++            if nivel == 0:
++                return texto[inicio + 1:i]
++        i += 1
++    return ""
++
++
++def tests_js_sin_valor(fuente: str) -> list:
++    """[(nombre, linea, detalle)] de tests de JS (node:test, jest, vitest, mocha) que no prueban nada: sin ninguna
++    verificación, o con verificaciones que siempre pasan (assert.ok(true), assert.equal(1, 1),
++    expect(true).toBe(true)). Conservador: si llama a algo que parezca verificar, no lo marca."""
++    texto = _RE_COMENTARIO_WEB.sub(lambda m: "\n" * m.group(0).count("\n"), fuente)
++    salida = []
++    for m in _RE_TEST_JS_INICIO.finditer(texto):
++        cuerpo = _cuerpo_js(texto, m.end())
++        linea = texto.count("\n", 0, m.start()) + 1
++        nombre = m.group(2).strip()[:60]
++        if not cuerpo.strip() or not _RE_ALGUNA_VERIFICACION_JS.search(cuerpo):
++            salida.append((nombre, linea, "el test no verifica nada (ni assert ni expect)"))
++            continue
++        asserts = [cuerpo[a.start():] for a in _RE_ASSERT_JS.finditer(cuerpo)]
++        if asserts and all(_RE_ASSERT_TAUTOLOGICO.match(a) or ((g := _RE_ASSERT_IGUALES.match(a)) is not None
++                                                                and g.group(1) == g.group(2)) for a in asserts):
++            salida.append((nombre, linea, "todas sus verificaciones pasan siempre (comparan algo consigo mismo)"))
++    return salida
++
++
++_LLAMADAS_IO_REAL = ("httpx", "requests", "urllib", "urlopen", "socket", "aiohttp", "http", "subprocess", "popen",
 +            "run", "open", "connect", "fetch", "get", "post", "session", "curl", "sqlite3", "psycopg", "execute")
 +_RE_PIDE_DATOS_REALES = re.compile(
 +    r"scrap|descarg|download|\bfetch|consult|obten|recib|\bapi\b|\bhttp|web\b|solicit|"
@@ -2867,7 +3222,7 @@ index ad78b6b..77c545b 100644
 +            objetivo = nodo.func
 +            nombre = (objetivo.attr if isinstance(objetivo, ast.Attribute)
 +                      else getattr(objetivo, "id", "")).lower()
-+            if nombre in _IO_REAL:
++            if nombre in _LLAMADAS_IO_REAL:
 +                return True
 +    return False
 +
@@ -2899,13 +3254,15 @@ index ad78b6b..77c545b 100644
 +    return salida
 +
 +
-+def examen_de_realidad(ws, cid_build: Optional[int], plan=None) -> list:
++def examen_de_realidad(ws, cid_build: Optional[int], plan=None, pedido: str = "") -> list:
 +    """
 +    Determinista (0 tokens): ¿lo entregado es REAL o una simulación? Revisa lo que cambió en esta build:
 +    - funciones que el plan pidió (def nombre en la interfaz o las tareas) y quedaron vacías (pass / ...), y
 +      cualquier `raise NotImplementedError` fuera de métodos abstractos: el código existe pero no hace nada;
 +    - tests creados o tocados en esta build que no prueban nada (tautologías, sin assert, mockean justo lo que
-+      deberían probar, esperan el valor que inyectó el propio mock): un verde que no demuestra nada.
++      deberían probar, esperan el valor que inyectó el propio mock): un verde que no demuestra nada;
++    - comentarios/strings que CONFIESAN ser provisionales (también en JS/TS/HTML), salvo lo que el PEDIDO pidió a
++      propósito ("3 recetas de ejemplo", "--simular").
 +    Devuelve hallazgos legibles; [] si lo revisado es real.
 +    """
 +    if cid_build is None:
@@ -2915,6 +3272,7 @@ index ad78b6b..77c545b 100644
 +    if plan is not None:
 +        texto = (getattr(plan, "interfaz", "") or "") + "\n" + "\n".join(t.descripcion for t in plan.tareas)
 +        declaradas = set(re.findall(r"\bdef\s+([A-Za-z_]\w*)", texto))
++        declaradas |= set(re.findall(r"\bfunction\*?\s+([A-Za-z_$][\w$]*)", texto))   # interfaz de JS
 +        # Funciones cuyo CONTEXTO en el plan pide datos reales (traer de la web, SMS, una API, un número…):
 +        # si las fabrican con random en vez de traerlas, es simulación. Se mira la línea de cada `def` declarado.
 +        for linea in texto.splitlines():
@@ -2923,14 +3281,29 @@ index ad78b6b..77c545b 100644
 +        # Si el pedido entero habla de traer datos reales, cualquier función declarada cuenta (plan corto sin detalle).
 +        if _RE_PIDE_DATOS_REALES.search(texto) and not deben_traer_datos:
 +            deben_traer_datos = set(declaradas)
++    permitidas = familias_pedidas(pedido)
 +    hallazgos = []
 +    for rel in ws.checkpoints.archivos_desde(cid_build):
 +        ruta = ws.raiz / rel
-+        if not rel.endswith(".py") or not ruta.is_file():
++        es_web = rel.lower().endswith(EXTENSIONES_WEB)
++        if not (rel.endswith(".py") or es_web) or not ruta.is_file():
 +            continue
 +        try:
 +            fuente = ruta.read_text(encoding="utf-8", errors="replace")
 +        except OSError:
++            continue
++        if es_web:
++            if _es_test(rel):
++                for nombre, linea, detalle in tests_js_sin_valor(fuente)[:3]:
++                    hallazgos.append(f"TEST SIN VALOR en {rel}::{nombre} (línea {linea}): {detalle}")
++            else:
++                for nombre, linea in stubs_js(fuente):
++                    if nombre in declaradas:
++                        hallazgos.append(f"SIMULACIÓN en {rel}:{linea}: `{nombre}` quedó vacía ({{ }}): existe pero "
++                                         "no hace nada.")
++                for linea, frase in admisiones_web(fuente, permitidas):
++                    hallazgos.append(f"SIMULACIÓN CONFESADA en {rel}:{linea}: «{recortar(frase, 80)}»: el código "
++                                     "admite ser provisional/ficticio, no lo real que se pidió.")
 +            continue
 +        if _es_test(rel):
 +            graves = [p for p in analizar_tests_python(fuente).problemas if p.severidad == "alta"]
@@ -2944,7 +3317,7 @@ index ad78b6b..77c545b 100644
 +        for nombre, linea in fabricaciones_en_codigo(fuente, deben_traer_datos):
 +            hallazgos.append(f"DATOS FABRICADOS en {rel}:{linea}: `{nombre}` los INVENTA (random/uuid) en vez de "
 +                             "traerlos de verdad; el pedido pide datos reales, no generados.")
-+        for linea, frase in admisiones_de_simulacion(fuente):
++        for linea, frase in admisiones_de_simulacion(fuente, permitidas):
 +            hallazgos.append(f"SIMULACIÓN CONFESADA en {rel}:{linea}: «{frase}»: el código admite ser "
 +                             "provisional/ficticio, no lo real que se pidió.")
 +    return hallazgos[:12]
@@ -2980,7 +3353,7 @@ index ad78b6b..77c545b 100644
  @dataclass
  class Tarea:
      id: str
-@@ -178,13 +591,218 @@ def verificacion_peor(despues: "Verificacion", antes: "Verificacion") -> bool:
+@@ -178,13 +755,218 @@ def verificacion_peor(despues: "Verificacion", antes: "Verificacion") -> bool:
  
  
  def veredicto(informe: str) -> tuple[bool, bool]:
@@ -3201,7 +3574,7 @@ index ad78b6b..77c545b 100644
  @dataclass
  class Verificacion:
      ok: bool
-@@ -193,6 +811,7 @@ class Verificacion:
+@@ -193,6 +975,7 @@ class Verificacion:
      diagnostico: str
      archivos: list
      conteo: ConteoTests = field(default_factory=ConteoTests)
@@ -3209,7 +3582,7 @@ index ad78b6b..77c545b 100644
  
  
  @dataclass
-@@ -201,6 +820,7 @@ class InformeBuild:
+@@ -201,6 +984,7 @@ class InformeBuild:
      plan: Optional[Plan] = None
      archivos: list = field(default_factory=list)
      tests: Optional[Resultado] = None
@@ -3217,7 +3590,7 @@ index ad78b6b..77c545b 100644
      diagnostico: str = ""
      cid: Optional[int] = None
      ruta_informe: Optional[Path] = None
-@@ -211,12 +831,32 @@ class InformeBuild:
+@@ -211,12 +995,32 @@ class InformeBuild:
      commit: Optional[str] = None
      spec_tests: list = field(default_factory=list)
      segundos: float = 0.0
@@ -3250,7 +3623,7 @@ index ad78b6b..77c545b 100644
  def _diffstat(diff: str) -> str:
      stats: dict[str, list[int]] = {}
      actual = None
-@@ -231,6 +871,23 @@ def _diffstat(diff: str) -> str:
+@@ -231,6 +1035,23 @@ def _diffstat(diff: str) -> str:
      return "\n".join(f"  {a}  +{m} -{n}" for a, (m, n) in stats.items())
  
  
@@ -3274,7 +3647,7 @@ index ad78b6b..77c545b 100644
  def _es_test(rel: str) -> bool:
      return any(fnmatch.fnmatch(rel, p) for p in PATRONES_TESTS)
  
-@@ -246,6 +903,214 @@ def _es_de_especificacion(nombre_test: str, protegidos: dict) -> bool:
+@@ -246,6 +1067,214 @@ def _es_de_especificacion(nombre_test: str, protegidos: dict) -> bool:
      return False
  
  
@@ -3489,7 +3862,7 @@ index ad78b6b..77c545b 100644
  class Orquestador:
      def __init__(self, llm, ws: Workspace, settings: Settings, ui: UI):
          self.llm = llm
-@@ -255,6 +1120,7 @@ class Orquestador:
+@@ -255,6 +1284,7 @@ class Orquestador:
          self.memoria = MemoriaLecciones(ws) if settings.lecciones else None
          self.escalador = Escalador(llm, settings, ui)
          self._protegidos: dict[str, Optional[str]] = {}
@@ -3497,7 +3870,7 @@ index ad78b6b..77c545b 100644
  
      def _sub(self, rol: str, tarea: str, cid: Optional[int], archivos: str = "", titulo: str = "",
               **opciones) -> ResultadoAgente:
-@@ -264,6 +1130,20 @@ class Orquestador:
+@@ -264,6 +1294,20 @@ class Orquestador:
              profundidad=1, cid_inicio=cid,
          )[0]
  
@@ -3518,7 +3891,7 @@ index ad78b6b..77c545b 100644
      # ------------------------------------------------------------ fases
      def explorar(self, pedido: str) -> str:
          archivos = self.ws.archivos_codigo(limite=500)
-@@ -296,7 +1176,13 @@ class Orquestador:
+@@ -296,7 +1340,13 @@ class Orquestador:
                  "cómo se ejecuta y se prueba el proyecto",
                  {"memoria": self.memoria},
              ))
@@ -3533,7 +3906,7 @@ index ad78b6b..77c545b 100644
          informe = "\n\n".join(
              f"### Informe explorador {i}\n{r.resumen}" for i, r in enumerate(resultados, start=1)
          )
-@@ -308,7 +1194,10 @@ class Orquestador:
+@@ -308,7 +1358,10 @@ class Orquestador:
              f"PEDIDO DEL USUARIO:\n{pedido}\n\n"
              f"INFORME DE EXPLORACIÓN (código real):\n{recortar(exploracion, 7000)}\n\n"
              f"Comando de tests detectado: {detectado[0] if detectado else 'ninguno (habrá que crear tests)'}\n"
@@ -3545,7 +3918,7 @@ index ad78b6b..77c545b 100644
          )
          if self.settings.tests_primero:
              tarea += ("\nLos tests se escriben ANTES de implementar a partir de tu <interfaz> y tus <criterios>: "
-@@ -323,6 +1212,10 @@ class Orquestador:
+@@ -323,6 +1376,10 @@ class Orquestador:
          if not _RE_TAREA.search(texto) and _RE_TAREA.search(res.contexto):
              texto = res.contexto + "\n" + texto
          plan = parsear_plan(texto, pedido, self.settings.max_tareas)
@@ -3556,7 +3929,7 @@ index ad78b6b..77c545b 100644
          if not res.ok:
              self.ui.aviso("El arquitecto no terminó limpio; uso lo que produjo.")
          motivo = plan_degenerado(plan, pedido, texto)
-@@ -378,6 +1271,25 @@ class Orquestador:
+@@ -378,6 +1435,25 @@ class Orquestador:
                  return {}
          r = ejecutar_tests(self.ws, timeout=self.settings.tests_timeout, completo=True)
          conteo = conteo_de_resultado(r)
@@ -3582,7 +3955,7 @@ index ad78b6b..77c545b 100644
          if r is not None and conteo.reconocido:
              if conteo.ok and conteo.pasados:
                  self.ui.aviso(f"  Ojo: la especificación ya pasa entera ({conteo.texto()}); quizá la función ya existía.")
-@@ -421,27 +1333,38 @@ class Orquestador:
+@@ -421,27 +1497,38 @@ class Orquestador:
          return torneo.correr(texto, archivos=", ".join(tarea.archivos), titulo=titulo,
                               n=self.settings.candidatos if usar_torneo else 1, protegidos=protegidos, cid=cid)
  
@@ -3625,7 +3998,7 @@ index ad78b6b..77c545b 100644
          detectado = detectar_comando_tests(self.ws)
          criterios = "\n".join(f"- {c}" for c in plan.criterios) or "- (derivalos del pedido)"
          texto = (
-@@ -452,7 +1375,7 @@ class Orquestador:
+@@ -452,7 +1539,7 @@ class Orquestador:
              "Escribí (o completá) tests automáticos que verifiquen los criterios y corrélos con run_tests. "
              "Reportá el resultado REAL."
          )
@@ -3634,7 +4007,7 @@ index ad78b6b..77c545b 100644
  
      def verificar(self, cid: int) -> Verificacion:
          archivos = [r for r in self.ws.checkpoints.archivos_desde(cid) if (self.ws.raiz / r).is_file()]
-@@ -462,13 +1385,35 @@ class Orquestador:
+@@ -462,13 +1549,35 @@ class Orquestador:
          malos = fallos(validaciones)
          tests_ok = tests is None or tests.ok
          partes = [r.resumen(2500) for r in malos]
@@ -3672,7 +4045,7 @@ index ad78b6b..77c545b 100644
  
      def reparar(self, pedido: str, verif: Verificacion, cid: int, base_fallaba: bool,
                  diagnostico_experto: str = "", contexto: str = "") -> ResultadoAgente:
-@@ -485,7 +1430,8 @@ class Orquestador:
+@@ -485,7 +1594,8 @@ class Orquestador:
          if diagnostico_experto:
              texto = tarea_con_diagnostico(texto, diagnostico_experto)
          protegidos = set(self._protegidos)
@@ -3682,7 +4055,7 @@ index ad78b6b..77c545b 100644
                                                                                      if diagnostico_experto else ""),
                           protegidos=protegidos)
  
-@@ -513,7 +1459,17 @@ class Orquestador:
+@@ -513,7 +1623,17 @@ class Orquestador:
          intentos_txt: list[str] = []
          forense_hecho = False
          informe_forense = ""
@@ -3700,7 +4073,7 @@ index ad78b6b..77c545b 100644
              firma = _firma_error(verif.diagnostico)
              if diagnosticos_vistos.count(firma) >= 3:
                  informe.notas.append(f"{etiqueta}: la reparación no logró avances (mismo diagnóstico repetido).")
-@@ -549,6 +1505,7 @@ class Orquestador:
+@@ -549,6 +1669,7 @@ class Orquestador:
                                       + "\n---\n".join(intentos_txt[-2:]))
              res = self.reparar(pedido, verif, rcid, base_fallaba, experto, contexto_intento.strip())
              intentos_txt.append(recortar(res.resumen, 1200))
@@ -3708,7 +4081,7 @@ index ad78b6b..77c545b 100644
              verif = verificador()
              self._mostrar_verificacion(verif)
              if verif.ok:
-@@ -566,6 +1523,221 @@ class Orquestador:
+@@ -566,6 +1687,221 @@ class Orquestador:
                  verif = antes
          return verif
  
@@ -3843,7 +4216,7 @@ index ad78b6b..77c545b 100644
 +            return  # la build ya está en rojo/parcial: el juez solo endurece, no hay verde que revisar
 +        # 1) EXAMEN DE REALIDAD, gratis: si algo es una simulación (funciones pedidas vacías, NotImplementedError,
 +        #    tests que no prueban nada), el juez decide SIN llamar al modelo. Gasta 0 tokens y hace más que nadie.
-+        realidad = examen_de_realidad(self.ws, informe.cid, plan)
++        realidad = examen_de_realidad(self.ws, informe.cid, plan, pedido)
 +        if realidad:
 +            self._aplicar_juicio(Juicio(False, realidad, [], "high", determinista=True), informe)
 +            return
@@ -3930,7 +4303,7 @@ index ad78b6b..77c545b 100644
      # ------------------------------------------------------------ flujos
      def _mostrar_plan(self, plan: Plan) -> None:
          self.ui.titulo("PLAN")
-@@ -575,10 +1747,47 @@ class Orquestador:
+@@ -575,10 +1911,47 @@ class Orquestador:
          self.ui.fase(1, "Exploración")
          exploracion = self.explorar(pedido)
          self.ui.fase(2, "Arquitectura")
@@ -3980,7 +4353,7 @@ index ad78b6b..77c545b 100644
                  return plan, exploracion
              feedback = self.ui.preguntar("¿Qué cambiarías del plan? (Enter vacío = cancelar)")
              if not feedback:
-@@ -598,8 +1807,64 @@ class Orquestador:
+@@ -598,8 +1971,64 @@ class Orquestador:
          ))
          return ruta
  
@@ -4046,7 +4419,7 @@ index ad78b6b..77c545b 100644
          """
          Una tarea intermedia no necesita que pasen TODOS los tests (los de tareas
          siguientes todavía fallan): alcanza con validadores OK y que no se rompa
-@@ -609,7 +1874,52 @@ class Orquestador:
+@@ -609,7 +2038,52 @@ class Orquestador:
          validaciones = validar_archivos(self.ws, archivos)
          tests = ejecutar_tests(self.ws, timeout=self.settings.tests_timeout, completo=True)
          conteo = conteo_de_resultado(tests)
@@ -4100,7 +4473,7 @@ index ad78b6b..77c545b 100644
          if tests is not None and not tests.ok and conteo.reconocido:
              # Los tests de la especificación de tareas siguientes fallan a propósito: no son regresión.
              nuevos_fallos = [n for n in conteo.nombres_fallados
-@@ -629,7 +1939,9 @@ class Orquestador:
+@@ -629,7 +2103,9 @@ class Orquestador:
          if exigir_progreso and not problemas:
              # El implementador NO terminó (límite de pasos, error...). "No romper nada" no alcanza:
              # tiene que haber cambios reales y, si hay tests fallando, alguno más tiene que pasar.
@@ -4111,7 +4484,7 @@ index ad78b6b..77c545b 100644
                  problemas.append("SIN PROGRESO: el implementador no terminó y no cambió ningún archivo.")
              elif tests is not None and not tests.ok and conteo.reconocido and conteo.pasados <= antes.pasados:
                  problemas.append(
-@@ -642,30 +1954,225 @@ class Orquestador:
+@@ -642,30 +2118,225 @@ class Orquestador:
              diagnostico = anexar_pistas(diagnostico, 2)
          return Verificacion(not problemas, validaciones, tests, diagnostico, archivos, conteo)
  
@@ -4351,7 +4724,7 @@ index ad78b6b..77c545b 100644
  
          self.ui.fase(numero_fase, "Implementación" + (" · torneo" if self.settings.torneo and self.settings.candidatos > 1 else ""))
          numero_fase += 1
-@@ -676,35 +2183,99 @@ class Orquestador:
+@@ -676,35 +2347,99 @@ class Orquestador:
          if [t.id for t in orden] != [t.id for t in plan.tareas]:
              self.ui.tenue("  Orden por dependencias: " + " → ".join(t.id for t in orden))
              plan.tareas = orden
@@ -4457,7 +4830,7 @@ index ad78b6b..77c545b 100644
                  continue
  
              for ronda in range(self.settings.max_revisiones):
-@@ -712,7 +2283,10 @@ class Orquestador:
+@@ -712,7 +2447,10 @@ class Orquestador:
                  if not diff.strip():
                      informe.notas.append(f"Tarea {tarea.id}: sin cambios en archivos.")
                      break
@@ -4469,7 +4842,7 @@ index ad78b6b..77c545b 100644
                  if aprobado:
                      self.ui.ok(f"Revisor aprobó la tarea {tarea.id}")
                      break
-@@ -722,6 +2296,31 @@ class Orquestador:
+@@ -722,6 +2460,31 @@ class Orquestador:
                      break
                  self.implementar(pedido, plan, i, exploracion, tcid, correcciones=revision,
                                   protegidos=self._protegidos)
@@ -4501,7 +4874,7 @@ index ad78b6b..77c545b 100644
  
          archivos = [r for r in self.ws.checkpoints.archivos_desde(grupo) if (self.ws.raiz / r).is_file()]
          hay_tests_build = any(_es_test(a) for a in archivos)
-@@ -734,21 +2333,42 @@ class Orquestador:
+@@ -734,21 +2497,42 @@ class Orquestador:
          self.ui.fase(numero_fase, "Verificación real")
          verif = self.verificar(grupo)
          self._mostrar_verificacion(verif)
@@ -4548,7 +4921,7 @@ index ad78b6b..77c545b 100644
          informe.ruta_informe = self._guardar_informe(pedido, informe)
          self._mostrar_cierre(informe)
          return informe
-@@ -769,19 +2389,51 @@ class Orquestador:
+@@ -769,19 +2553,51 @@ class Orquestador:
          else:
              self.ui.error(f"tests: fallaron ({verif.conteo.texto() if verif.conteo.reconocido else verif.tests.comando})")
              self.ui.tenue(recortar(fallos_relevantes(verif.tests.stdout + "\n" + verif.tests.stderr, 2, 1500), 1500))
@@ -4602,7 +4975,7 @@ index ad78b6b..77c545b 100644
                     if informe.spec_tests else "")
                  + (f"## Escaladas al modelo fuerte\n{informe.escaladas}\n\n" if informe.escaladas else "")
                  + ("## Lecciones aprendidas\n" + "\n".join(f"- {l}" for l in informe.lecciones) + "\n\n" if informe.lecciones else "")
-@@ -790,40 +2442,77 @@ class Orquestador:
+@@ -790,40 +2606,77 @@ class Orquestador:
                  + ("## Notas\n" + "\n".join(f"- {n}" for n in informe.notas) + "\n" if informe.notas else "")
              )
              ruta = self.ws.raiz / ".reaper" / "informes" / f"build_{datetime.now():%Y%m%d_%H%M%S}.md"
@@ -8545,10 +8918,10 @@ index 0000000..43841a9
 +        self.assertNotEqual(app.settings.modelo, "")
 diff --git a/partes/48ze_autotest_juez.py b/partes/48ze_autotest_juez.py
 new file mode 100644
-index 0000000..6daf81c
+index 0000000..d6a2252
 --- /dev/null
 +++ b/partes/48ze_autotest_juez.py
-@@ -0,0 +1,615 @@
+@@ -0,0 +1,697 @@
 +"""
 +Autotests del 8.º agente: el JUEZ DE ENTREGA. Al cerrar /construir compara lo entregado contra el PEDIDO y
 +SOLO endurece el estado (verde → parcial); nunca convierte una build roja en verde. Entrada compacta + veredicto
@@ -9085,6 +9458,88 @@ index 0000000..6daf81c
 +        hallazgos = examen_de_realidad(ws, grupo, parsear_plan(self.PLAN_NUMEROS, "números"))
 +        self.assertTrue(any("SIMULACIÓN CONFESADA" in h for h in hallazgos))
 +
++    # --- Precisión: comentarios LEGÍTIMOS que la primera versión tomaba por confesiones (8 de 8, octubre 2026) ---
++    LEGITIMOS = ("# No hardcodear la ruta: se lee de la config", "# Evitamos valores hardcodeados",
++                 "# Simulación de la gravedad en cada frame del juego", "# In production you should set DEBUG to False",
++                 "# En producción debería usarse HTTPS", "# Por ahora usamos SQLite; alcanza para este volumen",
++                 "# En producción habría que poner un proxy delante", "# Usamos la API real, sin datos simulados",
++                 "# simulamos la gravedad del salto")
++    CONFESIONES = ("# por ahora devolvemos una lista fija", "# In production we would call the real API",
++                   "# valor hardcodeado temporalmente", "# esto es una simulación", "# respuesta hardcodeada",
++                   "# simulamos la respuesta del servidor", "# En producción se usaría Twilio", "# mock data for now",
++                   "# No hay API: datos de ejemplo")
++
++    def test_admisiones_no_marca_comentarios_legitimos(self):
++        for c in self.LEGITIMOS:
++            with self.subTest(c=c):
++                self.assertEqual(admisiones_de_simulacion(f"x = 1  {c}\n"), [])
++
++    def test_admisiones_sigue_marcando_confesiones(self):
++        for c in self.CONFESIONES:
++            with self.subTest(c=c):
++                self.assertTrue(admisiones_de_simulacion(f"x = 1  {c}\n"))
++
++    def test_lo_que_el_pedido_pide_a_proposito_no_es_confesion(self):
++        self.assertEqual(familias_pedidas("La base se crea sola con 3 recetas de ejemplo"), {"ejemplo"})
++        self.assertEqual(familias_pedidas("organizar CARPETA con --simular (no mueve, solo muestra)"), {"simulacion"})
++        self.assertEqual(familias_pedidas("números reales, no simulados"), set())    # negado: no habilita nada
++        self.assertEqual(familias_pedidas("sin datos de ejemplo"), set())
++        fuente = 'x = 1  # Insertar datos de ejemplo (3 recetas) al crear la base\ny = "Esto es una simulación: no se movió nada"\n'
++        self.assertEqual(admisiones_de_simulacion(fuente, {"ejemplo", "simulacion"}), [])
++        self.assertEqual(len(admisiones_de_simulacion(fuente)), 2)                 # sin pedirlo, sí se marcan
++
++    def test_examen_usa_el_pedido_y_revisa_js(self):
++        ws, grupo = self._build({"db.py": "def crear():\n    # datos de ejemplo pedidos: 3 recetas\n    return 3\n",
++                                 "juego.js": "// Simulación de la gravedad\nexport function mover(s) { return s; }\n"
++                                             "// por ahora devolvemos un puntaje fijo\n",
++                                 "tests/juego.test.mjs": "// datos de ejemplo para el test\n"})
++        hallazgos = examen_de_realidad(ws, grupo, None, "web de recetas con 3 recetas de ejemplo")
++        self.assertEqual(len(hallazgos), 1, hallazgos)
++        self.assertIn("juego.js:3", hallazgos[0])                                   # la gravedad no; el fijo sí
++        self.assertTrue(admisiones_web('function f() { throw new Error("Not implemented"); }\n'))
++        self.assertEqual(admisiones_web('const URL = "https://x.com/api"; // sirve los datos reales\n'), [])
++
++    PLAN_JUEGO = """<plan>
++<objetivo>Juego de la serpiente</objetivo>
++<interfaz>
++- juego.js: export function mover(serpiente, direccion); export function crecer(serpiente)
++</interfaz>
++<tarea id="1" archivos="juego.js">Lógica pura del juego.</tarea>
++</plan>"""
++
++    def test_examen_marca_funcion_js_del_plan_vacia(self):
++        fuente = ("export function mover(serpiente, direccion) {\n  // TODO\n}\n"
++                  "export function crecer(serpiente) { return [...serpiente, serpiente.at(-1)]; }\n"
++                  "function noop() {}\n")                                    # vacía pero NO pedida: no se marca
++        ws, grupo = self._build({"juego.js": fuente})
++        hallazgos = examen_de_realidad(ws, grupo, parsear_plan(self.PLAN_JUEGO, "serpiente"))
++        self.assertEqual(len(hallazgos), 1, hallazgos)
++        self.assertIn("juego.js:1", hallazgos[0])
++        self.assertIn("`mover`", hallazgos[0])
++
++    def test_tests_js_sin_valor(self):
++        fuente = ("import { test } from 'node:test';\nimport assert from 'node:assert/strict';\n"
++                  "test('mueve', () => { assert.deepEqual(mover([[1, 1]], 'der'), [[2, 1]]); });\n"
++                  "test('vacío', () => {});\n"
++                  "test('siempre pasa', () => { assert.ok(true); assert.equal(1, 1); });\n"
++                  "test('con ayudante', () => { verificarMovimiento(mover, 'arriba'); });\n"
++                  "test('tira', () => { assert.throws(() => mover(null)); });\n")
++        self.assertEqual([(n, l) for n, l, _d in tests_js_sin_valor(fuente)], [("vacío", 4), ("siempre pasa", 5)])
++        ws, grupo = self._build({"tests/juego.test.mjs": fuente})
++        hallazgos = examen_de_realidad(ws, grupo, None)
++        self.assertEqual(len(hallazgos), 2, hallazgos)
++        self.assertTrue(all(h.startswith("TEST SIN VALOR en tests/juego.test.mjs::") for h in hallazgos))
++
++    def test_tests_js_de_las_plantillas_tienen_valor(self):
++        revisados = 0
++        for nombre, plantilla in PLANTILLAS.items():
++            for rel, contenido in plantilla.archivos.items():
++                if isinstance(contenido, str) and _es_test(rel) and rel.endswith(("js", "ts")):
++                    revisados += 1
++                    with self.subTest(plantilla=nombre, archivo=rel):
++                        self.assertEqual(tests_js_sin_valor(contenido), [])
++        self.assertGreater(revisados, 5)
++
 +    def test_veredicto_determinista_no_gasta_tokens(self):
 +        ws, grupo = self._build({"app.py": "def sumar(a, b):\n    pass\n"})
 +        llm = MockLLM(lambda m, k: '{"cumple": true, "confianza": "high"}')
@@ -9374,10 +9829,10 @@ index 0000000..dc02ba1
 +        self.assertNotIn("verificación: UNVERIFIED", texto)
 diff --git a/partes/48zg_autotest_openrouter_real.py b/partes/48zg_autotest_openrouter_real.py
 new file mode 100644
-index 0000000..c958b64
+index 0000000..13c4786
 --- /dev/null
 +++ b/partes/48zg_autotest_openrouter_real.py
-@@ -0,0 +1,505 @@
+@@ -0,0 +1,516 @@
 +"""
 +Autotests de regresión de la PRUEBA REAL con OpenRouter (modelos :free, octubre 2026). Lo que apareció con un
 +modelo de verdad y no con el MockLLM:
@@ -9428,6 +9883,17 @@ index 0000000..c958b64
 +        c.dormir = lambda s: esperas.append(s)
 +        self.assertEqual(c.chat([{"role": "user", "content": "x"}]).texto, "ok")
 +        self.assertGreater(sum(esperas), 0)                             # sin otro modelo: esperar es lo único
++
++
++    def test_sondeo_de_modelo_no_espera_a_un_saturado(self):
++        # /perfil gratis y prueba_real.py sondean varios :free; con reintentos normales y un 429 con Retry-After,
++        # el sondeo de UN modelo podía tardar minutos (sin alternativa, sin_respaldo=True) aunque igual se descarta.
++        c = self._cliente([_Transitorio("429 pool", espera=60, saturado=True), "REAPER_OK"], reintentos=4, rpm=0)
++        esperas = []
++        c.dormir = lambda s: esperas.append(s)
++        self.assertEqual(_probar_modelo(c, "a/saturado:free")["estado"], "FALLA")
++        self.assertEqual(sum(esperas), 0)
++        self.assertEqual(c.settings.reintentos, 4)                     # no se tocó la configuración del usuario
 +
 +
 +class TestOpenRouterRealVerificacion(BaseTest):
@@ -9883,6 +10349,128 @@ index 0000000..c958b64
 +        texto = app.ui.texto_registrado()
 +        self.assertIn("Probando los modelos gratis", texto)
 +        self.assertIn("pueden ser PAGOS: juez=anthropic/caro", texto)      # avisa del rol que puede cobrar
+diff --git a/partes/48zh_autotest_navegador.py b/partes/48zh_autotest_navegador.py
+new file mode 100644
+index 0000000..8210610
+--- /dev/null
++++ b/partes/48zh_autotest_navegador.py
+@@ -0,0 +1,116 @@
++"""
++Autotests de errores que SOLO aparecen en el navegador (node --test pasa igual), típicos de los modelos gratis al
++construir un juego o una web: el build salía VERIFICADO y la página no hacía nada.
++
++- <script src="juego.js"> sin type="module" con juego.js lleno de `export` → SyntaxError en el navegador.
++- onclick="reiniciar()" con reiniciar definida dentro de un módulo → ReferenceError (lo de un módulo no es global).
++"""
++
++
++class TestNavegadorScripts(BaseTest):
++    def _errores(self, archivos):
++        ws = self.proyecto(archivos)
++        return [r for r in validar_archivo(ws, "index.html") if not r.ok]
++
++    def test_script_clasico_que_es_modulo_es_error(self):
++        errores = self._errores({"index.html": '<body>\n<script src="juego.js"></script>\n</body>\n',
++                                 "juego.js": "export function mover(s) { return s; }\n"})
++        self.assertEqual(len(errores), 1)
++        self.assertIn('type="module"', errores[0].stderr)
++        self.assertIn("línea 2", errores[0].stderr)
++
++    def test_onclick_a_funcion_de_modulo_es_error(self):
++        errores = self._errores({"index.html": '<button onclick="reiniciar()">Otra</button>\n'
++                                               '<script type="module" src="main.js"></script>\n',
++                                 "main.js": 'import { mover } from "./juego.js";\nfunction reiniciar() { mover(1); }\n',
++                                 "juego.js": "export function mover(s) { return s; }\n"})
++        self.assertEqual(len(errores), 1)
++        self.assertIn("ReferenceError: reiniciar is not defined", errores[0].stderr)
++
++    def test_lo_correcto_no_se_marca(self):
++        casos = [
++            # módulo bien cargado y handler con addEventListener
++            {"index.html": '<button id="b">Otra</button>\n<script type="module" src="main.js"></script>\n',
++             "main.js": 'import { mover } from "./juego.js";\ndocument.getElementById("b").addEventListener("click", '
++                        '() => mover(1));\n', "juego.js": "export function mover(s) { return s; }\n"},
++            # handler inline con la función expuesta en window
++            {"index.html": '<button onclick="reiniciar()">Otra</button>\n<script type="module" src="m.js"></script>\n',
++             "m.js": "function reiniciar() {}\nwindow.reiniciar = reiniciar;\n"},
++            # script clásico con onclick a una función global, import() dinámico y un comentario con "export"
++            {"index.html": '<button onclick="reiniciar()">Otra</button>\n<script src="app.js"></script>\n',
++             "app.js": "// export no es un problema en un comentario\nfunction reiniciar() { import('./x.js'); }\n"},
++            # CDN externo: no se revisa
++            {"index.html": '<script src="https://cdn.example.com/lib.js"></script>\n'},
++        ]
++        for archivos in casos:
++            with self.subTest(html=archivos["index.html"][:40]):
++                self.assertEqual([r.stderr for r in self._errores(archivos)], [])
++
++    def test_plantillas_web_de_reaper_no_se_marcan(self):
++        # Las plantillas propias son la referencia: si la regla las marcara, sería la regla la que está mal.
++        for nombre, plantilla in PLANTILLAS.items():
++            archivos = {rel: contenido for rel, contenido in plantilla.archivos.items() if isinstance(contenido, str)}
++            htmls = [rel for rel in archivos if rel.endswith((".html", ".htm"))]
++            if not htmls:
++                continue
++            ws = self.proyecto(archivos, nombre=f"p_{nombre}")
++            for rel in htmls:
++                with self.subTest(plantilla=nombre, html=rel):
++                    self.assertEqual(scripts_html_incoherentes(ws, ws.raiz / rel, ws.leer(rel)), [])
++
++
++class TestBundleSinNombresPisados(BaseTest):
++    # Todas las partes se empaquetan en UN archivo: dos `_X = ...` globales con el mismo nombre en partes distintas
++    # no dan error, la segunda pisa a la primera y la parte de arriba usa en silencio datos ajenos. Pasó con
++    # _RE_NEGACION (afirma_verificacion dejó de ver "no verifiqué"), _IO_REAL (Test Intelligence usaba la lista
++    # del examen de realidad) y _LOCK_PROCESOS (dos locks distintos eran el mismo).
++    EXTENSIONES_A_PROPOSITO = {"_PARSERS"}                                 # _PARSERS = _PARSERS + (...): se extiende
++
++    def test_ningun_global_definido_dos_veces(self):
++        fuente = Path(__file__).read_text(encoding="utf-8")
++        contador = collections.Counter()
++        for nodo in ast.parse(fuente).body:
++            if isinstance(nodo, (ast.Assign, ast.AnnAssign)):
++                objetivos = nodo.targets if isinstance(nodo, ast.Assign) else [nodo.target]
++                for t in objetivos:
++                    contador.update(n.id for n in ast.walk(t) if isinstance(n, ast.Name))   # también `_A, _B = …`
++            elif isinstance(nodo, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
++                contador[nodo.name] += 1
++        repetidos = sorted(n for n, k in contador.items() if k > 1 and n not in self.EXTENSIONES_A_PROPOSITO)
++        self.assertEqual(repetidos, [])
++
++
++class TestSuitesMixtasYNombresJs(BaseTest):
++    TEST_PY_OK = "import unittest\n\nclass T(unittest.TestCase):\n    def test_a(self):\n        self.assertEqual(1 + 1, 2)\n"
++    TEST_JS_OK = "import { test } from 'node:test';\nimport assert from 'node:assert';\ntest('suma', () => assert.equal(1 + 1, 2));\n"
++    TEST_JS_MAL = "import { test } from 'node:test';\nimport assert from 'node:assert';\ntest('resta', () => assert.equal(1 - 1, 5));\n"
++
++    def test_nombres_de_tests_js_que_usan_los_modelos(self):
++        ws = self.proyecto({"tests/unidad/juego.spec.mjs": "", "tests/test_juego.mjs": "", "tests/juego_test.js": "",
++                            "tests/ayuda.js": "", "juego.test.mjs": "", "juego.js": "",
++                            "tests/node_modules/x/a.test.js": ""})
++        nombres = [ws.rel(p) for p in tests_node(ws.raiz)]
++        self.assertEqual(nombres, ["juego.test.mjs", "tests/juego_test.js", "tests/test_juego.mjs",
++                                   "tests/unidad/juego.spec.mjs"])                 # ni ayuda.js ni node_modules
++
++    def test_proyecto_mixto_corre_las_dos_suites(self):
++        if not shutil.which("node"):
++            self.skipTest("node no está instalado")
++        ws = self.proyecto({"tests/test_api.py": self.TEST_PY_OK, "tests/app.test.mjs": self.TEST_JS_MAL})
++        comando, nombre = detectar_comando_tests(ws)
++        self.assertIn("node --test", comando)
++        self.assertIn("+ node --test", nombre)
++        r = ejecutar_tests(ws, timeout=120)
++        self.assertFalse(r.ok)                                                  # antes: verde (solo corría Python)
++        conteo = conteo_de_resultado(r)
++        self.assertEqual((conteo.pasados, conteo.fallados), (1, 1))
++        ws.escribir("tests/app.test.mjs", self.TEST_JS_OK)
++        r = ejecutar_tests(ws, timeout=120)
++        self.assertTrue(r.ok, r.stdout + r.stderr)
++        self.assertEqual(conteo_de_resultado(r).pasados, 2)
++
++    def test_solo_python_no_cambia(self):
++        ws = self.proyecto({"tests/test_api.py": self.TEST_PY_OK})
++        comando, nombre = detectar_comando_tests(ws)
++        self.assertNotIn("node", comando)
++        self.assertIn(nombre, ("pytest", "unittest"))
 diff --git a/partes/49_autotest_runner.py b/partes/49_autotest_runner.py
 index 541aee7..02a88e9 100644
 --- a/partes/49_autotest_runner.py
@@ -10559,6 +11147,67 @@ index 8456a11..8004d91 100644
      ]
      if rol.rutas_permitidas:
          partes.append("- You may only write test files (" + ", ".join(rol.rutas_permitidas[:6]) + " ...).")
+diff --git a/partes/58_procesos.py b/partes/58_procesos.py
+index b80eb03..9cc73e2 100644
+--- a/partes/58_procesos.py
++++ b/partes/58_procesos.py
+@@ -116,17 +116,17 @@ class ProcesoFondo:
+ 
+ 
+ _PROCESOS: dict[str, ProcesoFondo] = {}
+-_LOCK_PROCESOS = threading.Lock()
++_LOCK_PROCESOS_FONDO = threading.Lock()
+ _CONTADOR_PROCESOS = itertools.count(1)
+ 
+ 
+ def procesos_activos() -> list[ProcesoFondo]:
+-    with _LOCK_PROCESOS:
++    with _LOCK_PROCESOS_FONDO:
+         return [p for p in _PROCESOS.values() if p.vivo]
+ 
+ 
+ def detener_todos_los_procesos() -> int:
+-    with _LOCK_PROCESOS:
++    with _LOCK_PROCESOS_FONDO:
+         procesos = list(_PROCESOS.values())
+         _PROCESOS.clear()
+     detenidos = 0
+@@ -142,7 +142,7 @@ atexit.register(detener_todos_los_procesos)
+ 
+ def _proceso(ctx: Contexto, p: dict) -> ProcesoFondo:
+     id_ = (p.get("id") or "").strip()
+-    with _LOCK_PROCESOS:
++    with _LOCK_PROCESOS_FONDO:
+         if not id_ and len(_PROCESOS) == 1:
+             return next(iter(_PROCESOS.values()))
+         proceso = _PROCESOS.get(id_)
+@@ -190,7 +190,7 @@ def start_process(ctx: Contexto, p: dict) -> str:
+         proceso = ProcesoFondo(id_, comando, ctx.ws.raiz, _entrada_estandar(p))
+     except OSError as e:
+         raise ErrorHerramienta(f"No pude iniciar el proceso: {e}")
+-    with _LOCK_PROCESOS:
++    with _LOCK_PROCESOS_FONDO:
+         _PROCESOS[id_] = proceso
+     listo = proceso.esperar_texto(patron, timeout if patron else min(timeout, 0.8))
+     salida = proceso.nuevas(80)
+@@ -243,7 +243,7 @@ def stop_process(ctx: Contexto, p: dict) -> str:
+     proceso = _proceso(ctx, p)
+     estaba_vivo = proceso.vivo
+     codigo = proceso.detener()
+-    with _LOCK_PROCESOS:
++    with _LOCK_PROCESOS_FONDO:
+         _PROCESOS.pop(proceso.id, None)
+     finales = proceso.nuevas(60) or proceso.ultimas(20)
+     estado = "detenido" if estaba_vivo else f"ya había terminado (código {codigo})"
+@@ -287,7 +287,7 @@ def _cmd_procesos(self: "App", arg: str) -> None:
+         if objetivo == "todos":
+             self.ui.ok(f"Detenidos {detener_todos_los_procesos()} proceso(s).")
+             return
+-        with _LOCK_PROCESOS:
++        with _LOCK_PROCESOS_FONDO:
+             proceso = _PROCESOS.pop(objetivo, None)
+         if proceso is None:
+             self.ui.error(f"No existe el proceso {objetivo}.")
 diff --git a/partes/59_manual.py b/partes/59_manual.py
 index c9c292f..eb8455e 100644
 --- a/partes/59_manual.py
@@ -10573,7 +11222,7 @@ index c9c292f..eb8455e 100644
  
      ## Primer uso
 diff --git a/partes/70_equipo.py b/partes/70_equipo.py
-index bde977a..572251e 100644
+index bde977a..c8ad35e 100644
 --- a/partes/70_equipo.py
 +++ b/partes/70_equipo.py
 @@ -21,18 +21,252 @@ ROLES_EQUIPO_SEIS = (
@@ -10840,14 +11489,17 @@ index bde977a..572251e 100644
          asignacion[rol] = candidatos[i % len(candidatos)]
      return asignacion, ""
  
-@@ -71,16 +305,39 @@ def _probar_modelo(llm, modelo: str) -> dict:
+@@ -71,16 +305,41 @@ def _probar_modelo(llm, modelo: str) -> dict:
      """Petición mínima REAL a un modelo concreto (sin fallback): dice si responde de verdad."""
      t0 = time.monotonic()
      try:
 -        resp = llm.chat([{"role": "user", "content": "ping"}], modelo=modelo, max_tokens=1,
+-                        temperatura=0, sin_respaldo=True, rol="probe")
++        # reintentos=0: un sondeo no espera. Con un :free saturado (429 con Retry-After) los reintentos normales
++        # podían tener /perfil gratis varios minutos "probando" un modelo que igual se descarta.
 +        resp = llm.chat([{"role": "user", "content": "Responde únicamente la palabra REAPER_OK."}],
 +                        modelo=modelo, max_tokens=64,
-                         temperatura=0, sin_respaldo=True, rol="probe")
++                        temperatura=0, sin_respaldo=True, rol="probe", reintentos=0)
          ms = round((time.monotonic() - t0) * 1000)
 -        return {"estado": "RESPONDE", "detalle": f"{ms}ms", "modelo_servido": getattr(resp, "modelo", "")}
 +        visible = str(getattr(resp, "texto", "") or "").strip()
@@ -10882,7 +11534,7 @@ index bde977a..572251e 100644
  def probar_equipo(llm, settings) -> list:
      """
      Prueba de verdad cada uno de los seis roles con una petición mínima. Dedup por modelo (no gasta de más).
-@@ -108,7 +365,8 @@ def resumen_arranque_equipo(settings) -> str:
+@@ -108,7 +367,8 @@ def resumen_arranque_equipo(settings) -> str:
      ind = independencia_equipo(estado)
      con_clave = sum(1 for e in estado if e["tiene_clave"])
      aviso = "" if con_clave == len(estado) else f" · {len(estado) - con_clave} sin clave"
