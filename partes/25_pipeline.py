@@ -121,9 +121,14 @@ def _primera_linea_util(diagnostico: str, limite: int = 200) -> str:
 # Tareas que PLANEAN simular (prueba real con OpenRouter: la tarea 1 decía "crear core.py con esqueletos que
 # lanzan NotImplementedError y un __main__ que imprima TODO"). De ahí salían las entregas de mentira.
 _RE_TAREA_SIMULADA = re.compile(
-    r"esqueleto|skeleton|\bstubs?\b|placeholder|marcador(?:es)?\s+de\s+posici|NotImplementedError|\bTODO\b|"
+    r"esqueleto|skeleton|\bstubs?\b|placeholder|marcador(?:es)?\s+de\s+posici|NotImplementedError|"
     r"implement\w*\s+(?:m[aá]s\s+)?(?:tarde|despu[eé]s|later)|datos?\s+de\s+ejemplo|datos?\s+fictici",
     re.IGNORECASE)
+# El marcador de programador va en MAYÚSCULAS y aparte: con IGNORECASE marcaba la palabra "todo" ("verificar que
+# todo funciona"), un falso positivo que en la prueba real hizo replanificar sin motivo.
+_RE_TODO = re.compile(r"\b(?:TODO|FIXME)\b")
+# Viñetas o numeración al principio ("- ejecutar las pruebas", "2) Correr los tests"): el modelo real las usa.
+_RE_VINETA = re.compile(r"^\s*(?:[-*•·]+|\d+[.)])\s*")
 # Tareas que solo "corren las pruebas": no entregan archivos y REAPER ya verifica después de cada tarea.
 _RE_META_TAREA = re.compile(
     r"^\s*(?:ejecut|corr[eé]|run\b|verific|valid|comprob|lanz)\w*\s+(?:que\s+)?"
@@ -137,20 +142,24 @@ def problemas_del_plan(plan) -> list:
     salida = []
     for tarea in getattr(plan, "tareas", []) or []:
         texto = tarea.descripcion or ""
-        m = _RE_TAREA_SIMULADA.search(texto)
+        m = _RE_TAREA_SIMULADA.search(texto) or _RE_TODO.search(texto)
         if m:
             salida.append(f"la tarea {tarea.id} planea una simulación («{m.group(0)}»): tiene que implementar "
                           "el código real y completo, sin esqueletos ni placeholders")
-        if _RE_META_TAREA.search(texto.splitlines()[0] if texto else ""):
+        if _es_meta_tarea(texto):
             salida.append(f"la tarea {tarea.id} solo corre/verifica pruebas: REAPER ya lo hace después de cada "
                           "tarea; quitala o fusionala con una tarea que cree archivos")
     return salida
 
 
+def _es_meta_tarea(descripcion: str) -> bool:
+    primera = (descripcion or "").strip().splitlines()[0] if (descripcion or "").strip() else ""
+    return bool(_RE_META_TAREA.search(_RE_VINETA.sub("", primera, count=1)))
+
+
 def quitar_meta_tareas(plan) -> list:
     """Saca del plan las tareas que solo corren pruebas (y sus ids de las deps de las demás). → ids quitados."""
-    quitadas = [t.id for t in plan.tareas if _RE_META_TAREA.search((t.descripcion or "").splitlines()[0]
-                                                                    if t.descripcion else "")]
+    quitadas = [t.id for t in plan.tareas if _es_meta_tarea(t.descripcion)]
     if quitadas and len(quitadas) < len(plan.tareas):
         plan.tareas = [t for t in plan.tareas if t.id not in quitadas]
         for t in plan.tareas:

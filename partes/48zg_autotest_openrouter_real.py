@@ -114,6 +114,20 @@ class TestOpenRouterRealPlan(BaseTest):
                      "Escribir pruebas unitarias en tests/test_core.py", "Ejecutar la migración de la base"):
             self.assertFalse(_RE_META_TAREA.search(real), real)
 
+    def test_falsos_positivos_y_vinetas_de_la_prueba_real(self):
+        # Build real 4: "verificar que todo funciona" se marcó como simulación por la palabra "todo", y
+        # "- ejecutar las pruebas…" (sin archivos) no se detectó como meta-tarea por el guion de viñeta.
+        plan = self._plan("- ejecutar las pruebas para verificar que todo funciona: usar python -m unittest",
+                          "Implementar todos los endpoints de la API en app.py",
+                          "2) Correr los tests", "Agregar validación; dejar un TODO para el caché")
+        problemas = problemas_del_plan(plan)
+        self.assertFalse(any("la tarea 2" in p for p in problemas))      # "todos" no es TODO
+        self.assertFalse(any("la tarea 1 planea una simulación" in p for p in problemas))
+        self.assertTrue(any(p.startswith("la tarea 1 solo corre") for p in problemas))
+        self.assertTrue(any(p.startswith("la tarea 3 solo corre") for p in problemas))
+        self.assertTrue(any("la tarea 4 planea una simulación («TODO»)" in p for p in problemas))
+        self.assertEqual(quitar_meta_tareas(plan), ["1", "3"])
+
     def test_quitar_meta_tareas_limpia_dependencias(self):
         plan = self._plan("Implementar sumar en core.py", "Correr los tests y verificar", "Agregar restar")
         plan.tareas[2].deps = ["1", "2"]
