@@ -305,9 +305,11 @@ def _probar_modelo(llm, modelo: str) -> dict:
     """Petición mínima REAL a un modelo concreto (sin fallback): dice si responde de verdad."""
     t0 = time.monotonic()
     try:
+        # reintentos=0: un sondeo no espera. Con un :free saturado (429 con Retry-After) los reintentos normales
+        # podían tener /perfil gratis varios minutos "probando" un modelo que igual se descarta.
         resp = llm.chat([{"role": "user", "content": "Responde únicamente la palabra REAPER_OK."}],
                         modelo=modelo, max_tokens=64,
-                        temperatura=0, sin_respaldo=True, rol="probe")
+                        temperatura=0, sin_respaldo=True, rol="probe", reintentos=0)
         ms = round((time.monotonic() - t0) * 1000)
         visible = str(getattr(resp, "texto", "") or "").strip()
         if "REAPER_OK" not in visible.upper():

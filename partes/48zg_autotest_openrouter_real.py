@@ -50,6 +50,17 @@ class TestOpenRouterRealErrores(BaseTest):
         self.assertGreater(sum(esperas), 0)                             # sin otro modelo: esperar es lo único
 
 
+    def test_sondeo_de_modelo_no_espera_a_un_saturado(self):
+        # /perfil gratis y prueba_real.py sondean varios :free; con reintentos normales y un 429 con Retry-After,
+        # el sondeo de UN modelo podía tardar minutos (sin alternativa, sin_respaldo=True) aunque igual se descarta.
+        c = self._cliente([_Transitorio("429 pool", espera=60, saturado=True), "REAPER_OK"], reintentos=4, rpm=0)
+        esperas = []
+        c.dormir = lambda s: esperas.append(s)
+        self.assertEqual(_probar_modelo(c, "a/saturado:free")["estado"], "FALLA")
+        self.assertEqual(sum(esperas), 0)
+        self.assertEqual(c.settings.reintentos, 4)                     # no se tocó la configuración del usuario
+
+
 class TestOpenRouterRealVerificacion(BaseTest):
     def test_respuesta_sin_cambios_no_muestra_unverified(self):
         app = App(self.ajustes(modo="auto"), MockLLM(lambda m, k: "OK"), self.ui(), self.proyecto(),

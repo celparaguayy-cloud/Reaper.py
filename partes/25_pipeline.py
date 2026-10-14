@@ -297,39 +297,109 @@ def stubs_en_codigo(fuente: str) -> list:
 # El modelo ADMITE que lo que escribió es provisional/ficticio. Frases muy específicas (no palabras sueltas) para
 # no marcar código legítimo: un comentario que dice "en una implementación real llamaríamos a la API" o un string
 # "número de ejemplo" es una simulación confesada. Caso real: get_free_number devolvía "+1555" + dígitos al azar.
+# Lo que NO es confesión (falsos positivos reales, ver PRUEBAS §18.d): "No hardcodear la ruta", "Evitamos valores
+# hardcodeados", "Simulación de la gravedad en cada frame", "In production you should set DEBUG to False", "En
+# producción debería usarse HTTPS", "Por ahora usamos SQLite", "En producción habría que poner un proxy".
+_COND_ES = (r"(?:ir|usar|conectar|llamar|consultar|traer|enviar|descargar|leer|recibir|pedir|integrar|"
+            r"reemplazar|scrapear)[ií]a(?:mos|n)?|obtendr[ií]a(?:mos|n)?|har[ií]a(?:mos|n)?")
 _RE_ADMITE_SIMULACION = re.compile(
     r"en\s+(?:una\s+|la\s+)?(?:implementaci[oó]n|versi[oó]n|app|aplicaci[oó]n)\s+real"
-    r"|in\s+a\s+real\s+(?:implementation|app)|in\s+production\s+(?:you|we|this)"
-    r"|en\s+producci[oó]n\s+(?:ir[ií]a|usar[ií]a|se\s+|conectar[ií]a|habr[ií]a|deber[ií]a|llamar[ií]a)"
-    r"|por\s+ahora\s+(?:devolv|retorn|simul|us|dev)"
-    r"|datos?\s+(?:de\s+ejemplo|simulad|fictici|dummy|de\s+prueba\s+fals)"
-    r"|(?:respuesta|valor(?:es)?|n[uú]mero|mensaje|c[oó]digo)\s+(?:simulad|fictici|de\s+ejemplo|hardcode)"
+    r"|in\s+a\s+real\s+(?:implementation|app|application|world\s+app)"
+    r"|in\s+production,?\s+(?:you|we|this|it|one)\s+would"
+    r"|en\s+producci[oó]n,?\s+(?:se\s+|esto\s+se\s+)?(?:" + _COND_ES + r")"
+    r"|por\s+ahora\s+(?:se\s+)?(?:devolv|retorn|simul|invent|fing)"
+    r"|de\s+momento\s+(?:se\s+)?(?:devolv|retorn|simul|invent|fing)"
+    r"|datos?\s+(?:de\s+ejemplo|simulad|fictici|inventad|dummy|falsos|de\s+prueba\s+fals)"
+    r"|(?:respuesta|n[uú]mero|mensaje|c[oó]digo|resultado)s?\s+(?:simulad|fictici|inventad|falsos?\b|de\s+ejemplo"
+    r"|hardcode|harcode)"
+    r"|valor(?:es)?\s+(?:simulad|fictici|inventad)"
+    r"|(?:fake|dummy|mock(?:ed)?|simulated)\s+(?:data|response|number|result|value)s?"
     r"|esto\s+es\s+(?:una\s+)?(?:simulaci[oó]n|un\s+mock|un\s+placeholder|provisional)"
-    r"|simulaci[oó]n\s+de\s+(?:la|el|los|las|un)"
-    r"|(?:har[dt]cod|harcod)\w*"
-    r"|reemplaz\w*\s+(?:esto|con\s+la\s+real|por\s+la\s+real|en\s+producci)"
+    r"|simula(?:mos)?\s+(?:la\s+|el\s+|una\s+|un\s+)?(?:llamada|respuesta|api|petici[oó]n|request|env[ií]o|consulta"
+    r"|descarga|conexi[oó]n|servidor|backend|base\s+de\s+datos|pago|sms|scrap)"
+    r"|har[dt]?cod\w*\s+(?:por\s+ahora|temporalmente|de\s+momento|for\s+now|temporarily)"
+    r"|placeholder\s+(?:value|data|response|implementation)|(?:mock|stub)\s+for\s+now"
+    r"|reemplaz\w*\s+(?:esto\s+(?:por|con)|con\s+la\s+real|por\s+la\s+real|en\s+producci)"
     r"|pendiente\s+de\s+implementar|falta\s+implementar|sin\s+implementar\s+(?:a[uú]n|todav)"
     r"|not\s+implemented\s+yet|implement\s+(?:this|me)\s+later",
     re.IGNORECASE)
+# Negación justo antes de la frase ("Evitamos valores hardcodeados", "sin datos simulados"): no es confesión.
+_RE_NEGACION_CONFESION = re.compile(r"^(?:no|sin|nunca|ni|evit\w*|avoid\w*|never|not|without|don'?t|nada)$", re.IGNORECASE)
+# Familias que el PEDIDO puede pedir a propósito: "3 recetas de ejemplo", "--simular (no mueve, solo muestra)".
+_FAMILIAS_PERMITIBLES = {
+    "ejemplo": (re.compile(r"ejemplo|example|sample|semilla|seed|demo", re.IGNORECASE),
+                re.compile(r"ejemplo|example|sample", re.IGNORECASE)),
+    "simulacion": (re.compile(r"simul|dry.?run|mock|fake|fictici|dummy", re.IGNORECASE),
+                   re.compile(r"simul|mock|fake|fictici|dummy", re.IGNORECASE)),
+}
 
 
-def admisiones_de_simulacion(fuente: str) -> list:
-    """[(linea, frase)] de comentarios o textos que CONFIESAN que el código es provisional/ficticio. Usa tokenize
-    para ver comentarios y strings reales (0 tokens de modelo). Precisión alta: solo frases inequívocas."""
+def familias_pedidas(pedido: str) -> set:
+    """Familias de 'confesión' que el PEDIDO del usuario pide a propósito (y sin negar: "no quiero datos simulados"
+    NO habilita nada). Solo se mira el pedido, nunca el plan: el plan lo escribe el modelo."""
+    salida = set()
+    for familia, (en_pedido, _en_frase) in _FAMILIAS_PERMITIBLES.items():
+        for m in en_pedido.finditer(pedido or ""):
+            previas = re.findall(r"[\w']+", pedido[max(0, m.start() - 40):m.start()])[-4:]   # "sin datos de ejemplo"
+            if not any(_RE_NEGACION_CONFESION.match(p) for p in previas):
+                salida.add(familia)
+                break
+    return salida
+
+
+def _confesiones_en_texto(texto: str, permitidas: set = frozenset()) -> list:
+    """Frases de confesión en un comentario o string, descartando las negadas y las de familias permitidas."""
     salida = []
+    for m in _RE_ADMITE_SIMULACION.finditer(texto):
+        previas = re.findall(r"[\w']+", texto[max(0, m.start() - 30):m.start()])[-2:]
+        if any(_RE_NEGACION_CONFESION.match(p) for p in previas):
+            continue
+        frase = m.group(0).strip()
+        if any(_FAMILIAS_PERMITIBLES[f][1].search(frase) for f in permitidas if f in _FAMILIAS_PERMITIBLES):
+            continue
+        salida.append(frase)
+    return salida
+
+
+def admisiones_de_simulacion(fuente: str, permitidas: set = frozenset()) -> list:
+    """[(linea, frase)] de comentarios o textos que CONFIESAN que el código es provisional/ficticio. Usa tokenize
+    para ver comentarios y strings reales (0 tokens de modelo). Precisión alta: solo frases inequívocas.
+    `permitidas`: familias que el pedido pidió a propósito (ver familias_pedidas)."""
+    salida = []
+    tipos = {tokenize.COMMENT, tokenize.STRING}
+    if hasattr(tokenize, "FSTRING_MIDDLE"):                            # Python 3.12+: el texto de un f-string
+        tipos.add(tokenize.FSTRING_MIDDLE)
     try:
-        tokens = tokenize.generate_tokens(io.StringIO(fuente).readline)
-        for tok in tokens:
-            if tok.type in (tokenize.COMMENT, tokenize.STRING):
-                m = _RE_ADMITE_SIMULACION.search(tok.string)
-                if m:
-                    salida.append((tok.start[0], m.group(0).strip()))
+        for tok in tokenize.generate_tokens(io.StringIO(fuente).readline):
+            if tok.type in tipos:
+                for frase in _confesiones_en_texto(tok.string, permitidas)[:1]:
+                    salida.append((tok.start[0], frase))
     except (tokenize.TokenError, IndentationError, SyntaxError, ValueError):
         pass
     return salida
 
 
-_IO_REAL = ("httpx", "requests", "urllib", "urlopen", "socket", "aiohttp", "http", "subprocess", "popen",
+# JS/TS/HTML: no hay tokenize, pero los comentarios se reconocen bien con regex (// y /* */ y <!-- -->). Un
+# `//` dentro de un string (una URL) puede colarse como "comentario"; no importa: una URL no confiesa nada.
+EXTENSIONES_WEB = (".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx", ".html", ".htm", ".vue", ".svelte")
+_RE_COMENTARIO_WEB = re.compile(r"/\*[\s\S]*?\*/|<!--[\s\S]*?-->|(?<![:\\])//[^\n]*")
+_RE_JS_NO_IMPLEMENTADO = re.compile(
+    r"throw\s+new\s+Error\(\s*['\"`]\s*(?:not\s+implemented|no\s+implementad|sin\s+implementar|todo\b)",
+    re.IGNORECASE)
+
+
+def admisiones_web(fuente: str, permitidas: set = frozenset()) -> list:
+    """[(linea, frase)] de confesiones en comentarios de JS/TS/HTML y de `throw new Error("not implemented")`."""
+    salida = []
+    for m in _RE_COMENTARIO_WEB.finditer(fuente):
+        for frase in _confesiones_en_texto(m.group(0), permitidas)[:1]:
+            salida.append((fuente.count("\n", 0, m.start()) + 1, frase))
+    for m in _RE_JS_NO_IMPLEMENTADO.finditer(fuente):
+        salida.append((fuente.count("\n", 0, m.start()) + 1, m.group(0).strip()))
+    return sorted(salida)
+
+
+_LLAMADAS_IO_REAL = ("httpx", "requests", "urllib", "urlopen", "socket", "aiohttp", "http", "subprocess", "popen",
             "run", "open", "connect", "fetch", "get", "post", "session", "curl", "sqlite3", "psycopg", "execute")
 _RE_PIDE_DATOS_REALES = re.compile(
     r"scrap|descarg|download|\bfetch|consult|obten|recib|\bapi\b|\bhttp|web\b|solicit|"
@@ -343,7 +413,7 @@ def _usa_io_real(fn) -> bool:
             objetivo = nodo.func
             nombre = (objetivo.attr if isinstance(objetivo, ast.Attribute)
                       else getattr(objetivo, "id", "")).lower()
-            if nombre in _IO_REAL:
+            if nombre in _LLAMADAS_IO_REAL:
                 return True
     return False
 
@@ -375,13 +445,15 @@ def fabricaciones_en_codigo(fuente: str, deben_traer_datos: set) -> list:
     return salida
 
 
-def examen_de_realidad(ws, cid_build: Optional[int], plan=None) -> list:
+def examen_de_realidad(ws, cid_build: Optional[int], plan=None, pedido: str = "") -> list:
     """
     Determinista (0 tokens): ¿lo entregado es REAL o una simulación? Revisa lo que cambió en esta build:
     - funciones que el plan pidió (def nombre en la interfaz o las tareas) y quedaron vacías (pass / ...), y
       cualquier `raise NotImplementedError` fuera de métodos abstractos: el código existe pero no hace nada;
     - tests creados o tocados en esta build que no prueban nada (tautologías, sin assert, mockean justo lo que
-      deberían probar, esperan el valor que inyectó el propio mock): un verde que no demuestra nada.
+      deberían probar, esperan el valor que inyectó el propio mock): un verde que no demuestra nada;
+    - comentarios/strings que CONFIESAN ser provisionales (también en JS/TS/HTML), salvo lo que el PEDIDO pidió a
+      propósito ("3 recetas de ejemplo", "--simular").
     Devuelve hallazgos legibles; [] si lo revisado es real.
     """
     if cid_build is None:
@@ -399,14 +471,22 @@ def examen_de_realidad(ws, cid_build: Optional[int], plan=None) -> list:
         # Si el pedido entero habla de traer datos reales, cualquier función declarada cuenta (plan corto sin detalle).
         if _RE_PIDE_DATOS_REALES.search(texto) and not deben_traer_datos:
             deben_traer_datos = set(declaradas)
+    permitidas = familias_pedidas(pedido)
     hallazgos = []
     for rel in ws.checkpoints.archivos_desde(cid_build):
         ruta = ws.raiz / rel
-        if not rel.endswith(".py") or not ruta.is_file():
+        es_web = rel.lower().endswith(EXTENSIONES_WEB)
+        if not (rel.endswith(".py") or es_web) or not ruta.is_file():
             continue
         try:
             fuente = ruta.read_text(encoding="utf-8", errors="replace")
         except OSError:
+            continue
+        if es_web:
+            if not _es_test(rel):
+                for linea, frase in admisiones_web(fuente, permitidas):
+                    hallazgos.append(f"SIMULACIÓN CONFESADA en {rel}:{linea}: «{recortar(frase, 80)}»: el código "
+                                     "admite ser provisional/ficticio, no lo real que se pidió.")
             continue
         if _es_test(rel):
             graves = [p for p in analizar_tests_python(fuente).problemas if p.severidad == "alta"]
@@ -420,7 +500,7 @@ def examen_de_realidad(ws, cid_build: Optional[int], plan=None) -> list:
         for nombre, linea in fabricaciones_en_codigo(fuente, deben_traer_datos):
             hallazgos.append(f"DATOS FABRICADOS en {rel}:{linea}: `{nombre}` los INVENTA (random/uuid) en vez de "
                              "traerlos de verdad; el pedido pide datos reales, no generados.")
-        for linea, frase in admisiones_de_simulacion(fuente):
+        for linea, frase in admisiones_de_simulacion(fuente, permitidas):
             hallazgos.append(f"SIMULACIÓN CONFESADA en {rel}:{linea}: «{frase}»: el código admite ser "
                              "provisional/ficticio, no lo real que se pidió.")
     return hallazgos[:12]
@@ -1654,7 +1734,7 @@ class Orquestador:
             return  # la build ya está en rojo/parcial: el juez solo endurece, no hay verde que revisar
         # 1) EXAMEN DE REALIDAD, gratis: si algo es una simulación (funciones pedidas vacías, NotImplementedError,
         #    tests que no prueban nada), el juez decide SIN llamar al modelo. Gasta 0 tokens y hace más que nadie.
-        realidad = examen_de_realidad(self.ws, informe.cid, plan)
+        realidad = examen_de_realidad(self.ws, informe.cid, plan, pedido)
         if realidad:
             self._aplicar_juicio(Juicio(False, realidad, [], "high", determinista=True), informe)
             return

@@ -919,25 +919,106 @@ _RECURSOS_HTML = re.compile(r"""<(?:script|link|img|source)\b[^>]*?\b(?:src|href
 _RAICES_WEB = ("public", "static", "web", "www", "assets", "dist", "build", "frontend")
 
 
+def _resolver_recurso_html(ws: Workspace, ruta: Path, destino: str) -> Optional[Path]:
+    """Archivo local al que apunta un src/href del HTML; None si no existe."""
+    if destino.startswith("/"):
+        # Una URL absoluta la resuelve el SERVIDOR desde su raíz web, que no siempre es la del proyecto:
+        # con web/index.html y "/script.js" el archivo real es web/script.js. Antes se buscaba solo en la raíz
+        # del proyecto, se marcaba como faltante y el reparador "arreglaba" rutas y servidor hasta romper "/".
+        limpio = destino.lstrip("/")
+        candidatos = [ws.raiz / limpio, ruta.parent / limpio] + [ws.raiz / d / limpio for d in _RAICES_WEB]
+    else:
+        candidatos = [ruta.parent / destino]
+    return next((c for c in candidatos if c.exists()), None)
+
+
+def _es_externo(destino: str) -> bool:
+    return not destino or bool(re.match(r"^(https?:|//|data:|mailto:|tel:|javascript:|\{\{|\$\{)", destino))
+
+
 def recursos_html_faltantes(ws: Workspace, ruta: Path, texto: str) -> list[str]:
     faltan = []
     for m in _RECURSOS_HTML.finditer(texto):
         destino = m.group(1).strip()
-        if not destino or re.match(r"^(https?:|//|data:|mailto:|tel:|javascript:|\{\{|\$\{)", destino):
+        if _es_externo(destino):
             continue
-        if destino.startswith("/"):
-            # Una URL absoluta la resuelve el SERVIDOR desde su raíz web, que no siempre es la del proyecto:
-            # con web/index.html y "/script.js" el archivo real es web/script.js. Antes se buscaba solo en la raíz
-            # del proyecto, se marcaba como faltante y el reparador "arreglaba" rutas y servidor hasta romper "/".
-            limpio = destino.lstrip("/")
-            candidatos = [ws.raiz / limpio, ruta.parent / limpio] + [ws.raiz / d / limpio for d in _RAICES_WEB]
-            existe = any(c.exists() for c in candidatos)
-        else:
-            existe = (ruta.parent / destino).exists()
+        existe = _resolver_recurso_html(ws, ruta, destino) is not None
         if not existe:
             linea = texto.count("\n", 0, m.start()) + 1
             faltan.append(f"línea {linea}: referencia a '{destino}' que no existe")
     return faltan
+
+
+_SCRIPT_SRC_HTML = re.compile(r"<script\b([^>]*?)\bsrc\s*=\s*[\"']([^\"'#?]+)[\"']([^>]*)>", re.I)
+_RE_ES_MODULO = re.compile(r"^\s*(?:export\s+(?:default\b|async\b|function\b|class\b|const\b|let\b|var\b|\{|\*)"
+                           r"|import\s+(?:[\w$*{]|[\"']))", re.M)
+_RE_HANDLER_INLINE = re.compile(r"\son[a-z]+\s*=\s*[\"']\s*(?:return\s+)?([A-Za-z_$][\w$]*)\s*\(", re.I)
+
+
+def _sin_comentarios_js(texto: str) -> str:
+    texto = re.sub(r"/\*.*?\*/", "", texto, flags=re.S)
+    return re.sub(r"(^|[^:\"'\\])//[^\n]*", r"\1", texto)
+
+
+def scripts_html_incoherentes(ws: Workspace, ruta: Path, texto: str) -> list[str]:
+    """Errores que SOLO aparecen en el navegador (node --test pasa igual), típicos de modelos flojos:
+    - <script src="juego.js"> SIN type="module" y juego.js usa import/export → "SyntaxError: Unexpected token
+      'export'" y la página no hace nada;
+    - onclick="reiniciar()" con reiniciar definida solo dentro de un módulo → "ReferenceError: reiniciar is not
+      defined" (lo de un módulo no es global)."""
+    problemas = []
+    modulos, clasicos = [], []                                         # (texto) de cada script, según cómo se carga
+    for m in _SCRIPT_SRC_HTML.finditer(texto):
+        atributos, destino = (m.group(1) + " " + m.group(3)).lower(), m.group(2).strip()
+        if _es_externo(destino):
+            continue
+        archivo = _resolver_recurso_html(ws, ruta, destino)
+        if archivo is None or not archivo.is_file():
+            continue                                                   # eso ya lo informa recursos-html
+        try:
+            codigo = _sin_comentarios_js(archivo.read_text(encoding="utf-8", errors="replace"))
+        except OSError:
+            continue
+        es_modulo = bool(re.search(r"type\s*=\s*[\"']?module", atributos))
+        if es_modulo:
+            modulos.append(codigo)
+            for imp in _RE_IMPORT_JS.finditer(codigo):                 # un nivel de imports: también son módulos
+                dep = _resolver_js(archivo.parent, imp.group("ruta") or imp.group("req") or "")
+                if dep is not None and dep.suffix != ".json":
+                    try:
+                        modulos.append(_sin_comentarios_js(dep.read_text(encoding="utf-8", errors="replace")))
+                    except OSError:
+                        pass
+        else:
+            clasicos.append(codigo)
+            if _RE_ES_MODULO.search(codigo):
+                linea = texto.count("\n", 0, m.start()) + 1
+                problemas.append(f"línea {linea}: <script src=\"{destino}\"> se carga SIN type=\"module\" pero "
+                                 f"{destino} usa import/export: en el navegador da \"SyntaxError: Unexpected token "
+                                 f"'export'\" y no corre nada. Usá <script type=\"module\" src=\"{destino}\">.")
+    for m in _SCRIPT_HTML.finditer(texto):
+        (modulos if re.search(r"type\s*=\s*[\"']?module", m.group(1).lower()) else clasicos).append(m.group(2))
+    todo = "\n".join(modulos + clasicos)
+    if re.search(r"Object\.assign\(\s*(?:window|globalThis|self)\b", todo):
+        return problemas                                               # expone funciones en bloque: no adivinamos
+    vistos = set()
+    for m in _RE_HANDLER_INLINE.finditer(texto):
+        nombre = m.group(1)
+        if nombre in vistos:
+            continue
+        vistos.add(nombre)
+        definicion = re.compile(rf"(?:function\s*\*?\s+{re.escape(nombre)}\b|(?:const|let|var|class)\s+"
+                                rf"{re.escape(nombre)}\b)")
+        expuesta = re.compile(rf"(?:window|globalThis|self)\s*(?:\.\s*{re.escape(nombre)}|\[\s*[\"']"
+                              rf"{re.escape(nombre)}[\"']\s*\])\s*=")
+        if any(definicion.search(c) for c in modulos) and not any(definicion.search(c) for c in clasicos) \
+                and not expuesta.search(todo):
+            linea = texto.count("\n", 0, m.start()) + 1
+            problemas.append(f"línea {linea}: el HTML llama a {nombre}() desde un atributo on…=\"\", pero "
+                             f"{nombre} está definida dentro de un módulo (type=\"module\") y no es global: en el "
+                             f"navegador da \"ReferenceError: {nombre} is not defined\". Usá addEventListener en el "
+                             f"módulo (o window.{nombre} = {nombre}).")
+    return problemas
 
 
 def _validar_html(ws: Workspace, ruta: Path, rel: str) -> list[Resultado]:
@@ -946,6 +1027,9 @@ def _validar_html(ws: Workspace, ruta: Path, rel: str) -> list[Resultado]:
     faltan = recursos_html_faltantes(ws, ruta, texto)
     if faltan:
         resultados.append(Resultado(False, f"recursos-html {rel}", 1, stderr="\n".join(faltan), archivo=rel))
+    incoherentes = scripts_html_incoherentes(ws, ruta, texto)
+    if incoherentes:
+        resultados.append(Resultado(False, f"scripts-html {rel}", 1, stderr="\n".join(incoherentes), archivo=rel))
     if not shutil.which("node"):
         return resultados
     for numero, m in enumerate(_SCRIPT_HTML.finditer(texto), start=1):

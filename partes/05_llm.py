@@ -331,7 +331,10 @@ class LLMClient:
         on_progress: Optional[Callable[[int], None]] = None,
         rol: str = "",
         sin_respaldo: bool = False,
+        reintentos: Optional[int] = None,
     ) -> Respuesta:
+        """`reintentos` pisa settings.reintentos solo para esta llamada: los SONDEOS (¿este modelo responde?) usan 0
+        para no quedarse minutos esperando a un :free saturado que igual se va a descartar."""
         self._verificar_presupuesto()
         principal = resolver_modelo(modelo or self.settings.modelo)
         candidatos = [principal]
@@ -369,7 +372,7 @@ class LLMClient:
             try:
                 respuesta = self._con_reintentos(
                     candidato, mensajes, temperatura, max_tokens, stop, on_progress,
-                    hay_alternativa=n + 1 < len(orden),
+                    hay_alternativa=n + 1 < len(orden), reintentos=reintentos,
                 )
                 self.disyuntor.exito(candidato)
                 if candidato != principal:
@@ -442,9 +445,9 @@ class LLMClient:
         return payload
 
     def _con_reintentos(self, modelo, mensajes, temperatura, max_tokens, stop, on_progress,
-                        hay_alternativa: bool = False):
+                        hay_alternativa: bool = False, reintentos: Optional[int] = None):
         payload = self._payload(modelo, mensajes, temperatura, max_tokens, stop, self._destino(modelo).proveedor)
-        intentos = max(0, int(self.settings.reintentos))
+        intentos = max(0, int(self.settings.reintentos if reintentos is None else reintentos))
         vacias = 0
         ampliado = False
         cancelado = (lambda: CANCELAR.is_set()) if "CANCELAR" in globals() else None

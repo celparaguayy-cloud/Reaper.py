@@ -116,17 +116,17 @@ class ProcesoFondo:
 
 
 _PROCESOS: dict[str, ProcesoFondo] = {}
-_LOCK_PROCESOS = threading.Lock()
+_LOCK_PROCESOS_FONDO = threading.Lock()
 _CONTADOR_PROCESOS = itertools.count(1)
 
 
 def procesos_activos() -> list[ProcesoFondo]:
-    with _LOCK_PROCESOS:
+    with _LOCK_PROCESOS_FONDO:
         return [p for p in _PROCESOS.values() if p.vivo]
 
 
 def detener_todos_los_procesos() -> int:
-    with _LOCK_PROCESOS:
+    with _LOCK_PROCESOS_FONDO:
         procesos = list(_PROCESOS.values())
         _PROCESOS.clear()
     detenidos = 0
@@ -142,7 +142,7 @@ atexit.register(detener_todos_los_procesos)
 
 def _proceso(ctx: Contexto, p: dict) -> ProcesoFondo:
     id_ = (p.get("id") or "").strip()
-    with _LOCK_PROCESOS:
+    with _LOCK_PROCESOS_FONDO:
         if not id_ and len(_PROCESOS) == 1:
             return next(iter(_PROCESOS.values()))
         proceso = _PROCESOS.get(id_)
@@ -190,7 +190,7 @@ def start_process(ctx: Contexto, p: dict) -> str:
         proceso = ProcesoFondo(id_, comando, ctx.ws.raiz, _entrada_estandar(p))
     except OSError as e:
         raise ErrorHerramienta(f"No pude iniciar el proceso: {e}")
-    with _LOCK_PROCESOS:
+    with _LOCK_PROCESOS_FONDO:
         _PROCESOS[id_] = proceso
     listo = proceso.esperar_texto(patron, timeout if patron else min(timeout, 0.8))
     salida = proceso.nuevas(80)
@@ -243,7 +243,7 @@ def stop_process(ctx: Contexto, p: dict) -> str:
     proceso = _proceso(ctx, p)
     estaba_vivo = proceso.vivo
     codigo = proceso.detener()
-    with _LOCK_PROCESOS:
+    with _LOCK_PROCESOS_FONDO:
         _PROCESOS.pop(proceso.id, None)
     finales = proceso.nuevas(60) or proceso.ultimas(20)
     estado = "detenido" if estaba_vivo else f"ya había terminado (código {codigo})"
@@ -287,7 +287,7 @@ def _cmd_procesos(self: "App", arg: str) -> None:
         if objetivo == "todos":
             self.ui.ok(f"Detenidos {detener_todos_los_procesos()} proceso(s).")
             return
-        with _LOCK_PROCESOS:
+        with _LOCK_PROCESOS_FONDO:
             proceso = _PROCESOS.pop(objetivo, None)
         if proceso is None:
             self.ui.error(f"No existe el proceso {objetivo}.")

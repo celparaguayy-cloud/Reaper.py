@@ -534,6 +534,47 @@ class TestJuezRealidad(BaseTest):
         hallazgos = examen_de_realidad(ws, grupo, parsear_plan(self.PLAN_NUMEROS, "números"))
         self.assertTrue(any("SIMULACIÓN CONFESADA" in h for h in hallazgos))
 
+    # --- Precisión: comentarios LEGÍTIMOS que la primera versión tomaba por confesiones (8 de 8, octubre 2026) ---
+    LEGITIMOS = ("# No hardcodear la ruta: se lee de la config", "# Evitamos valores hardcodeados",
+                 "# Simulación de la gravedad en cada frame del juego", "# In production you should set DEBUG to False",
+                 "# En producción debería usarse HTTPS", "# Por ahora usamos SQLite; alcanza para este volumen",
+                 "# En producción habría que poner un proxy delante", "# Usamos la API real, sin datos simulados",
+                 "# simulamos la gravedad del salto")
+    CONFESIONES = ("# por ahora devolvemos una lista fija", "# In production we would call the real API",
+                   "# valor hardcodeado temporalmente", "# esto es una simulación", "# respuesta hardcodeada",
+                   "# simulamos la respuesta del servidor", "# En producción se usaría Twilio", "# mock data for now",
+                   "# No hay API: datos de ejemplo")
+
+    def test_admisiones_no_marca_comentarios_legitimos(self):
+        for c in self.LEGITIMOS:
+            with self.subTest(c=c):
+                self.assertEqual(admisiones_de_simulacion(f"x = 1  {c}\n"), [])
+
+    def test_admisiones_sigue_marcando_confesiones(self):
+        for c in self.CONFESIONES:
+            with self.subTest(c=c):
+                self.assertTrue(admisiones_de_simulacion(f"x = 1  {c}\n"))
+
+    def test_lo_que_el_pedido_pide_a_proposito_no_es_confesion(self):
+        self.assertEqual(familias_pedidas("La base se crea sola con 3 recetas de ejemplo"), {"ejemplo"})
+        self.assertEqual(familias_pedidas("organizar CARPETA con --simular (no mueve, solo muestra)"), {"simulacion"})
+        self.assertEqual(familias_pedidas("números reales, no simulados"), set())    # negado: no habilita nada
+        self.assertEqual(familias_pedidas("sin datos de ejemplo"), set())
+        fuente = 'x = 1  # Insertar datos de ejemplo (3 recetas) al crear la base\ny = "Esto es una simulación: no se movió nada"\n'
+        self.assertEqual(admisiones_de_simulacion(fuente, {"ejemplo", "simulacion"}), [])
+        self.assertEqual(len(admisiones_de_simulacion(fuente)), 2)                 # sin pedirlo, sí se marcan
+
+    def test_examen_usa_el_pedido_y_revisa_js(self):
+        ws, grupo = self._build({"db.py": "def crear():\n    # datos de ejemplo pedidos: 3 recetas\n    return 3\n",
+                                 "juego.js": "// Simulación de la gravedad\nexport function mover(s) { return s; }\n"
+                                             "// por ahora devolvemos un puntaje fijo\n",
+                                 "tests/juego.test.mjs": "// datos de ejemplo para el test\n"})
+        hallazgos = examen_de_realidad(ws, grupo, None, "web de recetas con 3 recetas de ejemplo")
+        self.assertEqual(len(hallazgos), 1, hallazgos)
+        self.assertIn("juego.js:3", hallazgos[0])                                   # la gravedad no; el fijo sí
+        self.assertTrue(admisiones_web('function f() { throw new Error("Not implemented"); }\n'))
+        self.assertEqual(admisiones_web('const URL = "https://x.com/api"; // sirve los datos reales\n'), [])
+
     def test_veredicto_determinista_no_gasta_tokens(self):
         ws, grupo = self._build({"app.py": "def sumar(a, b):\n    pass\n"})
         llm = MockLLM(lambda m, k: '{"cumple": true, "confianza": "high"}')
