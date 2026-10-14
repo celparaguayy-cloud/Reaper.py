@@ -473,3 +473,33 @@ class TestOpenRouterRealMensajeCierre(BaseTest):
         texto = ui.texto_registrado()
         self.assertNotIn("no completó (completado)", texto)
         self.assertIn("terminó, pero su cierre no quedó respaldado", texto)
+
+
+class TestOpenRouterRealPerfilGratisProbado(BaseTest):
+    @staticmethod
+    def _llm(vivos):
+        return MockLLM(lambda m, k: "REAPER_OK" if k.get("modelo") in vivos else "no sé")
+
+    def test_se_quedan_solo_los_que_responden(self):
+        # Prueba real: el catálogo ponía inkling/inkling-small 2.º y 3.º, y daban 403. El catálogo no lo dice.
+        vivos = free_que_responden(self._llm({"b/ok:free", "d/ok:free", "e/ok:free"}),
+                                   ["a/403:free", "b/ok:free", "c/caido:free", "d/ok:free", "e/ok:free"], cuantos=2)
+        self.assertEqual(vivos, ["b/ok:free", "d/ok:free"])               # en orden y corta al llegar a 2
+
+    def test_perfil_gratis_con_clave_prueba_y_elige_los_vivos(self):
+        os.environ["OPENROUTER_API_KEY"] = "sk-or-v1-solo-para-test"
+        g = globals()
+        original = g["catalogo_free_openrouter"]
+        g["catalogo_free_openrouter"] = lambda: ["a/403:free", "b/ok:free", "c/ok:free"]
+        try:
+            app = App(self.ajustes(proveedor="openrouter", modelos_rol={"juez": "anthropic/caro"}),
+                      self._llm({"b/ok:free", "c/ok:free"}), self.ui(), self.proyecto(), persistir=False)
+            app.cmd_perfil("gratis")
+        finally:
+            g["catalogo_free_openrouter"] = original
+            os.environ.pop("OPENROUTER_API_KEY", None)
+        self.assertEqual(app.settings.modelo, "b/ok:free")               # el 403 quedó afuera
+        self.assertEqual(app.settings.fallbacks, ["c/ok:free"])
+        texto = app.ui.texto_registrado()
+        self.assertIn("Probando los modelos gratis", texto)
+        self.assertIn("pueden ser PAGOS: juez=anthropic/caro", texto)      # avisa del rol que puede cobrar

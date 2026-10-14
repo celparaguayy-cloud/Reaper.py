@@ -30247,8 +30247,16 @@ class App:
                           f"tests_primero={self.settings.tests_primero}, escalar={self.settings.escalar}")
             return
         try:
-            catalogo = (catalogo_free_openrouter() if arg.strip().lower() == "gratis"
-                        and self.settings.proveedor == "openrouter" else None)
+            gratis = arg.strip().lower() == "gratis" and self.settings.proveedor == "openrouter"
+            catalogo = catalogo_free_openrouter() if gratis else None
+            if catalogo and clave_de_proveedor("openrouter", self.settings):
+                # Con clave: se prueba cada candidato con un pedido mínimo ($0) y quedan solo los que responden.
+                self.ui.info("  Probando los modelos gratis de hoy (pedido mínimo, no cuesta nada)…")
+                vivos = free_que_responden(self.llm, catalogo, on_probar=lambda m: self.ui.tenue(f"    · {m}"))
+                if vivos:
+                    catalogo = vivos
+                else:
+                    self.ui.aviso("  Ningún modelo gratis respondió ahora (pool saturado): uso el orden del catálogo.")
             cambios = aplicar_perfil(self.settings, arg, catalogo)
         except KeyError:
             self.ui.error(f"Perfil desconocido: {arg} ({', '.join(PERFILES)})")
@@ -30256,6 +30264,13 @@ class App:
         self._guardar_settings()
         self.llm.limitador = LimitadorTasa(self.settings.rpm_efectivo()) if hasattr(self.llm, "limitador") else None
         self.ui.ok(f"Perfil {arg}: " + (", ".join(cambios) or "sin cambios"))
+        if arg.strip().lower() == "gratis":
+            pagos = sorted(f"{rol}={m}" for rol, m in (self.settings.modelos_rol or {}).items()
+                           if m and not resolver_modelo(m).endswith(":free")
+                           and info_modelo(m).proveedor in ("", "openrouter"))   # Groq/Gemini/Ollama: otra cuenta
+            if pagos:
+                self.ui.aviso("  Ojo: estos roles siguen en modelos que pueden ser PAGOS: " + ", ".join(pagos[:6])
+                              + " (/modelo <rol> <alias> para cambiarlos).")
 
     def cmd_tema(self, arg: str) -> None:
         if not arg:
@@ -48833,6 +48848,36 @@ class TestOpenRouterRealMensajeCierre(BaseTest):
         self.assertIn("terminó, pero su cierre no quedó respaldado", texto)
 
 
+class TestOpenRouterRealPerfilGratisProbado(BaseTest):
+    @staticmethod
+    def _llm(vivos):
+        return MockLLM(lambda m, k: "REAPER_OK" if k.get("modelo") in vivos else "no sé")
+
+    def test_se_quedan_solo_los_que_responden(self):
+        # Prueba real: el catálogo ponía inkling/inkling-small 2.º y 3.º, y daban 403. El catálogo no lo dice.
+        vivos = free_que_responden(self._llm({"b/ok:free", "d/ok:free", "e/ok:free"}),
+                                   ["a/403:free", "b/ok:free", "c/caido:free", "d/ok:free", "e/ok:free"], cuantos=2)
+        self.assertEqual(vivos, ["b/ok:free", "d/ok:free"])               # en orden y corta al llegar a 2
+
+    def test_perfil_gratis_con_clave_prueba_y_elige_los_vivos(self):
+        os.environ["OPENROUTER_API_KEY"] = "sk-or-v1-solo-para-test"
+        g = globals()
+        original = g["catalogo_free_openrouter"]
+        g["catalogo_free_openrouter"] = lambda: ["a/403:free", "b/ok:free", "c/ok:free"]
+        try:
+            app = App(self.ajustes(proveedor="openrouter", modelos_rol={"juez": "anthropic/caro"}),
+                      self._llm({"b/ok:free", "c/ok:free"}), self.ui(), self.proyecto(), persistir=False)
+            app.cmd_perfil("gratis")
+        finally:
+            g["catalogo_free_openrouter"] = original
+            os.environ.pop("OPENROUTER_API_KEY", None)
+        self.assertEqual(app.settings.modelo, "b/ok:free")               # el 403 quedó afuera
+        self.assertEqual(app.settings.fallbacks, ["c/ok:free"])
+        texto = app.ui.texto_registrado()
+        self.assertIn("Probando los modelos gratis", texto)
+        self.assertIn("pueden ser PAGOS: juez=anthropic/caro", texto)      # avisa del rol que puede cobrar
+
+
 # ======================================================================
 # MÓDULO: autotest_runner
 # ======================================================================
@@ -53983,6 +54028,21 @@ def _probar_modelo(llm, modelo: str) -> dict:
         return {"estado": "FALLA", "detalle": recortar(str(e), 120)}
     except (OSError, ValueError, RuntimeError) as e:
         return {"estado": "FALLA", "detalle": f"{type(e).__name__}: {e}"[:120]}
+
+
+def free_que_responden(llm, candidatos: list, cuantos: int = 4, max_probar: int = 8, on_probar=None) -> list:
+    """Prueba DE VERDAD (pedido mínimo, modelos gratis: $0) los candidatos del catálogo y devuelve los que
+    responden, en orden. El catálogo no dice cuáles están caídos o dan 403 "solo en harnesses agénticos": en la
+    prueba real de octubre 2026, inkling e inkling-small salían 2.º y 3.º del catálogo y no servían."""
+    vivos = []
+    for modelo in candidatos[:max_probar]:
+        if on_probar is not None:
+            on_probar(modelo)
+        if _probar_modelo(llm, modelo).get("estado") == "RESPONDE":
+            vivos.append(modelo)
+            if len(vivos) >= cuantos:
+                break
+    return vivos
 
 
 def probar_equipo(llm, settings) -> list:

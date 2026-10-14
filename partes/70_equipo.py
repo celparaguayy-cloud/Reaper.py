@@ -323,6 +323,21 @@ def _probar_modelo(llm, modelo: str) -> dict:
         return {"estado": "FALLA", "detalle": f"{type(e).__name__}: {e}"[:120]}
 
 
+def free_que_responden(llm, candidatos: list, cuantos: int = 4, max_probar: int = 8, on_probar=None) -> list:
+    """Prueba DE VERDAD (pedido mínimo, modelos gratis: $0) los candidatos del catálogo y devuelve los que
+    responden, en orden. El catálogo no dice cuáles están caídos o dan 403 "solo en harnesses agénticos": en la
+    prueba real de octubre 2026, inkling e inkling-small salían 2.º y 3.º del catálogo y no servían."""
+    vivos = []
+    for modelo in candidatos[:max_probar]:
+        if on_probar is not None:
+            on_probar(modelo)
+        if _probar_modelo(llm, modelo).get("estado") == "RESPONDE":
+            vivos.append(modelo)
+            if len(vivos) >= cuantos:
+                break
+    return vivos
+
+
 def probar_equipo(llm, settings) -> list:
     """
     Prueba de verdad cada uno de los seis roles con una petición mínima. Dedup por modelo (no gasta de más).

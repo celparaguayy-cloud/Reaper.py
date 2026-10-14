@@ -1110,8 +1110,16 @@ class App:
                           f"tests_primero={self.settings.tests_primero}, escalar={self.settings.escalar}")
             return
         try:
-            catalogo = (catalogo_free_openrouter() if arg.strip().lower() == "gratis"
-                        and self.settings.proveedor == "openrouter" else None)
+            gratis = arg.strip().lower() == "gratis" and self.settings.proveedor == "openrouter"
+            catalogo = catalogo_free_openrouter() if gratis else None
+            if catalogo and clave_de_proveedor("openrouter", self.settings):
+                # Con clave: se prueba cada candidato con un pedido mínimo ($0) y quedan solo los que responden.
+                self.ui.info("  Probando los modelos gratis de hoy (pedido mínimo, no cuesta nada)…")
+                vivos = free_que_responden(self.llm, catalogo, on_probar=lambda m: self.ui.tenue(f"    · {m}"))
+                if vivos:
+                    catalogo = vivos
+                else:
+                    self.ui.aviso("  Ningún modelo gratis respondió ahora (pool saturado): uso el orden del catálogo.")
             cambios = aplicar_perfil(self.settings, arg, catalogo)
         except KeyError:
             self.ui.error(f"Perfil desconocido: {arg} ({', '.join(PERFILES)})")
@@ -1119,6 +1127,13 @@ class App:
         self._guardar_settings()
         self.llm.limitador = LimitadorTasa(self.settings.rpm_efectivo()) if hasattr(self.llm, "limitador") else None
         self.ui.ok(f"Perfil {arg}: " + (", ".join(cambios) or "sin cambios"))
+        if arg.strip().lower() == "gratis":
+            pagos = sorted(f"{rol}={m}" for rol, m in (self.settings.modelos_rol or {}).items()
+                           if m and not resolver_modelo(m).endswith(":free")
+                           and info_modelo(m).proveedor in ("", "openrouter"))   # Groq/Gemini/Ollama: otra cuenta
+            if pagos:
+                self.ui.aviso("  Ojo: estos roles siguen en modelos que pueden ser PAGOS: " + ", ".join(pagos[:6])
+                              + " (/modelo <rol> <alias> para cambiarlos).")
 
     def cmd_tema(self, arg: str) -> None:
         if not arg:
