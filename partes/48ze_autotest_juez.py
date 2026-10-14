@@ -481,6 +481,59 @@ class TestJuezRealidad(BaseTest):
                                                       "    assert sumar(2, 3) == 5\n"})
         self.assertEqual(examen_de_realidad(ws, grupo, parsear_plan(self.PLAN, "sumadora")), [])
 
+    # --- Simulaciones que NO son función vacía: datos inventados y confesiones (caso +1555 de script_whatsapp) ---
+    PLAN_NUMEROS = """<plan>
+<objetivo>Obtener números y SMS de la web</objetivo>
+<interfaz>
+- app.py: def obtener_numero() -> str; def leer_sms(numero) -> list
+</interfaz>
+<tarea id="1" archivos="app.py">Scrapea una web gratuita para obtener un número real y sus SMS.</tarea>
+<criterios>
+- obtener_numero() devuelve un número real de la web
+</criterios>
+</plan>"""
+
+    def test_admisiones_detecta_confesiones_y_no_codigo_normal(self):
+        self.assertTrue(admisiones_de_simulacion("def f():\n    # en una implementación real llamaríamos a la API\n    return 1\n"))
+        self.assertTrue(admisiones_de_simulacion('def f():\n    return "+1555"  # número ficticio\n'))
+        self.assertTrue(admisiones_de_simulacion("def f():\n    pass  # TODO: falta implementar la descarga\n"))
+        self.assertTrue(admisiones_de_simulacion('x = "datos de ejemplo"\n'))
+        self.assertEqual(admisiones_de_simulacion("def sumar(a, b):\n    # suma los dos\n    return a + b\n"), [])
+        self.assertEqual(admisiones_de_simulacion('msg = "conexión real establecida"\n'), [])
+
+    def test_examen_marca_numero_fabricado_con_random(self):
+        fuente = ("import random\n"
+                  "def obtener_numero():\n"
+                  "    return '+1555' + ''.join(random.choice('0123456789') for _ in range(7))\n"
+                  "def leer_sms(numero):\n    return []\n")
+        ws, grupo = self._build({"app.py": fuente})
+        hallazgos = examen_de_realidad(ws, grupo, parsear_plan(self.PLAN_NUMEROS, "números"))
+        self.assertTrue(any("DATOS FABRICADOS" in h and "obtener_numero" in h for h in hallazgos))
+
+    def test_examen_no_marca_random_legitimo_fuera_de_contexto_de_datos_reales(self):
+        # Una sumadora que usa random para nada "real" no se marca: el plan no pide traer datos.
+        fuente = "import random\ndef sumar(a, b):\n    return a + b + random.randint(0, 0)\n"
+        ws, grupo = self._build({"app.py": fuente})
+        self.assertEqual([h for h in examen_de_realidad(ws, grupo, parsear_plan(self.PLAN, "sumadora"))
+                          if "FABRICADOS" in h], [])
+
+    def test_examen_no_marca_si_hay_llamada_de_red_real(self):
+        fuente = ("import httpx, random\n"
+                  "def obtener_numero():\n"
+                  "    r = httpx.get('https://ejemplo/numero')\n"
+                  "    return random.choice(r.json()['numeros'])\n")   # usa random pero SOBRE datos traídos
+        ws, grupo = self._build({"app.py": fuente})
+        self.assertEqual([h for h in examen_de_realidad(ws, grupo, parsear_plan(self.PLAN_NUMEROS, "números"))
+                          if "FABRICADOS" in h], [])
+
+    def test_examen_marca_simulacion_confesada_en_codigo_de_la_build(self):
+        fuente = ("def leer_sms(numero):\n"
+                  "    # Simulación de la bandeja; en producción consultaríamos el proveedor real\n"
+                  "    return [{'texto': 'tu código es 1234'}]\n")
+        ws, grupo = self._build({"app.py": fuente})
+        hallazgos = examen_de_realidad(ws, grupo, parsear_plan(self.PLAN_NUMEROS, "números"))
+        self.assertTrue(any("SIMULACIÓN CONFESADA" in h for h in hallazgos))
+
     def test_veredicto_determinista_no_gasta_tokens(self):
         ws, grupo = self._build({"app.py": "def sumar(a, b):\n    pass\n"})
         llm = MockLLM(lambda m, k: '{"cumple": true, "confianza": "high"}')

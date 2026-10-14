@@ -365,3 +365,27 @@ anterior: `Ran 15 tests … FAILED (failures=11, errors=4)` (fallan los 15); con
 Regresión completa: **1005 tests OK** en Python 3.11, 3.12 y 3.13. `pruebas_fusion/smoke_cli.py`: 0 fallas.
 Lint (`ruff --select F,E9,B`): sin hallazgos nuevos (los 62 existentes son anteriores a esta ronda).
 NO VERIFICADO con modelos reales ni en el teléfono: la prueba en Termux queda para el usuario.
+
+## 17. El examen de realidad ahora caza simulaciones, no solo funciones vacías
+
+Antes el examen determinista (0 tokens) marcaba funciones vacías (`pass`/`...`), `NotImplementedError` y tests sin
+valor. Pero una simulación típica NO está vacía: devuelve datos inventados con cara de reales. Caso real
+(`script_whatsapp`): `get_free_number()` devolvía `"+1555" + random`, y `fetch_sms()` una lista fija. Eso pasaba
+el examen. Ahora se agregan dos detecciones, también sin llamar al modelo:
+
+- **DATOS FABRICADOS** (`fabricaciones_en_codigo`, AST): una función que el plan pidió para **traer datos reales**
+  (su contexto en el plan dice scrapear, descargar, consultar, API, web, SMS, número…) pero que los **inventa** con
+  `random`/`uuid`/`secrets` y no hace ninguna llamada de IO (`httpx`, `requests`, `urllib`, `socket`, `open`,
+  `sqlite3`…). Es exactamente el patrón `+1555`. No se marca `random` legítimo (una sumadora) ni cuando sí hay una
+  llamada de red real de la que salen los datos.
+- **SIMULACIÓN CONFESADA** (`admisiones_de_simulacion`, tokenize): comentarios o textos que admiten ser
+  provisionales/ficticios, con frases inequívocas: "en una implementación real…", "en producción usaríamos…",
+  "número/datos de ejemplo", "datos simulados/ficticios", "TODO/falta implementar", "hardcode", "esto es una
+  simulación". No marca prosa normal ("suma los dos", "conexión real establecida").
+
+Cuando el examen encuentra cualquiera de estos, el juez decide **NO CUMPLE** sin gastar tokens y su bucle manda a
+implementarlo de verdad, re-verifica y vuelve a juzgar. Tests: `TestJuezRealidad` (+5: número fabricado, random
+legítimo no se marca, con red real no se marca, confesión en código, y el detector de admisiones aislado).
+
+Regresión: **1010 tests OK** en Python 3.11/3.12/3.13. Smoke CLI: 0 fallas. Lint sin hallazgos nuevos.
+NO VERIFICADO con modelos reales: medir falsos positivos con builds reales queda para el uso en el teléfono.

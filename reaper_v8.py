@@ -110,6 +110,7 @@ import tempfile
 import textwrap
 import threading
 import time
+import tokenize
 import traceback
 import unicodedata
 import unittest
@@ -14808,6 +14809,87 @@ def stubs_en_codigo(fuente: str) -> list:
     return salida
 
 
+# El modelo ADMITE que lo que escribió es provisional/ficticio. Frases muy específicas (no palabras sueltas) para
+# no marcar código legítimo: un comentario que dice "en una implementación real llamaríamos a la API" o un string
+# "número de ejemplo" es una simulación confesada. Caso real: get_free_number devolvía "+1555" + dígitos al azar.
+_RE_ADMITE_SIMULACION = re.compile(
+    r"en\s+(?:una\s+|la\s+)?(?:implementaci[oó]n|versi[oó]n|app|aplicaci[oó]n)\s+real"
+    r"|in\s+a\s+real\s+(?:implementation|app)|in\s+production\s+(?:you|we|this)"
+    r"|en\s+producci[oó]n\s+(?:ir[ií]a|usar[ií]a|se\s+|conectar[ií]a|habr[ií]a|deber[ií]a|llamar[ií]a)"
+    r"|por\s+ahora\s+(?:devolv|retorn|simul|us|dev)"
+    r"|datos?\s+(?:de\s+ejemplo|simulad|fictici|dummy|de\s+prueba\s+fals)"
+    r"|(?:respuesta|valor(?:es)?|n[uú]mero|mensaje|c[oó]digo)\s+(?:simulad|fictici|de\s+ejemplo|hardcode)"
+    r"|esto\s+es\s+(?:una\s+)?(?:simulaci[oó]n|un\s+mock|un\s+placeholder|provisional)"
+    r"|simulaci[oó]n\s+de\s+(?:la|el|los|las|un)"
+    r"|(?:har[dt]cod|harcod)\w*"
+    r"|reemplaz\w*\s+(?:esto|con\s+la\s+real|por\s+la\s+real|en\s+producci)"
+    r"|pendiente\s+de\s+implementar|falta\s+implementar|sin\s+implementar\s+(?:a[uú]n|todav)"
+    r"|not\s+implemented\s+yet|implement\s+(?:this|me)\s+later",
+    re.IGNORECASE)
+
+
+def admisiones_de_simulacion(fuente: str) -> list:
+    """[(linea, frase)] de comentarios o textos que CONFIESAN que el código es provisional/ficticio. Usa tokenize
+    para ver comentarios y strings reales (0 tokens de modelo). Precisión alta: solo frases inequívocas."""
+    salida = []
+    try:
+        tokens = tokenize.generate_tokens(io.StringIO(fuente).readline)
+        for tok in tokens:
+            if tok.type in (tokenize.COMMENT, tokenize.STRING):
+                m = _RE_ADMITE_SIMULACION.search(tok.string)
+                if m:
+                    salida.append((tok.start[0], m.group(0).strip()))
+    except (tokenize.TokenError, IndentationError, SyntaxError, ValueError):
+        pass
+    return salida
+
+
+_IO_REAL = ("httpx", "requests", "urllib", "urlopen", "socket", "aiohttp", "http", "subprocess", "popen",
+            "run", "open", "connect", "fetch", "get", "post", "session", "curl", "sqlite3", "psycopg", "execute")
+_RE_PIDE_DATOS_REALES = re.compile(
+    r"scrap|descarg|download|\bfetch|consult|obten|recib|\bapi\b|\bhttp|web\b|solicit|"
+    r"n[uú]mero|number|sms|mensaje|verificaci|\bsaldo\b|precio|cotiza",
+    re.IGNORECASE)
+
+
+def _usa_io_real(fn) -> bool:
+    for nodo in ast.walk(fn):
+        if isinstance(nodo, ast.Call):
+            objetivo = nodo.func
+            nombre = (objetivo.attr if isinstance(objetivo, ast.Attribute)
+                      else getattr(objetivo, "id", "")).lower()
+            if nombre in _IO_REAL:
+                return True
+    return False
+
+
+def _fabrica_datos(fn) -> bool:
+    """La función inventa su valor con random/uuid (no lo trae de ningún lado): señal de dato fabricado."""
+    for nodo in ast.walk(fn):
+        if isinstance(nodo, ast.Attribute) and isinstance(nodo.value, ast.Name) \
+                and nodo.value.id in ("random", "uuid", "secrets", "faker"):
+            return True
+        if isinstance(nodo, ast.Call) and isinstance(nodo.func, ast.Name) \
+                and nodo.func.id in ("randint", "randrange", "choice", "uuid4", "getrandbits"):
+            return True
+    return False
+
+
+def fabricaciones_en_codigo(fuente: str, deben_traer_datos: set) -> list:
+    """[(funcion, linea)] de funciones que el plan pidió para TRAER datos reales (de la web, SMS, una API…) pero que
+    los INVENTAN con random/uuid y no hacen ninguna llamada de IO. Es el patrón `+1555` + dígitos al azar."""
+    try:
+        arbol = ast.parse(fuente)
+    except SyntaxError:
+        return []
+    salida = []
+    for nodo in ast.walk(arbol):
+        if isinstance(nodo, (ast.FunctionDef, ast.AsyncFunctionDef)) and nodo.name in deben_traer_datos:
+            if _fabrica_datos(nodo) and not _usa_io_real(nodo):
+                salida.append((nodo.name, nodo.lineno))
+    return salida
+
+
 def examen_de_realidad(ws, cid_build: Optional[int], plan=None) -> list:
     """
     Determinista (0 tokens): ¿lo entregado es REAL o una simulación? Revisa lo que cambió en esta build:
@@ -14820,9 +14902,18 @@ def examen_de_realidad(ws, cid_build: Optional[int], plan=None) -> list:
     if cid_build is None:
         return []
     declaradas = set()
+    deben_traer_datos = set()
     if plan is not None:
         texto = (getattr(plan, "interfaz", "") or "") + "\n" + "\n".join(t.descripcion for t in plan.tareas)
         declaradas = set(re.findall(r"\bdef\s+([A-Za-z_]\w*)", texto))
+        # Funciones cuyo CONTEXTO en el plan pide datos reales (traer de la web, SMS, una API, un número…):
+        # si las fabrican con random en vez de traerlas, es simulación. Se mira la línea de cada `def` declarado.
+        for linea in texto.splitlines():
+            if _RE_PIDE_DATOS_REALES.search(linea):
+                deben_traer_datos.update(re.findall(r"\bdef\s+([A-Za-z_]\w*)", linea))
+        # Si el pedido entero habla de traer datos reales, cualquier función declarada cuenta (plan corto sin detalle).
+        if _RE_PIDE_DATOS_REALES.search(texto) and not deben_traer_datos:
+            deben_traer_datos = set(declaradas)
     hallazgos = []
     for rel in ws.checkpoints.archivos_desde(cid_build):
         ruta = ws.raiz / rel
@@ -14841,6 +14932,12 @@ def examen_de_realidad(ws, cid_build: Optional[int], plan=None) -> list:
             if tipo == "no_implementada" or nombre in declaradas:
                 motivo = "lanza NotImplementedError" if tipo == "no_implementada" else "quedó vacía (pass/...)"
                 hallazgos.append(f"SIMULACIÓN en {rel}:{linea}: `{nombre}` {motivo}: existe pero no hace nada.")
+        for nombre, linea in fabricaciones_en_codigo(fuente, deben_traer_datos):
+            hallazgos.append(f"DATOS FABRICADOS en {rel}:{linea}: `{nombre}` los INVENTA (random/uuid) en vez de "
+                             "traerlos de verdad; el pedido pide datos reales, no generados.")
+        for linea, frase in admisiones_de_simulacion(fuente):
+            hallazgos.append(f"SIMULACIÓN CONFESADA en {rel}:{linea}: «{frase}»: el código admite ser "
+                             "provisional/ficticio, no lo real que se pidió.")
     return hallazgos[:12]
 
 
@@ -47658,6 +47755,59 @@ class TestJuezRealidad(BaseTest):
                                  "tests/test_app.py": "from app import sumar\n\ndef test_suma():\n"
                                                       "    assert sumar(2, 3) == 5\n"})
         self.assertEqual(examen_de_realidad(ws, grupo, parsear_plan(self.PLAN, "sumadora")), [])
+
+    # --- Simulaciones que NO son función vacía: datos inventados y confesiones (caso +1555 de script_whatsapp) ---
+    PLAN_NUMEROS = """<plan>
+<objetivo>Obtener números y SMS de la web</objetivo>
+<interfaz>
+- app.py: def obtener_numero() -> str; def leer_sms(numero) -> list
+</interfaz>
+<tarea id="1" archivos="app.py">Scrapea una web gratuita para obtener un número real y sus SMS.</tarea>
+<criterios>
+- obtener_numero() devuelve un número real de la web
+</criterios>
+</plan>"""
+
+    def test_admisiones_detecta_confesiones_y_no_codigo_normal(self):
+        self.assertTrue(admisiones_de_simulacion("def f():\n    # en una implementación real llamaríamos a la API\n    return 1\n"))
+        self.assertTrue(admisiones_de_simulacion('def f():\n    return "+1555"  # número ficticio\n'))
+        self.assertTrue(admisiones_de_simulacion("def f():\n    pass  # TODO: falta implementar la descarga\n"))
+        self.assertTrue(admisiones_de_simulacion('x = "datos de ejemplo"\n'))
+        self.assertEqual(admisiones_de_simulacion("def sumar(a, b):\n    # suma los dos\n    return a + b\n"), [])
+        self.assertEqual(admisiones_de_simulacion('msg = "conexión real establecida"\n'), [])
+
+    def test_examen_marca_numero_fabricado_con_random(self):
+        fuente = ("import random\n"
+                  "def obtener_numero():\n"
+                  "    return '+1555' + ''.join(random.choice('0123456789') for _ in range(7))\n"
+                  "def leer_sms(numero):\n    return []\n")
+        ws, grupo = self._build({"app.py": fuente})
+        hallazgos = examen_de_realidad(ws, grupo, parsear_plan(self.PLAN_NUMEROS, "números"))
+        self.assertTrue(any("DATOS FABRICADOS" in h and "obtener_numero" in h for h in hallazgos))
+
+    def test_examen_no_marca_random_legitimo_fuera_de_contexto_de_datos_reales(self):
+        # Una sumadora que usa random para nada "real" no se marca: el plan no pide traer datos.
+        fuente = "import random\ndef sumar(a, b):\n    return a + b + random.randint(0, 0)\n"
+        ws, grupo = self._build({"app.py": fuente})
+        self.assertEqual([h for h in examen_de_realidad(ws, grupo, parsear_plan(self.PLAN, "sumadora"))
+                          if "FABRICADOS" in h], [])
+
+    def test_examen_no_marca_si_hay_llamada_de_red_real(self):
+        fuente = ("import httpx, random\n"
+                  "def obtener_numero():\n"
+                  "    r = httpx.get('https://ejemplo/numero')\n"
+                  "    return random.choice(r.json()['numeros'])\n")   # usa random pero SOBRE datos traídos
+        ws, grupo = self._build({"app.py": fuente})
+        self.assertEqual([h for h in examen_de_realidad(ws, grupo, parsear_plan(self.PLAN_NUMEROS, "números"))
+                          if "FABRICADOS" in h], [])
+
+    def test_examen_marca_simulacion_confesada_en_codigo_de_la_build(self):
+        fuente = ("def leer_sms(numero):\n"
+                  "    # Simulación de la bandeja; en producción consultaríamos el proveedor real\n"
+                  "    return [{'texto': 'tu código es 1234'}]\n")
+        ws, grupo = self._build({"app.py": fuente})
+        hallazgos = examen_de_realidad(ws, grupo, parsear_plan(self.PLAN_NUMEROS, "números"))
+        self.assertTrue(any("SIMULACIÓN CONFESADA" in h for h in hallazgos))
 
     def test_veredicto_determinista_no_gasta_tokens(self):
         ws, grupo = self._build({"app.py": "def sumar(a, b):\n    pass\n"})

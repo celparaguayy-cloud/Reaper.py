@@ -17,7 +17,7 @@
 
 ![versión](https://img.shields.io/badge/versión-8.10-8b5cf6?style=flat-square)
 ![python](https://img.shields.io/badge/python-3.11_→_3.14-3776ab?style=flat-square&logo=python&logoColor=white)
-![autotests](https://img.shields.io/badge/autotests-1005_OK-2ea44f?style=flat-square)
+![autotests](https://img.shields.io/badge/autotests-1010_OK-2ea44f?style=flat-square)
 ![juez](https://img.shields.io/badge/juez-motor_central-a855f7?style=flat-square)
 ![plataforma](https://img.shields.io/badge/Termux_·_Android-sin_root-10b981?style=flat-square&logo=android&logoColor=white)
 ![distribución](https://img.shields.io/badge/distribución-1_archivo-f59e0b?style=flat-square)
@@ -44,7 +44,7 @@ Su obsesión es la **honestidad**: no declara una build "verificada" sin tests r
 lo entregado **sea lo que pediste, funcione de verdad y no rompa lo que ya tenías**.
 
 > [!NOTE]
-> Proyecto **experimental**. El andamiaje está cubierto por **1005 autotests**; la calidad del código que
+> Proyecto **experimental**. El andamiaje está cubierto por **1010 autotests**; la calidad del código que
 > produzca depende del modelo que le conectes. Lee **[Estado honesto](#estado)** antes de esperar magia.
 
 ---
@@ -83,7 +83,7 @@ lo entregado **sea lo que pediste, funcione de verdad y no rompa lo que ya tení
 | ⚖️ **Juez como motor central** | arma el equipo, fija el contrato, vigila cada tarea, juzga la entrega e **interviene** si falta algo. |
 | 💸 **El que más hace, el que menos gasta** | casi todo su control es determinista (**0 tokens**); el cierre te muestra cuánto gastó. |
 | 🚀 **Arranca de verdad** | además de los tests, ejecuta el punto de entrada: si el programa no arranca, **no es verde**. |
-| 🔬 **Examen de realidad** | detecta funciones vacías, `NotImplementedError` y tests sin valor: **una simulación no se entrega**. |
+| 🔬 **Examen de realidad** | detecta funciones vacías, `NotImplementedError`, **datos inventados** (p. ej. un número con `random`) y comentarios que confiesan ser provisionales: **una simulación no se entrega**. |
 | 🛡️ **Protege tu trabajo previo** | agregar está bien; borrar o vaciar archivos que ya tenías sin que se pidiera **se rechaza**. |
 | 🎯 **Sin desvíos** | si una tarea toca archivos que no le tocaban (en lugar del pedido), se marca DESVÍO y se repara. |
 | 🤖 **Equipo de 8 agentes** | 6 roles + respaldo entre modelos + el **8.º: el juez**. |
@@ -326,7 +326,7 @@ verificación**, no la opinión de un modelo: un "terminé" sin pruebas no alcan
 > [!IMPORTANT]
 > Lo que **sí** está verificado y lo que **no**, sin maquillaje.
 
-- ✅ **1005 autotests OK** en Python **3.11, 3.12 y 3.13** (y en un Termux real con 3.14 en una versión
+- ✅ **1010 autotests OK** en Python **3.11, 3.12 y 3.13** (y en un Termux real con 3.14 en una versión
   anterior). Prueban la **orquestación** de forma determinista: ediciones y procesos reales, parseo de tests,
   gates de honestidad, Ctrl+C, plazos de pared y el juez (contrato, cierre, desvío, preservación, arranque,
   examen de realidad, armado del equipo). La red de modelos se simula con un **MockLLM**.
