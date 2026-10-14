@@ -5001,7 +5001,7 @@ index 390095e..919a836 100644
  """
  
 diff --git a/partes/35_cli.py b/partes/35_cli.py
-index 9e5d20f..9340c87 100644
+index 9e5d20f..dffcb94 100644
 --- a/partes/35_cli.py
 +++ b/partes/35_cli.py
 @@ -20,6 +20,7 @@ COMANDOS_AYUDA = [
@@ -5504,13 +5504,21 @@ index 9e5d20f..9340c87 100644
          self.ui.ok(f"Modo: {arg}")
  
      def cmd_perfil(self, arg: str) -> None:
-@@ -839,11 +1110,13 @@ class App:
+@@ -839,13 +1110,30 @@ class App:
                            f"tests_primero={self.settings.tests_primero}, escalar={self.settings.escalar}")
              return
          try:
 -            cambios = aplicar_perfil(self.settings, arg)
-+            catalogo = (catalogo_free_openrouter() if arg.strip().lower() == "gratis"
-+                        and self.settings.proveedor == "openrouter" else None)
++            gratis = arg.strip().lower() == "gratis" and self.settings.proveedor == "openrouter"
++            catalogo = catalogo_free_openrouter() if gratis else None
++            if catalogo and clave_de_proveedor("openrouter", self.settings):
++                # Con clave: se prueba cada candidato con un pedido mínimo ($0) y quedan solo los que responden.
++                self.ui.info("  Probando los modelos gratis de hoy (pedido mínimo, no cuesta nada)…")
++                vivos = free_que_responden(self.llm, catalogo, on_probar=lambda m: self.ui.tenue(f"    · {m}"))
++                if vivos:
++                    catalogo = vivos
++                else:
++                    self.ui.aviso("  Ningún modelo gratis respondió ahora (pool saturado): uso el orden del catálogo.")
 +            cambios = aplicar_perfil(self.settings, arg, catalogo)
          except KeyError:
              self.ui.error(f"Perfil desconocido: {arg} ({', '.join(PERFILES)})")
@@ -5519,8 +5527,17 @@ index 9e5d20f..9340c87 100644
 +        self._guardar_settings()
          self.llm.limitador = LimitadorTasa(self.settings.rpm_efectivo()) if hasattr(self.llm, "limitador") else None
          self.ui.ok(f"Perfil {arg}: " + (", ".join(cambios) or "sin cambios"))
++        if arg.strip().lower() == "gratis":
++            pagos = sorted(f"{rol}={m}" for rol, m in (self.settings.modelos_rol or {}).items()
++                           if m and not resolver_modelo(m).endswith(":free")
++                           and info_modelo(m).proveedor in ("", "openrouter"))   # Groq/Gemini/Ollama: otra cuenta
++            if pagos:
++                self.ui.aviso("  Ojo: estos roles siguen en modelos que pueden ser PAGOS: " + ", ".join(pagos[:6])
++                              + " (/modelo <rol> <alias> para cambiarlos).")
  
-@@ -853,22 +1126,83 @@ class App:
+     def cmd_tema(self, arg: str) -> None:
+         if not arg:
+@@ -853,22 +1141,83 @@ class App:
              return
          nombre = aplicar_tema(arg)
          self.settings.tema = nombre
@@ -5606,7 +5623,7 @@ index 9e5d20f..9340c87 100644
              return
          if len(partes) == 2 and partes[0].lower() in ROLES:
              rol = partes[0].lower()
-@@ -877,12 +1211,13 @@ class App:
+@@ -877,12 +1226,13 @@ class App:
              else:
                  self.settings.modelos_rol[rol] = resolver_modelo(partes[1])
              self.ui.ok(f"{rol} → {self.settings.modelo_para(rol)}")
@@ -5622,7 +5639,7 @@ index 9e5d20f..9340c87 100644
          else:
              self.ui.error("Uso: /modelo [<alias>] | /modelo <rol> <alias>. Demasiados argumentos; no guardé nada.")
  
-@@ -900,7 +1235,7 @@ class App:
+@@ -900,7 +1250,7 @@ class App:
              self.settings.modelo_fuerte = arg
              self.settings.escalar = True
              self.ui.ok(f"Modelo de escalada: {resolver_modelo(arg)}")
@@ -5631,7 +5648,7 @@ index 9e5d20f..9340c87 100644
  
      def cmd_modelos(self, arg: str) -> None:
          partes = (arg or "").split(maxsplit=1)
-@@ -955,12 +1290,12 @@ class App:
+@@ -955,12 +1305,12 @@ class App:
          arg = arg.strip()
          if arg.lower() in ("off", "no", "0", "stop", "salir", "apagar"):
              self.settings.modo_seguridad = False
@@ -5646,7 +5663,7 @@ index 9e5d20f..9340c87 100644
                  self.ui.info(f"  Alcance autorizado: {self.settings.alcance_autorizado}")
              else:
                  self.ui.info("Modo seguridad apagado.")
-@@ -970,7 +1305,7 @@ class App:
+@@ -970,7 +1320,7 @@ class App:
              return
          self.settings.alcance_autorizado = arg
          self.settings.modo_seguridad = True
@@ -5655,7 +5672,7 @@ index 9e5d20f..9340c87 100644
          self.ui.ok("Modo seguridad ACTIVADO (pentest / CTF / lab / estudio).")
          self.ui.info(f"  Alcance autorizado: {arg}")
          self.ui.aviso("  REAPER hará trabajo ofensivo SOLO dentro de ese alcance. Fuera de ahí, frena y avisa.")
-@@ -983,7 +1318,7 @@ class App:
+@@ -983,7 +1333,7 @@ class App:
          if sub in ("estricto", "estricta", "strict"):
              valor = len(partes) > 1 and partes[1].lower() in ("on", "si", "sí", "1", "true")
              self.settings.privacidad_estricta = valor
@@ -5664,7 +5681,7 @@ index 9e5d20f..9340c87 100644
              self.ui.ok(f"Privacidad estricta: {'ON' if valor else 'OFF'}.")
              if valor:
                  self.ui.tenue("  Los modelos externos quedan BLOQUEADOS: solo saldrá tráfico a un proveedor local (ollama).")
-@@ -991,8 +1326,55 @@ class App:
+@@ -991,8 +1341,55 @@ class App:
          self.ui.linea(texto_reporte_privacidad(reporte_privacidad(self.llm, self.settings)))
  
      def cmd_equipo(self, arg: str) -> None:
@@ -5721,7 +5738,7 @@ index 9e5d20f..9340c87 100644
          estado = estado_equipo(self.settings)
          ind = independencia_equipo(estado)
          if sub in ("independencia", "independence"):
-@@ -1008,33 +1390,43 @@ class App:
+@@ -1008,33 +1405,43 @@ class App:
                  self.ui.tenue("  Configurá un proveedor free: export GROQ_API_KEY=... (o NVIDIA/GEMINI/OpenRouter).")
              else:
                  self.settings.modelos_rol.update(asignacion)
@@ -5771,7 +5788,7 @@ index 9e5d20f..9340c87 100644
  
      def cmd_proveedores(self, arg: str) -> None:
          """Estado de proveedores SIN exponer secretos. Las claves salen de env o .clave_<proveedor>."""
-@@ -1077,12 +1469,28 @@ class App:
+@@ -1077,12 +1484,28 @@ class App:
                            f"{c['providers_chat_operational']} · free confirmado: {c['providers_free_confirmed']}")
              self.ui.tenue("  Un gateway (OpenRouter) es 1 proveedor, no cientos. Credencial presente ≠ autenticado.")
              return
@@ -5805,7 +5822,7 @@ index 9e5d20f..9340c87 100644
              return
          self.ui.error("Uso: /proveedores [estado|configurar|estadisticas|probar|sincronizar|diagnostico]")
  
-@@ -1170,7 +1578,11 @@ class App:
+@@ -1170,7 +1593,11 @@ class App:
              self.ui.error("Uso: /muestra <archivo>  (análisis estático; la muestra NUNCA se ejecuta)")
              return
          try:
@@ -5818,7 +5835,7 @@ index 9e5d20f..9340c87 100644
          except (OSError, ValueError, ErrorRuta) as e:
              self.ui.error(f"No pude leer {ruta}: {e}")
              return
-@@ -1333,7 +1745,7 @@ class App:
+@@ -1333,7 +1760,7 @@ class App:
              aplicar_tema(self.settings.tema)
          if clave in ("rpm", "modelo") and hasattr(self.llm, "limitador"):
              self.llm.limitador = LimitadorTasa(self.settings.rpm_efectivo())
@@ -5827,7 +5844,7 @@ index 9e5d20f..9340c87 100644
          self.ui.ok(f"{clave} = {getattr(self.settings, clave)!r}")
  
      def cmd_uso(self, arg: str) -> None:
-@@ -1374,6 +1786,7 @@ class App:
+@@ -1374,6 +1801,7 @@ class App:
  
      def cmd_reset(self, arg: str) -> None:
          self.principal = self._nuevo_principal()
@@ -5835,7 +5852,7 @@ index 9e5d20f..9340c87 100644
          try:
              self._ruta_sesion().unlink()
          except OSError:
-@@ -1399,6 +1812,32 @@ class App:
+@@ -1399,6 +1827,32 @@ class App:
  
      def cmd_doctor(self, arg: str) -> None:
          diagnostico_sistema(self.ui, self.settings, self.llm)
@@ -5868,7 +5885,7 @@ index 9e5d20f..9340c87 100644
  
      def cmd_instalar(self, arg: str) -> None:
          instalar_lanzador(self.ui)
-@@ -1471,15 +1910,24 @@ class App:
+@@ -1471,15 +1925,24 @@ class App:
  
      def _leer_entrada(self) -> str:
          marca = f"{Tema.aviso}[plan] {C.RESET}" if self.modo_plan else ""
@@ -5900,7 +5917,7 @@ index 9e5d20f..9340c87 100644
  
      def mostrar_inicio(self, animar: bool = True) -> None:
          if not (animar and self.settings.animacion and animar_intro()):
-@@ -1494,24 +1942,44 @@ class App:
+@@ -1494,24 +1957,44 @@ class App:
              funciones.append(f"escalada→{self.settings.modelo_fuerte}")
          if self.settings.lecciones:
              funciones.append("lecciones")
@@ -9357,10 +9374,10 @@ index 0000000..dc02ba1
 +        self.assertNotIn("verificación: UNVERIFIED", texto)
 diff --git a/partes/48zg_autotest_openrouter_real.py b/partes/48zg_autotest_openrouter_real.py
 new file mode 100644
-index 0000000..71497fc
+index 0000000..fd1cf26
 --- /dev/null
 +++ b/partes/48zg_autotest_openrouter_real.py
-@@ -0,0 +1,475 @@
+@@ -0,0 +1,505 @@
 +"""
 +Autotests de regresión de la PRUEBA REAL con OpenRouter (modelos :free, octubre 2026). Lo que apareció con un
 +modelo de verdad y no con el MockLLM:
@@ -9836,6 +9853,36 @@ index 0000000..71497fc
 +        texto = ui.texto_registrado()
 +        self.assertNotIn("no completó (completado)", texto)
 +        self.assertIn("terminó, pero su cierre no quedó respaldado", texto)
++
++
++class TestOpenRouterRealPerfilGratisProbado(BaseTest):
++    @staticmethod
++    def _llm(vivos):
++        return MockLLM(lambda m, k: "REAPER_OK" if k.get("modelo") in vivos else "no sé")
++
++    def test_se_quedan_solo_los_que_responden(self):
++        # Prueba real: el catálogo ponía inkling/inkling-small 2.º y 3.º, y daban 403. El catálogo no lo dice.
++        vivos = free_que_responden(self._llm({"b/ok:free", "d/ok:free", "e/ok:free"}),
++                                   ["a/403:free", "b/ok:free", "c/caido:free", "d/ok:free", "e/ok:free"], cuantos=2)
++        self.assertEqual(vivos, ["b/ok:free", "d/ok:free"])               # en orden y corta al llegar a 2
++
++    def test_perfil_gratis_con_clave_prueba_y_elige_los_vivos(self):
++        os.environ["OPENROUTER_API_KEY"] = "sk-or-v1-solo-para-test"
++        g = globals()
++        original = g["catalogo_free_openrouter"]
++        g["catalogo_free_openrouter"] = lambda: ["a/403:free", "b/ok:free", "c/ok:free"]
++        try:
++            app = App(self.ajustes(proveedor="openrouter", modelos_rol={"juez": "anthropic/caro"}),
++                      self._llm({"b/ok:free", "c/ok:free"}), self.ui(), self.proyecto(), persistir=False)
++            app.cmd_perfil("gratis")
++        finally:
++            g["catalogo_free_openrouter"] = original
++            os.environ.pop("OPENROUTER_API_KEY", None)
++        self.assertEqual(app.settings.modelo, "b/ok:free")               # el 403 quedó afuera
++        self.assertEqual(app.settings.fallbacks, ["c/ok:free"])
++        texto = app.ui.texto_registrado()
++        self.assertIn("Probando los modelos gratis", texto)
++        self.assertIn("pueden ser PAGOS: juez=anthropic/caro", texto)      # avisa del rol que puede cobrar
 diff --git a/partes/49_autotest_runner.py b/partes/49_autotest_runner.py
 index 541aee7..02a88e9 100644
 --- a/partes/49_autotest_runner.py
@@ -10526,7 +10573,7 @@ index c9c292f..eb8455e 100644
  
      ## Primer uso
 diff --git a/partes/70_equipo.py b/partes/70_equipo.py
-index bde977a..35c7159 100644
+index bde977a..572251e 100644
 --- a/partes/70_equipo.py
 +++ b/partes/70_equipo.py
 @@ -21,18 +21,252 @@ ROLES_EQUIPO_SEIS = (
@@ -10793,7 +10840,7 @@ index bde977a..35c7159 100644
          asignacion[rol] = candidatos[i % len(candidatos)]
      return asignacion, ""
  
-@@ -71,11 +305,19 @@ def _probar_modelo(llm, modelo: str) -> dict:
+@@ -71,16 +305,39 @@ def _probar_modelo(llm, modelo: str) -> dict:
      """Petición mínima REAL a un modelo concreto (sin fallback): dice si responde de verdad."""
      t0 = time.monotonic()
      try:
@@ -10815,7 +10862,27 @@ index bde977a..35c7159 100644
          return {"estado": "FALLA", "detalle": recortar(str(e), 120)}
      except (OSError, ValueError, RuntimeError) as e:
          return {"estado": "FALLA", "detalle": f"{type(e).__name__}: {e}"[:120]}
-@@ -108,7 +350,8 @@ def resumen_arranque_equipo(settings) -> str:
+ 
+ 
++def free_que_responden(llm, candidatos: list, cuantos: int = 4, max_probar: int = 8, on_probar=None) -> list:
++    """Prueba DE VERDAD (pedido mínimo, modelos gratis: $0) los candidatos del catálogo y devuelve los que
++    responden, en orden. El catálogo no dice cuáles están caídos o dan 403 "solo en harnesses agénticos": en la
++    prueba real de octubre 2026, inkling e inkling-small salían 2.º y 3.º del catálogo y no servían."""
++    vivos = []
++    for modelo in candidatos[:max_probar]:
++        if on_probar is not None:
++            on_probar(modelo)
++        if _probar_modelo(llm, modelo).get("estado") == "RESPONDE":
++            vivos.append(modelo)
++            if len(vivos) >= cuantos:
++                break
++    return vivos
++
++
+ def probar_equipo(llm, settings) -> list:
+     """
+     Prueba de verdad cada uno de los seis roles con una petición mínima. Dedup por modelo (no gasta de más).
+@@ -108,7 +365,8 @@ def resumen_arranque_equipo(settings) -> str:
      ind = independencia_equipo(estado)
      con_clave = sum(1 for e in estado if e["tiene_clave"])
      aviso = "" if con_clave == len(estado) else f" · {len(estado) - con_clave} sin clave"

@@ -2779,11 +2779,13 @@
 +                              "pediste ni aprobaste el plan: se protegen (no se pierde lo que ya tenías).")
              registro_build.guardar(previo)
 +        self._reemplazos_autorizados = set(previo.get("reemplazos_autorizados", []))
-+
+ 
+-        informe = InformeBuild("fallida", plan=plan, cid=grupo)
 +        informe = InformeBuild("fallida", plan=plan, cid=grupo,
 +                               reemplazos_autorizados=sorted(self._reemplazos_autorizados))
  
--        informe = InformeBuild("fallida", plan=plan, cid=grupo)
+-        testeable = any(a.endswith(EXTENSIONES_TESTEABLES) for a in plan.archivos()) or any(
+-            a.endswith(EXTENSIONES_TESTEABLES) for a in self.ws.archivos_codigo(limite=200)) or not self.ws.archivos_codigo(limite=5)
 +        # Motor central: el juez fija el CONTRATO (criterios del pedido) antes de construir. En reanudación se
 +        # reutiliza el que ya quedó en el diario: no se gasta otra llamada.
 +        if not reanudar:
@@ -2802,9 +2804,7 @@
 +                self._mostrar_contrato(informe.criterios_entrega, plan)
 +        else:
 +            informe.criterios_entrega = list(previo.get("criterios_entrega", []))
- 
--        testeable = any(a.endswith(EXTENSIONES_TESTEABLES) for a in plan.archivos()) or any(
--            a.endswith(EXTENSIONES_TESTEABLES) for a in self.ws.archivos_codigo(limite=200)) or not self.ws.archivos_codigo(limite=5)
++
 +        testeable = _es_testeable(plan.archivos(), self.ws.archivos_codigo(limite=200))
          numero_fase = 3
 +        if not reanudar:
@@ -3377,18 +3377,39 @@
      def cmd_correr(self, arg: str) -> None:
          try:
              tokens = shlex.split(arg)
-@@ -28432,7 +30247,9 @@
+@@ -28432,13 +30247,30 @@
                            f"tests_primero={self.settings.tests_primero}, escalar={self.settings.escalar}")
              return
          try:
 -            cambios = aplicar_perfil(self.settings, arg)
-+            catalogo = (catalogo_free_openrouter() if arg.strip().lower() == "gratis"
-+                        and self.settings.proveedor == "openrouter" else None)
++            gratis = arg.strip().lower() == "gratis" and self.settings.proveedor == "openrouter"
++            catalogo = catalogo_free_openrouter() if gratis else None
++            if catalogo and clave_de_proveedor("openrouter", self.settings):
++                # Con clave: se prueba cada candidato con un pedido mínimo ($0) y quedan solo los que responden.
++                self.ui.info("  Probando los modelos gratis de hoy (pedido mínimo, no cuesta nada)…")
++                vivos = free_que_responden(self.llm, catalogo, on_probar=lambda m: self.ui.tenue(f"    · {m}"))
++                if vivos:
++                    catalogo = vivos
++                else:
++                    self.ui.aviso("  Ningún modelo gratis respondió ahora (pool saturado): uso el orden del catálogo.")
 +            cambios = aplicar_perfil(self.settings, arg, catalogo)
          except KeyError:
              self.ui.error(f"Perfil desconocido: {arg} ({', '.join(PERFILES)})")
              return
-@@ -28449,13 +30266,63 @@
+         self._guardar_settings()
+         self.llm.limitador = LimitadorTasa(self.settings.rpm_efectivo()) if hasattr(self.llm, "limitador") else None
+         self.ui.ok(f"Perfil {arg}: " + (", ".join(cambios) or "sin cambios"))
++        if arg.strip().lower() == "gratis":
++            pagos = sorted(f"{rol}={m}" for rol, m in (self.settings.modelos_rol or {}).items()
++                           if m and not resolver_modelo(m).endswith(":free")
++                           and info_modelo(m).proveedor in ("", "openrouter"))   # Groq/Gemini/Ollama: otra cuenta
++            if pagos:
++                self.ui.aviso("  Ojo: estos roles siguen en modelos que pueden ser PAGOS: " + ", ".join(pagos[:6])
++                              + " (/modelo <rol> <alias> para cambiarlos).")
+ 
+     def cmd_tema(self, arg: str) -> None:
+         if not arg:
+@@ -28449,13 +30281,63 @@
          self._guardar_settings()
          self.ui.ok(f"Tema: {nombre}")
  
@@ -3452,7 +3473,7 @@
              return
          # Ω §5.1: solo /modelo <alias> o /modelo <rol> <alias> con rol conocido. Nada más se guarda.
          if len(partes) == 1:
-@@ -28600,14 +30467,51 @@
+@@ -28600,14 +30482,51 @@
          sub = (arg or "").strip().lower()
          if sub.startswith("x"):
              partes_x = sub.split()
@@ -3507,7 +3528,7 @@
          estado = estado_equipo(self.settings)
          ind = independencia_equipo(estado)
          if sub in ("independencia", "independence"):
-@@ -28648,6 +30552,11 @@
+@@ -28648,6 +30567,11 @@
          for e in estado:
              marca = "✓ clave" if e["tiene_clave"] else "⚠ FALTA CLAVE"
              self.ui.info(f"  {e['rol']:<13} → {e['proveedor']}/{e.get('modelo_real') or e['modelo']}   {marca}")
@@ -3519,7 +3540,7 @@
          self.ui.tenue(f"  proveedores distintos: {ind['proveedores_distintos']} · "
                        f"modelos distintos: {ind['modelos_distintos']}"
                        + ("  · independencia REDUCIDA" if ind["reducida"] else ""))
-@@ -28699,7 +30608,8 @@
+@@ -28699,7 +30623,8 @@
              return
          if sub == "probar":
              candidatos = [p for p, d in PROVEEDORES.items()
@@ -3529,7 +3550,7 @@
              if not candidatos:
                  self.ui.aviso("Ningún proveedor tiene credencial configurada. Configurá con /proveedores configurar.")
                  return
-@@ -29039,6 +30949,32 @@
+@@ -29039,6 +30964,32 @@
  
      def cmd_doctor(self, arg: str) -> None:
          diagnostico_sistema(self.ui, self.settings, self.llm)
@@ -3562,7 +3583,7 @@
  
      def cmd_instalar(self, arg: str) -> None:
          instalar_lanzador(self.ui)
-@@ -29111,7 +31047,7 @@
+@@ -29111,7 +31062,7 @@
  
      def _leer_entrada(self) -> str:
          marca = f"{Tema.aviso}[plan] {C.RESET}" if self.modo_plan else ""
@@ -3571,7 +3592,7 @@
          if entrada.strip().lower() not in ('"""', '/pegar'):
              return entrada.strip()
          lineas = []
-@@ -29143,25 +31079,44 @@
+@@ -29143,25 +31094,44 @@
              funciones.append(f"escalada→{self.settings.modelo_fuerte}")
          if self.settings.lecciones:
              funciones.append("lecciones")
@@ -3627,7 +3648,7 @@
              for r in ejecutar_hooks(self.ws, "al_iniciar", {"proyecto": str(self.ws.raiz)}):
                  (self.ui.tenue if r.ok else self.ui.aviso)(f"  hook al_iniciar: {r.comando} → {'ok' if r.ok else r.salida[-200:]}")
          while True:
-@@ -33617,7 +35572,7 @@
+@@ -33617,7 +35587,7 @@
      comando_tests="ruby -Ilib -Itest test/test_biblioteca.rb",
      comando_ejecutar="ruby bin/biblioteca",
      etiquetas=("ruby", "cli", "json"),
@@ -3636,7 +3657,7 @@
  )
  
  # ======================================================================
-@@ -33762,7 +35717,7 @@
+@@ -33762,7 +35732,7 @@
  eval { convertir(-1, 'm', 'cm') };
  like($@, qr/negativo/, 'longitud negativa');
  
@@ -3645,7 +3666,7 @@
  like($salida, qr/100 c = 212 f/, 'REPL por stdin convierte');
  like($salida, qr/error: no se puede convertir/, 'REPL por stdin informa errores');
  
-@@ -36762,7 +38717,8 @@
+@@ -36762,7 +38732,8 @@
          for nombre in _RUTAS_GLOBALES:
              self._previas[nombre] = g[nombre]
              g[nombre] = nuevas[nombre]
@@ -3655,7 +3676,7 @@
              self._env_previo[variable] = os.environ.get(variable)
              os.environ[variable] = valor
          (self.base / "tmp").mkdir(parents=True, exist_ok=True)
-@@ -36856,6 +38812,26 @@
+@@ -36856,6 +38827,26 @@
          self.assertEqual(ancho_visible(ajustar("abcdef", 4)), 4)
          self.assertEqual(ajustar("ab", 4), "ab  ")
  
@@ -3682,7 +3703,7 @@
      def test_caja_y_tabla(self):
          dibujo = sin_ansi(caja(["uno", "dos"], titulo="T"))
          lineas = dibujo.splitlines()
-@@ -37928,6 +39904,45 @@
+@@ -37928,6 +39919,45 @@
          self.assertIn("operativos", c.disyuntor.resumen())
  
  
@@ -3728,7 +3749,7 @@
  # ======================================================================
  # MÓDULO: autotest_registro
  # ======================================================================
-@@ -39189,6 +41204,12 @@
+@@ -39189,6 +41219,12 @@
          texto = self.salida(app)
          self.assertIn("proyecto", texto)
          self.assertIn(__version__, texto)
@@ -3741,7 +3762,7 @@
  
      def test_sesion_persistente(self):
          ws = self.proyecto()
-@@ -39271,6 +41292,64 @@
+@@ -39271,6 +41307,64 @@
          diagnostico_sistema(ui, self.ajustes(proveedor="ollama"))
          self.assertIn("DOCTOR REAPER", ui.texto_registrado())
  
@@ -3806,7 +3827,7 @@
      def test_instalar_lanzador(self):
          casa = self.dir / "casa"
          casa.mkdir()
-@@ -39357,7 +41436,7 @@
+@@ -39357,7 +41451,7 @@
                  if not plantilla.comando_tests:
                      continue
                  if not plantilla.disponible():
@@ -3815,7 +3836,7 @@
                  if set(plantilla.requiere) & {"go", "cargo", "javac", "make"} and not os.getenv("REAPER_AUTOTEST_COMPLETO"):
                      continue  # compilar Go/Rust/Java/C tarda: solo con REAPER_AUTOTEST_COMPLETO=1
                  destino = self.dir / "plantillas_generadas" / nombre.replace("-", "_")
-@@ -39527,6 +41606,8 @@
+@@ -39527,6 +41621,8 @@
              "antes_de_comando": ["echo {comando} | grep -qv prohibido"],
          }})})
          ctx = self.contexto(ws)
@@ -3824,7 +3845,7 @@
          salida = self.herramienta(ctx, "write_to_file", path="a.py", content="x = 1")
          self.assertIn("un hook del proyecto modificó a.py", salida)
          self.assertIn("# formateado", ws.leer("a.py"))
-@@ -39535,6 +41616,14 @@
+@@ -39535,6 +41631,14 @@
              self.herramienta(ctx, "execute_command", command="echo prohibido")
          self.assertIn("hook", str(cm.exception))
  
@@ -3839,7 +3860,7 @@
      def test_eventos_y_desactivados(self):
          ws = self.proyecto({".reaper/config.json": '{"hooks": {"despues_de_build": "echo {estado}"}}'})
          resultados = ejecutar_hooks(ws, "despues_de_build", {"estado": "verificada"})
-@@ -39547,8 +41636,9 @@
+@@ -39547,8 +41651,9 @@
  
  class TestRenombrar(BaseTest):
      def test_python_no_toca_strings_ni_comentarios(self):
@@ -3850,7 +3871,7 @@
          self.assertEqual(n, 3)
          self.assertIn("def suma(x):", nuevo)
          self.assertIn("# total sin cambiar", nuevo)
-@@ -39556,9 +41646,23 @@
+@@ -39556,9 +41661,23 @@
          self.assertIn("obj.suma = 1", nuevo)
          self.assertNotIn("subtotal", renombrar_en_texto("b.py", "subtotal = total\n", "total", "suma")[0].replace("subtotal", "ok"))
  
@@ -3875,7 +3896,7 @@
          self.assertEqual(n, 2)
          self.assertIn("const suma = 1; // total", nuevo)
          self.assertIn("subtotal, suma)", nuevo)
-@@ -39586,6 +41690,32 @@
+@@ -39586,6 +41705,32 @@
          self.assertIn("def nueva", ws.leer("m.py"))
          self.assertIn("No encontré", self.herramienta(ctx, "rename_symbol", old="inexistente", new="x"))
  
@@ -3908,7 +3929,7 @@
  
  class TestIngles(BaseTest):
      def test_prompt_en(self):
-@@ -40176,6 +42306,24 @@
+@@ -40176,6 +42321,24 @@
          self.assertIn("SIN PROGRESO", verif.diagnostico)
          self.assertTrue(orq._verificar_tarea(tcid, ConteoTests(), set()).ok)
  
@@ -3933,7 +3954,7 @@
      def test_revisor_no_aprueba_una_tarea_que_rompe_tests(self):
          ws = self.proyecto({
              "calc.py": "def suma(a, b):\n    return a + b\n",
-@@ -40517,8 +42665,9 @@
+@@ -40517,8 +42680,9 @@
          self.assertIsNone(self._detectar({"README.md": "hola"}))
  
      def test_plantilla_ruby_se_detecta_sin_config(self):
@@ -3945,7 +3966,7 @@
          destino = self.dir / "bib"
          crear_desde_plantilla("ruby-biblioteca", destino)
          (destino / ".reaper" / "config.json").unlink(missing_ok=True)
-@@ -43233,11 +45382,20 @@
+@@ -43233,11 +45397,20 @@
          self.assertEqual(destino.read_text(encoding="utf-8"), "previo")   # no lo pisó
  
      def test_ruta_destino_cae_a_interna_sin_sdcard(self):
@@ -3968,7 +3989,7 @@
  
  class TestDeshacerEntrega(BaseTest):
      def test_deshace_si_no_cambio(self):
-@@ -44268,6 +46426,45 @@
+@@ -44268,6 +46441,45 @@
          self.assertTrue(any("descartado" in n for n in informe.notas))
  
  
@@ -4014,7 +4035,7 @@
  class TestReaper810(BaseTest):
      """Regresiones de permisos, identificación e informes del propio REAPER."""
  
-@@ -44300,8 +46497,11 @@
+@@ -44300,8 +46512,11 @@
  # ======================================================================
  class TestReaper810Mejoras(BaseTest):
      def test_alias_heredados_resuelven_sin_id_invalido(self):
@@ -4027,7 +4048,7 @@
          self.assertEqual(resolver_modelo("groq:openai/gpt-oss-120b"), "groq:openai/gpt-oss-120b")
          self.assertEqual(resolver_modelo("openrouter:cohere/north-mini-code:free"),
                           "openrouter:cohere/north-mini-code:free")
-@@ -44501,6 +46701,2139 @@
+@@ -44501,6 +46716,2169 @@
  
  
  # ======================================================================
@@ -6163,11 +6184,41 @@
 +        self.assertIn("terminó, pero su cierre no quedó respaldado", texto)
 +
 +
++class TestOpenRouterRealPerfilGratisProbado(BaseTest):
++    @staticmethod
++    def _llm(vivos):
++        return MockLLM(lambda m, k: "REAPER_OK" if k.get("modelo") in vivos else "no sé")
++
++    def test_se_quedan_solo_los_que_responden(self):
++        # Prueba real: el catálogo ponía inkling/inkling-small 2.º y 3.º, y daban 403. El catálogo no lo dice.
++        vivos = free_que_responden(self._llm({"b/ok:free", "d/ok:free", "e/ok:free"}),
++                                   ["a/403:free", "b/ok:free", "c/caido:free", "d/ok:free", "e/ok:free"], cuantos=2)
++        self.assertEqual(vivos, ["b/ok:free", "d/ok:free"])               # en orden y corta al llegar a 2
++
++    def test_perfil_gratis_con_clave_prueba_y_elige_los_vivos(self):
++        os.environ["OPENROUTER_API_KEY"] = "sk-or-v1-solo-para-test"
++        g = globals()
++        original = g["catalogo_free_openrouter"]
++        g["catalogo_free_openrouter"] = lambda: ["a/403:free", "b/ok:free", "c/ok:free"]
++        try:
++            app = App(self.ajustes(proveedor="openrouter", modelos_rol={"juez": "anthropic/caro"}),
++                      self._llm({"b/ok:free", "c/ok:free"}), self.ui(), self.proyecto(), persistir=False)
++            app.cmd_perfil("gratis")
++        finally:
++            g["catalogo_free_openrouter"] = original
++            os.environ.pop("OPENROUTER_API_KEY", None)
++        self.assertEqual(app.settings.modelo, "b/ok:free")               # el 403 quedó afuera
++        self.assertEqual(app.settings.fallbacks, ["c/ok:free"])
++        texto = app.ui.texto_registrado()
++        self.assertIn("Probando los modelos gratis", texto)
++        self.assertIn("pueden ser PAGOS: juez=anthropic/caro", texto)      # avisa del rol que puede cobrar
++
++
 +# ======================================================================
  # MÓDULO: autotest_runner
  # ======================================================================
  """Ejecutor del autotest interno."""
-@@ -44514,6 +48847,44 @@
+@@ -44514,6 +48892,44 @@
      )
  
  
@@ -6212,7 +6263,7 @@
  def correr_autotest(filtro: Optional[str] = None, verbosidad: Optional[int] = None) -> int:
      filtro = (filtro if filtro is not None else os.getenv("REAPER_AUTOTEST", "")).lower()
      verbosidad = verbosidad if verbosidad is not None else (2 if os.getenv("REAPER_AUTOTEST_V") else 1)
-@@ -44525,13 +48896,39 @@
+@@ -44525,13 +48941,39 @@
          suite.addTests(cargador.loadTestsFromTestCase(clase))
      total = suite.countTestCases()
      if total == 0:
@@ -6254,7 +6305,7 @@
      if resultado.wasSuccessful():
          print(f"{Tema.ok}✓ {resultado.testsRun} tests OK en {duracion}"
                f"{f' ({len(resultado.skipped)} salteados)' if resultado.skipped else ''}{C.RESET}")
-@@ -45345,6 +49742,33 @@
+@@ -45345,6 +49787,33 @@
      return [c for c in comandos if isinstance(c, str) and c.strip()]
  
  
@@ -6288,7 +6339,7 @@
  def ejecutar_hooks(ws: Workspace, evento: str, variables: Optional[dict] = None, timeout: int = 60) -> list[ResultadoHook]:
      if evento not in EVENTOS_HOOK:
          raise ValueError(f"evento de hook desconocido: {evento}")
-@@ -45360,7 +49784,7 @@
+@@ -45360,7 +49829,7 @@
  
  def _hook_post_escritura(ctx: Contexto, rel: str) -> str:
      """Corre los hooks despues_de_escribir; devuelve texto para el agente si alguno falló o cambió algo."""
@@ -6297,7 +6348,7 @@
          return ""
      antes = ctx.ws.hash(rel)
      resultados = ejecutar_hooks(ctx.ws, "despues_de_escribir", {"archivo": rel})
-@@ -45377,7 +49801,7 @@
+@@ -45377,7 +49846,7 @@
  
  def _hook_antes_de_comando(ctx: Contexto, comando: str) -> Optional[str]:
      """Devuelve el motivo si un hook bloquea el comando."""
@@ -6306,16 +6357,15 @@
          return None
      for r in ejecutar_hooks(ctx.ws, "antes_de_comando", {"comando": comando}):
          if not r.ok:
-@@ -45404,27 +49828,84 @@
+@@ -45404,27 +49873,84 @@
  import tokenize as _tokenize
  
  _RE_IDENT_VALIDO = re.compile(r"^[A-Za-z_$][\w$]*$")
 +_IGNORAR_TOKEN = frozenset({
 +    _tokenize.NL, _tokenize.NEWLINE, _tokenize.COMMENT, _tokenize.INDENT, _tokenize.DEDENT, _tokenize.ENCODING,
 +})
- 
- 
--def _renombrar_python(texto: str, viejo: str, nuevo: str) -> tuple[str, int]:
++
++
 +def _modulos_importados(texto: str) -> set:
 +    """Nombres ligados por `import X` / `import X as Y` / `import a.b` (se liga `a`): un `a.viejo` es la función,
 +    no un atributo ajeno, así que sí hay que renombrarlo."""
@@ -6344,8 +6394,9 @@
 +                if isinstance(hijo, (ast.FunctionDef, ast.AsyncFunctionDef)) and hijo.name == viejo:
 +                    return True
 +    return False
-+
-+
+ 
+ 
+-def _renombrar_python(texto: str, viejo: str, nuevo: str) -> tuple[str, int]:
 +def _renombrar_python(texto: str, viejo: str, nuevo: str, incluir_atributos: bool = True) -> tuple[str, int, int]:
 +    """
 +    Renombra tokens NAME == viejo (nunca strings ni comentarios). Cuando incluir_atributos es False, NO toca los
@@ -6398,7 +6449,7 @@
      largo = len(viejo)
      while i < n:
          ch = texto[i]
-@@ -45455,27 +49936,33 @@
+@@ -45455,27 +49981,33 @@
              antes = texto[i - 1] if i > 0 else ""
              despues = texto[i + largo] if i + largo < n else ""
              if not (antes.isalnum() or antes in "_$") and not (despues.isalnum() or despues in "_$"):
@@ -6440,7 +6491,7 @@
  
  
  @dataclass
-@@ -45484,6 +49971,7 @@
+@@ -45484,6 +50016,7 @@
      nuevo: str
      cambios: dict = field(default_factory=dict)  # rel → (antes, despues, cantidad)
      conflictos: list = field(default_factory=list)
@@ -6448,7 +6499,7 @@
  
      @property
      def total(self) -> int:
-@@ -45507,6 +49995,10 @@
+@@ -45507,6 +50040,10 @@
          raise ValueError(f"'{nuevo}' es una palabra reservada de Python")
      plan = PlanRenombrado(viejo, nuevo)
      candidatos = list(archivos) if archivos else ws.archivos_codigo(limite=3000)
@@ -6459,7 +6510,7 @@
      for rel in candidatos:
          try:
              texto = ws.leer(rel)
-@@ -45514,7 +50006,13 @@
+@@ -45514,7 +50051,13 @@
              continue
          if viejo not in texto:
              continue
@@ -6474,7 +6525,7 @@
          if cantidad > 0:
              if re.search(r"(?<![\w$])" + re.escape(nuevo) + r"(?![\w$])", texto):
                  plan.conflictos.append(f"{rel}: ya existe el nombre '{nuevo}'")
-@@ -45570,6 +50068,10 @@
+@@ -45570,6 +50113,10 @@
      texto = plan.resumen()
      if plan.conflictos:
          texto += "\nOjo, el nombre nuevo ya existía en: " + "; ".join(plan.conflictos)
@@ -6485,7 +6536,7 @@
      return texto + "\nValidación: " + resumen_validacion(resultados)
  
  
-@@ -45675,6 +50177,11 @@
+@@ -45675,6 +50222,11 @@
  Define the public INTERFACE (files, functions/classes and exact signatures): tests are written from it BEFORE
  implementing, so it must be precise and importable.
  If a new file will be long (more than ~250 lines), split it into several modules or tasks.
@@ -6497,7 +6548,7 @@
  Your attempt_completion MUST contain the plan EXACTLY in this format:
  <plan>
  <objetivo>one sentence</objetivo>
-@@ -45788,6 +50295,23 @@
+@@ -45788,6 +50340,23 @@
  A criterion is MET only if you cite evidence that proves it; without evidence it is UNKNOWN.
  Reply ONLY a JSON object: {"criteria": [{"criterion": "...", "status": "MET|NOT_MET|UNKNOWN",
  "evidence_ids": ["EV-..."]}]}""",
@@ -6521,7 +6572,7 @@
  }
  
  DOCS_EN = {
-@@ -49171,6 +53695,240 @@
+@@ -49171,6 +53740,240 @@
      return salida
  
  
@@ -6762,7 +6813,29 @@
  def modelos_potentes_free() -> list:
      """Alias curados de modelos free POTENTES (del catálogo estático), como (alias, info)."""
      return [(alias, info) for alias, info in INFO_MODELOS.items() if info.free]
-@@ -49254,7 +54012,8 @@
+@@ -49227,6 +54030,21 @@
+         return {"estado": "FALLA", "detalle": f"{type(e).__name__}: {e}"[:120]}
+ 
+ 
++def free_que_responden(llm, candidatos: list, cuantos: int = 4, max_probar: int = 8, on_probar=None) -> list:
++    """Prueba DE VERDAD (pedido mínimo, modelos gratis: $0) los candidatos del catálogo y devuelve los que
++    responden, en orden. El catálogo no dice cuáles están caídos o dan 403 "solo en harnesses agénticos": en la
++    prueba real de octubre 2026, inkling e inkling-small salían 2.º y 3.º del catálogo y no servían."""
++    vivos = []
++    for modelo in candidatos[:max_probar]:
++        if on_probar is not None:
++            on_probar(modelo)
++        if _probar_modelo(llm, modelo).get("estado") == "RESPONDE":
++            vivos.append(modelo)
++            if len(vivos) >= cuantos:
++                break
++    return vivos
++
++
+ def probar_equipo(llm, settings) -> list:
+     """
+     Prueba de verdad cada uno de los seis roles con una petición mínima. Dedup por modelo (no gasta de más).
+@@ -49254,7 +54072,8 @@
      ind = independencia_equipo(estado)
      con_clave = sum(1 for e in estado if e["tiene_clave"])
      aviso = "" if con_clave == len(estado) else f" · {len(estado) - con_clave} sin clave"
@@ -6772,7 +6845,7 @@
              f" · conectividad NO VERIFICADA (/equipo probar)")
  
  
-@@ -49593,7 +54352,8 @@
+@@ -49593,7 +54412,8 @@
      return h.hexdigest(), tam
  
  
@@ -6782,7 +6855,7 @@
      """
      Elige una ruta de salida REAL y legible. Prefiere la autorizada; si no hay acceso a almacenamiento
      compartido, cae a una carpeta interna de REAPER (sin fingir que llegó a /sdcard). Devuelve (ruta, externo).
-@@ -49601,7 +54361,8 @@
+@@ -49601,7 +54421,8 @@
      candidatas = []
      if preferida:
          candidatas.append(Path(preferida).expanduser())
@@ -6792,7 +6865,7 @@
      for base in candidatas:
          try:
              if base.is_dir() and os.access(base, os.W_OK):
-@@ -49938,7 +54699,8 @@
+@@ -49938,7 +54759,8 @@
      """Prueba cada proveedor pedido (o todos los que tengan credencial). Dedup implícito por proveedor."""
      if not proveedores:
          proveedores = [p for p, d in PROVEEDORES.items()
@@ -6802,7 +6875,7 @@
      return [probar_proveedor(llm, p, settings) for p in proveedores]
  
  
-@@ -50198,6 +54960,65 @@
+@@ -50198,6 +55020,65 @@
      return salida
  
  
@@ -6868,7 +6941,7 @@
  def conteo_equipo_x(settings, probados: Optional[dict] = None) -> dict:
      """
      Conteos honestos y separados: roles, modelos distintos configurados, modelos distintos VERIFICADOS (solo los
-@@ -50263,7 +55084,9 @@
+@@ -50263,7 +55144,9 @@
  def aplicar_flags_cli(settings: Settings, args) -> Settings:
      """Flags de línea de comandos ("solo esta ejecución"): tienen la máxima precedencia."""
      if args.perfil:
@@ -6879,7 +6952,7 @@
      if args.modelo:
          settings.modelo = resolver_modelo(args.modelo)
      if args.modelo_fuerte:
-@@ -50387,9 +55210,13 @@
+@@ -50387,9 +55270,13 @@
      # R-011: aplicar los overrides de .reaper/config.json del proyecto ANTES de construir el cliente, para que
      # candidatos/torneo/rpm/modelo/temperatura del proyecto manden de verdad (antes se definían y se ignoraban).
      if ws.config_local().get("settings"):

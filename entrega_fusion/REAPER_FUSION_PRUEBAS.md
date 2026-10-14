@@ -476,3 +476,16 @@ Se reprodujeron offline las respuestas REALES que los modelos dieron en las buil
 | "✗ no completó **(completado)**" | 2 veces | "⚠ terminó, pero su cierre no quedó respaldado por evidencia" (afirmación sin evidencia o archivos que no validan) |
 
 Tests: +5 (todos fallan con el código anterior). Regresión: **1042 tests OK** en Python 3.11/3.12/3.13.
+
+### 18.c Lanzador de pruebas reales y perfil gratis que prueba los modelos
+
+- `pruebas_fusion/prueba_real.py`: corre `/construir` sobre tres proyectos reales (un juego en el navegador, una
+  página web con backend en Python y un script organizador de archivos) **sin ayudar al modelo**, con las mismas
+  garantías de la prueba anterior: clave solo por entorno (y borrada del disco al terminar), solo modelos gratis
+  que RESPONDEN, tope de costo, gasto antes/después y búsqueda de la clave en todo lo generado.
+- Al armarlo apareció otro problema de mi arreglo del perfil gratis: el catálogo real ponía `inkling` e
+  `inkling-small` como respaldo y como juez, y en la prueba real daban 403. Ahora `/perfil gratis` (con clave)
+  **prueba cada candidato** con un pedido mínimo ($0) y se queda solo con los que responden; además avisa si algún
+  rol sigue en un modelo de OpenRouter que puede ser pago.
+
+Tests: +2 (fallan con el código anterior). Regresión: **1044 tests OK** en Python 3.11/3.12/3.13.
