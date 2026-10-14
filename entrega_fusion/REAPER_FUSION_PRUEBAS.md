@@ -394,7 +394,7 @@ NO VERIFICADO con modelos reales: medir falsos positivos con builds reales queda
 
 Hasta acá todo se probaba con MockLLM. Con una clave de OpenRouter del usuario se corrieron builds reales de
 `/construir` usando **solo modelos gratis** (gasto de la cuenta: USD 6,94519608 antes y después → **$0**).
-La clave vivió solo en una carpeta temporal fuera del repo (nunca en el repo ni en commits) y se borra al terminar las pruebas.
+La clave vivió solo en una carpeta temporal fuera del repo (nunca en el repo ni en commits) y se borró del disco al terminar las pruebas.
 
 Configuración aislada (`REAPER_HOME` temporal): principal `nvidia/nemotron-3-super-120b-a12b:free`, juez
 `poolside/laguna-xs-2.1:free`, respaldos `cohere/north-mini-code:free`, `poolside/laguna-*`, `google/gemma-4-31b-it:free`,
@@ -436,6 +436,31 @@ del juez. Buena parte de los ~757k tokens se fue en la meta-tarea (3 reparacione
 CAMBIOS" (3 reparaciones inútiles → PARCIAL con todo andando; en la build 3 el reparador creó un archivo para
 "cumplir"). Ahora no falla si la suite pasa; la juzgan la verificación final y el juez. Si la suite falla, sigue fallando.
 
-Tests: `partes/48zg_autotest_openrouter_real.py` (24). Contra el código anterior: 19 fallan; los 2 que pasan
+**Build 5 — proyecto más grande (gestor de gastos: modelos, SQLite, servicio con presupuestos, CSV, CLI con 6
+subcomandos):** **✓ VERIFICADA** en 17m28s · 11 archivos · 622 líneas · 33/33 validadores · 26 tests · juez CUMPLE
+(high) con ~2,2k tokens (0,2 %). Plan sano: 5 tareas de código real, sin esqueletos ni meta-tareas.
+
+Prueba independiente del programa generado (fuera de REAPER, base temporal): `agregar`, `listar`, `resumen 2026-10`
+(2050,00 correcto), `exportar` (CSV solo del mes, encabezado correcto), alertas de 80 % y 100 % y validaciones de
+monto/fecha **funcionan**. Pero tiene fallos que **ni los tests ni el juez detectaron** (calidad del modelo):
+- **`presupuesto` mezcla meses**: con 850 gastados en octubre y 99 en septiembre informó 949 (el pedido decía
+  presupuesto *mensual*). Ningún test cubría gastos de dos meses.
+- `listar` no muestra los IDs, así que `borrar --id` no se puede usar en la práctica.
+- Los errores de validación salen como traceback en vez de un mensaje limpio.
+
+Conclusión honesta: **"verificada" = pasa los tests que existen y el contrato que derivó el juez**; no garantiza
+cada detalle semántico. Cuanto más explícito el pedido ("el presupuesto cuenta solo los gastos de ese mes"), más lo
+cubren el contrato y los tests.
+
+**Bug #11 (build 5):** el implementador mandó 3 veces `{"items": ["[x] Implementar … gastos/modelos.py", …]}` (los
+argumentos de `update_todo`, sin el nombre) **sin haber creado el archivo** → "sin herramientas" → tarea fallida de
+entrada (la verificación real lo detectó: "falta gastos/modelos.py"). Arreglo: se infiere la herramienta si UNA ÚNICA
+tiene esas claves (ambiguos y `attempt_completion` nunca), y `update_todo` denuncia ítems [x] sobre archivos que no
+existen. (La build 5 corrió con el código anterior a este arreglo.)
+
+Seguridad: la clave **no aparece** en ningún log, informe ni proyecto generado (redacción de secretos OK con modelo
+real). Gasto total de todas las pruebas: **$0**. La clave se borró del disco al terminar.
+
+Tests: `partes/48zg_autotest_openrouter_real.py` (27). Contra el código anterior: 19 fallan; los 2 que pasan
 son guardas de "no excederse" (en proyecto existente no se toca; no se reintenta infinito).
-Regresión: **1034 tests OK** en Python 3.11/3.12/3.13. Smoke CLI: 0 fallas. Lint sin hallazgos nuevos.
+Regresión: **1037 tests OK** en Python 3.11/3.12/3.13. Smoke CLI: 0 fallas. Lint sin hallazgos nuevos.
