@@ -1915,7 +1915,8 @@ PERFILES = {
         "descripcion": "modelos :free, 2 candidatos, sin escalada paga, 16 solicitudes/min y tope de costo ~0",
         # R-010: el perfil gratis impone un techo de costo casi cero. Los modelos :free reportan costo 0, así
         # que no estorba; pero si por error se usa uno pago, el presupuesto de la sesión corta enseguida.
-        "valores": {"modelo": MODELOS["venice-free"], "paralelo": 1, "paralelo_torneo": 1,
+        # Sin red, este modelo fijo (existe y respondió en la prueba real 2026-10; dolphin…:free fue retirado).
+        "valores": {"modelo": "nvidia/nemotron-3-super-120b-a12b:free", "paralelo": 1, "paralelo_torneo": 1,
                     "candidatos": 2, "rpm": 16, "escalar": False, "costo_maximo": 0.01},
     },
     "rapido": {
@@ -1935,7 +1936,9 @@ PERFILES = {
 }
 
 
-def aplicar_perfil(settings: Settings, nombre: str) -> list[str]:
+def aplicar_perfil(settings: Settings, nombre: str, catalogo: Optional[list] = None) -> list[str]:
+    """Aplica un perfil. Para "gratis" con OpenRouter, `catalogo` (modelos gratis que existen HOY, ver
+    catalogo_free_openrouter) manda sobre el modelo fijo: la lista fija se pudre cuando cambian los :free."""
     perfil = PERFILES.get((nombre or "").strip().lower())
     if not perfil:
         raise KeyError(nombre)
@@ -1944,6 +1947,12 @@ def aplicar_perfil(settings: Settings, nombre: str) -> list[str]:
         if getattr(settings, clave) != valor:
             setattr(settings, clave, copy.deepcopy(valor))
             cambios.append(f"{clave}={valor}")
+    if (nombre or "").strip().lower() == "gratis" and catalogo and settings.proveedor == "openrouter":
+        settings.modelo = catalogo[0]
+        settings.fallbacks = list(catalogo[1:5])
+        cambios.append(f"modelo={catalogo[0]} (catálogo real de OpenRouter)")
+        if settings.fallbacks:
+            cambios.append(f"respaldos={', '.join(settings.fallbacks)}")
     settings.validar()
     return cambios
 
@@ -2283,10 +2292,11 @@ class LLMError(RuntimeError):
 class _Transitorio(Exception):
     """Error que vale la pena reintentar (429, 5xx, red, respuesta vacía)."""
 
-    def __init__(self, mensaje: str, espera: Optional[float] = None, vacia: bool = False):
+    def __init__(self, mensaje: str, espera: Optional[float] = None, vacia: bool = False, saturado: bool = False):
         super().__init__(mensaje)
         self.espera = espera
         self.vacia = vacia          # el modelo respondió 200 pero sin contenido
+        self.saturado = saturado    # 429 del pool compartido del proveedor (típico de :free): no se libera en segundos
 
 
 @dataclass
@@ -2350,13 +2360,37 @@ _RE_CONTEXTO = re.compile(
 )
 # Modelo inexistente/retirado para esta cuenta (404): se retira de la ruta, no se reintenta (Ω §5.2).
 _RE_MODELO_RETIRADO = re.compile(
-    r"\b404\b|model_not_found|does not exist|no such model|modelo o endpoint no disponible|model.*not found",
+    r"\b404\b|model_not_found|does not exist|no such model|modelo o endpoint no disponible|model.*not found"
+    # 403 permanente para esta cuenta/cliente (prueba real: "inkling:free is only available on agentic
+    # harnesses"): reintentarlo en cada pedido solo gasta tiempo; se retira como un 404.
+    r"|only available (?:on|in|for|to)\b|not available (?:on|for|to) (?:this|your)",
     re.I,
 )
 
 
+# 429 que NO es tu límite sino el del pool gratis compartido del proveedor (OpenRouter :free): reintentar el mismo
+# modelo durante ~35 s no sirve; conviene pasar enseguida a otro modelo del equipo.
+_RE_POOL_SATURADO = re.compile(r"rate-limited upstream|upstream_provider_shared_pool|shared pool", re.I)
+
+
+def _detalle_error(cuerpo: str, limite: int = 220) -> str:
+    """Lo que dice el proveedor, legible: el campo útil del JSON (metadata.raw o message) en vez del JSON crudo de
+    400 caracteres cortado a la mitad que se repetía en cada reintento (prueba real con OpenRouter :free)."""
+    texto = (cuerpo or "").strip()
+    try:
+        datos = json.loads(texto)
+        error = datos.get("error", datos) if isinstance(datos, dict) else {}
+        if isinstance(error, dict):
+            meta = error.get("metadata") if isinstance(error.get("metadata"), dict) else {}
+            texto = str(meta.get("raw") or error.get("message") or texto)
+    except (ValueError, TypeError, AttributeError):
+        pass
+    texto = " ".join(texto.split())
+    return texto if len(texto) <= limite else texto[:limite - 1] + "…"
+
+
 def _lanzar_http(status: int, cuerpo: str, retry_after: Optional[str]) -> None:
-    detalle = " ".join((cuerpo or "").split())[:400]
+    detalle = _detalle_error(cuerpo)
     motivo = MENSAJES_HTTP.get(status, "Error HTTP del proveedor.")
     if status in TRANSITORIOS:
         espera = None
@@ -2364,7 +2398,8 @@ def _lanzar_http(status: int, cuerpo: str, retry_after: Optional[str]) -> None:
             espera = float(retry_after) if retry_after else None
         except ValueError:
             espera = None
-        raise _Transitorio(f"{motivo} HTTP {status}. {detalle}".strip(), espera)
+        saturado = status == 429 and bool(_RE_POOL_SATURADO.search(cuerpo or ""))
+        raise _Transitorio(f"{motivo} HTTP {status}. {detalle}".strip(), espera, saturado=saturado)
     excedido = status in (400, 413) and bool(_RE_CONTEXTO.search(cuerpo or ""))
     raise LLMError(
         f"{motivo} HTTP {status}. {detalle}".strip(),
@@ -2601,7 +2636,8 @@ class LLMClient:
         for n, candidato in enumerate(orden):
             try:
                 respuesta = self._con_reintentos(
-                    candidato, mensajes, temperatura, max_tokens, stop, on_progress
+                    candidato, mensajes, temperatura, max_tokens, stop, on_progress,
+                    hay_alternativa=n + 1 < len(orden),
                 )
                 self.disyuntor.exito(candidato)
                 if candidato != principal:
@@ -2648,8 +2684,14 @@ class LLMClient:
     def _payload(self, modelo, mensajes, temperatura, max_tokens, stop, proveedor=None) -> dict:
         info = info_modelo(modelo)
         proveedor = proveedor or self._destino(modelo).proveedor
+        objetivo = max_tokens or self.settings.max_tokens
+        ampliar = getattr(self, "_ampliar_razonamiento", False)
+        if ampliar and objetivo < 2048:
+            # Ya se vio un modelo de razonamiento quedarse sin salida pensando: los pedidos cortos (el juez pide
+            # ~350) necesitan margen para el razonamiento, que cuenta dentro de max_tokens.
+            objetivo = 2048
         presupuesto = Presupuesto(min(self.settings.contexto_tokens, info.contexto) if info.contexto else
-                                  self.settings.contexto_tokens, max_tokens or self.settings.max_tokens)
+                                  self.settings.contexto_tokens, objetivo)
         payload = {
             "model": self._destino(modelo).modelo,
             "messages": mensajes,
@@ -2659,25 +2701,51 @@ class LLMClient:
         }
         if proveedor == "openrouter":
             payload["usage"] = {"include": True}
+            if ampliar:
+                payload["reasoning"] = {"effort": "low"}
         elif proveedor == "openai":
             payload["stream_options"] = {"include_usage": True}
         if stop:
             payload["stop"] = stop[:4]
         return payload
 
-    def _con_reintentos(self, modelo, mensajes, temperatura, max_tokens, stop, on_progress):
+    def _con_reintentos(self, modelo, mensajes, temperatura, max_tokens, stop, on_progress,
+                        hay_alternativa: bool = False):
         payload = self._payload(modelo, mensajes, temperatura, max_tokens, stop, self._destino(modelo).proveedor)
         intentos = max(0, int(self.settings.reintentos))
         vacias = 0
+        ampliado = False
         cancelado = (lambda: CANCELAR.is_set()) if "CANCELAR" in globals() else None
-        for intento in range(intentos + 1):
+        # +1 vuelta para el reintento con más margen de razonamiento; los transitorios cortan igual en `intentos`.
+        for intento in range(intentos + 2):
             try:
                 self.limitador.adquirir(cancelado)
                 return self._una_vez(modelo, payload, on_progress)
+            except LLMError as e:
+                # Modelo de razonamiento que se quedó sin tokens PENSANDO (finish=length, sin texto): con los pedidos
+                # cortos del juez (~350 tokens) pasaba casi siempre con los :free de hoy, que razonan todos. Un
+                # reintento en el mismo modelo con margen para pensar y razonamiento corto; si igual falla, otro modelo.
+                if not (e.solo_razonamiento and "finish=length" in str(e)) or ampliado:
+                    raise
+                self._ampliar_razonamiento = True           # de acá en más, margen para pensar en pedidos cortos
+                if hay_alternativa:
+                    raise                                   # con otro modelo disponible, se cambia enseguida
+                ampliado = True
+                payload = self._payload(modelo, mensajes, temperatura, max_tokens, stop,
+                                        self._destino(modelo).proveedor)
+                if self.on_evento:
+                    self.on_evento(f"{modelo} se quedó pensando sin responder: reintento con más margen y "
+                                   "razonamiento corto")
+                continue
             except _Transitorio as e:
                 with self._lock:
                     self.uso.reintentos += 1
                 vacias += int(getattr(e, "vacia", False))
+                if getattr(e, "saturado", False) and hay_alternativa:
+                    # Pool gratis del proveedor saturado: con otro modelo disponible, pasar YA (antes se reintentaba
+                    # 4 veces el mismo, ~35 s por modelo, y con varios :free saturados la build parecía colgada).
+                    raise LLMError(f"{modelo}: saturado en el proveedor (pool gratis compartido)",
+                                   probar_otro_modelo=True) from e
                 if vacias >= 2 and intento < intentos:
                     # Dos respuestas vacías seguidas: ese modelo no está respondiendo (típico de :free saturados);
                     # mejor pasar a otra IA del equipo que esperar ~30 s más de reintentos.
@@ -10525,6 +10593,11 @@ que solo lee esa tarea. Verificá con herramientas qué existe antes de planific
 Definí la INTERFAZ pública (archivos, funciones/clases y firmas exactas): con ella se escriben los tests
 ANTES de implementar, así que tiene que ser precisa e importable.
 Si un archivo nuevo va a ser largo (más de ~250 líneas), dividilo en varios módulos o en varias tareas.
+Cada tarea entrega código REAL y completo. PROHIBIDO planear esqueletos, stubs, placeholders, `pass`,
+`raise NotImplementedError`, "TODO" o datos de ejemplo para completar después: la tarea que crea una función la
+implementa entera. Si algo necesita datos de afuera (web, API, archivo), la tarea los obtiene de verdad.
+NO agregues tareas de solo "ejecutar/verificar las pruebas": REAPER corre los tests después de cada tarea.
+Toda tarea crea o modifica archivos concretos.
 Tu attempt_completion DEBE contener el plan EXACTAMENTE con este formato:
 <plan>
 <objetivo>una frase</objetivo>
@@ -13358,6 +13431,17 @@ class ResultadoTorneo:
         return self.ganador is not None and not self.ganador.error and self.ganador.validaciones_ok \
             and bool(self.aplicados or self.ganador.cambios)
 
+    @property
+    def termino_sin_cambios(self) -> bool:
+        """Un implementador TERMINÓ bien y nadie cambió archivos: el trabajo ya estaba hecho (p. ej. lo adelantó una
+        tarea anterior). No es lo mismo que "no terminó": prueba real con OpenRouter, la tarea 2 corrió los tests
+        (7 pasaron) y terminó, pero se la trató como SIN PROGRESO y el reparador quedó en un bucle sin nada que
+        arreglar hasta fallar y bloquear a las demás."""
+        if self.aplicados or (self.ganador is not None and self.ganador.cambios):
+            return False
+        return any(c.resultado is not None and getattr(c.resultado, "ok", False) and not c.error
+                   for c in self.candidatos)
+
     def informe(self) -> str:
         if not self.ganador:
             return "Ningún candidato produjo un resultado utilizable."
@@ -14683,6 +14767,47 @@ def _primera_linea_util(diagnostico: str, limite: int = 200) -> str:
     return "sin detalle"
 
 
+# Tareas que PLANEAN simular (prueba real con OpenRouter: la tarea 1 decía "crear core.py con esqueletos que
+# lanzan NotImplementedError y un __main__ que imprima TODO"). De ahí salían las entregas de mentira.
+_RE_TAREA_SIMULADA = re.compile(
+    r"esqueleto|skeleton|\bstubs?\b|placeholder|marcador(?:es)?\s+de\s+posici|NotImplementedError|\bTODO\b|"
+    r"implement\w*\s+(?:m[aá]s\s+)?(?:tarde|despu[eé]s|later)|datos?\s+de\s+ejemplo|datos?\s+fictici",
+    re.IGNORECASE)
+# Tareas que solo "corren las pruebas": no entregan archivos y REAPER ya verifica después de cada tarea.
+_RE_META_TAREA = re.compile(
+    r"^\s*(?:ejecut|corr[eé]|run\b|verific|valid|comprob|lanz)\w*\s+(?:que\s+)?"
+    r"(?:(?:todas?|todos|el|la|los|las|the|all)\s+)*"
+    r"(?:(?:conjunto|suite|bater[ií]a|set|juego)\s+(?:de\s+|of\s+)?)?"     # "Ejecutar el conjunto de pruebas"
+    r"(?:(?:las?|los|the)\s+)?(?:pruebas|tests?|suite|unit\s*tests?)\b", re.IGNORECASE)
+
+
+def problemas_del_plan(plan) -> list:
+    """Determinista (0 tokens): tareas que planean simular o que no entregan nada. → mensajes para replanificar."""
+    salida = []
+    for tarea in getattr(plan, "tareas", []) or []:
+        texto = tarea.descripcion or ""
+        m = _RE_TAREA_SIMULADA.search(texto)
+        if m:
+            salida.append(f"la tarea {tarea.id} planea una simulación («{m.group(0)}»): tiene que implementar "
+                          "el código real y completo, sin esqueletos ni placeholders")
+        if _RE_META_TAREA.search(texto.splitlines()[0] if texto else ""):
+            salida.append(f"la tarea {tarea.id} solo corre/verifica pruebas: REAPER ya lo hace después de cada "
+                          "tarea; quitala o fusionala con una tarea que cree archivos")
+    return salida
+
+
+def quitar_meta_tareas(plan) -> list:
+    """Saca del plan las tareas que solo corren pruebas (y sus ids de las deps de las demás). → ids quitados."""
+    quitadas = [t.id for t in plan.tareas if _RE_META_TAREA.search((t.descripcion or "").splitlines()[0]
+                                                                    if t.descripcion else "")]
+    if quitadas and len(quitadas) < len(plan.tareas):
+        plan.tareas = [t for t in plan.tareas if t.id not in quitadas]
+        for t in plan.tareas:
+            t.deps = [d for d in (t.deps or []) if d not in quitadas]
+        return quitadas
+    return []
+
+
 def reemplazos_del_plan(ws, plan) -> dict:
     """Archivos que YA EXISTEN y que una tarea del plan dice que va a reemplazar → líneas que tienen hoy.
 
@@ -15786,6 +15911,25 @@ class Orquestador:
                 return {}
         r = ejecutar_tests(self.ws, timeout=self.settings.tests_timeout, completo=True)
         conteo = conteo_de_resultado(r)
+        codigo_plan = [a for a in plan.archivos() if not _es_test(a)]
+        proyecto_nuevo = bool(codigo_plan) and not any(self.ws.existe(a) for a in codigo_plan)
+        if r is not None and conteo.reconocido and conteo.pasados and not conteo.ok and proyecto_nuevo:
+            # Prueba real con OpenRouter: 3 tests "de error" pasaban SIN que existiera el código (solo miraban
+            # returncode != 0 y stderr no vacío; "No module named conversor" también cumple). Después darían verde
+            # aunque el CLI se rompiera por cualquier otra cosa. En un proyecto nuevo, un test que ya pasa no prueba nada.
+            self.ui.aviso(f"  {conteo.pasados} test(s) de la especificación YA pasan sin que exista el código: no "
+                          "prueban la función. Le pido al especificador que los ajuste.")
+            self._sub("especificador",
+                      f"{conteo.pasados} de tus tests YA PASAN y la implementación todavía no existe "
+                      f"({conteo.texto()}): esos tests no prueban nada. Un test de aceptación tiene que FALLAR ahora. "
+                      "Típico: un test de error que solo mira returncode != 0 o stderr no vacío también pasa si el "
+                      "módulo ni existe. Comprobá el error CONCRETO (el tipo, p. ej. 'ValueError' en stderr, o el "
+                      "mensaje pedido). Corregí SOLO esos tests y corré run_tests.", cid,
+                      titulo="ajusta los tests que pasan sin implementación")
+            r = ejecutar_tests(self.ws, timeout=self.settings.tests_timeout, completo=True)
+            conteo = conteo_de_resultado(r)
+            tests = sorted(set(tests) | {x for x in self.ws.checkpoints.archivos_desde(cid)
+                                          if _es_test(x) and (self.ws.raiz / x).is_file()})
         if r is not None and conteo.reconocido:
             if conteo.ok and conteo.pasados:
                 self.ui.aviso(f"  Ojo: la especificación ya pasa entera ({conteo.texto()}); quizá la función ya existía.")
@@ -16251,6 +16395,20 @@ class Orquestador:
                 plan = self.planificar(pedido_plan, exploracion,
                                        "Observaciones del supervisor:\n" + "\n".join(f"- {r}" for r in dictamen.reasons),
                                        plan)
+        # Juez (0 tokens): un plan que ORDENA simular (esqueletos, NotImplementedError, TODO) o que trae tareas de
+        # "solo correr las pruebas" se rehace una vez con las razones. Lo que quede de meta-tareas se quita solo.
+        problemas = problemas_del_plan(plan)
+        if problemas:
+            self.ui.aviso("  Juez · el plan pide simulaciones o tareas sin entrega: lo hago replanificar.")
+            for problema in problemas[:4]:
+                self.ui.tenue(f"    • {problema}")
+            plan = self.planificar(pedido_plan, exploracion,
+                                   "Corregí estos problemas del plan:\n" + "\n".join(f"- {p}" for p in problemas),
+                                   plan)
+        quitadas = quitar_meta_tareas(plan)
+        if quitadas:
+            self.ui.tenue(f"  Juez · quité la(s) tarea(s) {', '.join(quitadas)}: solo corrían pruebas "
+                          "(REAPER verifica después de cada tarea).")
         self._plan_confirmado = False
         for _ in range(3):
             self._mostrar_plan(plan)
@@ -16352,6 +16510,7 @@ class Orquestador:
         tests = ejecutar_tests(self.ws, timeout=self.settings.tests_timeout, completo=True)
         conteo = conteo_de_resultado(tests)
         problemas = []
+        creados_en_build = False
         for r in fallos(validaciones):
             r = _sin_recursos_planeados(self.ws, r, archivos_planeados)
             if r is not None:
@@ -16409,7 +16568,9 @@ class Orquestador:
         if exigir_progreso and not problemas:
             # El implementador NO terminó (límite de pasos, error...). "No romper nada" no alcanza:
             # tiene que haber cambios reales y, si hay tests fallando, alguno más tiene que pasar.
-            if not archivos:
+            # Si una tarea anterior de ESTA build ya entregó sus archivos y la suite pasa, no hay nada que reparar:
+            # exigir "progreso" ahí dejaba al reparador en un bucle sin salida (prueba real con OpenRouter).
+            if not archivos and not (creados_en_build and tests is not None and tests.ok):
                 problemas.append("SIN PROGRESO: el implementador no terminó y no cambió ningún archivo.")
             elif tests is not None and not tests.ok and conteo.reconocido and conteo.pasados <= antes.pasados:
                 problemas.append(
@@ -16695,10 +16856,16 @@ class Orquestador:
             registro_build.guardar(previo)
             resultado = self.implementar(pedido, plan, i, exploracion, tcid, protegidos=self._protegidos)
             informe.torneos.append((tarea.id, resultado.modo, resultado.ganador.indice if resultado.ganador else None))
-            if not resultado.ok:
+            # "Terminó sin cambiar nada" (el trabajo ya estaba hecho) NO es "no terminó": exigir progreso ahí era un
+            # callejón sin salida (nada que reparar). Los archivos previos siguen protegidos por SIN CAMBIOS.
+            termino_sin_cambios = getattr(resultado, "termino_sin_cambios", False)
+            if not resultado.ok and not termino_sin_cambios:
                 informe.notas.append(f"Tarea {tarea.id}: la implementación no terminó limpia.")
+            elif termino_sin_cambios:
+                self.ui.tenue(f"  Tarea {tarea.id}: el implementador terminó sin cambios (ya estaba hecho); "
+                              "lo confirma la verificación real.")
 
-            exigir = not resultado.ok
+            exigir = not resultado.ok and not termino_sin_cambios
             verif_tarea = self._verificar_tarea(tcid, conteo_antes, nombres_antes,
                                                  exigir_progreso=exigir, verificar_entrega=True,
                                                  archivos_esperados=tarea.archivos,
@@ -29281,7 +29448,10 @@ class App:
             self.ui.aviso(f"  ⚠ SIN VERIFICAR: cambió {len(res.cambios)} archivo(s) pero ninguna prueba real lo "
                           "respalda. No lo tomes como terminado: /tests para probarlo, o /construir para que el "
                           "juez lo verifique.")
-        elif claim is not None and claim.nivel and claim.nivel != "BEHAVIOR_VERIFIED":
+        elif claim is not None and claim.nivel and claim.nivel != "BEHAVIOR_VERIFIED" \
+                and not (claim.nivel == "UNVERIFIED" and not res.cambios):
+            # Una respuesta sin archivos cambiados (una pregunta, un "OK") no tiene nada que verificar: mostrarle
+            # "UNVERIFIED" era ruido que asustaba (prueba real con OpenRouter: "Respondé OK" → UNVERIFIED).
             self.ui.tenue(f"  verificación: {claim.nivel}" + (f" — {recortar(claim.motivo, 120)}" if claim.motivo else ""))
         if not res.ok:
             self.ui.aviso(f"  (terminó con estado: {res.motivo})")
@@ -29994,7 +30164,9 @@ class App:
                           f"tests_primero={self.settings.tests_primero}, escalar={self.settings.escalar}")
             return
         try:
-            cambios = aplicar_perfil(self.settings, arg)
+            catalogo = (catalogo_free_openrouter() if arg.strip().lower() == "gratis"
+                        and self.settings.proveedor == "openrouter" else None)
+            cambios = aplicar_perfil(self.settings, arg, catalogo)
         except KeyError:
             self.ui.error(f"Perfil desconocido: {arg} ({', '.join(PERFILES)})")
             return
@@ -38462,7 +38634,8 @@ class entorno_aislado:
         for nombre in _RUTAS_GLOBALES:
             self._previas[nombre] = g[nombre]
             g[nombre] = nuevas[nombre]
-        for variable, valor in (("REAPER_TMP", str(self.base / "tmp")), ("REAPER_SIN_ANIMACION", "1")):
+        for variable, valor in (("REAPER_TMP", str(self.base / "tmp")), ("REAPER_SIN_ANIMACION", "1"),
+                                ("REAPER_SIN_RED", "1")):
             self._env_previo[variable] = os.environ.get(variable)
             os.environ[variable] = valor
         (self.base / "tmp").mkdir(parents=True, exist_ok=True)
@@ -48098,6 +48271,342 @@ class TestBuildRealSinVerificar(BaseTest):
 
 
 # ======================================================================
+# MÓDULO: autotest_openrouter_real
+# ======================================================================
+"""
+Autotests de regresión de la PRUEBA REAL con OpenRouter (modelos :free, octubre 2026). Lo que apareció con un
+modelo de verdad y no con el MockLLM:
+
+- Un 429 del pool gratis compartido ("rate-limited upstream") se reintentaba 4 veces contra el MISMO modelo
+  (~35 s por modelo) y el mensaje era el JSON crudo del proveedor, cortado a la mitad, en cada reintento.
+- A una respuesta sin archivos cambiados ("Respondé OK") se le mostraba "verificación: UNVERIFIED".
+"""
+
+_CUERPO_SATURADO = json.dumps({"error": {"message": "Provider returned error", "code": 429, "metadata": {
+    "raw": "poolside/laguna-s-2.1:free is temporarily rate-limited upstream. Please retry shortly.",
+    "provider_name": "Poolside", "limit_source": "upstream_provider_shared_pool"}}})
+
+
+class TestOpenRouterRealErrores(BaseTest):
+    def _cliente(self, eventos, **ajustes):
+        return LLMClient("clave", self.ajustes(**ajustes), url="http://falso", transporte=transporte_falso(eventos))
+
+    def test_detalle_error_es_legible_y_corto(self):
+        detalle = _detalle_error(_CUERPO_SATURADO)
+        self.assertIn("temporarily rate-limited upstream", detalle)
+        self.assertNotIn('{"error"', detalle)                          # no el JSON crudo
+        self.assertLessEqual(len(_detalle_error("x" * 5000)), 220)
+        self.assertEqual(_detalle_error("Bad Gateway"), "Bad Gateway")  # texto plano: tal cual
+
+    def test_429_de_pool_compartido_se_marca_saturado(self):
+        with self.assertRaises(_Transitorio) as ctx:
+            _lanzar_http(429, _CUERPO_SATURADO, None)
+        self.assertTrue(ctx.exception.saturado)
+        self.assertNotIn('{"error"', str(ctx.exception))
+        with self.assertRaises(_Transitorio) as ctx2:
+            _lanzar_http(429, "Too Many Requests", "3")                 # TU límite: no es el pool compartido
+        self.assertFalse(ctx2.exception.saturado)
+
+    def test_pool_saturado_pasa_enseguida_a_otro_modelo(self):
+        c = self._cliente([_Transitorio("429 pool", saturado=True), "ok"], reintentos=4, rpm=0,
+                          fallbacks=["otro/modelo:free"])
+        esperas = []
+        c.dormir = lambda s: esperas.append(s)
+        self.assertEqual(c.chat([{"role": "user", "content": "x"}]).texto, "ok")
+        self.assertEqual(sum(esperas), 0)                               # antes: 4 reintentos, ~35 s
+        self.assertEqual(c.uso.respaldos, 1)
+
+    def test_pool_saturado_sin_alternativa_sigue_reintentando(self):
+        c = self._cliente([_Transitorio("429 pool", saturado=True), "ok"], reintentos=2, rpm=0,
+                          fallbacks=[], respaldo_equipo=False)
+        esperas = []
+        c.dormir = lambda s: esperas.append(s)
+        self.assertEqual(c.chat([{"role": "user", "content": "x"}]).texto, "ok")
+        self.assertGreater(sum(esperas), 0)                             # sin otro modelo: esperar es lo único
+
+
+class TestOpenRouterRealVerificacion(BaseTest):
+    def test_respuesta_sin_cambios_no_muestra_unverified(self):
+        app = App(self.ajustes(modo="auto"), MockLLM(lambda m, k: "OK"), self.ui(), self.proyecto(),
+                  persistir=False)
+        app.turno("Respondé solo la palabra OK, sin herramientas.")
+        claim = getattr(app.principal, "_ultimo_claim", None)
+        if claim is None or claim.nivel != "UNVERIFIED":
+            self.skipTest(f"el Evidence Gate no dejó UNVERIFIED en este cierre ({getattr(claim, 'nivel', None)})")
+        texto = app.ui.texto_registrado()
+        self.assertNotIn("UNVERIFIED", texto)                         # nada que verificar: no asustar
+        self.assertNotIn("SIN VERIFICAR", texto)
+
+
+class TestOpenRouterRealRazonamiento(BaseTest):
+    def test_se_quedo_pensando_reintenta_con_mas_margen(self):
+        pagos = []
+        eventos = [LLMError("m solo devolvió razonamiento (1471 caracteres) y ninguna respuesta (finish=length).",
+                            probar_otro_modelo=True, solo_razonamiento=True), "ok"]
+        base = transporte_falso(eventos)
+
+        def transporte(url, headers, payload, timeout):
+            pagos.append(dict(payload))
+            return base(url, headers, payload, timeout)
+
+        c = LLMClient("clave", self.ajustes(reintentos=0, rpm=0, fallbacks=[], respaldo_equipo=False),
+                      url="http://falso", transporte=transporte)
+        self.assertEqual(c.chat([{"role": "user", "content": "x"}], max_tokens=350).texto, "ok")
+        self.assertEqual(len(pagos), 2)                                   # mismo modelo, una vez más
+        self.assertGreaterEqual(pagos[1]["max_tokens"], 2048)             # con margen para pensar
+        self.assertGreater(pagos[1]["max_tokens"], pagos[0]["max_tokens"])
+
+    def test_otro_corte_por_razonamiento_no_se_reintenta_infinito(self):
+        error = LLMError("m solo devolvió razonamiento (9 caracteres) y ninguna respuesta (finish=length).",
+                         probar_otro_modelo=True, solo_razonamiento=True)
+        c = LLMClient("clave", self.ajustes(reintentos=3, rpm=0, fallbacks=[], respaldo_equipo=False),
+                      url="http://falso", transporte=transporte_falso([error, error, "nunca"]))
+        with self.assertRaises(LLMError):
+            c.chat([{"role": "user", "content": "x"}], max_tokens=350)   # un solo reintento ampliado
+
+
+class TestOpenRouterRealPlan(BaseTest):
+    def _plan(self, *descripciones):
+        return Plan(objetivo="", criterios=[], tareas=[Tarea(str(i), d, [f"m{i}.py"])
+                                                      for i, d in enumerate(descripciones, 1)])
+
+    def test_detecta_planes_que_ordenan_simular_y_meta_tareas(self):
+        plan = self._plan("Crear core.py con esqueletos de las funciones que lanzan NotImplementedError",
+                          "Implementar sumar(a, b) en core.py",
+                          "Ejecutar las pruebas con python -m unittest y ajustar si fallan",
+                          "Escribir tests en tests/test_core.py")
+        problemas = problemas_del_plan(plan)
+        self.assertEqual(len(problemas), 2)
+        self.assertTrue(problemas[0].startswith("la tarea 1"))
+        self.assertTrue(problemas[1].startswith("la tarea 3"))
+
+    def test_meta_tareas_reales_y_no_falsos_positivos(self):
+        for meta in ("Ejecutar el conjunto de pruebas (python -m unittest discover) para confirmar que pasan",
+                     "Verificar que todos los tests pasen", "Correr la suite", "Run all the tests",
+                     "Ejecutar las pruebas con python -m unittest"):
+            self.assertTrue(_RE_META_TAREA.search(meta), meta)
+        for real in ("Validar el formulario de login en app.py", "Verificar las entradas del usuario",
+                     "Escribir pruebas unitarias en tests/test_core.py", "Ejecutar la migración de la base"):
+            self.assertFalse(_RE_META_TAREA.search(real), real)
+
+    def test_quitar_meta_tareas_limpia_dependencias(self):
+        plan = self._plan("Implementar sumar en core.py", "Correr los tests y verificar", "Agregar restar")
+        plan.tareas[2].deps = ["1", "2"]
+        self.assertEqual(quitar_meta_tareas(plan), ["2"])
+        self.assertEqual([t.id for t in plan.tareas], ["1", "3"])
+        self.assertEqual(plan.tareas[1].deps, ["1"])
+        solo_meta = self._plan("Ejecutar las pruebas")
+        self.assertEqual(quitar_meta_tareas(solo_meta), [])               # nunca deja el plan vacío
+
+    def test_el_juez_hace_replanificar_un_plan_que_pide_esqueletos(self):
+        malo = ('<plan><objetivo>x</objetivo><interfaz>- core.py: def sumar(a, b)</interfaz>'
+                '<tarea id="1" archivos="core.py">Crear core.py con esqueletos que lanzan NotImplementedError</tarea>'
+                '<tarea id="2" archivos="core.py" deps="1">Ejecutar las pruebas</tarea>'
+                '<criterios>- sumar(2, 3) == 5</criterios></plan>')
+        bueno = ('<plan><objetivo>x</objetivo><interfaz>- core.py: def sumar(a, b)</interfaz>'
+                 '<tarea id="1" archivos="core.py">Implementar sumar(a, b) completa en core.py</tarea>'
+                 '<criterios>- sumar(2, 3) == 5</criterios></plan>')
+        pedidos = []
+
+        def guion(mensajes, kw):
+            if MockLLM.rol_de(mensajes) == "arquitecto":
+                pedidos.append(mensajes[-1]["content"])
+                return terminar_xml(bueno if any("Corregí estos problemas" in m["content"] for m in mensajes)
+                                    else malo)
+            return terminar_xml("ok")
+
+        ui = self.ui()
+        orq = Orquestador(MockLLM(guion), self.proyecto(), self.ajustes(), ui)
+        plan, _ = orq.obtener_plan("una sumadora", confirmar=False)
+        self.assertEqual([t.descripcion for t in plan.tareas], ["Implementar sumar(a, b) completa en core.py"])
+        self.assertIn("el plan pide simulaciones", ui.texto_registrado())
+
+
+class TestOpenRouterRealTareaYaHecha(BaseTest):
+    PLAN = """<plan>
+<objetivo>Conversor</objetivo>
+<interfaz>
+- conversor.py: def c_a_f(c) -> float; def f_a_c(f) -> float
+</interfaz>
+<tarea id="1" archivos="conversor.py">Crear conversor.py con c_a_f(c).</tarea>
+<tarea id="2" archivos="conversor.py" deps="1">Agregar f_a_c(f) en conversor.py.</tarea>
+<tarea id="3" archivos="extra.py" deps="2">Crear extra.py con def nada(): return 1</tarea>
+<criterios>
+- c_a_f(100) == 212.0
+</criterios>
+</plan>"""
+
+    def test_tarea_que_ya_hizo_otra_no_falla_ni_bloquea(self):
+        # Caso real: la tarea 1 se adelantó e implementó todo; el implementador de la 2 leyó, corrió los tests
+        # (pasaban) y terminó SIN cambios. Antes: "SIN PROGRESO: no terminó" → 3 reparaciones sin nada que
+        # arreglar → tarea 2 fallida y la 3 BLOQUEADA.
+        completo = "def c_a_f(c):\n    return c * 9 / 5 + 32\n\n\ndef f_a_c(f):\n    return (f - 32) * 5 / 9\n"
+
+        def guion(mensajes, kw):
+            rol = MockLLM.rol_de(mensajes)
+            turno = _turno(mensajes)
+            todo = "\n".join(m["content"] for m in mensajes if m["role"] == "user")
+            actual = re.search(r"TU TAREA AHORA \(#(\d+)\)", todo)
+            tarea = actual.group(1) if actual else ""
+            if rol == "arquitecto":
+                return terminar_xml(self.PLAN)
+            if rol == "implementador":
+                if tarea == "1":
+                    return herramienta_xml("write_to_file", path="conversor.py", content=completo) \
+                        if turno == 0 else terminar_xml("conversor.py con las dos funciones")
+                if tarea == "3":
+                    return herramienta_xml("write_to_file", path="extra.py", content="def nada():\n    return 1\n") \
+                        if turno == 0 else terminar_xml("extra.py listo")
+                return terminar_xml("f_a_c ya estaba implementada por la tarea anterior; no hay nada que cambiar")
+            return terminar_xml("ok")
+
+        ajustes = self.ajustes(tests_primero=False, torneo=False, escalar=False, max_revisiones=0, qa=False,
+                               max_reparaciones=1, juez=False)
+        ws = self.proyecto()
+        informe = Orquestador(MockLLM(guion), ws, ajustes, self.ui()).construir("conversor", confirmar=False)
+        self.assertEqual(informe.tareas_fallidas, [], informe.notas)
+        self.assertEqual(informe.tareas_bloqueadas, [])
+        self.assertTrue(ws.existe("extra.py"))                          # la 3 se construyó, no quedó bloqueada
+        self.assertTrue(informe.ok, informe.notas)
+
+
+class TestOpenRouterRealCatalogoGratis(BaseTest):
+    CATALOGO = [
+        {"id": "anthropic/caro", "pricing": {"prompt": "0.000003", "completion": "0.000015"}, "context_length": 200000},
+        {"id": "openrouter/free", "pricing": {"prompt": "0", "completion": "0"}, "context_length": 200000},
+        {"id": "google/lyria-3-pro-preview", "pricing": {"prompt": "0", "completion": "0"}},
+        {"id": "nvidia/nemotron-3.5-content-safety:free", "pricing": {"prompt": "0", "completion": "0"}},
+        {"id": "liquid/lfm-2.5-2.6b:free", "pricing": {"prompt": "0", "completion": "0"}, "context_length": 65536},
+        {"id": "nvidia/nemotron-3-super-120b-a12b:free", "pricing": {"prompt": "0", "completion": "0"},
+         "context_length": 262144, "supported_parameters": ["tools"]},
+        {"id": "cohere/north-mini-code:free", "pricing": {"prompt": "0", "completion": "0"},
+         "context_length": 256000, "supported_parameters": ["tools"]},
+        {"id": "google/gemma-4-31b-it:free", "pricing": {"prompt": 0, "completion": 0}, "context_length": 262144},
+        {"id": "img/solo-imagen:free", "pricing": {"prompt": "0", "completion": "0"},
+         "architecture": {"output_modalities": ["image"]}},
+    ]
+
+    def test_elige_solo_gratis_de_texto_que_sirven_para_programar(self):
+        self.assertEqual(elegir_free_de_catalogo(self.CATALOGO),
+                         ["cohere/north-mini-code:free",                  # código + tools primero
+                          "nvidia/nemotron-3-super-120b-a12b:free",       # tools
+                          "google/gemma-4-31b-it:free"])                 # nada pago, de música, router ni 2.6B
+
+    def test_perfil_gratis_usa_el_catalogo_real(self):
+        s = Settings(proveedor="openrouter")
+        cambios = aplicar_perfil(s, "gratis", ["a/uno:free", "b/dos:free", "c/tres:free"])
+        self.assertEqual(s.modelo, "a/uno:free")
+        self.assertEqual(s.fallbacks, ["b/dos:free", "c/tres:free"])
+        self.assertTrue(any("catálogo real" in c for c in cambios))
+
+    def test_perfil_gratis_sin_red_no_usa_el_modelo_retirado(self):
+        s = Settings(proveedor="openrouter")
+        aplicar_perfil(s, "gratis")
+        self.assertNotIn("dolphin", s.modelo)                            # dolphin…:free ya no existe
+        self.assertTrue(s.modelo.endswith(":free"))
+
+    def test_sin_red_no_consulta_y_con_cache_no_sale_a_internet(self):
+        self.assertEqual(catalogo_free_openrouter(), [])                 # los autotests corren con REAPER_SIN_RED
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        (CACHE_DIR / "openrouter_free.json").write_text(json.dumps({"ts": time.time(), "ids": ["x/y:free"]}),
+                                                        encoding="utf-8")
+        previa = os.environ.pop("REAPER_SIN_RED", None)
+        try:
+            self.assertEqual(catalogo_free_openrouter(timeout=0.01), ["x/y:free"])   # de la caché, sin red
+        finally:
+            if previa is not None:
+                os.environ["REAPER_SIN_RED"] = previa
+
+    def test_403_solo_disponible_en_otro_cliente_se_retira(self):
+        self.assertTrue(_RE_MODELO_RETIRADO.search(
+            "Acceso denegado HTTP 403. thinkingmachines/inkling:free is only available on agentic harnesses."))
+        self.assertFalse(_RE_MODELO_RETIRADO.search("Acceso denegado HTTP 403. moderation flagged the input"))
+
+    def test_modelo_que_expira_baja_de_prioridad(self):
+        catalogo = [{"id": "a/code-viejo:free", "pricing": {"prompt": "0", "completion": "0"},
+                     "expiration_date": "2026-11-01"},
+                    {"id": "b/general:free", "pricing": {"prompt": "0", "completion": "0"}}]
+        self.assertEqual(elegir_free_de_catalogo(catalogo), ["b/general:free", "a/code-viejo:free"])
+
+
+class TestOpenRouterRealEspecificacion(BaseTest):
+    VACIO = ("import subprocess, sys, unittest\n\n\nclass T(unittest.TestCase):\n"
+             "    def test_error(self):\n"
+             "        r = subprocess.run([sys.executable, '-m', 'conversor'], capture_output=True, text=True)\n"
+             "        self.assertNotEqual(r.returncode, 0)\n\n"
+             "    def test_valor(self):\n        from conversor import c_a_f\n        self.assertEqual(c_a_f(100), 212.0)\n")
+    ESTRICTO = VACIO.replace("self.assertNotEqual(r.returncode, 0)",
+                             "self.assertIn('ValueError', r.stderr)\n        self.assertIn('cero absoluto', r.stderr)")
+
+    def test_tests_que_pasan_sin_codigo_se_mandan_a_ajustar(self):
+        pedidos = []
+
+        def guion(mensajes, kw):
+            if MockLLM.rol_de(mensajes) != "especificador":
+                return terminar_xml("ok")
+            primero = next(m["content"] for m in mensajes if m["role"] == "user")
+            if _turno(mensajes) == 0:
+                pedidos.append(primero)
+                contenido = self.ESTRICTO if "YA PASAN" in primero else self.VACIO
+                return herramienta_xml("write_to_file", path="tests/test_cli.py", content=contenido)
+            return terminar_xml("tests listos")
+
+        ui = self.ui()
+        ws = self.proyecto()
+        orq = Orquestador(MockLLM(guion), ws, self.ajustes(), ui)
+        plan = Plan(objetivo="conversor", criterios=["c_a_f(100) == 212.0"],
+                    tareas=[Tarea("1", "Implementar conversor.py", ["conversor.py"])])
+        espec = orq.especificar("conversor", plan, ws.checkpoints.iniciar("construir"))
+        self.assertEqual(len(pedidos), 2)                                # se le pidió ajustar una vez
+        self.assertIn("YA pasan sin que exista el código", ui.texto_registrado())
+        self.assertIn("ValueError", espec["tests/test_cli.py"])          # la versión protegida es la estricta
+
+    def test_en_un_proyecto_existente_no_se_toca(self):
+        # Si el código del plan ya existe, que algunos tests pasen es normal (funcionalidad previa).
+        pedidos = []
+
+        def guion(mensajes, kw):
+            if MockLLM.rol_de(mensajes) == "especificador" and _turno(mensajes) == 0:
+                pedidos.append(1)
+                previo_y_nuevo = ("import unittest\n\n\nclass T(unittest.TestCase):\n"
+                                  "    def test_lo_que_ya_habia(self):\n        from conversor import otra\n"
+                                  "        self.assertEqual(otra(), 1)\n\n"
+                                  "    def test_lo_nuevo(self):\n        from conversor import c_a_f\n"
+                                  "        self.assertEqual(c_a_f(100), 212.0)\n")
+                return herramienta_xml("write_to_file", path="tests/test_cli.py", content=previo_y_nuevo)
+            return terminar_xml("ok")
+
+        ws = self.proyecto({"conversor.py": "def otra():\n    return 1\n"})
+        orq = Orquestador(MockLLM(guion), ws, self.ajustes(), self.ui())
+        plan = Plan(objetivo="conversor", criterios=[], tareas=[Tarea("1", "Agregar c_a_f", ["conversor.py"])])
+        orq.especificar("conversor", plan, ws.checkpoints.iniciar("construir"))
+        conteo = conteo_de_resultado(ejecutar_tests(ws, timeout=60, completo=True))
+        self.assertEqual((conteo.pasados, conteo.ok), (1, False))      # uno pasa legítimamente (código previo)
+        self.assertEqual(len(pedidos), 1)                                # y aun así no se lo manda a "corregir"
+
+
+class TestOpenRouterRealMargenRazonamiento(BaseTest):
+    def test_tras_ver_un_modelo_pensando_los_pedidos_cortos_tienen_margen(self):
+        # Con alternativa se cambia de modelo enseguida, pero REAPER aprende: desde ahí los pedidos cortos
+        # (el juez pide ~350 tokens) salen con margen y razonamiento corto, para que el siguiente no falle igual.
+        pagos = []
+        pensando = {"choices": [{"delta": {"reasoning": "pienso... " * 30}, "finish_reason": "length"}]}
+        base = transporte_falso([pensando, "ok", "otra"])
+
+        def transporte(url, headers, payload, timeout):
+            pagos.append(dict(payload))
+            return base(url, headers, payload, timeout)
+
+        c = LLMClient("clave", self.ajustes(reintentos=0, rpm=0, fallbacks=["otro/modelo:free"]),
+                      url="http://falso", transporte=transporte)
+        self.assertEqual(c.chat([{"role": "user", "content": "x"}], max_tokens=350).texto, "ok")
+        self.assertEqual(pagos[0]["max_tokens"], 350)
+        self.assertGreaterEqual(pagos[1]["max_tokens"], 2048)            # el respaldo ya va con margen
+        c.chat([{"role": "user", "content": "y"}], max_tokens=350)
+        self.assertGreaterEqual(pagos[2]["max_tokens"], 2048)            # y los pedidos siguientes también
+
+
+# ======================================================================
 # MÓDULO: autotest_runner
 # ======================================================================
 """Ejecutor del autotest interno."""
@@ -49441,6 +49950,11 @@ Check with tools what exists before planning changes on it.
 Define the public INTERFACE (files, functions/classes and exact signatures): tests are written from it BEFORE
 implementing, so it must be precise and importable.
 If a new file will be long (more than ~250 lines), split it into several modules or tasks.
+Every task delivers REAL, complete code. FORBIDDEN: planning skeletons, stubs, placeholders, `pass`,
+`raise NotImplementedError`, "TODO" or sample data to be filled in later: the task that creates a function
+implements it fully. If something needs outside data (web, API, file), the task really fetches it.
+Do NOT add tasks that only "run/verify the tests": REAPER runs the tests after every task.
+Every task creates or modifies concrete files.
 Your attempt_completion MUST contain the plan EXACTLY in this format:
 <plan>
 <objetivo>one sentence</objetivo>
@@ -53128,6 +53642,66 @@ def diagnostico_texto(settings, incluir_equipo: bool = True) -> str:
     return redactar_secretos("\n".join(lineas))
 
 
+# Catálogo REAL de OpenRouter (público: sin clave y sin costo). La lista fija de modelos gratis se pudre: en la
+# prueba real (2026-10) el perfil "gratis" apuntaba a dolphin…:free, que ya no existía, y llama-3.3-70b:free tampoco.
+URL_CATALOGO_OPENROUTER = "https://openrouter.ai/api/v1/models"
+_RE_NO_SIRVE_PARA_CODIGO = re.compile(r"safety|guard|lyria|embed|tts|whisper|moderation|^openrouter/", re.I)
+_RE_MODELO_DIMINUTO = re.compile(r"[-_/](?:0?\.\d+|[0-6](?:\.\d+)?)b\b", re.I)   # ≤ 6B: no sirven para programar
+
+
+def elegir_free_de_catalogo(datos: list) -> list:
+    """Del catálogo (lista de modelos de /api/v1/models) los GRATIS de chat de texto que sirven para programar,
+    mejores primero (código > herramientas > contexto). Excluye pagos, música/seguridad/embeddings, el router
+    'openrouter/free' (cae en modelos de 2B) y los diminutos."""
+    elegidos = []
+    for m in datos or []:
+        if not isinstance(m, dict):
+            continue
+        mid = str(m.get("id", ""))
+        precio = m.get("pricing") or {}
+        try:
+            gratis = float(precio.get("prompt", 1)) == 0 and float(precio.get("completion", 1)) == 0
+        except (TypeError, ValueError):
+            gratis = False
+        if not gratis or not mid or _RE_NO_SIRVE_PARA_CODIGO.search(mid) or _RE_MODELO_DIMINUTO.search(mid):
+            continue
+        salida = (m.get("architecture") or {}).get("output_modalities") or ["text"]
+        if "text" not in salida:
+            continue
+        params = m.get("supported_parameters") or []
+        puntaje = (2 if re.search(r"code|coder", mid, re.I) else 0) + (1 if "tools" in params else 0)
+        if m.get("expiration_date"):
+            puntaje -= 3                               # se va a retirar: no conviene que sea el principal
+        elegidos.append((-puntaje, -int(m.get("context_length") or 0), mid))
+    return [mid for _p, _c, mid in sorted(elegidos)]
+
+
+def catalogo_free_openrouter(timeout: float = 8.0, horas_cache: float = 12.0) -> list:
+    """Modelos gratis que OpenRouter ofrece HOY (con caché). [] sin red o con REAPER_SIN_RED (los autotests)."""
+    if os.getenv("REAPER_SIN_RED"):
+        return []
+    cache = CACHE_DIR / "openrouter_free.json"
+    try:
+        datos = json.loads(cache.read_text(encoding="utf-8"))
+        if time.time() - float(datos.get("ts", 0)) < horas_cache * 3600 and datos.get("ids"):
+            return list(datos["ids"])
+    except (OSError, ValueError, TypeError, AttributeError):
+        pass
+    try:
+        pedido = urllib.request.Request(URL_CATALOGO_OPENROUTER, headers={"User-Agent": "REAPER"})
+        with urllib.request.urlopen(pedido, timeout=timeout) as r:
+            lista = json.loads(r.read().decode("utf-8")).get("data", [])
+    except (OSError, ValueError, AttributeError, urllib.error.URLError):
+        return []
+    ids = elegir_free_de_catalogo(lista)
+    if ids:
+        try:
+            escritura_atomica(cache, json.dumps({"ts": time.time(), "ids": ids}))
+        except OSError:
+            pass
+    return ids
+
+
 def modelos_potentes_free() -> list:
     """Alias curados de modelos free POTENTES (del catálogo estático), como (alias, info)."""
     return [(alias, info) for alias, info in INFO_MODELOS.items() if info.free]
@@ -54283,7 +54857,9 @@ def construir_parser() -> argparse.ArgumentParser:
 def aplicar_flags_cli(settings: Settings, args) -> Settings:
     """Flags de línea de comandos ("solo esta ejecución"): tienen la máxima precedencia."""
     if args.perfil:
-        aplicar_perfil(settings, args.perfil)
+        catalogo = (catalogo_free_openrouter() if args.perfil.strip().lower() == "gratis"
+                    and settings.proveedor == "openrouter" else None)
+        aplicar_perfil(settings, args.perfil, catalogo)
     if args.modelo:
         settings.modelo = resolver_modelo(args.modelo)
     if args.modelo_fuerte:

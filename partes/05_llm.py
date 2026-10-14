@@ -24,10 +24,11 @@ class LLMError(RuntimeError):
 class _Transitorio(Exception):
     """Error que vale la pena reintentar (429, 5xx, red, respuesta vacía)."""
 
-    def __init__(self, mensaje: str, espera: Optional[float] = None, vacia: bool = False):
+    def __init__(self, mensaje: str, espera: Optional[float] = None, vacia: bool = False, saturado: bool = False):
         super().__init__(mensaje)
         self.espera = espera
         self.vacia = vacia          # el modelo respondió 200 pero sin contenido
+        self.saturado = saturado    # 429 del pool compartido del proveedor (típico de :free): no se libera en segundos
 
 
 @dataclass
@@ -91,13 +92,37 @@ _RE_CONTEXTO = re.compile(
 )
 # Modelo inexistente/retirado para esta cuenta (404): se retira de la ruta, no se reintenta (Ω §5.2).
 _RE_MODELO_RETIRADO = re.compile(
-    r"\b404\b|model_not_found|does not exist|no such model|modelo o endpoint no disponible|model.*not found",
+    r"\b404\b|model_not_found|does not exist|no such model|modelo o endpoint no disponible|model.*not found"
+    # 403 permanente para esta cuenta/cliente (prueba real: "inkling:free is only available on agentic
+    # harnesses"): reintentarlo en cada pedido solo gasta tiempo; se retira como un 404.
+    r"|only available (?:on|in|for|to)\b|not available (?:on|for|to) (?:this|your)",
     re.I,
 )
 
 
+# 429 que NO es tu límite sino el del pool gratis compartido del proveedor (OpenRouter :free): reintentar el mismo
+# modelo durante ~35 s no sirve; conviene pasar enseguida a otro modelo del equipo.
+_RE_POOL_SATURADO = re.compile(r"rate-limited upstream|upstream_provider_shared_pool|shared pool", re.I)
+
+
+def _detalle_error(cuerpo: str, limite: int = 220) -> str:
+    """Lo que dice el proveedor, legible: el campo útil del JSON (metadata.raw o message) en vez del JSON crudo de
+    400 caracteres cortado a la mitad que se repetía en cada reintento (prueba real con OpenRouter :free)."""
+    texto = (cuerpo or "").strip()
+    try:
+        datos = json.loads(texto)
+        error = datos.get("error", datos) if isinstance(datos, dict) else {}
+        if isinstance(error, dict):
+            meta = error.get("metadata") if isinstance(error.get("metadata"), dict) else {}
+            texto = str(meta.get("raw") or error.get("message") or texto)
+    except (ValueError, TypeError, AttributeError):
+        pass
+    texto = " ".join(texto.split())
+    return texto if len(texto) <= limite else texto[:limite - 1] + "…"
+
+
 def _lanzar_http(status: int, cuerpo: str, retry_after: Optional[str]) -> None:
-    detalle = " ".join((cuerpo or "").split())[:400]
+    detalle = _detalle_error(cuerpo)
     motivo = MENSAJES_HTTP.get(status, "Error HTTP del proveedor.")
     if status in TRANSITORIOS:
         espera = None
@@ -105,7 +130,8 @@ def _lanzar_http(status: int, cuerpo: str, retry_after: Optional[str]) -> None:
             espera = float(retry_after) if retry_after else None
         except ValueError:
             espera = None
-        raise _Transitorio(f"{motivo} HTTP {status}. {detalle}".strip(), espera)
+        saturado = status == 429 and bool(_RE_POOL_SATURADO.search(cuerpo or ""))
+        raise _Transitorio(f"{motivo} HTTP {status}. {detalle}".strip(), espera, saturado=saturado)
     excedido = status in (400, 413) and bool(_RE_CONTEXTO.search(cuerpo or ""))
     raise LLMError(
         f"{motivo} HTTP {status}. {detalle}".strip(),
@@ -342,7 +368,8 @@ class LLMClient:
         for n, candidato in enumerate(orden):
             try:
                 respuesta = self._con_reintentos(
-                    candidato, mensajes, temperatura, max_tokens, stop, on_progress
+                    candidato, mensajes, temperatura, max_tokens, stop, on_progress,
+                    hay_alternativa=n + 1 < len(orden),
                 )
                 self.disyuntor.exito(candidato)
                 if candidato != principal:
@@ -389,8 +416,14 @@ class LLMClient:
     def _payload(self, modelo, mensajes, temperatura, max_tokens, stop, proveedor=None) -> dict:
         info = info_modelo(modelo)
         proveedor = proveedor or self._destino(modelo).proveedor
+        objetivo = max_tokens or self.settings.max_tokens
+        ampliar = getattr(self, "_ampliar_razonamiento", False)
+        if ampliar and objetivo < 2048:
+            # Ya se vio un modelo de razonamiento quedarse sin salida pensando: los pedidos cortos (el juez pide
+            # ~350) necesitan margen para el razonamiento, que cuenta dentro de max_tokens.
+            objetivo = 2048
         presupuesto = Presupuesto(min(self.settings.contexto_tokens, info.contexto) if info.contexto else
-                                  self.settings.contexto_tokens, max_tokens or self.settings.max_tokens)
+                                  self.settings.contexto_tokens, objetivo)
         payload = {
             "model": self._destino(modelo).modelo,
             "messages": mensajes,
@@ -400,25 +433,51 @@ class LLMClient:
         }
         if proveedor == "openrouter":
             payload["usage"] = {"include": True}
+            if ampliar:
+                payload["reasoning"] = {"effort": "low"}
         elif proveedor == "openai":
             payload["stream_options"] = {"include_usage": True}
         if stop:
             payload["stop"] = stop[:4]
         return payload
 
-    def _con_reintentos(self, modelo, mensajes, temperatura, max_tokens, stop, on_progress):
+    def _con_reintentos(self, modelo, mensajes, temperatura, max_tokens, stop, on_progress,
+                        hay_alternativa: bool = False):
         payload = self._payload(modelo, mensajes, temperatura, max_tokens, stop, self._destino(modelo).proveedor)
         intentos = max(0, int(self.settings.reintentos))
         vacias = 0
+        ampliado = False
         cancelado = (lambda: CANCELAR.is_set()) if "CANCELAR" in globals() else None
-        for intento in range(intentos + 1):
+        # +1 vuelta para el reintento con más margen de razonamiento; los transitorios cortan igual en `intentos`.
+        for intento in range(intentos + 2):
             try:
                 self.limitador.adquirir(cancelado)
                 return self._una_vez(modelo, payload, on_progress)
+            except LLMError as e:
+                # Modelo de razonamiento que se quedó sin tokens PENSANDO (finish=length, sin texto): con los pedidos
+                # cortos del juez (~350 tokens) pasaba casi siempre con los :free de hoy, que razonan todos. Un
+                # reintento en el mismo modelo con margen para pensar y razonamiento corto; si igual falla, otro modelo.
+                if not (e.solo_razonamiento and "finish=length" in str(e)) or ampliado:
+                    raise
+                self._ampliar_razonamiento = True           # de acá en más, margen para pensar en pedidos cortos
+                if hay_alternativa:
+                    raise                                   # con otro modelo disponible, se cambia enseguida
+                ampliado = True
+                payload = self._payload(modelo, mensajes, temperatura, max_tokens, stop,
+                                        self._destino(modelo).proveedor)
+                if self.on_evento:
+                    self.on_evento(f"{modelo} se quedó pensando sin responder: reintento con más margen y "
+                                   "razonamiento corto")
+                continue
             except _Transitorio as e:
                 with self._lock:
                     self.uso.reintentos += 1
                 vacias += int(getattr(e, "vacia", False))
+                if getattr(e, "saturado", False) and hay_alternativa:
+                    # Pool gratis del proveedor saturado: con otro modelo disponible, pasar YA (antes se reintentaba
+                    # 4 veces el mismo, ~35 s por modelo, y con varios :free saturados la build parecía colgada).
+                    raise LLMError(f"{modelo}: saturado en el proveedor (pool gratis compartido)",
+                                   probar_otro_modelo=True) from e
                 if vacias >= 2 and intento < intentos:
                     # Dos respuestas vacías seguidas: ese modelo no está respondiendo (típico de :free saturados);
                     # mejor pasar a otra IA del equipo que esperar ~30 s más de reintentos.

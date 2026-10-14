@@ -93,6 +93,11 @@ Check with tools what exists before planning changes on it.
 Define the public INTERFACE (files, functions/classes and exact signatures): tests are written from it BEFORE
 implementing, so it must be precise and importable.
 If a new file will be long (more than ~250 lines), split it into several modules or tasks.
+Every task delivers REAL, complete code. FORBIDDEN: planning skeletons, stubs, placeholders, `pass`,
+`raise NotImplementedError`, "TODO" or sample data to be filled in later: the task that creates a function
+implements it fully. If something needs outside data (web, API, file), the task really fetches it.
+Do NOT add tasks that only "run/verify the tests": REAPER runs the tests after every task.
+Every task creates or modifies concrete files.
 Your attempt_completion MUST contain the plan EXACTLY in this format:
 <plan>
 <objetivo>one sentence</objetivo>

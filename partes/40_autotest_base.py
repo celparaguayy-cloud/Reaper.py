@@ -41,7 +41,8 @@ class entorno_aislado:
         for nombre in _RUTAS_GLOBALES:
             self._previas[nombre] = g[nombre]
             g[nombre] = nuevas[nombre]
-        for variable, valor in (("REAPER_TMP", str(self.base / "tmp")), ("REAPER_SIN_ANIMACION", "1")):
+        for variable, valor in (("REAPER_TMP", str(self.base / "tmp")), ("REAPER_SIN_ANIMACION", "1"),
+                                ("REAPER_SIN_RED", "1")):
             self._env_previo[variable] = os.environ.get(variable)
             os.environ[variable] = valor
         (self.base / "tmp").mkdir(parents=True, exist_ok=True)

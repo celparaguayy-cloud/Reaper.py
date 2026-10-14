@@ -410,7 +410,8 @@ PERFILES = {
         "descripcion": "modelos :free, 2 candidatos, sin escalada paga, 16 solicitudes/min y tope de costo ~0",
         # R-010: el perfil gratis impone un techo de costo casi cero. Los modelos :free reportan costo 0, así
         # que no estorba; pero si por error se usa uno pago, el presupuesto de la sesión corta enseguida.
-        "valores": {"modelo": MODELOS["venice-free"], "paralelo": 1, "paralelo_torneo": 1,
+        # Sin red, este modelo fijo (existe y respondió en la prueba real 2026-10; dolphin…:free fue retirado).
+        "valores": {"modelo": "nvidia/nemotron-3-super-120b-a12b:free", "paralelo": 1, "paralelo_torneo": 1,
                     "candidatos": 2, "rpm": 16, "escalar": False, "costo_maximo": 0.01},
     },
     "rapido": {
@@ -430,7 +431,9 @@ PERFILES = {
 }
 
 
-def aplicar_perfil(settings: Settings, nombre: str) -> list[str]:
+def aplicar_perfil(settings: Settings, nombre: str, catalogo: Optional[list] = None) -> list[str]:
+    """Aplica un perfil. Para "gratis" con OpenRouter, `catalogo` (modelos gratis que existen HOY, ver
+    catalogo_free_openrouter) manda sobre el modelo fijo: la lista fija se pudre cuando cambian los :free."""
     perfil = PERFILES.get((nombre or "").strip().lower())
     if not perfil:
         raise KeyError(nombre)
@@ -439,6 +442,12 @@ def aplicar_perfil(settings: Settings, nombre: str) -> list[str]:
         if getattr(settings, clave) != valor:
             setattr(settings, clave, copy.deepcopy(valor))
             cambios.append(f"{clave}={valor}")
+    if (nombre or "").strip().lower() == "gratis" and catalogo and settings.proveedor == "openrouter":
+        settings.modelo = catalogo[0]
+        settings.fallbacks = list(catalogo[1:5])
+        cambios.append(f"modelo={catalogo[0]} (catálogo real de OpenRouter)")
+        if settings.fallbacks:
+            cambios.append(f"respaldos={', '.join(settings.fallbacks)}")
     settings.validar()
     return cambios
 

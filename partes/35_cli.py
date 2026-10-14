@@ -394,7 +394,10 @@ class App:
             self.ui.aviso(f"  ⚠ SIN VERIFICAR: cambió {len(res.cambios)} archivo(s) pero ninguna prueba real lo "
                           "respalda. No lo tomes como terminado: /tests para probarlo, o /construir para que el "
                           "juez lo verifique.")
-        elif claim is not None and claim.nivel and claim.nivel != "BEHAVIOR_VERIFIED":
+        elif claim is not None and claim.nivel and claim.nivel != "BEHAVIOR_VERIFIED" \
+                and not (claim.nivel == "UNVERIFIED" and not res.cambios):
+            # Una respuesta sin archivos cambiados (una pregunta, un "OK") no tiene nada que verificar: mostrarle
+            # "UNVERIFIED" era ruido que asustaba (prueba real con OpenRouter: "Respondé OK" → UNVERIFIED).
             self.ui.tenue(f"  verificación: {claim.nivel}" + (f" — {recortar(claim.motivo, 120)}" if claim.motivo else ""))
         if not res.ok:
             self.ui.aviso(f"  (terminó con estado: {res.motivo})")
@@ -1107,7 +1110,9 @@ class App:
                           f"tests_primero={self.settings.tests_primero}, escalar={self.settings.escalar}")
             return
         try:
-            cambios = aplicar_perfil(self.settings, arg)
+            catalogo = (catalogo_free_openrouter() if arg.strip().lower() == "gratis"
+                        and self.settings.proveedor == "openrouter" else None)
+            cambios = aplicar_perfil(self.settings, arg, catalogo)
         except KeyError:
             self.ui.error(f"Perfil desconocido: {arg} ({', '.join(PERFILES)})")
             return

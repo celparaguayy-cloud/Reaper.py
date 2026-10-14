@@ -76,6 +76,17 @@ class ResultadoTorneo:
         return self.ganador is not None and not self.ganador.error and self.ganador.validaciones_ok \
             and bool(self.aplicados or self.ganador.cambios)
 
+    @property
+    def termino_sin_cambios(self) -> bool:
+        """Un implementador TERMINÓ bien y nadie cambió archivos: el trabajo ya estaba hecho (p. ej. lo adelantó una
+        tarea anterior). No es lo mismo que "no terminó": prueba real con OpenRouter, la tarea 2 corrió los tests
+        (7 pasaron) y terminó, pero se la trató como SIN PROGRESO y el reparador quedó en un bucle sin nada que
+        arreglar hasta fallar y bloquear a las demás."""
+        if self.aplicados or (self.ganador is not None and self.ganador.cambios):
+            return False
+        return any(c.resultado is not None and getattr(c.resultado, "ok", False) and not c.error
+                   for c in self.candidatos)
+
     def informe(self) -> str:
         if not self.ganador:
             return "Ningún candidato produjo un resultado utilizable."

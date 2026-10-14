@@ -207,6 +207,66 @@ def diagnostico_texto(settings, incluir_equipo: bool = True) -> str:
     return redactar_secretos("\n".join(lineas))
 
 
+# Catálogo REAL de OpenRouter (público: sin clave y sin costo). La lista fija de modelos gratis se pudre: en la
+# prueba real (2026-10) el perfil "gratis" apuntaba a dolphin…:free, que ya no existía, y llama-3.3-70b:free tampoco.
+URL_CATALOGO_OPENROUTER = "https://openrouter.ai/api/v1/models"
+_RE_NO_SIRVE_PARA_CODIGO = re.compile(r"safety|guard|lyria|embed|tts|whisper|moderation|^openrouter/", re.I)
+_RE_MODELO_DIMINUTO = re.compile(r"[-_/](?:0?\.\d+|[0-6](?:\.\d+)?)b\b", re.I)   # ≤ 6B: no sirven para programar
+
+
+def elegir_free_de_catalogo(datos: list) -> list:
+    """Del catálogo (lista de modelos de /api/v1/models) los GRATIS de chat de texto que sirven para programar,
+    mejores primero (código > herramientas > contexto). Excluye pagos, música/seguridad/embeddings, el router
+    'openrouter/free' (cae en modelos de 2B) y los diminutos."""
+    elegidos = []
+    for m in datos or []:
+        if not isinstance(m, dict):
+            continue
+        mid = str(m.get("id", ""))
+        precio = m.get("pricing") or {}
+        try:
+            gratis = float(precio.get("prompt", 1)) == 0 and float(precio.get("completion", 1)) == 0
+        except (TypeError, ValueError):
+            gratis = False
+        if not gratis or not mid or _RE_NO_SIRVE_PARA_CODIGO.search(mid) or _RE_MODELO_DIMINUTO.search(mid):
+            continue
+        salida = (m.get("architecture") or {}).get("output_modalities") or ["text"]
+        if "text" not in salida:
+            continue
+        params = m.get("supported_parameters") or []
+        puntaje = (2 if re.search(r"code|coder", mid, re.I) else 0) + (1 if "tools" in params else 0)
+        if m.get("expiration_date"):
+            puntaje -= 3                               # se va a retirar: no conviene que sea el principal
+        elegidos.append((-puntaje, -int(m.get("context_length") or 0), mid))
+    return [mid for _p, _c, mid in sorted(elegidos)]
+
+
+def catalogo_free_openrouter(timeout: float = 8.0, horas_cache: float = 12.0) -> list:
+    """Modelos gratis que OpenRouter ofrece HOY (con caché). [] sin red o con REAPER_SIN_RED (los autotests)."""
+    if os.getenv("REAPER_SIN_RED"):
+        return []
+    cache = CACHE_DIR / "openrouter_free.json"
+    try:
+        datos = json.loads(cache.read_text(encoding="utf-8"))
+        if time.time() - float(datos.get("ts", 0)) < horas_cache * 3600 and datos.get("ids"):
+            return list(datos["ids"])
+    except (OSError, ValueError, TypeError, AttributeError):
+        pass
+    try:
+        pedido = urllib.request.Request(URL_CATALOGO_OPENROUTER, headers={"User-Agent": "REAPER"})
+        with urllib.request.urlopen(pedido, timeout=timeout) as r:
+            lista = json.loads(r.read().decode("utf-8")).get("data", [])
+    except (OSError, ValueError, AttributeError, urllib.error.URLError):
+        return []
+    ids = elegir_free_de_catalogo(lista)
+    if ids:
+        try:
+            escritura_atomica(cache, json.dumps({"ts": time.time(), "ids": ids}))
+        except OSError:
+            pass
+    return ids
+
+
 def modelos_potentes_free() -> list:
     """Alias curados de modelos free POTENTES (del catálogo estático), como (alias, info)."""
     return [(alias, info) for alias, info in INFO_MODELOS.items() if info.free]

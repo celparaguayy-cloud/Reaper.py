@@ -43,7 +43,9 @@ def construir_parser() -> argparse.ArgumentParser:
 def aplicar_flags_cli(settings: Settings, args) -> Settings:
     """Flags de línea de comandos ("solo esta ejecución"): tienen la máxima precedencia."""
     if args.perfil:
-        aplicar_perfil(settings, args.perfil)
+        catalogo = (catalogo_free_openrouter() if args.perfil.strip().lower() == "gratis"
+                    and settings.proveedor == "openrouter" else None)
+        aplicar_perfil(settings, args.perfil, catalogo)
     if args.modelo:
         settings.modelo = resolver_modelo(args.modelo)
     if args.modelo_fuerte:

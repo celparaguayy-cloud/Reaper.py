@@ -118,6 +118,47 @@ def _primera_linea_util(diagnostico: str, limite: int = 200) -> str:
     return "sin detalle"
 
 
+# Tareas que PLANEAN simular (prueba real con OpenRouter: la tarea 1 decía "crear core.py con esqueletos que
+# lanzan NotImplementedError y un __main__ que imprima TODO"). De ahí salían las entregas de mentira.
+_RE_TAREA_SIMULADA = re.compile(
+    r"esqueleto|skeleton|\bstubs?\b|placeholder|marcador(?:es)?\s+de\s+posici|NotImplementedError|\bTODO\b|"
+    r"implement\w*\s+(?:m[aá]s\s+)?(?:tarde|despu[eé]s|later)|datos?\s+de\s+ejemplo|datos?\s+fictici",
+    re.IGNORECASE)
+# Tareas que solo "corren las pruebas": no entregan archivos y REAPER ya verifica después de cada tarea.
+_RE_META_TAREA = re.compile(
+    r"^\s*(?:ejecut|corr[eé]|run\b|verific|valid|comprob|lanz)\w*\s+(?:que\s+)?"
+    r"(?:(?:todas?|todos|el|la|los|las|the|all)\s+)*"
+    r"(?:(?:conjunto|suite|bater[ií]a|set|juego)\s+(?:de\s+|of\s+)?)?"     # "Ejecutar el conjunto de pruebas"
+    r"(?:(?:las?|los|the)\s+)?(?:pruebas|tests?|suite|unit\s*tests?)\b", re.IGNORECASE)
+
+
+def problemas_del_plan(plan) -> list:
+    """Determinista (0 tokens): tareas que planean simular o que no entregan nada. → mensajes para replanificar."""
+    salida = []
+    for tarea in getattr(plan, "tareas", []) or []:
+        texto = tarea.descripcion or ""
+        m = _RE_TAREA_SIMULADA.search(texto)
+        if m:
+            salida.append(f"la tarea {tarea.id} planea una simulación («{m.group(0)}»): tiene que implementar "
+                          "el código real y completo, sin esqueletos ni placeholders")
+        if _RE_META_TAREA.search(texto.splitlines()[0] if texto else ""):
+            salida.append(f"la tarea {tarea.id} solo corre/verifica pruebas: REAPER ya lo hace después de cada "
+                          "tarea; quitala o fusionala con una tarea que cree archivos")
+    return salida
+
+
+def quitar_meta_tareas(plan) -> list:
+    """Saca del plan las tareas que solo corren pruebas (y sus ids de las deps de las demás). → ids quitados."""
+    quitadas = [t.id for t in plan.tareas if _RE_META_TAREA.search((t.descripcion or "").splitlines()[0]
+                                                                    if t.descripcion else "")]
+    if quitadas and len(quitadas) < len(plan.tareas):
+        plan.tareas = [t for t in plan.tareas if t.id not in quitadas]
+        for t in plan.tareas:
+            t.deps = [d for d in (t.deps or []) if d not in quitadas]
+        return quitadas
+    return []
+
+
 def reemplazos_del_plan(ws, plan) -> dict:
     """Archivos que YA EXISTEN y que una tarea del plan dice que va a reemplazar → líneas que tienen hoy.
 
@@ -1221,6 +1262,25 @@ class Orquestador:
                 return {}
         r = ejecutar_tests(self.ws, timeout=self.settings.tests_timeout, completo=True)
         conteo = conteo_de_resultado(r)
+        codigo_plan = [a for a in plan.archivos() if not _es_test(a)]
+        proyecto_nuevo = bool(codigo_plan) and not any(self.ws.existe(a) for a in codigo_plan)
+        if r is not None and conteo.reconocido and conteo.pasados and not conteo.ok and proyecto_nuevo:
+            # Prueba real con OpenRouter: 3 tests "de error" pasaban SIN que existiera el código (solo miraban
+            # returncode != 0 y stderr no vacío; "No module named conversor" también cumple). Después darían verde
+            # aunque el CLI se rompiera por cualquier otra cosa. En un proyecto nuevo, un test que ya pasa no prueba nada.
+            self.ui.aviso(f"  {conteo.pasados} test(s) de la especificación YA pasan sin que exista el código: no "
+                          "prueban la función. Le pido al especificador que los ajuste.")
+            self._sub("especificador",
+                      f"{conteo.pasados} de tus tests YA PASAN y la implementación todavía no existe "
+                      f"({conteo.texto()}): esos tests no prueban nada. Un test de aceptación tiene que FALLAR ahora. "
+                      "Típico: un test de error que solo mira returncode != 0 o stderr no vacío también pasa si el "
+                      "módulo ni existe. Comprobá el error CONCRETO (el tipo, p. ej. 'ValueError' en stderr, o el "
+                      "mensaje pedido). Corregí SOLO esos tests y corré run_tests.", cid,
+                      titulo="ajusta los tests que pasan sin implementación")
+            r = ejecutar_tests(self.ws, timeout=self.settings.tests_timeout, completo=True)
+            conteo = conteo_de_resultado(r)
+            tests = sorted(set(tests) | {x for x in self.ws.checkpoints.archivos_desde(cid)
+                                          if _es_test(x) and (self.ws.raiz / x).is_file()})
         if r is not None and conteo.reconocido:
             if conteo.ok and conteo.pasados:
                 self.ui.aviso(f"  Ojo: la especificación ya pasa entera ({conteo.texto()}); quizá la función ya existía.")
@@ -1686,6 +1746,20 @@ class Orquestador:
                 plan = self.planificar(pedido_plan, exploracion,
                                        "Observaciones del supervisor:\n" + "\n".join(f"- {r}" for r in dictamen.reasons),
                                        plan)
+        # Juez (0 tokens): un plan que ORDENA simular (esqueletos, NotImplementedError, TODO) o que trae tareas de
+        # "solo correr las pruebas" se rehace una vez con las razones. Lo que quede de meta-tareas se quita solo.
+        problemas = problemas_del_plan(plan)
+        if problemas:
+            self.ui.aviso("  Juez · el plan pide simulaciones o tareas sin entrega: lo hago replanificar.")
+            for problema in problemas[:4]:
+                self.ui.tenue(f"    • {problema}")
+            plan = self.planificar(pedido_plan, exploracion,
+                                   "Corregí estos problemas del plan:\n" + "\n".join(f"- {p}" for p in problemas),
+                                   plan)
+        quitadas = quitar_meta_tareas(plan)
+        if quitadas:
+            self.ui.tenue(f"  Juez · quité la(s) tarea(s) {', '.join(quitadas)}: solo corrían pruebas "
+                          "(REAPER verifica después de cada tarea).")
         self._plan_confirmado = False
         for _ in range(3):
             self._mostrar_plan(plan)
@@ -1787,6 +1861,7 @@ class Orquestador:
         tests = ejecutar_tests(self.ws, timeout=self.settings.tests_timeout, completo=True)
         conteo = conteo_de_resultado(tests)
         problemas = []
+        creados_en_build = False
         for r in fallos(validaciones):
             r = _sin_recursos_planeados(self.ws, r, archivos_planeados)
             if r is not None:
@@ -1844,7 +1919,9 @@ class Orquestador:
         if exigir_progreso and not problemas:
             # El implementador NO terminó (límite de pasos, error...). "No romper nada" no alcanza:
             # tiene que haber cambios reales y, si hay tests fallando, alguno más tiene que pasar.
-            if not archivos:
+            # Si una tarea anterior de ESTA build ya entregó sus archivos y la suite pasa, no hay nada que reparar:
+            # exigir "progreso" ahí dejaba al reparador en un bucle sin salida (prueba real con OpenRouter).
+            if not archivos and not (creados_en_build and tests is not None and tests.ok):
                 problemas.append("SIN PROGRESO: el implementador no terminó y no cambió ningún archivo.")
             elif tests is not None and not tests.ok and conteo.reconocido and conteo.pasados <= antes.pasados:
                 problemas.append(
@@ -2130,10 +2207,16 @@ class Orquestador:
             registro_build.guardar(previo)
             resultado = self.implementar(pedido, plan, i, exploracion, tcid, protegidos=self._protegidos)
             informe.torneos.append((tarea.id, resultado.modo, resultado.ganador.indice if resultado.ganador else None))
-            if not resultado.ok:
+            # "Terminó sin cambiar nada" (el trabajo ya estaba hecho) NO es "no terminó": exigir progreso ahí era un
+            # callejón sin salida (nada que reparar). Los archivos previos siguen protegidos por SIN CAMBIOS.
+            termino_sin_cambios = getattr(resultado, "termino_sin_cambios", False)
+            if not resultado.ok and not termino_sin_cambios:
                 informe.notas.append(f"Tarea {tarea.id}: la implementación no terminó limpia.")
+            elif termino_sin_cambios:
+                self.ui.tenue(f"  Tarea {tarea.id}: el implementador terminó sin cambios (ya estaba hecho); "
+                              "lo confirma la verificación real.")
 
-            exigir = not resultado.ok
+            exigir = not resultado.ok and not termino_sin_cambios
             verif_tarea = self._verificar_tarea(tcid, conteo_antes, nombres_antes,
                                                  exigir_progreso=exigir, verificar_entrega=True,
                                                  archivos_esperados=tarea.archivos,

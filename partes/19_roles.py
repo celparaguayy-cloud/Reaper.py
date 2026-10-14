@@ -69,6 +69,11 @@ que solo lee esa tarea. Verificá con herramientas qué existe antes de planific
 Definí la INTERFAZ pública (archivos, funciones/clases y firmas exactas): con ella se escriben los tests
 ANTES de implementar, así que tiene que ser precisa e importable.
 Si un archivo nuevo va a ser largo (más de ~250 líneas), dividilo en varios módulos o en varias tareas.
+Cada tarea entrega código REAL y completo. PROHIBIDO planear esqueletos, stubs, placeholders, `pass`,
+`raise NotImplementedError`, "TODO" o datos de ejemplo para completar después: la tarea que crea una función la
+implementa entera. Si algo necesita datos de afuera (web, API, archivo), la tarea los obtiene de verdad.
+NO agregues tareas de solo "ejecutar/verificar las pruebas": REAPER corre los tests después de cada tarea.
+Toda tarea crea o modifica archivos concretos.
 Tu attempt_completion DEBE contener el plan EXACTAMENTE con este formato:
 <plan>
 <objetivo>una frase</objetivo>
