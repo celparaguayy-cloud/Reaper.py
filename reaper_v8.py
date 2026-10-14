@@ -1758,6 +1758,8 @@ class Settings:
     # por módulo hasta este tope. 12 por defecto para que un proyecto mediano no se trunque; subilo para uno grande
     # (/config max_tareas 40). Al pasarse, el resto se agrupa en la última tarea y se avisa.
     max_tareas: int = 12
+    # /grande: tope de ETAPAS del plan maestro (cada etapa es un /construir de hasta max_tareas tareas).
+    max_etapas: int = 10
     paralelo: int = 2
     qa: bool = True
 
@@ -1866,6 +1868,7 @@ class Settings:
         acotar("tiempo_max_build", 0, 86400)
         acotar("max_revisiones", 0, 5)
         acotar("max_tareas", 1, 60)
+        acotar("max_etapas", 2, 30)
         acotar("paralelo", 1, 8)
         acotar("candidatos", 1, 6)
         acotar("paralelo_torneo", 1, 6)
@@ -14974,12 +14977,16 @@ _RE_META_TAREA = re.compile(
     r"(?:(?:las?|los|the)\s+)?(?:pruebas|tests?|suite|unit\s*tests?)\b", re.IGNORECASE)
 
 
-def problemas_del_plan(plan) -> list:
-    """Determinista (0 tokens): tareas que planean simular o que no entregan nada. → mensajes para replanificar."""
+def problemas_del_plan(plan, pedido: str = "") -> list:
+    """Determinista (0 tokens): tareas que planean simular o que no entregan nada. → mensajes para replanificar.
+    "Datos de ejemplo" no cuenta si el PEDIDO los pide ("la base arranca con 3 recetas de ejemplo")."""
     salida = []
+    pide_ejemplos = "ejemplo" in familias_pedidas(pedido)
     for tarea in getattr(plan, "tareas", []) or []:
         texto = tarea.descripcion or ""
         m = _RE_TAREA_SIMULADA.search(texto) or _RE_TODO.search(texto)
+        if m and pide_ejemplos and re.search(r"ejemplo", m.group(0), re.I):
+            m = _RE_TODO.search(texto)
         if m:
             salida.append(f"la tarea {tarea.id} planea una simulación («{m.group(0)}»): tiene que implementar "
                           "el código real y completo, sin esqueletos ni placeholders")
@@ -15522,10 +15529,13 @@ def parsear_plan(texto: str, pedido: str, max_tareas: int = 8) -> Plan:
 
     if len(tareas) > max_tareas:
         sobrantes = tareas[max_tareas - 1:]
+        ids_sobrantes = {t.id for t in sobrantes}
         tareas = tareas[: max_tareas - 1] + [Tarea(
             sobrantes[0].id,
             "\n".join(f"- {t.descripcion}" for t in sobrantes),
             sorted({a for t in sobrantes for a in t.archivos}),
+            # Antes se perdían: la tarea agrupada podía correr aunque una de la que dependía hubiera fallado.
+            sorted({d for t in sobrantes for d in t.deps if d not in ids_sobrantes}),
         )]
 
     criterios = []
@@ -15893,6 +15903,15 @@ def _es_test(rel: str) -> bool:
     return any(fnmatch.fnmatch(rel, p) for p in PATRONES_TESTS)
 
 
+def fallos_tolerables_al_reintentar(fallan_ahora: set, fallaban_al_inicio: Sequence[str], tarea, tareas) -> set:
+    """Al RE-EJECUTAR una tarea que falló o se cortó, ¿qué tests en rojo no son culpa suya? Los que ya fallaban al
+    empezar la build y los de archivos de test que declaran OTRAS tareas (en una corrida normal también se
+    toleran). Los suyos —o los que rompió y no declaraba— no: si no, su propio test en rojo pasaba por "previo"."""
+    ajenos = {rel: None for t in tareas if t.id != tarea.id for rel in t.archivos if _es_test(rel)}
+    previos = set(fallaban_al_inicio)
+    return {n for n in fallan_ahora if n in previos or (ajenos and _es_de_especificacion(n, ajenos))}
+
+
 def _es_de_especificacion(nombre_test: str, protegidos: dict) -> bool:
     """¿El test que falla pertenece a un archivo de la especificación? (pytest usa ruta::test, unittest modulo.Clase.test)"""
     for rel in protegidos:
@@ -16122,6 +16141,9 @@ class Orquestador:
         self.escalador = Escalador(llm, settings, ui)
         self._protegidos: dict[str, Optional[str]] = {}
         self._huella_aceptacion: Optional[str] = None
+        # Pedido ORIGINAL del usuario cuando el pedido de la build lo arma REAPER (etapas de /grande): lo que
+        # autoriza reescribir archivos previos o pedir "datos de ejemplo" sale de acá, nunca del plan del modelo.
+        self.pedido_usuario: Optional[str] = None
 
     def _sub(self, rol: str, tarea: str, cid: Optional[int], archivos: str = "", titulo: str = "",
              **opciones) -> ResultadoAgente:
@@ -16216,7 +16238,8 @@ class Orquestador:
         crudas = len(_RE_TAREA.findall(texto))
         if crudas > self.settings.max_tareas:
             self.ui.aviso(f"  El plan traía {crudas} tareas y el tope es {self.settings.max_tareas}: agrupé el resto "
-                          f"en la última. Para un proyecto grande subí el tope: /config max_tareas {min(60, crudas)}")
+                          f"en la última. Para un proyecto grande usá /grande (por etapas verificadas) o subí el tope: "
+                          f"/config max_tareas {min(60, crudas)}")
         if not res.ok:
             self.ui.aviso("El arquitecto no terminó limpio; uso lo que produjo.")
         motivo = plan_degenerado(plan, pedido, texto)
@@ -16655,7 +16678,7 @@ class Orquestador:
             return  # la build ya está en rojo/parcial: el juez solo endurece, no hay verde que revisar
         # 1) EXAMEN DE REALIDAD, gratis: si algo es una simulación (funciones pedidas vacías, NotImplementedError,
         #    tests que no prueban nada), el juez decide SIN llamar al modelo. Gasta 0 tokens y hace más que nadie.
-        realidad = examen_de_realidad(self.ws, informe.cid, plan, pedido)
+        realidad = examen_de_realidad(self.ws, informe.cid, plan, self.pedido_usuario or pedido)
         if realidad:
             self._aplicar_juicio(Juicio(False, realidad, [], "high", determinista=True), informe)
             return
@@ -16763,7 +16786,7 @@ class Orquestador:
                                        plan)
         # Juez (0 tokens): un plan que ORDENA simular (esqueletos, NotImplementedError, TODO) o que trae tareas de
         # "solo correr las pruebas" se rehace una vez con las razones. Lo que quede de meta-tareas se quita solo.
-        problemas = problemas_del_plan(plan)
+        problemas = problemas_del_plan(plan, self.pedido_usuario or pedido)
         if problemas:
             self.ui.aviso("  Juez · el plan pide simulaciones o tareas sin entrega: lo hago replanificar.")
             for problema in problemas[:4]:
@@ -17005,7 +17028,7 @@ class Orquestador:
             return InformeBuild("cancelada")
         base = ejecutar_tests(self.ws, timeout=self.settings.tests_timeout, completo=True)
         base_fallaba = base is not None and not base.ok
-        if base_fallaba:
+        if base_fallaba and not reanudar:
             self.ui.aviso("Atención: la suite de tests YA falla antes de empezar; se tendrá en cuenta.")
         # La huella original es ajena al LLM: si sus tests cambian durante la
         # construcción, el verificador fallará sin conceder un falso verde.
@@ -17083,6 +17106,16 @@ class Orquestador:
                     self.ui.error("Los tests de especificación cambiaron: " + rel)
                     return InformeBuild("cancelada")
                 self._protegidos[rel] = self.ws.leer(rel)
+            # Lo que fallaba ANTES de la build sale del diario, no de medir ahora: al retomar, la suite puede estar
+            # roja por esta MISMA build (una tarea que falló). Medirlo de nuevo lo convertía en "ya fallaba antes" y
+            # la tarea re-ejecutada quedaba VERIFICADA con su propio test en rojo (y nunca más se reintentaba).
+            if "base_fallaba" in previo:
+                if base_fallaba and not previo["base_fallaba"]:
+                    self.ui.tenue("  La suite falla al retomar por cambios de esta misma build (antes de empezar "
+                                  "pasaba): se repara, no se toma como fallo previo.")
+                base_fallaba = bool(previo["base_fallaba"])
+            elif base_fallaba:
+                self.ui.aviso("Atención: la suite de tests falla al retomar (diario sin el estado inicial).")
             self.ui.info("Retomo la build desde el checkpoint guardado, sin replanificar.")
         else:
             if previo and previo.get("estado") not in ("verificada", "validada"):
@@ -17105,13 +17138,18 @@ class Orquestador:
                       "tests_protegidos": {}, "archivos_verificados": {}, "estado": "en_curso",
                       "especificacion_completa": False,
                       "tests_primero": bool(self.settings.tests_primero),
-                      "huella_aceptacion": huella_actual}
+                      "huella_aceptacion": huella_actual,
+                      # Estado de la suite AL EMPEZAR: al retomar, es la única base honesta para decidir qué
+                      # fallo es "previo" y cuál lo causó esta build.
+                      "base_fallaba": bool(base_fallaba),
+                      "fallaban_al_inicio": sorted(conteo_de_resultado(base).nombres_fallados) if base else []}
             self._huella_aceptacion = huella_actual
             # ¿Quién autoriza reescribir un archivo que ya existía? Vos: pidiéndolo, o aprobando un plan que lo
             # anunciaba (el aviso sale antes de aprobar). Sin eso, PRESERVAR lo protege. Antes no había forma: hasta
             # un "reescribí app.py desde cero" terminaba en REESCRITURA DESTRUCTIVA y tarea fallida.
             reemplazos = reemplazos_del_plan(self.ws, plan)
-            if reemplazos and (getattr(self, "_plan_confirmado", False) or _RE_REESCRITURA_PEDIDA.search(pedido)):
+            if reemplazos and (getattr(self, "_plan_confirmado", False)
+                               or _RE_REESCRITURA_PEDIDA.search(self.pedido_usuario or pedido)):
                 previo["reemplazos_autorizados"] = sorted(reemplazos)
             elif reemplazos:
                 self.ui.aviso("  El plan quiere reemplazar " + ", ".join(sorted(reemplazos)[:6]) + " pero no lo "
@@ -17220,9 +17258,13 @@ class Orquestador:
             previo["huellas_inicio"] = registro_build.huellas()
             registro_build.guardar(previo)
             planeados_despues = [a for t_sig in plan.tareas[i + 1:] for a in t_sig.archivos]
+            estado_previo_tarea = previo["estados"].get(tarea.id) if reanudar else None
             antes_tests = ejecutar_tests(self.ws, timeout=self.settings.tests_timeout, completo=True)
             conteo_antes = conteo_de_resultado(antes_tests)
             nombres_antes = set(conteo_antes.nombres_fallados)
+            if estado_previo_tarea in ("fallida", "en_curso") and "fallaban_al_inicio" in previo:
+                nombres_antes = fallos_tolerables_al_reintentar(
+                    nombres_antes, previo["fallaban_al_inicio"], tarea, plan.tareas)
             tcid = self.ws.checkpoints.iniciar(f"tarea {tarea.id}", grupo=grupo)
             previo["tcid"] = tcid
             registro_build.guardar(previo)
@@ -29449,6 +29491,8 @@ COMANDOS_AYUDA = [
     ]),
     ("EQUIPO", [
         ("/construir <pedido>", "exploradores → arquitecto → tests primero → torneo por tarea → verificación → reparador"),
+        ("/grande <pedido>", "proyecto grande: plan maestro por etapas, cada etapa un /construir verificado"),
+        ("/grande estado · continuar", "ver el avance por etapa y retomar donde quedó (aunque se haya cortado)"),
         ("/pendiente · /continuar", "revisar y reanudar con control tareas que agotaron pasos"),
         ("/plan <pedido>", "solo exploración + plan (se guarda en .reaper/planes)"),
         ("/modo plan", "modo plan: propone un plan en solo lectura y lo ejecuta cuando lo aprobás"),
@@ -29834,6 +29878,10 @@ class App:
         return res.ok
 
     def construir(self, pedido: str, confirmar: bool = True, reanudar: bool = False) -> bool:
+        return self._construir_informe(pedido, confirmar, reanudar).ok
+
+    def _construir_informe(self, pedido: str, confirmar: bool = True, reanudar: bool = False,
+                           pedido_usuario: Optional[str] = None) -> "InformeBuild":
         if reanudar:
             try:
                 previo = RegistroBuild(self.ws).leer()
@@ -29842,15 +29890,17 @@ class App:
                 return False
             if not previo:
                 self.ui.aviso("No hay ninguna construcción pendiente.")
-                return False
+                return InformeBuild("cancelada")
             pedido = previo["pedido"]
         conflicto = detectar_workspace_mezclado(self.ws, pedido)
         if conflicto:
             self.ui.aviso(conflicto)
             self.ui.aviso("Usá /proyecto para abrir una carpeta nueva; no tocaré ni borraré tests ajenos.")
-            return False
+            return InformeBuild("cancelada")
         self._pedido_actual = pedido
-        informe = Orquestador(self.llm, self.ws, self.settings, self.ui).construir(pedido, confirmar, reanudar=reanudar)
+        orquestador = Orquestador(self.llm, self.ws, self.settings, self.ui)
+        orquestador.pedido_usuario = pedido_usuario
+        informe = orquestador.construir(pedido, confirmar, reanudar=reanudar)
         self.historial.append((datetime.now().strftime("%H:%M"), f"/construir {pedido[:180]}", informe.ok))
         if informe.estado != "cancelada":
             self.estadisticas.registrar(
@@ -29860,7 +29910,7 @@ class App:
             if hooks_autorizados(self):          # hooks del repo: consentimiento una vez, cerrado si no hay TTY
                 for r in ejecutar_hooks(self.ws, "despues_de_build", {"estado": informe.estado, "pedido": pedido[:200]}):
                     (self.ui.tenue if r.ok else self.ui.aviso)(f"  hook: {r.comando} → {'ok' if r.ok else 'falló'}")
-        return informe.ok
+        return informe
 
     # ------------------------------------------------------------ comandos
     def comando(self, entrada: str) -> Optional[str]:
@@ -49340,8 +49390,13 @@ class TestBundleSinNombresPisados(BaseTest):
         for nodo in ast.parse(fuente).body:
             if isinstance(nodo, (ast.Assign, ast.AnnAssign)):
                 objetivos = nodo.targets if isinstance(nodo, ast.Assign) else [nodo.target]
-                for t in objetivos:
-                    contador.update(n.id for n in ast.walk(t) if isinstance(n, ast.Name))   # también `_A, _B = …`
+                pendientes = list(objetivos)
+                while pendientes:                     # `_A, _B = …` cuenta; `App.cmd_x = …` (atributo) no redefine App
+                    t = pendientes.pop()
+                    if isinstance(t, ast.Name):
+                        contador[t.id] += 1
+                    elif isinstance(t, (ast.Tuple, ast.List)):
+                        pendientes.extend(t.elts)
             elif isinstance(nodo, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 contador[nodo.name] += 1
         repetidos = sorted(n for n, k in contador.items() if k > 1 and n not in self.EXTENSIONES_A_PROPOSITO)
@@ -49382,6 +49437,503 @@ class TestSuitesMixtasYNombresJs(BaseTest):
         comando, nombre = detectar_comando_tests(ws)
         self.assertNotIn("node", comando)
         self.assertIn(nombre, ("pytest", "unittest"))
+
+
+# ======================================================================
+# MÓDULO: autotest_grande
+# ======================================================================
+"""
+Autotests de /grande (proyecto grande por etapas) con un modelo SIMULADO que escribe código de verdad: un gestor de
+biblioteca en 3 etapas (almacenamiento SQLite → préstamos → CLI). Los tests del proyecto se ejecutan de verdad en
+cada etapa; lo único simulado es lo que "escribiría" el modelo.
+"""
+
+
+class _GuionBiblioteca:
+    """Las respuestas de cada rol para el proyecto biblioteca. `prestamos_roto` simula un modelo que entrega una
+    etapa con un bug real (presta dos veces el mismo libro)."""
+
+    MAESTRO = """<maestro>
+<vision>Gestor de biblioteca de consola: libros en SQLite, préstamos y una CLI.</vision>
+<arquitectura>
+Python 3 solo librería estándar. Paquete biblioteca/. Tests con unittest en tests/. Se arranca con python -m biblioteca.
+</arquitectura>
+<etapa id="1" titulo="Almacenamiento" deps="">
+<objetivo>Guardar y listar libros en SQLite.</objetivo>
+<archivos>biblioteca/__init__.py, biblioteca/almacen.py, tests/test_almacen.py</archivos>
+<interfaz>
+- biblioteca/almacen.py: class Almacen(ruta=":memory:") con agregar(titulo) -> int, listar() -> list, marcar(id, prestado) -> bool
+</interfaz>
+<criterios>
+- agregar("Rayuela") y listar() lo devuelve sin prestar
+</criterios>
+</etapa>
+<etapa id="2" titulo="Préstamos" deps="1">
+<objetivo>Prestar y devolver libros sin prestar dos veces el mismo.</objetivo>
+<archivos>biblioteca/prestamos.py, tests/test_prestamos.py</archivos>
+<interfaz>
+- biblioteca/prestamos.py: class Prestamos(almacen) con prestar(id) -> bool, devolver(id) -> bool
+</interfaz>
+<criterios>
+- prestar dos veces el mismo libro devuelve False la segunda
+</criterios>
+</etapa>
+<etapa id="3" titulo="Línea de comandos" deps="2">
+<objetivo>CLI python -m biblioteca con agregar, listar y prestar.</objetivo>
+<archivos>biblioteca/__main__.py, tests/test_cli.py</archivos>
+<criterios>
+- python -m biblioteca --db x.db agregar "Rayuela" y después listar lo muestra
+</criterios>
+</etapa>
+</maestro>"""
+
+    PLANES = {
+        "1": """<plan><objetivo>Almacenamiento</objetivo>
+<tarea id="1" archivos="biblioteca/__init__.py, biblioteca/almacen.py, tests/test_almacen.py">Crear Almacen con SQLite y sus tests (E1).</tarea>
+<criterios>
+- agregar y listar
+</criterios></plan>""",
+        "2": """<plan><objetivo>Préstamos</objetivo>
+<tarea id="1" archivos="biblioteca/prestamos.py, tests/test_prestamos.py">Crear Prestamos sobre Almacen y sus tests (E2).</tarea>
+<criterios>
+- no se presta dos veces
+</criterios></plan>""",
+        "3": """<plan><objetivo>CLI</objetivo>
+<tarea id="1" archivos="biblioteca/__main__.py, tests/test_cli.py">Crear la CLI con argparse y sus tests (E3).</tarea>
+<criterios>
+- agregar y listar desde la CLI
+</criterios></plan>""",
+        "INT": """<plan><objetivo>Integración</objetivo>
+<tarea id="1" archivos="biblioteca/__main__.py, tests/test_cli_devolver.py">Agregar el subcomando devolver a la CLI (INT).</tarea>
+<criterios>
+- devolver desde la CLI
+</criterios></plan>""",
+    }
+
+    ALMACEN = '''import sqlite3
+
+
+class Almacen:
+    def __init__(self, ruta=":memory:"):
+        self.con = sqlite3.connect(ruta)
+        self.con.execute("CREATE TABLE IF NOT EXISTS libros "
+                         "(id INTEGER PRIMARY KEY, titulo TEXT NOT NULL, prestado INTEGER DEFAULT 0)")
+
+    def agregar(self, titulo):
+        if not titulo.strip():
+            raise ValueError("el título no puede estar vacío")
+        cur = self.con.execute("INSERT INTO libros (titulo) VALUES (?)", (titulo.strip(),))
+        self.con.commit()
+        return cur.lastrowid
+
+    def listar(self):
+        filas = self.con.execute("SELECT id, titulo, prestado FROM libros ORDER BY id")
+        return [{"id": i, "titulo": t, "prestado": bool(p)} for i, t, p in filas]
+
+    def marcar(self, libro_id, prestado):
+        cur = self.con.execute("UPDATE libros SET prestado = ? WHERE id = ?", (int(prestado), libro_id))
+        self.con.commit()
+        return cur.rowcount == 1
+'''
+    TEST_ALMACEN = '''import unittest
+
+from biblioteca.almacen import Almacen
+
+
+class TestAlmacen(unittest.TestCase):
+    def test_agregar_y_listar(self):
+        a = Almacen()
+        i = a.agregar("Rayuela")
+        self.assertEqual(a.listar(), [{"id": i, "titulo": "Rayuela", "prestado": False}])
+
+    def test_titulo_vacio(self):
+        with self.assertRaises(ValueError):
+            Almacen().agregar("   ")
+'''
+    PRESTAMOS = '''from biblioteca.almacen import Almacen
+
+
+class Prestamos:
+    def __init__(self, almacen: Almacen):
+        self.almacen = almacen
+
+    def _libro(self, libro_id):
+        libro = next((l for l in self.almacen.listar() if l["id"] == libro_id), None)
+        if libro is None:
+            raise KeyError(libro_id)
+        return libro
+
+    def prestar(self, libro_id):
+        if self._libro(libro_id)["prestado"]:
+            return False
+        return self.almacen.marcar(libro_id, True)
+
+    def devolver(self, libro_id):
+        if not self._libro(libro_id)["prestado"]:
+            return False
+        return self.almacen.marcar(libro_id, False)
+'''
+    # El bug que entregaría un modelo flojo: no mira si ya estaba prestado.
+    PRESTAMOS_ROTO = PRESTAMOS.replace('        if self._libro(libro_id)["prestado"]:\n            return False\n'
+                                       '        return self.almacen.marcar(libro_id, True)',
+                                       '        self._libro(libro_id)\n        return self.almacen.marcar(libro_id, True)')
+    TEST_PRESTAMOS = '''import unittest
+
+from biblioteca.almacen import Almacen
+from biblioteca.prestamos import Prestamos
+
+
+class TestPrestamos(unittest.TestCase):
+    def setUp(self):
+        self.almacen = Almacen()
+        self.id = self.almacen.agregar("Rayuela")
+        self.p = Prestamos(self.almacen)
+
+    def test_no_presta_dos_veces(self):
+        self.assertTrue(self.p.prestar(self.id))
+        self.assertFalse(self.p.prestar(self.id))
+
+    def test_devolver(self):
+        self.p.prestar(self.id)
+        self.assertTrue(self.p.devolver(self.id))
+        self.assertFalse(self.almacen.listar()[0]["prestado"])
+'''
+    CLI = '''import argparse
+import sys
+
+from biblioteca.almacen import Almacen
+from biblioteca.prestamos import Prestamos
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog="biblioteca")
+    parser.add_argument("--db", default="biblioteca.db")
+    sub = parser.add_subparsers(dest="comando", required=True)
+    sub.add_parser("agregar").add_argument("titulo")
+    sub.add_parser("listar")
+    sub.add_parser("prestar").add_argument("id", type=int)
+    args = parser.parse_args(argv)
+    almacen = Almacen(args.db)
+    if args.comando == "agregar":
+        print(almacen.agregar(args.titulo))
+    elif args.comando == "listar":
+        for libro in almacen.listar():
+            print(f"{libro['id']}\\t{libro['titulo']}\\t{'prestado' if libro['prestado'] else 'disponible'}")
+    elif args.comando == "prestar":
+        if not Prestamos(almacen).prestar(args.id):
+            print("ya estaba prestado", file=sys.stderr)
+            return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+'''
+    TEST_CLI = '''import os
+import subprocess
+import sys
+import tempfile
+import unittest
+
+
+def correr(*args):
+    return subprocess.run([sys.executable, "-m", "biblioteca", *args], capture_output=True, text=True, timeout=60)
+
+
+class TestCli(unittest.TestCase):
+    def test_agregar_y_listar(self):
+        with tempfile.TemporaryDirectory() as d:
+            db = os.path.join(d, "b.db")
+            self.assertEqual(correr("--db", db, "agregar", "Rayuela").returncode, 0)
+            salida = correr("--db", db, "listar").stdout
+            self.assertIn("Rayuela", salida)
+            self.assertIn("disponible", salida)
+'''
+    TEST_CLI_DEVOLVER = '''import os
+import subprocess
+import sys
+import tempfile
+import unittest
+
+
+def correr(*args):
+    return subprocess.run([sys.executable, "-m", "biblioteca", *args], capture_output=True, text=True, timeout=60)
+
+
+class TestCliDevolver(unittest.TestCase):
+    def test_devolver(self):
+        with tempfile.TemporaryDirectory() as d:
+            db = os.path.join(d, "b.db")
+            correr("--db", db, "agregar", "Rayuela")
+            correr("--db", db, "prestar", "1")
+            self.assertEqual(correr("--db", db, "devolver", "1").returncode, 0)
+            self.assertIn("disponible", correr("--db", db, "listar").stdout)
+'''
+
+    def __init__(self, ws, prestamos_roto=False, juez_pide_devolver=False):
+        self.ws = ws
+        self.prestamos_roto = prestamos_roto
+        self.juez_pide_devolver = juez_pide_devolver
+        self.llamadas = collections.Counter()
+
+    def _archivos(self, marca):
+        if marca == "E1":
+            return [("biblioteca/__init__.py", ""), ("biblioteca/almacen.py", self.ALMACEN),
+                    ("tests/test_almacen.py", self.TEST_ALMACEN)]
+        if marca == "E2":
+            return [("biblioteca/prestamos.py", self.PRESTAMOS_ROTO if self.prestamos_roto else self.PRESTAMOS),
+                    ("tests/test_prestamos.py", self.TEST_PRESTAMOS)]
+        if marca == "E3":
+            return [("biblioteca/__main__.py", self.CLI), ("tests/test_cli.py", self.TEST_CLI)]
+        cli = self.CLI.replace('    sub.add_parser("prestar").add_argument("id", type=int)\n',
+                               '    sub.add_parser("prestar").add_argument("id", type=int)\n'
+                               '    sub.add_parser("devolver").add_argument("id", type=int)\n')
+        cli = cli.replace("    return 0\n\n\nif __name__",
+                          '    elif args.comando == "devolver":\n'
+                          '        if not Prestamos(almacen).devolver(args.id):\n'
+                          '            return 1\n    return 0\n\n\nif __name__')
+        return [("biblioteca/__main__.py", cli), ("tests/test_cli_devolver.py", self.TEST_CLI_DEVOLVER)]
+
+    def __call__(self, mensajes, kw):
+        rol = MockLLM.rol_de(mensajes)
+        self.llamadas[rol] += 1
+        primero = next((m["content"] for m in mensajes if m["role"] == "user"), "")
+        if rol == "maestro":
+            return self.MAESTRO
+        if rol == "arquitecto":
+            if "INTEGRACIÓN FINAL" in primero:
+                return terminar_xml(self.PLANES["INT"])
+            etapa = re.search(r"ETAPA (\d+) de 3", primero)
+            return terminar_xml(self.PLANES[etapa.group(1) if etapa else "1"])
+        if rol == "implementador":
+            tarea = re.search(r"TU TAREA AHORA \(#[^)]*\):\n(.*?)\n\n", primero, re.S)
+            marca = re.search(r"\((E\d|INT)\)", tarea.group(1) if tarea else "")
+            archivos = self._archivos(marca.group(1) if marca else "E1")
+            turno = _turno(mensajes)
+            if turno < len(archivos):
+                ruta, contenido = archivos[turno]
+                return herramienta_xml("write_to_file", path=ruta, content=contenido)
+            return terminar_xml("listo: archivos escritos")
+        if rol == "juez":
+            texto = MockLLM.ultimo_usuario(mensajes)
+            if "TAREA: CONTRATO" in texto:
+                return '{"criterios": ["lo que pide el pedido funciona y tiene tests"]}'
+            global_ = "PROYECTO GRANDE —" not in texto
+            if global_ and self.juez_pide_devolver and "devolver" not in self.ws.leer("biblioteca/__main__.py"):
+                return ('{"cumple": false, "confianza": "high", "faltantes": ["la CLI no tiene el comando devolver"],'
+                        ' "evidence_ids": ["EV-DIFF"]}')
+            return '{"cumple": true, "confianza": "high", "evidence_ids": ["EV-TESTS"]}'
+        return terminar_xml("sin cambios")
+
+
+class TestGrandePlanMaestro(BaseTest):
+    def test_parsea_etapas_y_valida(self):
+        m = parsear_maestro(_GuionBiblioteca.MAESTRO)
+        self.assertEqual([e.id for e in m.etapas], ["1", "2", "3"])
+        self.assertEqual(m.etapas[1].deps, ["1"])
+        self.assertIn("biblioteca/almacen.py", m.etapas[0].archivos)
+        self.assertTrue(m.vision.startswith("Gestor de biblioteca"))
+        self.assertEqual(problemas_maestro(m, 10), [])
+        self.assertTrue(any("tope es 2" in p for p in problemas_maestro(m, 2)))
+
+    def test_detecta_maestro_inservible(self):
+        self.assertEqual(problemas_maestro(parsear_maestro("no sé"), 10),
+                         ["no vino ninguna <etapa> con el formato pedido"])
+        ciclo = parsear_maestro('<etapa id="1" deps="2"><objetivo>a</objetivo></etapa>'
+                                '<etapa id="2" deps="1"><objetivo>b</objetivo></etapa>')
+        self.assertTrue(any("ciclo" in p for p in problemas_maestro(ciclo, 10)))
+        falso = parsear_maestro('<etapa id="1"><objetivo>Crear el esqueleto con stubs para completar después'
+                                '</objetivo></etapa><etapa id="2" deps="9"><objetivo>Ejecutar todas las pruebas'
+                                '</objetivo></etapa>')
+        problemas = problemas_maestro(falso, 10)
+        self.assertTrue(any("etapa 1 planea una simulación" in p for p in problemas), problemas)
+        self.assertTrue(any("etapa 2 solo corre" in p for p in problemas), problemas)
+        self.assertTrue(any("depende de '9'" in p for p in problemas), problemas)
+
+    def test_rutas_peligrosas_no_entran(self):
+        m = parsear_maestro('<etapa id="1"><objetivo>x</objetivo><archivos>/etc/passwd, ../fuera.py, '
+                            '`app.py`, ~/x.py, src/ok.py</archivos></etapa>')
+        self.assertEqual(m.etapas[0].archivos, ["app.py", "src/ok.py"])
+
+    def test_pedido_de_etapa_es_determinista_y_trae_contexto(self):
+        m = parsear_maestro(_GuionBiblioteca.MAESTRO)
+        texto = pedido_de_etapa("una biblioteca", m, m.etapas[1])
+        self.assertEqual(texto, pedido_de_etapa("una biblioteca", m, m.etapas[1]))   # retomable
+        self.assertIn("ETAPA 2 de 3: Préstamos", texto)
+        self.assertIn("class Almacen", texto)                                        # interfaz de la anterior
+        self.assertIn("NO construyas todavía", texto)
+        self.assertIn("Línea de comandos", texto)
+
+    def test_ejemplos_pedidos_no_son_simulacion_en_el_plan(self):
+        plan = Plan("x", [Tarea("1", "Crear la base con 3 datos de ejemplo de recetas", ["db.py"])], [])
+        self.assertTrue(problemas_del_plan(plan))                                   # sin pedirlo: simulación
+        self.assertEqual(problemas_del_plan(plan, "que arranque con datos de ejemplo"), [])
+
+    def test_plan_que_se_pasa_del_tope_conserva_dependencias(self):
+        texto = "<plan>" + "".join(f'<tarea id="{i}" archivos="m{i}.py" deps="{"1" if i > 1 else ""}">'
+                                   f'Crear m{i}.py.</tarea>' for i in range(1, 6)) + "</plan>"
+        plan = parsear_plan(texto, "x", max_tareas=3)
+        self.assertEqual(len(plan.tareas), 3)
+        self.assertEqual(plan.tareas[-1].deps, ["1"])                               # antes: [] (se perdía)
+
+
+class TestGrandeConstruccion(BaseTest):
+    def _ajustes(self, **extra):
+        valores = dict(tests_primero=False, torneo=False, escalar=False, max_revisiones=0, qa=False,
+                       max_reparaciones=1, juez=False, git_snapshots=False)
+        valores.update(extra)
+        return self.ajustes(**valores)
+
+    def _grande(self, guion_kw=None, **ajustes):
+        ws = self.proyecto({})
+        guion = _GuionBiblioteca(ws, **(guion_kw or {}))
+        ui = self.ui()
+        return ws, guion, ui, ConstructorGrande(MockLLM(guion), ws, self._ajustes(**ajustes), ui)
+
+    def test_tres_etapas_verificadas_e_integracion(self):
+        ws, guion, ui, grande = self._grande()
+        self.assertTrue(grande.iniciar("Un gestor de biblioteca con préstamos y CLI", confirmar=False),
+                        ui.texto_registrado()[-3000:])
+        estado = grande.leer()
+        self.assertEqual(estado["estado"], "terminado")
+        self.assertEqual([e["estado"] for e in estado["maestro"]["etapas"]], ["verificada"] * 3)
+        self.assertTrue(estado["integracion"]["ok"])
+        for rel in ("biblioteca/almacen.py", "biblioteca/prestamos.py", "biblioteca/__main__.py"):
+            self.assertTrue(ws.existe(rel), rel)
+        r = ejecutar_tests(ws, timeout=120)
+        self.assertTrue(r.ok)
+        self.assertEqual(conteo_de_resultado(r).pasados, 5)                         # los tests de las 3 etapas
+        self.assertEqual(guion.llamadas["maestro"], 1)
+        self.assertIsNone(RegistroBuild(ws).leer())                                 # ninguna build colgada
+        self.assertIn("TERMINADO Y VERIFICADO", ui.texto_registrado())
+        informes = list((ws.carpeta_reaper() / "informes").glob("proyecto_grande_*.md"))
+        self.assertEqual(len(informes), 1)
+
+    def test_etapa_rota_frena_y_continuar_la_termina(self):
+        ws, guion, ui, grande = self._grande({"prestamos_roto": True})
+        self.assertFalse(grande.iniciar("Un gestor de biblioteca con préstamos y CLI", confirmar=False))
+        estado = grande.leer()
+        etapas = {e["id"]: e for e in estado["maestro"]["etapas"]}
+        self.assertEqual(estado["estado"], "detenido")
+        self.assertEqual(etapas["1"]["estado"], "verificada")
+        self.assertIn(etapas["2"]["estado"], ("parcial", "fallida"))
+        self.assertEqual(etapas["2"]["intentos"], 2)                                # el original + 1 reanudación
+        self.assertEqual(etapas["3"]["estado"], "pendiente")                        # no se construyó encima
+        self.assertFalse(ws.existe("biblioteca/__main__.py"))
+        self.assertIn("test_no_presta_dos_veces", etapas["2"]["motivo"])            # el error REAL
+        self.assertIn("DETENIDO", ui.texto_registrado())
+        self.assertEqual(ws.leer("biblioteca/almacen.py"), _GuionBiblioteca.ALMACEN)  # la etapa 1 intacta
+        # El modelo "se corrige" y el usuario retoma: la build de la etapa 2 se RETOMA (no se replanifica).
+        guion.prestamos_roto = False
+        arquitecto_antes = guion.llamadas["arquitecto"]
+        self.assertTrue(grande.continuar(), ui.texto_registrado()[-3000:])
+        self.assertEqual(guion.llamadas["arquitecto"], arquitecto_antes + 1)        # solo el plan de la etapa 3
+        self.assertEqual(grande.leer()["estado"], "terminado")
+        self.assertEqual(guion.llamadas["maestro"], 1)
+
+    def test_otro_construir_pendiente_no_se_pisa(self):
+        ws, _guion, ui, grande = self._grande()
+        # Un /construir que quedó a medias (falla y deja su diario): /grande no arranca encima ni lo pisa.
+        orq = Orquestador(MockLLM([]), ws, self._ajustes(max_reparaciones=0), self.ui())
+        orq.obtener_plan = lambda *a: (Plan("x", [Tarea("1", "Crear app.py", ["app.py"])], []), "")
+        orq.implementar = lambda *a, **k: type("R", (), {"ok": True, "modo": "simple", "ganador": None})()
+        orq._reparar_con_escalada = lambda pedido, verif, *a, **k: verif
+        self.assertFalse(orq.construir("otra cosa", confirmar=False).ok)
+        self.assertIsNotNone(RegistroBuild(ws).leer())
+        self.assertFalse(grande.iniciar("biblioteca", confirmar=False))
+        self.assertIn("/construir sin terminar", ui.texto_registrado())
+        self.assertIsNone(grande.leer())
+
+    def test_estado_con_numeros_grandes_se_puede_releer(self):
+        ws, _guion, _ui, grande = self._grande()
+        maestro = parsear_maestro(_GuionBiblioteca.MAESTRO)
+        maestro.etapas[0].consumo, maestro.etapas[0].segundos = 123456, 98.7
+        grande.guardar({"esquema": 1, "pedido": "x", "estado": "en_curso", "token_api": "sk-or-v1-0123456789abcdef0123"},
+                       maestro)
+        estado = grande.leer()
+        self.assertEqual(estado["maestro"]["etapas"][0]["consumo"], 123456)
+        self.assertNotIn("0123456789abcdef0123", grande.ruta.read_text(encoding="utf-8"))   # el secreto sí se redacta
+
+    def test_integracion_completa_lo_que_falta_segun_el_pedido_original(self):
+        ws, guion, ui, grande = self._grande({"juez_pide_devolver": True}, juez=True)
+        self.assertTrue(grande.iniciar("Biblioteca con CLI para agregar, listar, prestar y devolver",
+                                       confirmar=False), ui.texto_registrado()[-3000:])
+        estado = grande.leer()
+        self.assertTrue(estado["integracion"]["reparada"])                          # hubo build de integración
+        self.assertIn("devolver", ws.leer("biblioteca/__main__.py"))
+        self.assertTrue(ws.existe("tests/test_cli_devolver.py"))
+        self.assertEqual(estado["estado"], "terminado")
+        self.assertIn("la CLI no tiene el comando devolver", ui.texto_registrado())
+
+    def test_el_plan_del_modelo_no_autoriza_reescrituras(self):
+        orq = Orquestador(MockLLM([]), self.proyecto({}), self._ajustes(), self.ui())
+        orq.pedido_usuario = "una biblioteca"
+        # El texto de la etapa (que arma REAPER con lo que escribió el modelo) dice "reescribir desde cero",
+        # pero el usuario no lo pidió: lo que autoriza sale de pedido_usuario.
+        self.assertIsNone(_RE_REESCRITURA_PEDIDA.search(orq.pedido_usuario))
+
+    def test_comando_grande_estado_y_uso(self):
+        app = App(self._ajustes(), MockLLM([]), self.ui(), self.proyecto({}), persistir=False)
+        app.cmd_grande("")
+        app.cmd_grande("estado")
+        texto = app.ui.texto_registrado()
+        self.assertIn("Uso: /grande", texto)
+        self.assertIn("No hay ningún proyecto grande", texto)
+        self.assertIn("/grande", texto_ayuda())
+
+
+class TestReanudarNoRegalaVerdes(BaseTest):
+    """Bug de /construir que destapó la simulación de /grande: al retomar, la suite ya estaba roja por la MISMA
+    build; REAPER lo tomaba como "fallaba antes de empezar" y la tarea re-ejecutada quedaba VERIFICADA con su propio
+    test en rojo. Después cada /construir continuar la "conservaba" y la build no se podía arreglar nunca."""
+
+    PLAN = """<plan><objetivo>calc</objetivo>
+<tarea id="1" archivos="calc.py, tests/test_calc.py">Crear calc.py con doble(x) y su test.</tarea>
+</plan>"""
+
+    def _guion(self, roto):
+        def responder(mensajes, kw):
+            rol = MockLLM.rol_de(mensajes)
+            if rol == "arquitecto":
+                return terminar_xml(self.PLAN)
+            if rol == "implementador":
+                cuerpo = "x + 1" if roto[0] else "x + x"                 # roto: el bug que entrega el modelo
+                archivos = [("calc.py", f"def doble(x):\n    return {cuerpo}\n"),
+                            ("tests/test_calc.py", "import unittest\nfrom calc import doble\n\n\n"
+                                                   "class T(unittest.TestCase):\n    def test_doble(self):\n"
+                                                   "        self.assertEqual(doble(4), 8)\n")]
+                turno = _turno(mensajes)
+                if turno < len(archivos):
+                    return herramienta_xml("write_to_file", path=archivos[turno][0], content=archivos[turno][1])
+                return terminar_xml("listo")
+            return terminar_xml("sin cambios")
+        return responder
+
+    def test_tarea_reintentada_con_su_test_en_rojo_no_queda_verificada(self):
+        ws = self.proyecto({})
+        roto = [True]
+        ajustes = self.ajustes(tests_primero=False, torneo=False, escalar=False, max_revisiones=0, qa=False,
+                               max_reparaciones=0, juez=False, git_snapshots=False)
+        orq = lambda: Orquestador(MockLLM(self._guion(roto)), ws, ajustes, self.ui())
+        self.assertFalse(orq().construir("calculadora", confirmar=False).ok)
+        diario = RegistroBuild(ws).leer()
+        self.assertFalse(diario["base_fallaba"])                                    # al empezar no fallaba nada
+        self.assertEqual(diario["fallaban_al_inicio"], [])
+        ui = self.ui()
+        informe = Orquestador(MockLLM(self._guion(roto)), ws, ajustes, ui).construir("", confirmar=False,
+                                                                                     reanudar=True)
+        self.assertFalse(informe.ok)
+        self.assertNotEqual(RegistroBuild(ws).leer()["estados"].get("1"), "verificada")   # antes: "verificada"
+        self.assertNotIn("YA falla antes de empezar", ui.texto_registrado())
+        self.assertIn("por cambios de esta misma build", ui.texto_registrado())
+        roto[0] = False                                                              # el modelo lo corrige
+        self.assertTrue(orq().construir("", confirmar=False, reanudar=True).ok)
+
+    def test_fallos_tolerables(self):
+        tareas = [Tarea("1", "a", ["calc.py", "tests/test_calc.py"]), Tarea("2", "b", ["web.py", "tests/test_web.py"])]
+        fallan = {"test_calc.T.test_doble", "test_web.T.test_ruta", "test_viejo.T.test_x"}
+        self.assertEqual(fallos_tolerables_al_reintentar(fallan, ["test_viejo.T.test_x"], tareas[0], tareas),
+                         {"test_web.T.test_ruta", "test_viejo.T.test_x"})            # el suyo no se tolera
 
 
 # ======================================================================
@@ -52214,6 +52766,37 @@ capitulo("modos", "Modos y permisos", """
     Los comandos bloqueados (`rm -rf ~`, `sudo`, formatear, `curl | sh`...) siguen bloqueados en cualquier
     modo: no es censura, protegen el celular de un error del modelo.
 """)
+
+capitulo("grande", "/grande: proyectos grandes por etapas verificadas", """
+    # /grande
+
+    Para lo que no entra en un solo /construir (una app con base de datos, API, panel, varias pantallas…).
+
+    ```
+    plan maestro: visión + arquitectura + ETAPAS (archivos, interfaz que deja, criterios, dependencias)
+      → tu aprobación
+      → por etapa, en orden de dependencias: un /construir COMPLETO (tests, juez, preservación, realidad)
+           · si no queda verificada: se retoma UNA vez su misma build; si sigue mal, se FRENA
+           · nada se construye encima de una etapa que no está verificada
+      → integración final: verificación real de TODO el proyecto + juez contra tu pedido ORIGINAL
+           · si falta algo: UNA build de integración con lo que falta
+    ```
+
+    ## Comandos
+
+    - `/grande <pedido>` arma el plan maestro y arranca (con `--auto` o `reaper --grande "..."` no pregunta).
+    - `/grande estado` muestra qué etapas están verificadas y por qué paró la última.
+    - `/grande continuar` retoma donde quedó, aunque se haya cortado a mitad de una etapa (no replanifica).
+    - `/grande descartar` borra solo el estado; tus archivos quedan.
+    - `/config max_etapas 15` sube el tope de etapas (2 a 30; cada etapa hasta `max_tareas` tareas).
+
+    ## Lo que NO hace
+
+    - No convierte un modelo débil en uno fuerte: si una etapa no sale, se detiene y te lo dice.
+    - Lo que el modelo escribe en el plan maestro no autoriza nada: reescribir archivos que ya tenías o aceptar
+      "datos de ejemplo" se decide con TU pedido.
+""")
+
 
 capitulo("construir", "/construir: el pipeline completo", """
     # /construir
@@ -55605,6 +56188,623 @@ def conteo_equipo_x(settings, probados: Optional[dict] = None) -> dict:
 
 
 # ======================================================================
+# MÓDULO: grande
+# ======================================================================
+"""
+Proyectos GRANDES por etapas (/grande).
+
+Un /construir mete todo el pedido en UN plan de hasta max_tareas tareas y un plazo de pared: alcanza para un proyecto
+chico o mediano, pero uno grande (una app con backend, base de datos, frontend, autenticación, panel…) terminaba con
+las tareas sobrantes amontonadas en la última o cortado por el plazo. Acá:
+
+1. Un PLAN MAESTRO divide el pedido en etapas. Cada etapa es una porción que se puede construir y probar sola, con
+   los archivos que toca, la INTERFAZ que deja para las siguientes y sus criterios.
+2. Cada etapa es un /construir completo, con TODAS sus guardas (tests primero, juez, preservación de lo anterior,
+   examen de realidad, arranque). Los tests de las etapas anteriores quedan protegidos: una etapa nueva no puede
+   debilitarlos para pasar.
+3. Si una etapa no queda verificada, NO se construye nada encima (se reintenta una vez retomando su build y, si
+   sigue mal, se frena y se informa). /grande continuar retoma donde quedó, aunque se haya cortado a mitad.
+4. Al final, una verificación de INTEGRACIÓN sobre todo el proyecto y el juez contra el PEDIDO ORIGINAL (no contra
+   lo que escribió el modelo). Si falta algo, una build de integración acotada lo completa.
+
+Lo que el modelo escribe en el plan maestro NUNCA autoriza nada: reescribir archivos previos o aceptar "datos de
+ejemplo" se decide con el pedido del usuario (Orquestador.pedido_usuario).
+"""
+
+_RE_ETAPA = re.compile(r"<etapa\b([^>]*)>(.*?)</etapa\s*>", re.S | re.I)
+_RE_ATTR_ETAPA = re.compile(r"""(\w+)\s*=\s*["']([^"']*)["']""")
+# Intentos TOTALES por etapa (entre todas las invocaciones) antes de pedir intervención: no quemar tokens en bucle.
+MAX_INTENTOS_ETAPA = 4
+ESTADOS_OK_ETAPA = ("verificada", "validada")
+
+MISION_MAESTRO = """Sos el ARQUITECTO DE UN PROYECTO GRANDE. No escribís código: dividís el pedido en ETAPAS que otro
+equipo va a construir UNA POR VEZ, cada una con su propio plan, sus tests y su verificación.
+
+Reglas:
+- Cada etapa entrega código REAL, completo y que se puede probar SOLO (con tests automáticos), sobre lo que dejaron
+  las anteriores. Nada de esqueletos, stubs, placeholders, TODO, `pass`, NotImplementedError ni "datos de ejemplo
+  para completar después": lo que una etapa crea, lo termina.
+- Orden por dependencias: primero la base (modelo de datos, núcleo, configuración), después lo que la usa. Preferí
+  porciones verticales que funcionen de punta a punta antes que capas sueltas.
+- Cada etapa entra en un plan de ~4 a 10 tareas: si es más grande, partila.
+- Definí la ARQUITECTURA una sola vez (stack, carpetas, cómo se corren los tests y la app, convenciones) y que
+  todas las etapas la respeten.
+- La INTERFAZ de cada etapa (archivos, funciones/clases/endpoints con firmas exactas) es un contrato: las etapas
+  siguientes la usan tal cual y no la rompen.
+- NO agregues etapas de solo "ejecutar/verificar pruebas" ni de "documentación" suelta: REAPER verifica todo.
+- Usá solo lo que el entorno tiene (Termux/Linux: Python y su librería estándar, Node si hace falta). No inventes
+  servicios, claves ni datos: si algo viene de afuera, la etapa lo obtiene de verdad.
+
+Respondé EXACTAMENTE con este formato (nada antes ni después):
+<maestro>
+<vision>qué es el producto terminado, en 2-4 frases</vision>
+<arquitectura>
+stack, estructura de carpetas, comando de tests, cómo se arranca, convenciones
+</arquitectura>
+<etapa id="1" titulo="nombre corto" deps="">
+<objetivo>qué queda funcionando al terminar esta etapa</objetivo>
+<archivos>ruta/a.py, ruta/b.py, tests/test_a.py</archivos>
+<interfaz>
+- ruta/a.py: def funcion(param: tipo) -> tipo — qué devuelve
+</interfaz>
+<criterios>
+- criterio comprobable con un test (entrada → salida esperada)
+</criterios>
+</etapa>
+<etapa id="2" titulo="..." deps="1">
+...
+</etapa>
+</maestro>"""
+
+
+@dataclass
+class Etapa:
+    id: str
+    titulo: str
+    objetivo: str
+    archivos: list = field(default_factory=list)
+    interfaz: str = ""
+    criterios: list = field(default_factory=list)
+    deps: list = field(default_factory=list)
+    estado: str = "pendiente"           # pendiente | en_curso | verificada | validada | parcial | fallida | cancelada
+    intentos: int = 0
+    informe: str = ""                   # ruta del informe de la última build de la etapa
+    motivo: str = ""                    # por qué no quedó verificada (el error REAL, recortado)
+    segundos: float = 0.0
+    consumo: int = 0                    # tokens (entrada + salida) de sus builds
+
+    @property
+    def ok(self) -> bool:
+        return self.estado in ESTADOS_OK_ETAPA
+
+
+@dataclass
+class PlanMaestro:
+    vision: str
+    arquitectura: str
+    etapas: list
+    texto: str = ""
+
+    def por_id(self, eid: str) -> Optional[Etapa]:
+        return next((e for e in self.etapas if e.id == eid), None)
+
+    def como_texto(self) -> str:
+        lineas = [f"Visión: {self.vision}"]
+        if self.arquitectura:
+            lineas.append("Arquitectura:")
+            lineas.extend(f"  {l.strip()}" for l in self.arquitectura.strip().splitlines() if l.strip())
+        for e in self.etapas:
+            deps = f" (después de {', '.join(e.deps)})" if e.deps else ""
+            lineas.append(f"[{e.estado}] Etapa {e.id} · {e.titulo}{deps}: {recortar(e.objetivo, 300)}")
+        return "\n".join(lineas)
+
+
+def _tag(cuerpo: str, nombre: str) -> str:
+    m = re.search(rf"<{nombre}>(.*?)</{nombre}\s*>", cuerpo or "", re.S | re.I)
+    return m.group(1).strip() if m else ""
+
+
+def _lista_criterios(texto: str) -> list:
+    salida = []
+    for linea in (texto or "").splitlines():
+        linea = re.sub(r"^\s*([-*•]|\d+[.)])\s*", "", linea).strip()
+        if linea:
+            salida.append(linea)
+    return salida
+
+
+def _rutas_etapa(texto: str) -> list:
+    """Rutas relativas sanas: sin absolutas, sin '..', sin basura de markdown."""
+    salida = []
+    for parte in re.split(r"[,;\n]+", texto or ""):
+        rel = parte.strip().strip("`'\"*-• ").strip()
+        if not rel or " " in rel or rel.startswith(("/", "~")) or ".." in Path(rel).parts:
+            continue
+        if rel not in salida:
+            salida.append(rel)
+    return salida
+
+
+def parsear_maestro(texto: str) -> PlanMaestro:
+    """Plan maestro desde la respuesta del modelo. Tolerante con el formato; no inventa etapas que no vinieron."""
+    texto = texto or ""
+    etapas = []
+    for m in _RE_ETAPA.finditer(texto):
+        attrs = {k.lower(): v for k, v in _RE_ATTR_ETAPA.findall(m.group(1))}
+        cuerpo = m.group(2)
+        objetivo = _tag(cuerpo, "objetivo") or re.sub(r"<[^>]+>", " ", cuerpo).strip()[:400]
+        if not objetivo:
+            continue
+        eid = (attrs.get("id") or str(len(etapas) + 1)).strip()
+        deps = [d.strip() for d in re.split(r"[,;\s]+", attrs.get("deps", "")) if d.strip()]
+        etapas.append(Etapa(eid, (attrs.get("titulo") or attrs.get("title") or f"Etapa {eid}").strip()[:80],
+                            objetivo, _rutas_etapa(_tag(cuerpo, "archivos")), _tag(cuerpo, "interfaz"),
+                            _lista_criterios(_tag(cuerpo, "criterios"))[:10], deps))
+    return PlanMaestro(_tag(texto, "vision"), _tag(texto, "arquitectura"), etapas, texto)
+
+
+def problemas_maestro(maestro: PlanMaestro, max_etapas: int, pedido: str = "") -> list:
+    """Determinista (0 tokens): lo que hace que un plan maestro no sirva. → razones para replanificar."""
+    salida = []
+    if not maestro.etapas:
+        return ["no vino ninguna <etapa> con el formato pedido"]
+    if len(maestro.etapas) > max_etapas:
+        salida.append(f"trae {len(maestro.etapas)} etapas y el tope es {max_etapas}: agrupá etapas chicas "
+                      "(cada etapa puede tener hasta ~10 tareas)")
+    ids = [e.id for e in maestro.etapas]
+    repetidos = sorted({i for i in ids if ids.count(i) > 1})
+    if repetidos:
+        salida.append(f"ids de etapa repetidos: {', '.join(repetidos)}")
+    for e in maestro.etapas:
+        for d in e.deps:
+            if d not in ids:
+                salida.append(f"la etapa {e.id} depende de '{d}', que no existe")
+    if GrafoTareas(maestro.etapas).tiene_ciclo():
+        salida.append("las dependencias entre etapas forman un ciclo")
+    # Las mismas reglas que un plan de tareas: nada de simular ni de etapas que solo corren pruebas.
+    como_plan = Plan(maestro.vision, [Tarea(e.id, f"{e.objetivo}\n{e.interfaz}", e.archivos, e.deps)
+                                      for e in maestro.etapas], [])
+    salida.extend(p.replace("la tarea", "la etapa") for p in problemas_del_plan(como_plan, pedido))
+    return salida
+
+
+def pedido_de_etapa(pedido: str, maestro: PlanMaestro, etapa: Etapa) -> str:
+    """El pedido que recibe el /construir de UNA etapa. Determinista (mismo texto en cada intento): así una build de
+    etapa cortada a mitad se reconoce y se RETOMA en vez de empezar otra."""
+    orden = [e for e in GrafoTareas(maestro.etapas).orden()]
+    previas = orden[:orden.index(etapa)] if etapa in orden else []
+    siguientes = orden[orden.index(etapa) + 1:] if etapa in orden else []
+    n = len(maestro.etapas)
+    partes = [f"PROYECTO GRANDE — ETAPA {etapa.id} de {n}: {etapa.titulo}",
+              f"PEDIDO ORIGINAL DEL USUARIO (contexto; NO lo construyas entero ahora):\n{recortar(pedido, 2500)}"]
+    if maestro.vision:
+        partes.append(f"VISIÓN DEL PRODUCTO:\n{recortar(maestro.vision, 800)}")
+    if maestro.arquitectura:
+        partes.append(f"ARQUITECTURA ACORDADA (respetala):\n{recortar(maestro.arquitectura, 1500)}")
+    if previas:
+        bloque = []
+        for e in previas:
+            bloque.append(f"- Etapa {e.id} · {e.titulo}: {recortar(e.objetivo, 200)}")
+            if e.interfaz:
+                bloque.extend(f"    {l.strip()}" for l in e.interfaz.strip().splitlines()[:12] if l.strip())
+        partes.append("YA CONSTRUIDO EN ETAPAS ANTERIORES (está en el proyecto y tiene tests; usá estas interfaces "
+                      "tal cual y NO las rompas):\n" + "\n".join(bloque))
+    esta = [f"Objetivo: {etapa.objetivo}"]
+    if etapa.archivos:
+        esta.append("Archivos: " + ", ".join(etapa.archivos))
+    if etapa.interfaz:
+        esta.append("Interfaz que tiene que quedar disponible:\n" + etapa.interfaz.strip())
+    if etapa.criterios:
+        esta.append("Criterios de aceptación:\n" + "\n".join(f"- {c}" for c in etapa.criterios))
+    partes.append("CONSTRUÍ AHORA SOLO ESTA ETAPA, completa y con tests reales:\n" + "\n".join(esta))
+    if siguientes:
+        partes.append("NO construyas todavía (lo hacen etapas posteriores): "
+                      + "; ".join(f"{e.titulo}" for e in siguientes))
+    return "\n\n".join(partes)
+
+
+def _redactar_textos(valor):
+    """Copia con redactar_secretos aplicado a cada string (las claves y los números quedan como están)."""
+    if isinstance(valor, str):
+        return redactar_secretos(valor)
+    if isinstance(valor, dict):
+        return {k: _redactar_textos(v) for k, v in valor.items()}
+    if isinstance(valor, list):
+        return [_redactar_textos(v) for v in valor]
+    return valor
+
+
+class ConstructorGrande:
+    """Orquesta un proyecto por etapas. `construir_build(pedido_etapa, reanudar, pedido_usuario)` corre UN
+    /construir y devuelve su InformeBuild (en la App suma estadísticas y hooks; en los tests, un Orquestador)."""
+
+    ESQUEMA = 1
+
+    def __init__(self, llm, ws: Workspace, settings: Settings, ui: UI,
+                 construir_build: Optional[Callable[..., "InformeBuild"]] = None):
+        self.llm, self.ws, self.settings, self.ui = llm, ws, settings, ui
+        self.ruta = ws.carpeta_reaper() / "proyecto_grande.json"
+        self._construir_build = construir_build or self._build_directo
+
+    # ------------------------------------------------------------ estado en disco
+    def leer(self) -> Optional[dict]:
+        if not self.ruta.is_file():
+            return None
+        try:
+            datos = json.loads(self.ruta.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as e:
+            raise ValueError(f"Estado de /grande ilegible ({self.ruta.name}): {e}")
+        if not isinstance(datos, dict) or datos.get("esquema") != self.ESQUEMA or "maestro" not in datos:
+            raise ValueError(f"Estado de /grande con formato desconocido ({self.ruta.name})")
+        return datos
+
+    def guardar(self, estado: dict, maestro: PlanMaestro) -> None:
+        estado["maestro"] = asdict(maestro)
+        estado["actualizado"] = datetime.now().isoformat(timespec="seconds")
+        # Se redactan los TEXTOS, no el JSON serializado: redactar_secretos tomaba `"tokens": 1234` por una
+        # credencial, lo cambiaba por [REDACTADO] y el estado quedaba ilegible (lo atrapó el autotest de /grande).
+        escritura_atomica(self.ruta, json.dumps(_redactar_textos(estado), ensure_ascii=False, indent=2))
+
+    def borrar(self) -> None:
+        if self.ruta.is_file():
+            self.ruta.unlink()
+
+    @staticmethod
+    def maestro_de(estado: dict) -> PlanMaestro:
+        datos = estado["maestro"]
+        campos = {f.name for f in fields(Etapa)}
+        etapas = [Etapa(**{k: v for k, v in e.items() if k in campos}) for e in datos.get("etapas", [])]
+        return PlanMaestro(datos.get("vision", ""), datos.get("arquitectura", ""), etapas, datos.get("texto", ""))
+
+    # ------------------------------------------------------------ plan maestro
+    def _pedir_maestro(self, pedido: str, feedback: str = "", anterior: Optional[PlanMaestro] = None) -> PlanMaestro:
+        existentes = self.ws.archivos_codigo(limite=150)
+        prompt = (f"PEDIDO DEL USUARIO:\n{pedido}\n\n"
+                  f"ARCHIVOS QUE YA EXISTEN EN EL PROYECTO ({len(existentes)}):\n"
+                  + ("\n".join(f"- {a}" for a in existentes[:150]) or "(ninguno: proyecto nuevo)")
+                  + f"\n\nTope: {self.settings.max_etapas} etapas, cada una de hasta {self.settings.max_tareas} tareas.")
+        if anterior is not None and feedback:
+            prompt += (f"\n\nTU PLAN MAESTRO ANTERIOR:\n{anterior.como_texto()}\n\n"
+                       f"CORREGÍ ESTO:\n{feedback}")
+        modelo = self.settings.modelo_para("arquitecto")
+        resp = self.llm.chat([{"role": "system", "content": "# TU ROL: MAESTRO\n" + MISION_MAESTRO}, {"role": "user", "content": prompt}],
+                             modelo=modelo, temperatura=0.3, max_tokens=max(3000, self.settings.max_tokens // 2),
+                             rol="arquitecto")
+        return parsear_maestro(str(getattr(resp, "texto", "") or ""))
+
+    def planificar(self, pedido: str, confirmar: bool) -> Optional[PlanMaestro]:
+        self.ui.fase("G", "Plan maestro (proyecto grande por etapas)")
+        maestro = self._pedir_maestro(pedido)
+        problemas = problemas_maestro(maestro, self.settings.max_etapas, pedido)
+        if problemas:
+            # Juez (0 tokens): una sola replanificación con las razones; si sigue mal, no se arranca a ciegas.
+            self.ui.aviso("  Juez · el plan maestro tiene problemas: lo hago rehacer una vez.")
+            for p in problemas[:5]:
+                self.ui.tenue(f"    • {p}")
+            maestro = self._pedir_maestro(pedido, "\n".join(f"- {p}" for p in problemas), maestro)
+            problemas = problemas_maestro(maestro, self.settings.max_etapas, pedido)
+            if problemas:
+                self.ui.error("El plan maestro sigue sin servir: " + "; ".join(problemas[:4]))
+                if any("tope es" in p for p in problemas):
+                    self.ui.tenue(f"  Si de verdad necesita más etapas: /config max_etapas "
+                                  f"{min(30, len(maestro.etapas))}")
+                return None
+        maestro.etapas = GrafoTareas(maestro.etapas).orden()
+        for _ in range(3):
+            self._mostrar_maestro(maestro)
+            if not confirmar:
+                return maestro
+            if self.ui.confirmar("¿Aprobás el plan maestro y arrancamos por la etapa 1?", defecto=True):
+                return maestro
+            feedback = self.ui.preguntar("¿Qué cambiarías del plan maestro? (Enter vacío = cancelar)")
+            if not feedback:
+                return None
+            nuevo = self._pedir_maestro(pedido, feedback, maestro)
+            if problemas_maestro(nuevo, self.settings.max_etapas, pedido):
+                self.ui.aviso("  El plan corregido no cumple las reglas; te muestro el anterior.")
+            else:
+                maestro = nuevo
+                maestro.etapas = GrafoTareas(maestro.etapas).orden()
+        return None
+
+    def _mostrar_maestro(self, maestro: PlanMaestro) -> None:
+        self.ui.linea("")
+        if maestro.vision:
+            self.ui.info("  " + recortar(maestro.vision, 400))
+        if maestro.arquitectura:
+            for l in maestro.arquitectura.strip().splitlines()[:10]:
+                self.ui.tenue("    " + recortar(l.strip(), 140))
+        for e in maestro.etapas:
+            marca = "✓" if e.ok else ("✗" if e.estado in ("parcial", "fallida") else "○")
+            deps = f"  (tras {', '.join(e.deps)})" if e.deps else ""
+            self.ui.linea(f"  {marca} Etapa {e.id} · {e.titulo}{deps}")
+            self.ui.tenue(f"      {recortar(e.objetivo, 160)}")
+            if e.archivos:
+                self.ui.tenue("      archivos: " + recortar(", ".join(e.archivos), 150))
+
+    # ------------------------------------------------------------ ejecución
+    def iniciar(self, pedido: str, confirmar: bool = True) -> bool:
+        try:
+            previo = self.leer()
+        except ValueError as e:
+            self.ui.error(str(e))
+            return False
+        if previo and previo.get("estado") != "terminado":
+            self.ui.error("Ya hay un proyecto grande sin terminar en esta carpeta. Usá /grande continuar, "
+                          "/grande estado o /grande descartar (no borra archivos).")
+            return False
+        try:
+            pendiente = RegistroBuild(self.ws).leer()
+        except ValueError as e:
+            self.ui.error(str(e))
+            return False
+        if pendiente and pendiente.get("estado") not in ESTADOS_OK_ETAPA:
+            self.ui.error("Hay un /construir sin terminar en esta carpeta: terminalo (/construir continuar) o "
+                          "descartalo (/construir descartar) antes de empezar un proyecto grande.")
+            return False
+        try:
+            maestro = self.planificar(pedido, confirmar)
+        except LLMError as e:
+            self.ui.error(f"El arquitecto no respondió el plan maestro: {recortar(str(e), 200)}")
+            return False
+        if maestro is None:
+            self.ui.tenue("Proyecto grande cancelado; no se tocó ningún archivo.")
+            return False
+        estado = {"esquema": self.ESQUEMA, "pedido": pedido, "estado": "en_curso",
+                  "creado": datetime.now().isoformat(timespec="seconds"),
+                  # Todo lo que se escriba desde acá queda en checkpoints >= cid_inicio: así la integración final
+                  # revisa el proyecto ENTERO (validación, examen de realidad, diff para el juez).
+                  "cid_inicio": self.ws.checkpoints.iniciar(f"proyecto grande: {pedido[:80]}"),
+                  "integracion": {}}
+        self.guardar(estado, maestro)
+        return self._ejecutar(estado, maestro)
+
+    def continuar(self) -> bool:
+        try:
+            estado = self.leer()
+        except ValueError as e:
+            self.ui.error(str(e))
+            return False
+        if not estado:
+            self.ui.aviso("No hay ningún proyecto grande en esta carpeta. Empezá uno con /grande <pedido>.")
+            return False
+        if estado.get("estado") == "terminado":
+            self.ui.ok("El proyecto grande ya está terminado y verificado.")
+            return True
+        maestro = self.maestro_de(estado)
+        self.ui.info("Retomo el proyecto grande: " + recortar(redactar_secretos(estado["pedido"]), 140))
+        return self._ejecutar(estado, maestro)
+
+    def _ejecutar(self, estado: dict, maestro: PlanMaestro) -> bool:
+        inicio = time.monotonic()
+        grafo = GrafoTareas(maestro.etapas)
+        for n, etapa in enumerate(grafo.orden(), start=1):
+            if etapa.ok:
+                continue
+            rotas = [d for d in grafo.dependencias(etapa.id) if not maestro.por_id(d).ok]
+            if rotas:
+                # Mismo principio que BUG-012 entre tareas: nunca construir sobre una base que no está verificada.
+                return self._detener(estado, maestro, f"la etapa {etapa.id} depende de {', '.join(rotas)}, que no "
+                                                      "quedó verificada")
+            if etapa.intentos >= MAX_INTENTOS_ETAPA:
+                return self._detener(estado, maestro, f"la etapa {etapa.id} ya se intentó {etapa.intentos} veces sin "
+                                                      "quedar verificada: revisá su informe y partila o corregila a mano")
+            self.ui.linea("")
+            self.ui.titulo(f"Etapa {etapa.id} ({n}/{len(maestro.etapas)}) · {etapa.titulo}")
+            for intento in range(2):                     # el intento original + UNA reanudación de su misma build
+                try:
+                    informe = self._correr_etapa(estado, maestro, etapa)
+                except LLMError as e:
+                    etapa.estado, etapa.motivo = "pendiente", recortar(str(e), 400)
+                    return self._detener(estado, maestro, f"el modelo no responde ({recortar(str(e), 160)})")
+                if etapa.ok or informe.estado == "cancelada" or intento == 1:
+                    break
+                if etapa.intentos >= MAX_INTENTOS_ETAPA:
+                    break
+                self.ui.aviso(f"  La etapa {etapa.id} quedó {etapa.estado.upper()}: la retomo una vez (sin replanificar) "
+                              "para que el reparador termine lo que falta.")
+            if not etapa.ok:
+                return self._detener(estado, maestro, f"la etapa {etapa.id} quedó {etapa.estado.upper()}"
+                                     + (f": {_primera_linea_util(etapa.motivo)}" if etapa.motivo else ""))
+        ok = self._integrar(estado, maestro)
+        self._cierre(estado, maestro, time.monotonic() - inicio)
+        return ok
+
+    def _correr_etapa(self, estado: dict, maestro: PlanMaestro, etapa: Etapa) -> "InformeBuild":
+        pedido_etapa = pedido_de_etapa(estado["pedido"], maestro, etapa)
+        try:
+            pendiente = RegistroBuild(self.ws).leer()
+        except ValueError as e:
+            raise LLMError(f"diario de build ilegible: {e}", probar_otro_modelo=False)
+        reanudar = bool(pendiente and pendiente.get("estado") not in ESTADOS_OK_ETAPA)
+        if reanudar and pendiente.get("pedido") != pedido_etapa:
+            etapa.estado, etapa.motivo = "pendiente", "hay otro /construir sin terminar en la carpeta"
+            self.guardar(estado, maestro)
+            self.ui.error("Hay un /construir sin terminar que no es de esta etapa: terminalo o descartalo "
+                          "(/construir estado) y después /grande continuar.")
+            return InformeBuild("cancelada")
+        etapa.estado = "en_curso"
+        etapa.intentos += 1
+        self.guardar(estado, maestro)
+        if reanudar:
+            self.ui.tenue("  Hay una build de esta etapa a medio terminar: la retomo sin replanificar.")
+        informe = self._construir_build(pedido_etapa, reanudar, estado["pedido"])
+        etapa.estado = informe.estado if informe.estado != "cancelada" else "pendiente"
+        etapa.segundos += float(getattr(informe, "segundos", 0.0) or 0.0)
+        etapa.consumo += int(getattr(informe, "tokens_build", 0) or 0)
+        etapa.informe = str(informe.ruta_informe or "")
+        etapa.motivo = "" if etapa.ok else recortar(
+            informe.diagnostico or "; ".join(f"{t}: {m}" for t, m in informe.motivos_fallo.items())
+            or "; ".join(informe.notas[-3:]), 1500)
+        self.guardar(estado, maestro)
+        return informe
+
+    def _build_directo(self, pedido_etapa: str, reanudar: bool, pedido_usuario: str) -> "InformeBuild":
+        orq = Orquestador(self.llm, self.ws, self.settings, self.ui)
+        orq.pedido_usuario = pedido_usuario
+        return orq.construir("" if reanudar else pedido_etapa, confirmar=False, reanudar=reanudar)
+
+    def _detener(self, estado: dict, maestro: PlanMaestro, motivo: str) -> bool:
+        estado["estado"] = "detenido"
+        estado["motivo"] = motivo
+        self.guardar(estado, maestro)
+        hechas = sum(1 for e in maestro.etapas if e.ok)
+        self.ui.linea("")
+        self.ui.caja([f"Etapas verificadas: {hechas}/{len(maestro.etapas)}",
+                      f"Me detengo: {recortar(motivo, 300)}",
+                      "No construyo encima de algo que no está verificado.",
+                      "Revisá el informe de la etapa y seguí con: /grande continuar"],
+                     titulo="Proyecto grande · DETENIDO", color=Tema.aviso)
+        return False
+
+    # ------------------------------------------------------------ integración
+    def _integrar(self, estado: dict, maestro: PlanMaestro) -> bool:
+        """Todas las etapas verdes ≠ el pedido cumplido. Verificación real del proyecto ENTERO + juez contra el PEDIDO
+        ORIGINAL. Si falta algo: UNA build de integración con lo que falta y se vuelve a juzgar."""
+        self.ui.linea("")
+        self.ui.fase("G", "Integración final (todo el proyecto contra tu pedido original)")
+        pedido = estado["pedido"]
+        resultado = self._verificar_integracion(estado, maestro)
+        if not resultado["ok"] and not estado["integracion"].get("reparada"):
+            faltas = resultado["faltantes"] or [_primera_linea_util(resultado["diagnostico"])]
+            self.ui.aviso("  Falta para cumplir el pedido completo: " + "; ".join(recortar(f, 80) for f in faltas[:4]))
+            estado["integracion"]["reparada"] = True
+            self.guardar(estado, maestro)
+            pedido_integracion = (
+                "PROYECTO GRANDE — INTEGRACIÓN FINAL. Todas las etapas están construidas y verificadas; NO rehagas "
+                "nada que funcione. Completá SOLO esto para que el proyecto cumpla el pedido original:\n"
+                + "\n".join(f"- {f}" for f in faltas[:8])
+                + (f"\n\nDiagnóstico real:\n{recortar(resultado['diagnostico'], 2500)}" if resultado["diagnostico"] else "")
+                + f"\n\nPEDIDO ORIGINAL DEL USUARIO:\n{recortar(pedido, 2500)}")
+            try:
+                informe = self._construir_build(pedido_integracion, False, pedido)
+            except LLMError as e:
+                informe = InformeBuild("fallida", diagnostico=str(e))
+            if informe.estado == "cancelada":
+                self.ui.aviso("  La build de integración no arrancó (otro /construir pendiente o plan inválido).")
+            resultado = self._verificar_integracion(estado, maestro)
+        estado["integracion"].update({k: resultado[k] for k in ("ok", "estado", "faltantes", "juicio")})
+        estado["estado"] = "terminado" if resultado["ok"] else "integracion_pendiente"
+        if not resultado["ok"]:
+            estado["motivo"] = "la integración final no quedó verificada: " + (
+                "; ".join(resultado["faltantes"][:3]) or _primera_linea_util(resultado["diagnostico"]))
+        self.guardar(estado, maestro)
+        return resultado["ok"]
+
+    def _verificar_integracion(self, estado: dict, maestro: PlanMaestro) -> dict:
+        orq = Orquestador(self.llm, self.ws, self.settings, self.ui)
+        orq.pedido_usuario = estado["pedido"]
+        try:
+            orq._huella_aceptacion = huella_aceptacion(self.ws)
+        except (ValueError, OSError):
+            orq._huella_aceptacion = None
+        cid = int(estado.get("cid_inicio") or 1)
+        verif = orq.verificar(cid)
+        orq._mostrar_verificacion(verif)
+        plan = Plan(maestro.vision or recortar(estado["pedido"], 200),
+                    [Tarea(e.id, f"{e.titulo}: {e.objetivo}", e.archivos, e.deps) for e in maestro.etapas],
+                    [c for e in maestro.etapas for c in e.criterios][:20],
+                    interfaz="\n".join(e.interfaz for e in maestro.etapas if e.interfaz))
+        informe = InformeBuild("fallida", plan=plan, cid=cid)
+        informe.estado = estado_final_build(verif, informe)
+        informe.criterios_entrega = orq._contrato_de_entrega(estado["pedido"])
+        orq._juicio_de_entrega(estado["pedido"], plan, verif, informe)
+        juicio = informe.juicio
+        faltantes = list(juicio.faltantes) if juicio is not None and juicio.valido and not juicio.cumple else []
+        return {"ok": informe.ok, "estado": informe.estado, "faltantes": faltantes,
+                "diagnostico": verif.diagnostico if not verif.ok else "",
+                "juicio": juicio.texto() if juicio is not None else "sin veredicto del juez"}
+
+    # ------------------------------------------------------------ salida
+    def _cierre(self, estado: dict, maestro: PlanMaestro, segundos: float) -> None:
+        integ = estado.get("integracion", {})
+        ok = estado.get("estado") == "terminado"
+        lineas = [f"{'✓' if e.ok else '✗'} Etapa {e.id} · {recortar(e.titulo, 40)}: {e.estado}"
+                  f" · {formatear_duracion(e.segundos)}" for e in maestro.etapas]
+        lineas.append(f"Integración final: {integ.get('estado', '?')} · {recortar(str(integ.get('juicio', '')), 90)}")
+        if not ok:
+            lineas.append("Pendiente: " + recortar(str(estado.get("motivo", "")), 200))
+            lineas.append("Seguí con: /grande continuar")
+        lineas.append(f"Tiempo de esta corrida: {formatear_duracion(segundos)}")
+        self.ui.linea("")
+        self.ui.caja(lineas, titulo="Proyecto grande · " + ("✓ TERMINADO Y VERIFICADO" if ok else "INCOMPLETO"),
+                     color=Tema.ok if ok else Tema.aviso)
+        ruta = self._guardar_informe(estado, maestro)
+        if ruta:
+            self.ui.tenue(f"  Informe: {ruta}")
+
+    def _guardar_informe(self, estado: dict, maestro: PlanMaestro) -> Optional[Path]:
+        lineas = [f"# Proyecto grande REAPER — {estado.get('estado', '?')}", "",
+                  f"Fecha: {datetime.now():%Y-%m-%d %H:%M}", "", "## Pedido", redactar_secretos(estado["pedido"]), "",
+                  "## Plan maestro", "```", maestro.como_texto(), "```", "", "## Etapas"]
+        for e in maestro.etapas:
+            lineas.append(f"- Etapa {e.id} · {e.titulo}: **{e.estado}** · intentos {e.intentos} · "
+                          f"{formatear_duracion(e.segundos)} · ~{e.consumo} tokens"
+                          + (f" · informe: {e.informe}" if e.informe else ""))
+            if e.motivo and not e.ok:
+                lineas.append(f"  - motivo: {recortar(e.motivo, 400)}")
+        integ = estado.get("integracion", {})
+        lineas += ["", "## Integración final", f"- estado: {integ.get('estado', 'no corrió')}",
+                   f"- juez: {integ.get('juicio', '—')}"]
+        lineas += [f"- falta: {f}" for f in integ.get("faltantes", [])]
+        try:
+            carpeta = self.ws.carpeta_reaper() / "informes"
+            ruta = carpeta / f"proyecto_grande_{datetime.now():%Y%m%d_%H%M%S}.md"
+            escritura_atomica(ruta, "\n".join(lineas) + "\n")
+            return ruta
+        except OSError:
+            return None
+
+    def mostrar_estado(self) -> None:
+        try:
+            estado = self.leer()
+        except ValueError as e:
+            self.ui.error(str(e))
+            return
+        if not estado:
+            self.ui.tenue("No hay ningún proyecto grande en esta carpeta. Empezá uno con /grande <pedido>.")
+            return
+        maestro = self.maestro_de(estado)
+        hechas = sum(1 for e in maestro.etapas if e.ok)
+        self.ui.info(f"Proyecto grande ({estado.get('estado')}): {hechas}/{len(maestro.etapas)} etapas verificadas")
+        self.ui.tenue("  " + recortar(redactar_secretos(estado["pedido"]), 200))
+        self._mostrar_maestro(maestro)
+        if estado.get("motivo"):
+            self.ui.aviso("  Último motivo de parada: " + recortar(str(estado["motivo"]), 300))
+
+
+def _cmd_grande(self: "App", arg: str) -> None:
+    """/grande <pedido> | estado | continuar | descartar — proyecto grande construido por etapas verificadas."""
+    modo = arg.strip().lower()
+    grande = ConstructorGrande(self.llm, self.ws, self.settings, self.ui, construir_build=self._build_de_etapa)
+    if modo == "estado":
+        grande.mostrar_estado()
+        return
+    if modo == "descartar":
+        if self.ui.confirmar("¿Descartar el ESTADO del proyecto grande? Los archivos del proyecto no se borran."):
+            grande.borrar()
+            self.ui.ok("Estado del proyecto grande descartado; los archivos siguen intactos.")
+        return
+    if modo == "continuar":
+        grande.continuar()
+        return
+    if not arg.strip():
+        self.ui.tenue("Uso: /grande <pedido> | estado | continuar | descartar   "
+                      f"(hasta {self.settings.max_etapas} etapas; cada una es un /construir verificado)")
+        return
+    grande.iniciar(arg.strip(), confirmar=self.ui.interactivo and self.settings.modo != "auto")
+
+
+def _build_de_etapa(self: "App", pedido_etapa: str, reanudar: bool, pedido_usuario: str) -> "InformeBuild":
+    """Un /construir de etapa con la misma contabilidad que /construir (historial, estadísticas, hooks)."""
+    return self._construir_informe(pedido_etapa, confirmar=False, reanudar=reanudar, pedido_usuario=pedido_usuario)
+
+
+App.cmd_grande = _cmd_grande
+App._build_de_etapa = _build_de_etapa
+
+
+# ======================================================================
 # MÓDULO: main
 # ======================================================================
 """Punto de entrada."""
@@ -55617,6 +56817,8 @@ def construir_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("-p", "--pedido", help="ejecuta un pedido con el agente principal y sale")
     parser.add_argument("--construir", help="corre el pipeline completo (tests primero + torneo) y sale")
+    parser.add_argument("--grande", help="proyecto grande por etapas verificadas (plan maestro + un /construir por "
+                                         "etapa + integración final) y sale")
     parser.add_argument("--plan", help="solo exploración + plan y sale")
     parser.add_argument("--torneo", help="corre un torneo de implementadores para una tarea y sale")
     parser.add_argument("--escribir", nargs=2, metavar=("RUTA", "DESCRIPCION"), help="genera un archivo largo y sale")
@@ -55699,7 +56901,7 @@ def main(argv: Optional[list] = None) -> int:
     aplicar_tema(settings.tema)
     aplicar_flags_cli(settings, args)
 
-    no_interactivo = bool(args.pedido or args.construir or args.plan or args.torneo or args.escribir
+    no_interactivo = bool(args.pedido or args.construir or args.grande or args.plan or args.torneo or args.escribir
                           or args.evaluar is not None or args.comportamiento is not None or args.aceptacion)
     log = LOGS_DIR / f"{datetime.now():%Y%m%d}.log" if settings.log else None
     ui = UI(interactivo=not no_interactivo or sys.stdin.isatty(), log=log,
@@ -55802,6 +57004,12 @@ def main(argv: Optional[list] = None) -> int:
             ok = app.construir(args.construir, confirmar=not args.auto)
             if time.monotonic() - inicio > 120:
                 notificar("REAPER", f"Build {'verificada ✓' if ok else 'fallida ✗'}: {args.construir[:80]}")
+            return 0 if ok else 2
+        if args.grande:
+            grande = ConstructorGrande(llm, app.ws, settings, ui, construir_build=app._build_de_etapa)
+            ok = grande.iniciar(args.grande, confirmar=not args.auto)
+            if time.monotonic() - inicio > 120:
+                notificar("REAPER", f"Proyecto grande {'terminado ✓' if ok else 'incompleto ✗'}: {args.grande[:80]}")
             return 0 if ok else 2
         if args.torneo:
             app.cmd_torneo(args.torneo)

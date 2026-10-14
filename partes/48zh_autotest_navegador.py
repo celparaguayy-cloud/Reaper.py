@@ -72,8 +72,13 @@ class TestBundleSinNombresPisados(BaseTest):
         for nodo in ast.parse(fuente).body:
             if isinstance(nodo, (ast.Assign, ast.AnnAssign)):
                 objetivos = nodo.targets if isinstance(nodo, ast.Assign) else [nodo.target]
-                for t in objetivos:
-                    contador.update(n.id for n in ast.walk(t) if isinstance(n, ast.Name))   # también `_A, _B = …`
+                pendientes = list(objetivos)
+                while pendientes:                     # `_A, _B = …` cuenta; `App.cmd_x = …` (atributo) no redefine App
+                    t = pendientes.pop()
+                    if isinstance(t, ast.Name):
+                        contador[t.id] += 1
+                    elif isinstance(t, (ast.Tuple, ast.List)):
+                        pendientes.extend(t.elts)
             elif isinstance(nodo, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 contador[nodo.name] += 1
         repetidos = sorted(n for n, k in contador.items() if k > 1 and n not in self.EXTENSIONES_A_PROPOSITO)

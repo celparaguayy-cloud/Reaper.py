@@ -11,8 +11,8 @@ Garantías (las mismas de las pruebas reales de octubre 2026):
 - Gasto de la cuenta antes y después, y búsqueda de la clave en todos los logs, informes y proyectos (no debe
   aparecer en ningún lado).
 
-Uso:  OPENROUTER_API_KEY=... python3 pruebas_fusion/prueba_real.py [juego] [web] [script] [--minutos N]
-      (sin nombres corre los tres, uno detrás del otro)
+Uso:  OPENROUTER_API_KEY=... python3 pruebas_fusion/prueba_real.py [juego] [web] [script] [grande] [--minutos N]
+      (sin nombres corre juego, web y script; "grande" va aparte porque tarda mucho más: usa --grande, por etapas)
 """
 import json
 import os
@@ -58,7 +58,19 @@ PROYECTOS = {
         "organizado; 'estadisticas CARPETA' muestra cuántos archivos y cuánto espacio hay por categoría. "
         "Tests con unittest en tests/ usando carpetas temporales."
     ),
+    # Proyecto GRANDE: no entra en un solo /construir; se corre con --grande (plan maestro + etapas verificadas).
+    "grande": (
+        "Un sistema de gestión para un almacén de barrio, en Python con solo la librería estándar. Productos con "
+        "código, nombre, precio y stock; clientes; ventas con varios productos que descuentan el stock y NO "
+        "permiten vender sin stock; reporte de ventas por día y de los productos más vendidos; exportar productos "
+        "y ventas a CSV. Base sqlite3 que se crea sola. Una API JSON con http.server: productos (listar, buscar, "
+        "crear, editar), clientes, ventas (crear y listar) y reportes, validando los datos con mensajes de error "
+        "claros. Una página web en web/ (index.html, app.js, style.css) para cargar una venta, ver el stock y los "
+        "reportes, adaptable al celular. Arranca con 'python3 -m almacen --puerto 8000'. Tests con unittest en "
+        "tests/ para cada módulo y para la API levantando el servidor en un puerto libre."
+    ),
 }
+MODO_GRANDE = {"grande"}                                               # estos usan --grande en vez de --construir
 
 
 def _key() -> str:
@@ -109,6 +121,15 @@ def _configurar(home: Path, clave: str) -> dict:
 
 
 def _estado(proyecto: Path) -> str:
+    grande = proyecto / ".reaper" / "proyecto_grande.json"
+    if grande.is_file():
+        try:
+            datos = json.loads(grande.read_text(encoding="utf-8"))
+            etapas = datos["maestro"]["etapas"]
+            hechas = sum(1 for e in etapas if e.get("estado") in ("verificada", "validada"))
+            return f"{datos.get('estado')} ({hechas}/{len(etapas)} etapas)"
+        except (OSError, ValueError, KeyError, TypeError):
+            return "estado de /grande ilegible"
     informes = sorted((proyecto / ".reaper" / "informes").glob("build_*.md"))
     if not informes:
         return "sin informe (no llegó al cierre)"
@@ -121,7 +142,7 @@ def main() -> int:
     if "--minutos" in sys.argv:
         minutos = int(sys.argv[sys.argv.index("--minutos") + 1])
         args = [a for a in args if a != str(minutos)]
-    elegidos = args or list(PROYECTOS)
+    elegidos = args or [p for p in PROYECTOS if p not in MODO_GRANDE]
     desconocidos = [a for a in elegidos if a not in PROYECTOS]
     if desconocidos:
         sys.exit(f"Proyectos desconocidos: {desconocidos}. Opciones: {', '.join(PROYECTOS)}")
@@ -143,9 +164,11 @@ def main() -> int:
             env.pop("OPENROUTER_API_KEY", None)                        # REAPER la lee del archivo del HOME aislado
             try:
                 with open(log, "w", encoding="utf-8") as salida:
+                    modo = "--grande" if nombre in MODO_GRANDE else "--construir"
+                    tope = minutos * 60 * (4 if nombre in MODO_GRANDE else 1)   # varias builds, una por etapa
                     rc = subprocess.run([sys.executable, str(REAPER), "--proyecto", str(proyecto), "--sin-animacion",
-                                         "--auto", "--construir", PROYECTOS[nombre]], stdout=salida,
-                                        stderr=subprocess.STDOUT, env=env, timeout=minutos * 60).returncode
+                                         "--auto", modo, PROYECTOS[nombre]], stdout=salida,
+                                        stderr=subprocess.STDOUT, env=env, timeout=tope).returncode
             except subprocess.TimeoutExpired:
                 rc = "TIMEOUT"
             filas.append((nombre, rc, _estado(proyecto), round((time.monotonic() - inicio) / 60, 1)))

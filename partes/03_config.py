@@ -253,6 +253,8 @@ class Settings:
     # por módulo hasta este tope. 12 por defecto para que un proyecto mediano no se trunque; subilo para uno grande
     # (/config max_tareas 40). Al pasarse, el resto se agrupa en la última tarea y se avisa.
     max_tareas: int = 12
+    # /grande: tope de ETAPAS del plan maestro (cada etapa es un /construir de hasta max_tareas tareas).
+    max_etapas: int = 10
     paralelo: int = 2
     qa: bool = True
 
@@ -361,6 +363,7 @@ class Settings:
         acotar("tiempo_max_build", 0, 86400)
         acotar("max_revisiones", 0, 5)
         acotar("max_tareas", 1, 60)
+        acotar("max_etapas", 2, 30)
         acotar("paralelo", 1, 8)
         acotar("candidatos", 1, 6)
         acotar("paralelo_torneo", 1, 6)

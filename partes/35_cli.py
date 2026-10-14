@@ -20,6 +20,8 @@ COMANDOS_AYUDA = [
     ]),
     ("EQUIPO", [
         ("/construir <pedido>", "exploradores → arquitecto → tests primero → torneo por tarea → verificación → reparador"),
+        ("/grande <pedido>", "proyecto grande: plan maestro por etapas, cada etapa un /construir verificado"),
+        ("/grande estado · continuar", "ver el avance por etapa y retomar donde quedó (aunque se haya cortado)"),
         ("/pendiente · /continuar", "revisar y reanudar con control tareas que agotaron pasos"),
         ("/plan <pedido>", "solo exploración + plan (se guarda en .reaper/planes)"),
         ("/modo plan", "modo plan: propone un plan en solo lectura y lo ejecuta cuando lo aprobás"),
@@ -405,6 +407,10 @@ class App:
         return res.ok
 
     def construir(self, pedido: str, confirmar: bool = True, reanudar: bool = False) -> bool:
+        return self._construir_informe(pedido, confirmar, reanudar).ok
+
+    def _construir_informe(self, pedido: str, confirmar: bool = True, reanudar: bool = False,
+                           pedido_usuario: Optional[str] = None) -> "InformeBuild":
         if reanudar:
             try:
                 previo = RegistroBuild(self.ws).leer()
@@ -413,15 +419,17 @@ class App:
                 return False
             if not previo:
                 self.ui.aviso("No hay ninguna construcción pendiente.")
-                return False
+                return InformeBuild("cancelada")
             pedido = previo["pedido"]
         conflicto = detectar_workspace_mezclado(self.ws, pedido)
         if conflicto:
             self.ui.aviso(conflicto)
             self.ui.aviso("Usá /proyecto para abrir una carpeta nueva; no tocaré ni borraré tests ajenos.")
-            return False
+            return InformeBuild("cancelada")
         self._pedido_actual = pedido
-        informe = Orquestador(self.llm, self.ws, self.settings, self.ui).construir(pedido, confirmar, reanudar=reanudar)
+        orquestador = Orquestador(self.llm, self.ws, self.settings, self.ui)
+        orquestador.pedido_usuario = pedido_usuario
+        informe = orquestador.construir(pedido, confirmar, reanudar=reanudar)
         self.historial.append((datetime.now().strftime("%H:%M"), f"/construir {pedido[:180]}", informe.ok))
         if informe.estado != "cancelada":
             self.estadisticas.registrar(
@@ -431,7 +439,7 @@ class App:
             if hooks_autorizados(self):          # hooks del repo: consentimiento una vez, cerrado si no hay TTY
                 for r in ejecutar_hooks(self.ws, "despues_de_build", {"estado": informe.estado, "pedido": pedido[:200]}):
                     (self.ui.tenue if r.ok else self.ui.aviso)(f"  hook: {r.comando} → {'ok' if r.ok else 'falló'}")
-        return informe.ok
+        return informe
 
     # ------------------------------------------------------------ comandos
     def comando(self, entrada: str) -> Optional[str]:

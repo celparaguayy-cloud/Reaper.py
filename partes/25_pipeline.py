@@ -137,12 +137,16 @@ _RE_META_TAREA = re.compile(
     r"(?:(?:las?|los|the)\s+)?(?:pruebas|tests?|suite|unit\s*tests?)\b", re.IGNORECASE)
 
 
-def problemas_del_plan(plan) -> list:
-    """Determinista (0 tokens): tareas que planean simular o que no entregan nada. → mensajes para replanificar."""
+def problemas_del_plan(plan, pedido: str = "") -> list:
+    """Determinista (0 tokens): tareas que planean simular o que no entregan nada. → mensajes para replanificar.
+    "Datos de ejemplo" no cuenta si el PEDIDO los pide ("la base arranca con 3 recetas de ejemplo")."""
     salida = []
+    pide_ejemplos = "ejemplo" in familias_pedidas(pedido)
     for tarea in getattr(plan, "tareas", []) or []:
         texto = tarea.descripcion or ""
         m = _RE_TAREA_SIMULADA.search(texto) or _RE_TODO.search(texto)
+        if m and pide_ejemplos and re.search(r"ejemplo", m.group(0), re.I):
+            m = _RE_TODO.search(texto)
         if m:
             salida.append(f"la tarea {tarea.id} planea una simulación («{m.group(0)}»): tiene que implementar "
                           "el código real y completo, sin esqueletos ni placeholders")
@@ -685,10 +689,13 @@ def parsear_plan(texto: str, pedido: str, max_tareas: int = 8) -> Plan:
 
     if len(tareas) > max_tareas:
         sobrantes = tareas[max_tareas - 1:]
+        ids_sobrantes = {t.id for t in sobrantes}
         tareas = tareas[: max_tareas - 1] + [Tarea(
             sobrantes[0].id,
             "\n".join(f"- {t.descripcion}" for t in sobrantes),
             sorted({a for t in sobrantes for a in t.archivos}),
+            # Antes se perdían: la tarea agrupada podía correr aunque una de la que dependía hubiera fallado.
+            sorted({d for t in sobrantes for d in t.deps if d not in ids_sobrantes}),
         )]
 
     criterios = []
@@ -1056,6 +1063,15 @@ def _es_test(rel: str) -> bool:
     return any(fnmatch.fnmatch(rel, p) for p in PATRONES_TESTS)
 
 
+def fallos_tolerables_al_reintentar(fallan_ahora: set, fallaban_al_inicio: Sequence[str], tarea, tareas) -> set:
+    """Al RE-EJECUTAR una tarea que falló o se cortó, ¿qué tests en rojo no son culpa suya? Los que ya fallaban al
+    empezar la build y los de archivos de test que declaran OTRAS tareas (en una corrida normal también se
+    toleran). Los suyos —o los que rompió y no declaraba— no: si no, su propio test en rojo pasaba por "previo"."""
+    ajenos = {rel: None for t in tareas if t.id != tarea.id for rel in t.archivos if _es_test(rel)}
+    previos = set(fallaban_al_inicio)
+    return {n for n in fallan_ahora if n in previos or (ajenos and _es_de_especificacion(n, ajenos))}
+
+
 def _es_de_especificacion(nombre_test: str, protegidos: dict) -> bool:
     """¿El test que falla pertenece a un archivo de la especificación? (pytest usa ruta::test, unittest modulo.Clase.test)"""
     for rel in protegidos:
@@ -1285,6 +1301,9 @@ class Orquestador:
         self.escalador = Escalador(llm, settings, ui)
         self._protegidos: dict[str, Optional[str]] = {}
         self._huella_aceptacion: Optional[str] = None
+        # Pedido ORIGINAL del usuario cuando el pedido de la build lo arma REAPER (etapas de /grande): lo que
+        # autoriza reescribir archivos previos o pedir "datos de ejemplo" sale de acá, nunca del plan del modelo.
+        self.pedido_usuario: Optional[str] = None
 
     def _sub(self, rol: str, tarea: str, cid: Optional[int], archivos: str = "", titulo: str = "",
              **opciones) -> ResultadoAgente:
@@ -1379,7 +1398,8 @@ class Orquestador:
         crudas = len(_RE_TAREA.findall(texto))
         if crudas > self.settings.max_tareas:
             self.ui.aviso(f"  El plan traía {crudas} tareas y el tope es {self.settings.max_tareas}: agrupé el resto "
-                          f"en la última. Para un proyecto grande subí el tope: /config max_tareas {min(60, crudas)}")
+                          f"en la última. Para un proyecto grande usá /grande (por etapas verificadas) o subí el tope: "
+                          f"/config max_tareas {min(60, crudas)}")
         if not res.ok:
             self.ui.aviso("El arquitecto no terminó limpio; uso lo que produjo.")
         motivo = plan_degenerado(plan, pedido, texto)
@@ -1818,7 +1838,7 @@ class Orquestador:
             return  # la build ya está en rojo/parcial: el juez solo endurece, no hay verde que revisar
         # 1) EXAMEN DE REALIDAD, gratis: si algo es una simulación (funciones pedidas vacías, NotImplementedError,
         #    tests que no prueban nada), el juez decide SIN llamar al modelo. Gasta 0 tokens y hace más que nadie.
-        realidad = examen_de_realidad(self.ws, informe.cid, plan, pedido)
+        realidad = examen_de_realidad(self.ws, informe.cid, plan, self.pedido_usuario or pedido)
         if realidad:
             self._aplicar_juicio(Juicio(False, realidad, [], "high", determinista=True), informe)
             return
@@ -1926,7 +1946,7 @@ class Orquestador:
                                        plan)
         # Juez (0 tokens): un plan que ORDENA simular (esqueletos, NotImplementedError, TODO) o que trae tareas de
         # "solo correr las pruebas" se rehace una vez con las razones. Lo que quede de meta-tareas se quita solo.
-        problemas = problemas_del_plan(plan)
+        problemas = problemas_del_plan(plan, self.pedido_usuario or pedido)
         if problemas:
             self.ui.aviso("  Juez · el plan pide simulaciones o tareas sin entrega: lo hago replanificar.")
             for problema in problemas[:4]:
@@ -2168,7 +2188,7 @@ class Orquestador:
             return InformeBuild("cancelada")
         base = ejecutar_tests(self.ws, timeout=self.settings.tests_timeout, completo=True)
         base_fallaba = base is not None and not base.ok
-        if base_fallaba:
+        if base_fallaba and not reanudar:
             self.ui.aviso("Atención: la suite de tests YA falla antes de empezar; se tendrá en cuenta.")
         # La huella original es ajena al LLM: si sus tests cambian durante la
         # construcción, el verificador fallará sin conceder un falso verde.
@@ -2246,6 +2266,16 @@ class Orquestador:
                     self.ui.error("Los tests de especificación cambiaron: " + rel)
                     return InformeBuild("cancelada")
                 self._protegidos[rel] = self.ws.leer(rel)
+            # Lo que fallaba ANTES de la build sale del diario, no de medir ahora: al retomar, la suite puede estar
+            # roja por esta MISMA build (una tarea que falló). Medirlo de nuevo lo convertía en "ya fallaba antes" y
+            # la tarea re-ejecutada quedaba VERIFICADA con su propio test en rojo (y nunca más se reintentaba).
+            if "base_fallaba" in previo:
+                if base_fallaba and not previo["base_fallaba"]:
+                    self.ui.tenue("  La suite falla al retomar por cambios de esta misma build (antes de empezar "
+                                  "pasaba): se repara, no se toma como fallo previo.")
+                base_fallaba = bool(previo["base_fallaba"])
+            elif base_fallaba:
+                self.ui.aviso("Atención: la suite de tests falla al retomar (diario sin el estado inicial).")
             self.ui.info("Retomo la build desde el checkpoint guardado, sin replanificar.")
         else:
             if previo and previo.get("estado") not in ("verificada", "validada"):
@@ -2268,13 +2298,18 @@ class Orquestador:
                       "tests_protegidos": {}, "archivos_verificados": {}, "estado": "en_curso",
                       "especificacion_completa": False,
                       "tests_primero": bool(self.settings.tests_primero),
-                      "huella_aceptacion": huella_actual}
+                      "huella_aceptacion": huella_actual,
+                      # Estado de la suite AL EMPEZAR: al retomar, es la única base honesta para decidir qué
+                      # fallo es "previo" y cuál lo causó esta build.
+                      "base_fallaba": bool(base_fallaba),
+                      "fallaban_al_inicio": sorted(conteo_de_resultado(base).nombres_fallados) if base else []}
             self._huella_aceptacion = huella_actual
             # ¿Quién autoriza reescribir un archivo que ya existía? Vos: pidiéndolo, o aprobando un plan que lo
             # anunciaba (el aviso sale antes de aprobar). Sin eso, PRESERVAR lo protege. Antes no había forma: hasta
             # un "reescribí app.py desde cero" terminaba en REESCRITURA DESTRUCTIVA y tarea fallida.
             reemplazos = reemplazos_del_plan(self.ws, plan)
-            if reemplazos and (getattr(self, "_plan_confirmado", False) or _RE_REESCRITURA_PEDIDA.search(pedido)):
+            if reemplazos and (getattr(self, "_plan_confirmado", False)
+                               or _RE_REESCRITURA_PEDIDA.search(self.pedido_usuario or pedido)):
                 previo["reemplazos_autorizados"] = sorted(reemplazos)
             elif reemplazos:
                 self.ui.aviso("  El plan quiere reemplazar " + ", ".join(sorted(reemplazos)[:6]) + " pero no lo "
@@ -2383,9 +2418,13 @@ class Orquestador:
             previo["huellas_inicio"] = registro_build.huellas()
             registro_build.guardar(previo)
             planeados_despues = [a for t_sig in plan.tareas[i + 1:] for a in t_sig.archivos]
+            estado_previo_tarea = previo["estados"].get(tarea.id) if reanudar else None
             antes_tests = ejecutar_tests(self.ws, timeout=self.settings.tests_timeout, completo=True)
             conteo_antes = conteo_de_resultado(antes_tests)
             nombres_antes = set(conteo_antes.nombres_fallados)
+            if estado_previo_tarea in ("fallida", "en_curso") and "fallaban_al_inicio" in previo:
+                nombres_antes = fallos_tolerables_al_reintentar(
+                    nombres_antes, previo["fallaban_al_inicio"], tarea, plan.tareas)
             tcid = self.ws.checkpoints.iniciar(f"tarea {tarea.id}", grupo=grupo)
             previo["tcid"] = tcid
             registro_build.guardar(previo)

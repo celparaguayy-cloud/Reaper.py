@@ -92,6 +92,37 @@ capitulo("modos", "Modos y permisos", """
     modo: no es censura, protegen el celular de un error del modelo.
 """)
 
+capitulo("grande", "/grande: proyectos grandes por etapas verificadas", """
+    # /grande
+
+    Para lo que no entra en un solo /construir (una app con base de datos, API, panel, varias pantallas…).
+
+    ```
+    plan maestro: visión + arquitectura + ETAPAS (archivos, interfaz que deja, criterios, dependencias)
+      → tu aprobación
+      → por etapa, en orden de dependencias: un /construir COMPLETO (tests, juez, preservación, realidad)
+           · si no queda verificada: se retoma UNA vez su misma build; si sigue mal, se FRENA
+           · nada se construye encima de una etapa que no está verificada
+      → integración final: verificación real de TODO el proyecto + juez contra tu pedido ORIGINAL
+           · si falta algo: UNA build de integración con lo que falta
+    ```
+
+    ## Comandos
+
+    - `/grande <pedido>` arma el plan maestro y arranca (con `--auto` o `reaper --grande "..."` no pregunta).
+    - `/grande estado` muestra qué etapas están verificadas y por qué paró la última.
+    - `/grande continuar` retoma donde quedó, aunque se haya cortado a mitad de una etapa (no replanifica).
+    - `/grande descartar` borra solo el estado; tus archivos quedan.
+    - `/config max_etapas 15` sube el tope de etapas (2 a 30; cada etapa hasta `max_tareas` tareas).
+
+    ## Lo que NO hace
+
+    - No convierte un modelo débil en uno fuerte: si una etapa no sale, se detiene y te lo dice.
+    - Lo que el modelo escribe en el plan maestro no autoriza nada: reescribir archivos que ya tenías o aceptar
+      "datos de ejemplo" se decide con TU pedido.
+""")
+
+
 capitulo("construir", "/construir: el pipeline completo", """
     # /construir
 

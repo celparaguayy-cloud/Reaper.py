@@ -8,6 +8,8 @@ def construir_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("-p", "--pedido", help="ejecuta un pedido con el agente principal y sale")
     parser.add_argument("--construir", help="corre el pipeline completo (tests primero + torneo) y sale")
+    parser.add_argument("--grande", help="proyecto grande por etapas verificadas (plan maestro + un /construir por "
+                                         "etapa + integración final) y sale")
     parser.add_argument("--plan", help="solo exploración + plan y sale")
     parser.add_argument("--torneo", help="corre un torneo de implementadores para una tarea y sale")
     parser.add_argument("--escribir", nargs=2, metavar=("RUTA", "DESCRIPCION"), help="genera un archivo largo y sale")
@@ -90,7 +92,7 @@ def main(argv: Optional[list] = None) -> int:
     aplicar_tema(settings.tema)
     aplicar_flags_cli(settings, args)
 
-    no_interactivo = bool(args.pedido or args.construir or args.plan or args.torneo or args.escribir
+    no_interactivo = bool(args.pedido or args.construir or args.grande or args.plan or args.torneo or args.escribir
                           or args.evaluar is not None or args.comportamiento is not None or args.aceptacion)
     log = LOGS_DIR / f"{datetime.now():%Y%m%d}.log" if settings.log else None
     ui = UI(interactivo=not no_interactivo or sys.stdin.isatty(), log=log,
@@ -193,6 +195,12 @@ def main(argv: Optional[list] = None) -> int:
             ok = app.construir(args.construir, confirmar=not args.auto)
             if time.monotonic() - inicio > 120:
                 notificar("REAPER", f"Build {'verificada ✓' if ok else 'fallida ✗'}: {args.construir[:80]}")
+            return 0 if ok else 2
+        if args.grande:
+            grande = ConstructorGrande(llm, app.ws, settings, ui, construir_build=app._build_de_etapa)
+            ok = grande.iniciar(args.grande, confirmar=not args.auto)
+            if time.monotonic() - inicio > 120:
+                notificar("REAPER", f"Proyecto grande {'terminado ✓' if ok else 'incompleto ✗'}: {args.grande[:80]}")
             return 0 if ok else 2
         if args.torneo:
             app.cmd_torneo(args.torneo)
