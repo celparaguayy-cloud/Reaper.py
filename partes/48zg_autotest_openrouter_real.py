@@ -343,3 +343,47 @@ class TestOpenRouterRealMargenRazonamiento(BaseTest):
         self.assertGreaterEqual(pagos[1]["max_tokens"], 2048)            # el respaldo ya va con margen
         c.chat([{"role": "user", "content": "y"}], max_tokens=350)
         self.assertGreaterEqual(pagos[2]["max_tokens"], 2048)            # y los pedidos siguientes también
+
+
+class TestOpenRouterRealTareaSinArchivos(BaseTest):
+    PLAN = """<plan>
+<objetivo>Sumadora</objetivo>
+<interfaz>
+- calc.py: def sumar(a, b) -> int
+</interfaz>
+<tarea id="1" archivos="calc.py">Crear calc.py con def sumar(a, b).</tarea>
+<tarea id="2" archivos="" deps="1">Repasar que la implementación cumpla la interfaz pedida.</tarea>
+<criterios>
+- sumar(2, 3) == 5
+</criterios>
+</plan>"""
+
+    def _construir(self, tests_pasan=True):
+        def guion(mensajes, kw):
+            rol = MockLLM.rol_de(mensajes)
+            turno = _turno(mensajes)
+            todo = "\n".join(m["content"] for m in mensajes if m["role"] == "user")
+            actual = re.search(r"TU TAREA AHORA \(#(\d+)\)", todo)
+            if rol == "arquitecto":
+                return terminar_xml(self.PLAN)
+            if rol == "implementador" and actual and actual.group(1) == "1":
+                cuerpo = "return a + b" if tests_pasan else "return a - b"
+                return herramienta_xml("write_to_file", path="calc.py", content=f"def sumar(a, b):\n    {cuerpo}\n") \
+                    if turno == 0 else terminar_xml("calc.py listo")
+            return terminar_xml("revisado: cumple la interfaz")
+
+        ws = self.proyecto({"tests/test_calc.py": "import unittest\nfrom calc import sumar\n\n\nclass T(unittest.TestCase):\n"
+                                                  "    def test_suma(self):\n        self.assertEqual(sumar(2, 3), 5)\n"})
+        ajustes = self.ajustes(tests_primero=False, torneo=False, escalar=False, max_revisiones=0, qa=False,
+                               max_reparaciones=1, juez=False)
+        return Orquestador(MockLLM(guion), ws, ajustes, self.ui()).construir("sumadora", confirmar=False)
+
+    def test_tarea_sin_archivos_que_termina_limpia_no_falla(self):
+        # Build real 4: "- ejecutar las pruebas…" sin archivos → SIN CAMBIOS → 3 reparaciones → PARCIAL con todo OK.
+        informe = self._construir(tests_pasan=True)
+        self.assertEqual(informe.tareas_fallidas, [], informe.notas)
+        self.assertTrue(informe.ok, informe.notas)
+
+    def test_si_la_suite_falla_no_se_regala_nada(self):
+        informe = self._construir(tests_pasan=False)                    # sumar resta: la suite falla
+        self.assertFalse(informe.ok)

@@ -1892,7 +1892,13 @@ class Orquestador:
             # exigiendo cambios reales.
             creados_en_build = bool(declarados) and not faltantes and cid_build is not None and all(
                 self.ws.checkpoints._origen(rel, cid_build)[0] == "nuevo" for rel in declarados)
-            if not archivos and not creados_en_build:
+            # Una tarea que NO declara archivos ("- ejecutar las pruebas…") no tiene entrega verificable: si terminó
+            # limpia y la suite pasa, exigirle cambios solo quemaba reparaciones (prueba real: 3 reparaciones inútiles
+            # y build PARCIAL con todo funcionando; en otra corrida el reparador creó un archivo para "cumplir").
+            # El resultado lo juzgan la verificación final y el juez.
+            sin_entrega_declarada = (not declarados and not exigir_progreso
+                                     and tests is not None and tests.ok)
+            if not archivos and not creados_en_build and not sin_entrega_declarada:
                 problemas.append("SIN CAMBIOS: la tarea no modificó archivos del proyecto. "
                                  "No se puede verificar una implementación solo por el texto del modelo.")
             # DESVÍO: cambió archivos pero NINGUNO de los que la tarea declaró (p. ej. bumpeó la versión en vez de
