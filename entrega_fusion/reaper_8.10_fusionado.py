@@ -3356,8 +3356,12 @@ def analizar(texto: str, esquemas: Esquemas) -> Analisis:
         for obj in _objetos_json(limpio):
             if obj.keys() & {"tool", "name", "herramienta"}:
                 continue
+            # Valores planos (texto, número, lista de textos). Con objetos anidados es casi siempre un RESULTADO
+            # inventado (logs reales: {"items": [{"type": "file", "path": ...}]} = un listado alucinado), no un pedido.
+            planos = all(isinstance(v, (str, int, float, bool)) or
+                         (isinstance(v, list) and all(isinstance(x, str) for x in v)) for v in obj.values())
             claves = {_canonico_param(k) for k in obj}
-            candidatas = [n for n, ps in esquemas.items() if claves and claves <= {p for p, _ in ps}]
+            candidatas = [n for n, ps in esquemas.items() if planos and claves and claves <= {p for p, _ in ps}]
             if len(candidatas) == 1 and candidatas[0] != "attempt_completion":
                 llamadas.append(Llamada(candidatas[0], _params_json(obj), True,
                                         json.dumps(obj, ensure_ascii=False)))
@@ -11875,7 +11879,16 @@ class Agente:
         if h is None or nombre not in self.rol.herramientas:
             disponibles = ", ".join(self.rol.herramientas)
             self.ui.resultado_herramienta(False, f"herramienta no disponible: {nombre}")
-            return obs(f"ERROR: '{nombre}' no existe o no está disponible para tu rol. Disponibles: {disponibles}"), True
+            pista = ""
+            if nombre in ("execute_command", "run_command", "run_python", "bash", "shell", "terminal", "run_tests"):
+                # Logs reales: el revisor pidió execute_command 15 veces (hasta 6 seguidas) sin entender el "no".
+                if "run_tests" in self.rol.herramientas and nombre != "run_tests":
+                    pista = " Para correr los tests usá run_tests."
+                elif self.rol.solo_lectura:
+                    pista = (" Tu rol es de SOLO LECTURA y no ejecuta comandos: los tests y validadores reales ya los "
+                             "corrió REAPER (el resultado está en tu pedido). Revisá leyendo el código y respondé.")
+            return obs(f"ERROR: '{nombre}' no existe o no está disponible para tu rol.{pista} "
+                       f"Disponibles: {disponibles}"), True
         if not llamada.completa and self._finish_actual != "length" and llamada is self._ultima_llamada \
                 and all(llamada.params.get(p.nombre) not in (None, "") for p in h.params if p.requerido):
             # El mensaje terminó normal y la llamada es la última: el modelo solo olvidó cerrar las etiquetas.
@@ -12829,7 +12842,15 @@ def ejecutar_subagentes(
             raise
         except Exception as e:
             res = ResultadoAgente(False, f"{type(e).__name__}: {e}", sorted(agente.ctx.cambios), 0, "error", rol)
-        ui.agente(agente.etiqueta, ("✓ terminó" if res.ok else f"✗ no completó ({res.motivo})") + f" · {res.pasos} pasos")
+        if res.ok:
+            estado = "✓ terminó"
+        elif res.motivo == "completado":
+            # Terminó, pero su cierre no quedó respaldado (afirmación sin evidencia o archivos que no validan). Antes
+            # decía "✗ no completó (completado)": contradictorio (visto 2 veces en las builds reales).
+            estado = "⚠ terminó, pero su cierre no quedó respaldado por evidencia"
+        else:
+            estado = f"✗ no completó ({res.motivo})"
+        ui.agente(agente.etiqueta, estado + f" · {res.pasos} pasos")
         return res
 
     if not paralelo:
@@ -16021,14 +16042,19 @@ class Orquestador:
         return torneo.correr(texto, archivos=", ".join(tarea.archivos), titulo=titulo,
                              n=self.settings.candidatos if usar_torneo else 1, protegidos=protegidos, cid=cid)
 
-    def revisar(self, pedido: str, tarea: Tarea, diff: str, cid: int) -> tuple[bool, str]:
+    def revisar(self, pedido: str, tarea: Tarea, diff: str, cid: int, tests_reales: str = "") -> tuple[bool, str]:
         rels = self.ws.checkpoints.archivos_desde(cid)
         validacion = resumen_validacion(validar_archivos(self.ws, rels), limite=1500)
+        # El revisor es de solo lectura: sin el resultado real de los tests intentaba correrlos él mismo
+        # (logs reales: 15 pedidos de execute_command rechazados = turnos de modelo perdidos).
+        evidencia = (f"Tests reales (ya los corrió REAPER, no hace falta ejecutarlos): {tests_reales}\n\n"
+                     if tests_reales else "")
         texto = (
             f"PEDIDO ORIGINAL:\n{pedido}\n\n"
             f"TAREA REVISADA (#{tarea.id}):\n{tarea.descripcion}\n\n"
             f"DIFF REAL DE LOS CAMBIOS:\n```diff\n{recortar(diff, 12000)}\n```\n\n"
             f"Validación automática de los archivos cambiados: {validacion}\n\n"
+            f"{evidencia}"
             "Leé los archivos completos si necesitás contexto. Empezá tu informe con la línea VEREDICTO."
         )
         res = self._sub_opcional("revisor", texto, cid, titulo=f"revisa el diff de la tarea {tarea.id}")
@@ -16966,7 +16992,10 @@ class Orquestador:
                 if not diff.strip():
                     informe.notas.append(f"Tarea {tarea.id}: sin cambios en archivos.")
                     break
-                aprobado, revision = self.revisar(pedido, tarea, diff, tcid)
+                conteo_tarea = getattr(verif_tarea, "conteo", None)
+                aprobado, revision = self.revisar(
+                    pedido, tarea, diff, tcid,
+                    tests_reales=conteo_tarea.texto() if conteo_tarea is not None and conteo_tarea.reconocido else "")
                 if aprobado:
                     self.ui.ok(f"Revisor aprobó la tarea {tarea.id}")
                     break
@@ -48726,6 +48755,14 @@ class TestOpenRouterRealJsonSinNombre(BaseTest):
         self.assertEqual([l.nombre for l in a.llamadas], ["update_todo"])
         self.assertEqual(a.llamadas[0].params["items"], "[x] Crear estructura\n[ ] Escribir tests")
 
+    def test_listado_alucinado_no_se_toma_como_pedido(self):
+        # Logs reales (builds 3, 4 y 5): 6 veces el modelo inventó un listado de archivos con forma de "items".
+        texto = ('{\n  "items": [\n    {"type": "file", "path": "conversor/__init__.py"},\n'
+                 '    {"type": "file", "path": "conversor/__main__.py"}\n  ]\n}')
+        self.assertEqual(analizar(texto, esquemas()).llamadas, [])
+        self.assertEqual([l.nombre for l in analizar('{"path": ".", "recursive": true}', esquemas()).llamadas],
+                         ["list_files"])                                  # plano e inequívoco: sí
+
     def test_ambiguos_y_cierres_anticipados_no_se_adivinan(self):
         for texto in ('{"path": "app.py"}',                                       # lo usan muchas herramientas
                       '{"result": "listo, todo implementado"}',                   # nunca cerrar por inferencia
@@ -48742,6 +48779,58 @@ class TestOpenRouterRealJsonSinNombre(BaseTest):
         ws.escribir("gastos/modelos.py", "class Gasto:\n    pass\n")
         salida = self.herramienta(ctx, "update_todo", items="[x] Implementar gastos/modelos.py")
         self.assertNotIn("NO existe", salida)                            # ahora sí existe: sin queja
+
+
+class TestOpenRouterRealRevisorSoloLectura(BaseTest):
+    def _agente(self, rol, respuestas):
+        return Agente(rol, MockLLM(respuestas), self.proyecto({"app.py": "x = 1\n"}), self.ajustes(), self.ui(),
+                      memoria=None, mostrar_progreso=False)
+
+    def test_revisor_que_pide_ejecutar_recibe_una_explicacion_util(self):
+        # Logs reales: el revisor pidió execute_command 15 veces; solo recibía "no disponible" y reintentaba.
+        ag = self._agente("revisor", [])
+        salida, _ = ag._ejecutar_herramienta(Llamada("execute_command", {"command": "python -m app"}, True, ""), {})
+        self.assertIn("SOLO LECTURA", salida)
+        self.assertIn("ya los corrió REAPER", salida)
+
+    def test_rol_con_run_tests_recibe_la_herramienta_correcta(self):
+        ag = self._agente("especificador", [])
+        salida, _ = ag._ejecutar_herramienta(Llamada("execute_command", {"command": "python -m unittest"}, True, ""), {})
+        self.assertIn("usá run_tests", salida)
+
+    def test_el_revisor_recibe_el_resultado_real_de_los_tests(self):
+        vistos = []
+
+        def guion(mensajes, kw):
+            vistos.append(mensajes[-1]["content"])
+            return terminar_xml("VEREDICTO: APROBADO\\nTodo bien.")
+
+        ws = self.proyecto({"app.py": "x = 1\n"})
+        orq = Orquestador(MockLLM(guion), ws, self.ajustes(), self.ui())
+        cid = ws.checkpoints.iniciar("t")
+        ws.escribir("app.py", "x = 2\n")
+        orq.revisar("pedido", Tarea("1", "cambiar x", ["app.py"]), ws.checkpoints.diff_desde(cid), cid,
+                    tests_reales="26 pasaron (unittest)")
+        self.assertIn("Tests reales (ya los corrió REAPER", vistos[0])
+        self.assertIn("26 pasaron", vistos[0])
+
+
+class TestOpenRouterRealMensajeCierre(BaseTest):
+    def test_cierre_sin_respaldo_no_dice_no_completo_completado(self):
+        # Builds reales: "✗ no completó (completado)" aparecía cuando el agente SÍ terminaba pero su informe
+        # afirmaba más de lo que la evidencia sostenía.
+        def guion(m, k):
+            if _turno(m) == 0:
+                return herramienta_xml("write_to_file", path="app.py", content="def f():\n    return 1\n")
+            return terminar_xml("Listo: app.py es 100% correcto, sin errores y listo para producción.")
+
+        ui = self.ui()
+        res = ejecutar_subagentes([("implementador", "creá app.py con f()", "app.py", "prueba", {})],
+                                  MockLLM(guion), self.proyecto(), self.ajustes(), ui, profundidad=1)[0]
+        self.assertFalse(res.ok)
+        texto = ui.texto_registrado()
+        self.assertNotIn("no completó (completado)", texto)
+        self.assertIn("terminó, pero su cierre no quedó respaldado", texto)
 
 
 # ======================================================================

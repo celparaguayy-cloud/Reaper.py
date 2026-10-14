@@ -168,7 +168,7 @@ aparecieron con un modelo real (todos arreglados, 21 tests nuevos, 19 fallan con
 **A auditar:** (a) que el aviso de "tests que pasan sin código" no moleste en proyectos con código parcial; (b) que
 `_RE_TAREA_SIMULADA` no marque tareas legítimas de tests ("mockear la red en los tests" no está en la regex, a
 propósito); (c) el margen de razonamiento con modelos PAGOS (sube el tope a 2048 solo después de ver un corte).
-Regresión 1037 tests OK en Python 3.11/3.12/3.13.
+Regresión 1042 tests OK en Python 3.11/3.12/3.13.
 
 **Después:** bug #9 (tarea sin archivos → "SIN CAMBIOS" con todo funcionando) y bug #10 (el modelo manda solo los
 argumentos JSON de `update_todo` y marca [x] archivos que no existen), ambos arreglados con test. Un proyecto más

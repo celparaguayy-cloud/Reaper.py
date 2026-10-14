@@ -464,3 +464,15 @@ real). Gasto total de todas las pruebas: **$0**. La clave se borró del disco al
 Tests: `partes/48zg_autotest_openrouter_real.py` (27). Contra el código anterior: 19 fallan; los 2 que pasan
 son guardas de "no excederse" (en proyecto existente no se toca; no se reintenta infinito).
 Regresión: **1037 tests OK** en Python 3.11/3.12/3.13. Smoke CLI: 0 fallas. Lint sin hallazgos nuevos.
+
+### 18.b Análisis de los logs reales (sin nuevas llamadas al modelo)
+
+Se reprodujeron offline las respuestas REALES que los modelos dieron en las builds 2–5:
+
+| Hallazgo en los logs | Evidencia | Arreglo |
+|---|---|---|
+| Mi arreglo #11 (JSON sin nombre) también habría tomado como `update_todo` **listados de archivos inventados** (`{"items": [{"type": "file", "path": …}]}`) | 6 de 18 JSON con `items` eran objetos alucinados | Solo se infiere con valores planos (texto/número/lista de textos). Re-ejecutado sobre los 38 JSON reales: 12 listas de tareas → `update_todo`, 6 listados inventados → nada, 2 `list_files` inequívocos → sí |
+| El revisor (solo lectura) pidió `execute_command` **15 veces** (hasta 6 seguidas) y el especificador 2 | conteo por rol en los logs | El revisor recibe el resultado real de los tests que ya corrió REAPER; al rol de solo lectura que pide ejecutar se le explica eso, y al que tiene `run_tests` se le indica usarla |
+| "✗ no completó **(completado)**" | 2 veces | "⚠ terminó, pero su cierre no quedó respaldado por evidencia" (afirmación sin evidencia o archivos que no validan) |
+
+Tests: +5 (todos fallan con el código anterior). Regresión: **1042 tests OK** en Python 3.11/3.12/3.13.
