@@ -1119,7 +1119,7 @@ index 473dc36..bf7642d 100644
                      aplicados.append(c.rel)
              except (ErrorRuta, OSError):
 diff --git a/partes/10_validators.py b/partes/10_validators.py
-index b59a923..e348a87 100644
+index b59a923..60597e7 100644
 --- a/partes/10_validators.py
 +++ b/partes/10_validators.py
 @@ -19,7 +19,12 @@ try:
@@ -1136,7 +1136,49 @@ index b59a923..e348a87 100644
  _CACHE_MODULOS: dict[str, bool] = {}
  _LOCK_IMPORTS = threading.Lock()
  MAX_SALIDA_PROCESO = 400_000
-@@ -69,6 +74,35 @@ def entorno_seguro() -> dict:
+@@ -37,10 +42,31 @@ class Resultado:
+     archivo: str = ""
+     duracion: float = 0.0
+ 
++    def senal(self) -> str:
++        """Si el proceso no terminó solo sino que lo MATÓ una señal (código negativo, o 128+N vía bash), cuál fue.
++        En Android un SIGKILL suele venir del sistema por falta de memoria (p. ej. compilando grpcio con pip):
++        un "exit -9" pelado no le dice nada ni al modelo ni al usuario."""
++        if self.timeout or self.omitido:
++            return ""
++        numero = -self.codigo if self.codigo < 0 else (self.codigo - 128 if self.codigo in (137, 143) else 0)
++        if not numero:
++            return ""
++        try:
++            nombre = signal.Signals(numero).name
++        except ValueError:
++            nombre = f"señal {numero}"
++        if numero == getattr(signal, "SIGKILL", 9):
++            return (f"{nombre} (señal {numero}): el sistema MATÓ el proceso. En Android casi siempre es falta de "
++                    "memoria; no es un error del código. No lo reintentes igual.")
++        return f"{nombre} (señal {numero}): el proceso fue terminado desde afuera."
++
+     def resumen(self, limite: int = 4000) -> str:
+         partes = [f"$ {self.comando}", f"exit code: {self.codigo}"]
+         if self.timeout:
+             partes.append("estado: TIMEOUT")
++        senal = self.senal()
++        if senal:
++            partes.append(f"estado: {senal}")
+         if self.stdout.strip():
+             partes.append("STDOUT:\n" + recortar(self.stdout.strip(), limite))
+         if self.stderr.strip():
+@@ -52,6 +78,9 @@ class Resultado:
+             return f"↷ {self.comando}: {(self.stdout or self.stderr).strip()[:120]}"
+         if self.ok:
+             return f"✓ {self.comando}"
++        senal = self.senal()
++        if senal:
++            return f"✗ {self.comando}: {senal.split(':')[0]}: {senal.split(':', 1)[1].strip()[:120]}"
+         detalle = (self.stderr or self.stdout).strip().splitlines()
+         return f"✗ {self.comando}: {detalle[-1][:160] if detalle else 'exit ' + str(self.codigo)}"
+ 
+@@ -69,6 +98,35 @@ def entorno_seguro() -> dict:
      return env
  
  
@@ -1172,7 +1214,7 @@ index b59a923..e348a87 100644
  def ejecutar(
      cmd: Union[str, list],
      *,
-@@ -76,46 +110,84 @@ def ejecutar(
+@@ -76,46 +134,84 @@ def ejecutar(
      timeout: int = 60,
      shell: bool = False,
      entrada: Optional[str] = None,
@@ -1291,7 +1333,7 @@ index b59a923..e348a87 100644
  
  
  # ==================================================================
-@@ -819,6 +891,10 @@ _SCRIPT_HTML = re.compile(r"<script(?![^>]*\bsrc\s*=)([^>]*)>(.*?)</script\s*>",
+@@ -819,6 +915,10 @@ _SCRIPT_HTML = re.compile(r"<script(?![^>]*\bsrc\s*=)([^>]*)>(.*?)</script\s*>",
  _RECURSOS_HTML = re.compile(r"""<(?:script|link|img|source)\b[^>]*?\b(?:src|href)\s*=\s*["']([^"'#?]+)""", re.I)
  
  
@@ -1302,7 +1344,7 @@ index b59a923..e348a87 100644
  def recursos_html_faltantes(ws: Workspace, ruta: Path, texto: str) -> list[str]:
      faltan = []
      for m in _RECURSOS_HTML.finditer(texto):
-@@ -826,10 +902,15 @@ def recursos_html_faltantes(ws: Workspace, ruta: Path, texto: str) -> list[str]:
+@@ -826,10 +926,15 @@ def recursos_html_faltantes(ws: Workspace, ruta: Path, texto: str) -> list[str]:
          if not destino or re.match(r"^(https?:|//|data:|mailto:|tel:|javascript:|\{\{|\$\{)", destino):
              continue
          if destino.startswith("/"):
@@ -1321,7 +1363,7 @@ index b59a923..e348a87 100644
              linea = texto.count("\n", 0, m.start()) + 1
              faltan.append(f"línea {linea}: referencia a '{destino}' que no existe")
      return faltan
-@@ -1106,6 +1187,94 @@ def validar_proyecto(ws: Workspace, rels: list[str]) -> list[Resultado]:
+@@ -1106,6 +1211,94 @@ def validar_proyecto(ws: Workspace, rels: list[str]) -> list[Resultado]:
      return salida
  
  
@@ -1416,7 +1458,7 @@ index b59a923..e348a87 100644
  def fallos(resultados: list[Resultado]) -> list[Resultado]:
      return [r for r in resultados if not r.ok]
  
-@@ -1141,7 +1310,10 @@ def detectar_comando_tests(ws: Workspace, completo: bool = False) -> Optional[tu
+@@ -1141,7 +1334,10 @@ def detectar_comando_tests(ws: Workspace, completo: bool = False) -> Optional[tu
      )
      if hay_tests_py:
          if importlib.util.find_spec("pytest") is not None:
@@ -1428,7 +1470,7 @@ index b59a923..e348a87 100644
              return f"{py} -m pytest -q{corte} --tb=short -p no:cacheprovider", "pytest"
          for carpeta in ("tests", "test"):
              if (raiz / carpeta).is_dir():
-@@ -1212,7 +1384,12 @@ def ejecutar_tests(ws: Workspace, timeout: int = 300, completo: bool = False) ->
+@@ -1212,7 +1408,12 @@ def ejecutar_tests(ws: Workspace, timeout: int = 300, completo: bool = False) ->
      comando, _nombre = detectado
      r = ejecutar(comando, cwd=ws.raiz, timeout=timeout, shell=True)
      combinado = r.stdout + r.stderr
@@ -1485,10 +1527,30 @@ index eb72fd9..2bb9599 100644
      "archivo", "archivos", "codigo", "código", "funcion", "función", "funciones", "programa", "proyecto",
      "mi", "mis", "tu", "tus", "me", "te", "nos", "hola", "gracias", "bien", "mal", "usar", "usando",
 diff --git a/partes/15_knowledge.py b/partes/15_knowledge.py
-index 881d8b8..e053134 100644
+index 881d8b8..6863cbf 100644
 --- a/partes/15_knowledge.py
 +++ b/partes/15_knowledge.py
-@@ -246,9 +246,14 @@ PISTAS: list[Pista] = [
+@@ -232,6 +232,19 @@ PISTAS: list[Pista] = [
+     Pista(r"error: externally-managed-environment",
+           "pip se niega a instalar en el Python del sistema: usá un venv (`python3 -m venv .venv`) o "
+           "`pip install --user`.", "pip"),
++    # Antes que la pista genérica de compilación: en un teléfono, "instalá clang y reintentá" lleva al mismo
++    # proceso matado por falta de memoria (caso real: grpcio en Termux terminó con signal 9).
++    Pista(r"SIGKILL|\bsignal 9\b|se[ñn]al 9|exit code:? -9\b|exit status -9|^\s*Killed\s*$|"
++          r"Killed signal terminated|unable to execute command: Killed",
++          "El sistema mató el proceso (señal 9). En Android casi siempre es falta de memoria (compilar un paquete "
++          "nativo, varios procesos a la vez). No lo reintentes igual: buscá una versión precompilada "
++          "(`pkg search <nombre>`), una alternativa sin compilación o usá la API HTTP del servicio con "
++          "urllib en vez de su SDK.", "pip"),
++    Pista(r"(?:Building|Failed building|building) wheel for grpcio|grpcio.*(?:error|failed)|"
++          r"No module named 'grpc'",
++          "grpcio no tiene ruedas precompiladas para Termux: pip lo compila en C++ (lento y con mucha memoria; "
++          "suele morir con señal 9). Si el proyecto no lo necesita sí o sí, evitalo: casi todos los servicios "
++          "tienen API REST que se usa con urllib/httpx sin gRPC.", "pip"),
+     Pista(r"Failed building wheel for (\w+)|error: command '(?:gcc|clang)' failed",
+           "El paquete necesita compilarse. En Termux: `pkg install clang make pkg-config` (y libs como "
+           "libxml2, libjpeg-turbo según el paquete) o buscá una alternativa pura en Python.", "pip"),
+@@ -246,9 +259,14 @@ PISTAS: list[Pista] = [
      Pista(r"CONFLICT \(content\)|Automatic merge failed",
            "Conflicto de merge: editá los archivos marcados con <<<<<<< ======= >>>>>>> y hacé commit.", "git"),
      # ------------------------------------------------------------ HTML/CSS/web
@@ -2232,10 +2294,10 @@ index 4eba772..e986b98 100644
                  (self.ws.raiz / rel).unlink()
                  self.restaurados.append(f"{rel} (creado por los tests, borrado)")
 diff --git a/partes/25_pipeline.py b/partes/25_pipeline.py
-index ad78b6b..4e1cd35 100644
+index ad78b6b..169f3f3 100644
 --- a/partes/25_pipeline.py
 +++ b/partes/25_pipeline.py
-@@ -40,6 +40,231 @@ _RE_VEREDICTO = re.compile(r"VEREDICTO\s*:?\s*\**\s*(APROBADO|CAMBIOS|RECHAZADO)
+@@ -40,6 +40,273 @@ _RE_VEREDICTO = re.compile(r"VEREDICTO\s*:?\s*\**\s*(APROBADO|CAMBIOS|RECHAZADO)
  EXTENSIONES_TESTEABLES = (".py", ".js", ".mjs", ".cjs", ".ts")
  
  
@@ -2293,6 +2355,48 @@ index ad78b6b..4e1cd35 100644
 +    if reescritos:
 +        partes.append(f"REESCRITOS casi por completo: {'; '.join(reescritos[:5])}")
 +    return "; ".join(partes)
++
++
++# Intención EXPLÍCITA de reemplazar un archivo (en el pedido o en la tarea). Solo palabras fuertes: "eliminar
++# espacios" o "borrar duplicados" describen lógica, no reescribir el archivo.
++_RE_REEMPLAZO = re.compile(r"\b(?:reemplaz\w*|reescrib\w*|rehac\w*|sustitu\w*|desde\s+cero|"
++                           r"replac\w*|rewrit\w*|from\s+scratch)\b", re.IGNORECASE)
++# Para que el PEDIDO autorice por sí solo una reescritura hace falta intención de archivo ENTERO: "reemplazá
++# print por logging" es una edición chica y no habilita a borrar el 60 % de app.py.
++_RE_REESCRITURA_PEDIDA = re.compile(r"\b(?:reescrib\w*|rehac\w*|desde\s+cero|de\s+cero|rewrit\w*|"
++                                    r"from\s+scratch)\b", re.IGNORECASE)
++
++
++def _primera_linea_util(diagnostico: str, limite: int = 200) -> str:
++    """El motivo de un fallo en una línea, para pantalla y notas. Saltea el eco del comando ("$ ...", "exit code")
++    para mostrar el error en sí. Antes la nota decía solo "quedó con fallos de verificación" y el motivo real
++    (p. ej. REESCRITURA DESTRUCTIVA) no llegaba ni al usuario ni al informe."""
++    for linea in (diagnostico or "").splitlines():
++        texto = linea.strip()
++        if not texto or texto.startswith(("$ ", "exit code", "STDOUT:", "STDERR:", "Hay fallos REALES")):
++            continue
++        return recortar(texto, limite)
++    return "sin detalle"
++
++
++def reemplazos_del_plan(ws, plan) -> dict:
++    """Archivos que YA EXISTEN y que una tarea del plan dice que va a reemplazar → líneas que tienen hoy.
++
++    Determinista, 0 tokens. Sirve para avisar ANTES de aprobar el plan (caso real: el plan decía "Reemplazar la
++    funcionalidad actual" y se llevó puesto un app.py de 204 líneas que el pedido no mencionaba)."""
++    salida: dict = {}
++    for tarea in getattr(plan, "tareas", []) or []:
++        if not _RE_REEMPLAZO.search(tarea.descripcion or ""):
++            continue
++        for rel in tarea.archivos:
++            if not isinstance(rel, str) or rel in salida:
++                continue
++            try:
++                if ws.existe(rel) and (ws.raiz / rel).is_file():
++                    salida[rel] = sum(1 for l in ws.leer(rel).splitlines() if l.strip())
++            except (OSError, ValueError, ErrorRuta):
++                continue
++    return salida
 +
 +
 +_RE_MAIN_SCRIPT = re.compile(r"""__name__\s*==\s*['"]__main__['"]""")
@@ -2467,7 +2571,7 @@ index ad78b6b..4e1cd35 100644
  @dataclass
  class Tarea:
      id: str
-@@ -178,13 +403,218 @@ def verificacion_peor(despues: "Verificacion", antes: "Verificacion") -> bool:
+@@ -178,13 +445,218 @@ def verificacion_peor(despues: "Verificacion", antes: "Verificacion") -> bool:
  
  
  def veredicto(informe: str) -> tuple[bool, bool]:
@@ -2688,7 +2792,7 @@ index ad78b6b..4e1cd35 100644
  @dataclass
  class Verificacion:
      ok: bool
-@@ -193,6 +623,7 @@ class Verificacion:
+@@ -193,6 +665,7 @@ class Verificacion:
      diagnostico: str
      archivos: list
      conteo: ConteoTests = field(default_factory=ConteoTests)
@@ -2696,7 +2800,7 @@ index ad78b6b..4e1cd35 100644
  
  
  @dataclass
-@@ -201,6 +632,7 @@ class InformeBuild:
+@@ -201,6 +674,7 @@ class InformeBuild:
      plan: Optional[Plan] = None
      archivos: list = field(default_factory=list)
      tests: Optional[Resultado] = None
@@ -2704,7 +2808,7 @@ index ad78b6b..4e1cd35 100644
      diagnostico: str = ""
      cid: Optional[int] = None
      ruta_informe: Optional[Path] = None
-@@ -211,12 +643,29 @@ class InformeBuild:
+@@ -211,12 +685,32 @@ class InformeBuild:
      commit: Optional[str] = None
      spec_tests: list = field(default_factory=list)
      segundos: float = 0.0
@@ -2715,6 +2819,9 @@ index ad78b6b..4e1cd35 100644
 +    intervenciones_juez: int = 0                           # cuántas veces el juez tuvo que intervenir para cerrar
 +    tokens_juez: int = 0                                   # lo que gastó el juez en ESTA build (estimado)
 +    tokens_build: int = 0                                  # lo que gastó la build entera (para comparar)
++    motivos_fallo: dict = field(default_factory=dict)      # tarea → por qué quedó fallida (el error REAL, no "falló")
++    restaurados: list = field(default_factory=list)        # archivos previos que PRESERVAR devolvió a su estado
++    reemplazos_autorizados: list = field(default_factory=list)  # archivos previos que el usuario autorizó reescribir
  
      @property
      def ok(self) -> bool:
@@ -2734,7 +2841,7 @@ index ad78b6b..4e1cd35 100644
  def _diffstat(diff: str) -> str:
      stats: dict[str, list[int]] = {}
      actual = None
-@@ -231,6 +680,23 @@ def _diffstat(diff: str) -> str:
+@@ -231,6 +725,23 @@ def _diffstat(diff: str) -> str:
      return "\n".join(f"  {a}  +{m} -{n}" for a, (m, n) in stats.items())
  
  
@@ -2758,7 +2865,7 @@ index ad78b6b..4e1cd35 100644
  def _es_test(rel: str) -> bool:
      return any(fnmatch.fnmatch(rel, p) for p in PATRONES_TESTS)
  
-@@ -246,6 +712,214 @@ def _es_de_especificacion(nombre_test: str, protegidos: dict) -> bool:
+@@ -246,6 +757,214 @@ def _es_de_especificacion(nombre_test: str, protegidos: dict) -> bool:
      return False
  
  
@@ -2973,7 +3080,7 @@ index ad78b6b..4e1cd35 100644
  class Orquestador:
      def __init__(self, llm, ws: Workspace, settings: Settings, ui: UI):
          self.llm = llm
-@@ -255,6 +929,7 @@ class Orquestador:
+@@ -255,6 +974,7 @@ class Orquestador:
          self.memoria = MemoriaLecciones(ws) if settings.lecciones else None
          self.escalador = Escalador(llm, settings, ui)
          self._protegidos: dict[str, Optional[str]] = {}
@@ -2981,7 +3088,7 @@ index ad78b6b..4e1cd35 100644
  
      def _sub(self, rol: str, tarea: str, cid: Optional[int], archivos: str = "", titulo: str = "",
               **opciones) -> ResultadoAgente:
-@@ -264,6 +939,20 @@ class Orquestador:
+@@ -264,6 +984,20 @@ class Orquestador:
              profundidad=1, cid_inicio=cid,
          )[0]
  
@@ -3002,7 +3109,7 @@ index ad78b6b..4e1cd35 100644
      # ------------------------------------------------------------ fases
      def explorar(self, pedido: str) -> str:
          archivos = self.ws.archivos_codigo(limite=500)
-@@ -296,7 +985,13 @@ class Orquestador:
+@@ -296,7 +1030,13 @@ class Orquestador:
                  "cómo se ejecuta y se prueba el proyecto",
                  {"memoria": self.memoria},
              ))
@@ -3017,7 +3124,7 @@ index ad78b6b..4e1cd35 100644
          informe = "\n\n".join(
              f"### Informe explorador {i}\n{r.resumen}" for i, r in enumerate(resultados, start=1)
          )
-@@ -308,7 +1003,10 @@ class Orquestador:
+@@ -308,7 +1048,10 @@ class Orquestador:
              f"PEDIDO DEL USUARIO:\n{pedido}\n\n"
              f"INFORME DE EXPLORACIÓN (código real):\n{recortar(exploracion, 7000)}\n\n"
              f"Comando de tests detectado: {detectado[0] if detectado else 'ninguno (habrá que crear tests)'}\n"
@@ -3029,7 +3136,7 @@ index ad78b6b..4e1cd35 100644
          )
          if self.settings.tests_primero:
              tarea += ("\nLos tests se escriben ANTES de implementar a partir de tu <interfaz> y tus <criterios>: "
-@@ -323,6 +1021,10 @@ class Orquestador:
+@@ -323,6 +1066,10 @@ class Orquestador:
          if not _RE_TAREA.search(texto) and _RE_TAREA.search(res.contexto):
              texto = res.contexto + "\n" + texto
          plan = parsear_plan(texto, pedido, self.settings.max_tareas)
@@ -3040,7 +3147,7 @@ index ad78b6b..4e1cd35 100644
          if not res.ok:
              self.ui.aviso("El arquitecto no terminó limpio; uso lo que produjo.")
          motivo = plan_degenerado(plan, pedido, texto)
-@@ -431,17 +1133,23 @@ class Orquestador:
+@@ -431,17 +1178,23 @@ class Orquestador:
              f"Validación automática de los archivos cambiados: {validacion}\n\n"
              "Leé los archivos completos si necesitás contexto. Empezá tu informe con la línea VEREDICTO."
          )
@@ -3067,7 +3174,7 @@ index ad78b6b..4e1cd35 100644
          detectado = detectar_comando_tests(self.ws)
          criterios = "\n".join(f"- {c}" for c in plan.criterios) or "- (derivalos del pedido)"
          texto = (
-@@ -452,7 +1160,7 @@ class Orquestador:
+@@ -452,7 +1205,7 @@ class Orquestador:
              "Escribí (o completá) tests automáticos que verifiquen los criterios y corrélos con run_tests. "
              "Reportá el resultado REAL."
          )
@@ -3076,7 +3183,7 @@ index ad78b6b..4e1cd35 100644
  
      def verificar(self, cid: int) -> Verificacion:
          archivos = [r for r in self.ws.checkpoints.archivos_desde(cid) if (self.ws.raiz / r).is_file()]
-@@ -462,13 +1170,35 @@ class Orquestador:
+@@ -462,13 +1215,35 @@ class Orquestador:
          malos = fallos(validaciones)
          tests_ok = tests is None or tests.ok
          partes = [r.resumen(2500) for r in malos]
@@ -3114,7 +3221,7 @@ index ad78b6b..4e1cd35 100644
  
      def reparar(self, pedido: str, verif: Verificacion, cid: int, base_fallaba: bool,
                  diagnostico_experto: str = "", contexto: str = "") -> ResultadoAgente:
-@@ -485,7 +1215,8 @@ class Orquestador:
+@@ -485,7 +1260,8 @@ class Orquestador:
          if diagnostico_experto:
              texto = tarea_con_diagnostico(texto, diagnostico_experto)
          protegidos = set(self._protegidos)
@@ -3124,7 +3231,7 @@ index ad78b6b..4e1cd35 100644
                                                                                      if diagnostico_experto else ""),
                           protegidos=protegidos)
  
-@@ -513,7 +1244,17 @@ class Orquestador:
+@@ -513,7 +1289,17 @@ class Orquestador:
          intentos_txt: list[str] = []
          forense_hecho = False
          informe_forense = ""
@@ -3142,7 +3249,7 @@ index ad78b6b..4e1cd35 100644
              firma = _firma_error(verif.diagnostico)
              if diagnosticos_vistos.count(firma) >= 3:
                  informe.notas.append(f"{etiqueta}: la reparación no logró avances (mismo diagnóstico repetido).")
-@@ -549,6 +1290,7 @@ class Orquestador:
+@@ -549,6 +1335,7 @@ class Orquestador:
                                       + "\n---\n".join(intentos_txt[-2:]))
              res = self.reparar(pedido, verif, rcid, base_fallaba, experto, contexto_intento.strip())
              intentos_txt.append(recortar(res.resumen, 1200))
@@ -3150,7 +3257,7 @@ index ad78b6b..4e1cd35 100644
              verif = verificador()
              self._mostrar_verificacion(verif)
              if verif.ok:
-@@ -566,6 +1308,221 @@ class Orquestador:
+@@ -566,6 +1353,221 @@ class Orquestador:
                  verif = antes
          return verif
  
@@ -3372,7 +3479,7 @@ index ad78b6b..4e1cd35 100644
      # ------------------------------------------------------------ flujos
      def _mostrar_plan(self, plan: Plan) -> None:
          self.ui.titulo("PLAN")
-@@ -575,7 +1532,19 @@ class Orquestador:
+@@ -575,10 +1577,33 @@ class Orquestador:
          self.ui.fase(1, "Exploración")
          exploracion = self.explorar(pedido)
          self.ui.fase(2, "Arquitectura")
@@ -3390,12 +3497,81 @@ index ad78b6b..4e1cd35 100644
 +                plan = self.planificar(pedido_plan, exploracion,
 +                                       "Observaciones del supervisor:\n" + "\n".join(f"- {r}" for r in dictamen.reasons),
 +                                       plan)
++        self._plan_confirmado = False
          for _ in range(3):
              self._mostrar_plan(plan)
-             if not confirmar or self.ui.confirmar("¿Aprobás el plan y arrancamos?", defecto=True):
-@@ -599,7 +1568,10 @@ class Orquestador:
+-            if not confirmar or self.ui.confirmar("¿Aprobás el plan y arrancamos?", defecto=True):
++            reemplazos = reemplazos_del_plan(self.ws, plan)
++            if reemplazos:
++                # Que se vea ANTES de aprobar: el plan va a reemplazar código que ya existe.
++                self.ui.aviso("  ⚠ Este plan dice que REEMPLAZA código que ya existe: "
++                              + ", ".join(f"{rel} ({n} líneas)" for rel, n in list(reemplazos.items())[:6]))
++                self.ui.tenue("    Si no querés perderlo, respondé que no y pedí hacerlo en archivos nuevos "
++                              "(o en otra carpeta: reaper --proyecto ~/otra_carpeta).")
++            if not confirmar:
++                return plan, exploracion
++            if self.ui.confirmar("¿Aprobás el plan y arrancamos?", defecto=True):
++                self._plan_confirmado = True
+                 return plan, exploracion
+             feedback = self.ui.preguntar("¿Qué cambiarías del plan? (Enter vacío = cancelar)")
+             if not feedback:
+@@ -598,8 +1623,64 @@ class Orquestador:
+         ))
          return ruta
  
++    def _violaciones_preservar(self, tcid: int, cid_build: Optional[int], declarados: list) -> list:
++        """PRESERVAR TRABAJO PREVIO: en una actualización, lo que ya existía ANTES de esta build no se borra ni se
++        reescribe por accidente. Agregar está bien; borrar un archivo previo que la tarea no declaró, o perder buena
++        parte de su contenido, no. Los archivos creados en esta misma build no cuentan (se construyen unos sobre
++        otros) y las ediciones chicas (un import, una línea) pasan. Un archivo declarado cuyo reemplazo se AUTORIZÓ
++        (lo pidió el usuario o aprobó un plan que lo anunciaba) se puede reescribir. → [(rel, mensaje)]."""
++        if cid_build is None:
++            return []
++        autorizados = getattr(self, "_reemplazos_autorizados", set())
++        salida = []
++        for rel in self.ws.checkpoints.archivos_desde(tcid):
++            if self.ws.checkpoints.original(rel, cid_build) is None:
++                continue                               # nació en esta actualización
++            antes_tarea = self.ws.checkpoints.original(rel, tcid)
++            if antes_tarea is None:
++                continue
++            declarado = rel in declarados
++            if declarado and rel in autorizados:
++                continue
++            ruta = self.ws.raiz / rel
++            if not ruta.is_file():
++                if not declarado:
++                    salida.append((rel, f"BORRÓ TRABAJO PREVIO: eliminó {rel}, que ya existía antes de esta "
++                                        f"actualización y la tarea no lo pedía. Restauralo."))
++                continue
++            borradas, total = _lineas_borradas(antes_tarea, ruta.read_text(encoding="utf-8", errors="replace"))
++            if not total:
++                continue
++            fraccion = borradas / total
++            if (not declarado and borradas >= 3 and fraccion >= 0.2) or \
++                    (declarado and borradas >= 8 and fraccion >= 0.6):
++                tipo = "REESCRITURA DESTRUCTIVA" if declarado else "MODIFICÓ TRABAJO PREVIO"
++                salida.append((rel, f"{tipo}: borró {borradas} de {total} líneas ({fraccion:.0%}) que ya había en "
++                                    f"{rel} antes de esta actualización. Extendé el archivo sin perder lo que ya "
++                                    f"hacía."))
++        return salida
++
++    def _restaurar_trabajo_previo(self, tcid: int, cid_build: Optional[int], declarados: list) -> list:
++        """Si una tarea TERMINA rechazada por PRESERVAR, el daño no se queda en disco: cada archivo previo que
++        borró o vació vuelve a como estaba antes de la tarea. Antes el rechazo frenaba la tarea pero el app.py
++        reescrito quedaba igual (el trabajo previo solo se recuperaba con /deshacer). → archivos restaurados."""
++        restaurados = []
++        for rel, _mensaje in self._violaciones_preservar(tcid, cid_build, declarados):
++            contenido = self.ws.checkpoints.original(rel, tcid)
++            if contenido is None or rel in restaurados:
++                continue
++            try:
++                self.ws.escribir(rel, contenido)
++                restaurados.append(rel)
++            except (OSError, ValueError, ErrorRuta) as e:
++                self.ui.aviso(f"  No pude restaurar {rel}: {e}. Recuperalo con /deshacer.")
++        return restaurados
++
      def _verificar_tarea(self, tcid: int, antes: ConteoTests, nombres_antes: set,
 -                         exigir_progreso: bool = False) -> Verificacion:
 +                         exigir_progreso: bool = False, verificar_entrega: bool = False,
@@ -3405,7 +3581,7 @@ index ad78b6b..4e1cd35 100644
          """
          Una tarea intermedia no necesita que pasen TODOS los tests (los de tareas
          siguientes todavía fallan): alcanza con validadores OK y que no se rompa
-@@ -609,7 +1581,69 @@ class Orquestador:
+@@ -609,7 +1690,45 @@ class Orquestador:
          validaciones = validar_archivos(self.ws, archivos)
          tests = ejecutar_tests(self.ws, timeout=self.settings.tests_timeout, completo=True)
          conteo = conteo_de_resultado(tests)
@@ -3448,35 +3624,11 @@ index ad78b6b..4e1cd35 100644
 +            # reescribe por accidente. Agregar está bien; borrar un archivo previo que la tarea no declaró, o perder
 +            # buena parte de su contenido, no. Los archivos creados en esta misma build no cuentan (se construyen
 +            # unos sobre otros). Ediciones chicas (un import, una línea) pasan.
-+            if cid_build is not None:
-+                for rel in self.ws.checkpoints.archivos_desde(tcid):
-+                    if self.ws.checkpoints.original(rel, cid_build) is None:
-+                        continue                               # nació en esta actualización
-+                    antes_tarea = self.ws.checkpoints.original(rel, tcid)
-+                    if antes_tarea is None:
-+                        continue
-+                    declarado = rel in declarados
-+                    ruta = self.ws.raiz / rel
-+                    if not ruta.is_file():
-+                        if not declarado:
-+                            problemas.append(f"BORRÓ TRABAJO PREVIO: eliminó {rel}, que ya existía antes de esta "
-+                                             f"actualización y la tarea no lo pedía. Restauralo.")
-+                        continue
-+                    borradas, total = _lineas_borradas(antes_tarea, ruta.read_text(encoding="utf-8",
-+                                                                                    errors="replace"))
-+                    if not total:
-+                        continue
-+                    fraccion = borradas / total
-+                    if (not declarado and borradas >= 3 and fraccion >= 0.2) or \
-+                            (declarado and borradas >= 8 and fraccion >= 0.6):
-+                        tipo = "REESCRITURA DESTRUCTIVA" if declarado else "MODIFICÓ TRABAJO PREVIO"
-+                        problemas.append(
-+                            f"{tipo}: borró {borradas} de {total} líneas ({fraccion:.0%}) que ya había en {rel} antes "
-+                            f"de esta actualización. Extendé el archivo sin perder lo que ya hacía.")
++            problemas.extend(mensaje for _rel, mensaje in self._violaciones_preservar(tcid, cid_build, declarados))
          if tests is not None and not tests.ok and conteo.reconocido:
              # Los tests de la especificación de tareas siguientes fallan a propósito: no son regresión.
              nuevos_fallos = [n for n in conteo.nombres_fallados
-@@ -642,30 +1676,214 @@ class Orquestador:
+@@ -642,30 +1761,225 @@ class Orquestador:
              diagnostico = anexar_pistas(diagnostico, 2)
          return Verificacion(not problemas, validaciones, tests, diagnostico, archivos, conteo)
  
@@ -3633,18 +3785,21 @@ index ad78b6b..4e1cd35 100644
 +                      "tests_primero": bool(self.settings.tests_primero),
 +                      "huella_aceptacion": huella_actual}
 +            self._huella_aceptacion = huella_actual
++            # ¿Quién autoriza reescribir un archivo que ya existía? Vos: pidiéndolo, o aprobando un plan que lo
++            # anunciaba (el aviso sale antes de aprobar). Sin eso, PRESERVAR lo protege. Antes no había forma: hasta
++            # un "reescribí app.py desde cero" terminaba en REESCRITURA DESTRUCTIVA y tarea fallida.
++            reemplazos = reemplazos_del_plan(self.ws, plan)
++            if reemplazos and (getattr(self, "_plan_confirmado", False) or _RE_REESCRITURA_PEDIDA.search(pedido)):
++                previo["reemplazos_autorizados"] = sorted(reemplazos)
++            elif reemplazos:
++                self.ui.aviso("  El plan quiere reemplazar " + ", ".join(sorted(reemplazos)[:6]) + " pero no lo "
++                              "pediste ni aprobaste el plan: se protegen (no se pierde lo que ya tenías).")
 +            registro_build.guardar(previo)
- 
--        plan, exploracion = self.obtener_plan(pedido, confirmar)
--        if plan is None:
--            self.ui.tenue("Construcción cancelada; no se tocó ningún archivo.")
--            return InformeBuild("cancelada")
--
--        grupo = self.ws.checkpoints.iniciar(f"construir: {pedido[:80]}")
-         informe = InformeBuild("fallida", plan=plan, cid=grupo)
- 
--        testeable = any(a.endswith(EXTENSIONES_TESTEABLES) for a in plan.archivos()) or any(
--            a.endswith(EXTENSIONES_TESTEABLES) for a in self.ws.archivos_codigo(limite=200)) or not self.ws.archivos_codigo(limite=5)
++        self._reemplazos_autorizados = set(previo.get("reemplazos_autorizados", []))
++
++        informe = InformeBuild("fallida", plan=plan, cid=grupo,
++                               reemplazos_autorizados=sorted(self._reemplazos_autorizados))
++
 +        # Motor central: el juez fija el CONTRATO (criterios del pedido) antes de construir. En reanudación se
 +        # reutiliza el que ya quedó en el diario: no se gasta otra llamada.
 +        if not reanudar:
@@ -3663,7 +3818,17 @@ index ad78b6b..4e1cd35 100644
 +                self._mostrar_contrato(informe.criterios_entrega, plan)
 +        else:
 +            informe.criterios_entrega = list(previo.get("criterios_entrega", []))
-+
+ 
+-        plan, exploracion = self.obtener_plan(pedido, confirmar)
+-        if plan is None:
+-            self.ui.tenue("Construcción cancelada; no se tocó ningún archivo.")
+-            return InformeBuild("cancelada")
+-
+-        grupo = self.ws.checkpoints.iniciar(f"construir: {pedido[:80]}")
+-        informe = InformeBuild("fallida", plan=plan, cid=grupo)
+-
+-        testeable = any(a.endswith(EXTENSIONES_TESTEABLES) for a in plan.archivos()) or any(
+-            a.endswith(EXTENSIONES_TESTEABLES) for a in self.ws.archivos_codigo(limite=200)) or not self.ws.archivos_codigo(limite=5)
 +        testeable = _es_testeable(plan.archivos(), self.ws.archivos_codigo(limite=200))
          numero_fase = 3
 -        if self.settings.tests_primero and testeable:
@@ -3703,7 +3868,7 @@ index ad78b6b..4e1cd35 100644
  
          self.ui.fase(numero_fase, "Implementación" + (" · torneo" if self.settings.torneo and self.settings.candidatos > 1 else ""))
          numero_fase += 1
-@@ -676,35 +1894,83 @@ class Orquestador:
+@@ -676,35 +1990,93 @@ class Orquestador:
          if [t.id for t in orden] != [t.id for t in plan.tareas]:
              self.ui.tenue("  Orden por dependencias: " + " → ".join(t.id for t in orden))
              plan.tareas = orden
@@ -3762,6 +3927,7 @@ index ad78b6b..4e1cd35 100644
 +                                                 archivos_planeados=planeados_despues, cid_build=grupo)
              if not verif_tarea.ok:
                  self.ui.aviso(f"  La tarea {tarea.id} no pasó su verificación: la reparo con el error real.")
++                self.ui.tenue(f"    motivo: {_primera_linea_util(verif_tarea.diagnostico)}")
                  verif_tarea = self._reparar_con_escalada(
                      pedido, verif_tarea, grupo, base_fallaba, informe, f"tarea {tarea.id}",
                      max(1, self.settings.umbral_escalada + 1),
@@ -3773,8 +3939,18 @@ index ad78b6b..4e1cd35 100644
                      contexto=f"TAREA EN CURSO (#{tarea.id}): {tarea.descripcion}",
                  )
                  if not verif_tarea.ok:
-                     informe.notas.append(f"Tarea {tarea.id}: quedó con fallos de verificación.")
+-                    informe.notas.append(f"Tarea {tarea.id}: quedó con fallos de verificación.")
++                    motivo = _primera_linea_util(verif_tarea.diagnostico)
++                    informe.notas.append(f"Tarea {tarea.id}: quedó con fallos de verificación → {motivo}")
++                    informe.motivos_fallo[tarea.id] = recortar(verif_tarea.diagnostico, 1500)
 +                    informe.tareas_fallidas.append(tarea.id)
++                    restaurados = self._restaurar_trabajo_previo(tcid, grupo, tarea.archivos)
++                    if restaurados:
++                        informe.restaurados.extend(r for r in restaurados if r not in informe.restaurados)
++                        self.ui.aviso(f"  PRESERVAR: devolví a como estaban {', '.join(restaurados)} "
++                                      "(la tarea fallida los había borrado o reescrito).")
++                        informe.notas.append(f"Tarea {tarea.id}: se restauró el trabajo previo en "
++                                             f"{', '.join(restaurados)}.")
  
              if not verif_tarea.ok and self.settings.max_revisiones:
                  # Revisar código que no pasa su verificación no tiene sentido (y un revisor de 24B
@@ -3789,7 +3965,7 @@ index ad78b6b..4e1cd35 100644
                  continue
  
              for ronda in range(self.settings.max_revisiones):
-@@ -722,6 +1988,30 @@ class Orquestador:
+@@ -722,6 +2094,31 @@ class Orquestador:
                      break
                  self.implementar(pedido, plan, i, exploracion, tcid, correcciones=revision,
                                   protegidos=self._protegidos)
@@ -3811,6 +3987,7 @@ index ad78b6b..4e1cd35 100644
 +                previo["estados"][tarea.id] = "fallida"
 +                if tarea.id not in informe.tareas_fallidas:
 +                    informe.tareas_fallidas.append(tarea.id)
++                informe.motivos_fallo.setdefault(tarea.id, recortar(verif_post.diagnostico, 1500))
 +                informe.notas.append(f"Tarea {tarea.id}: falla tras revisión; verificación final pendiente.")
 +            previo.pop("tarea_activa", None)
 +            previo.pop("tcid", None)
@@ -3820,7 +3997,7 @@ index ad78b6b..4e1cd35 100644
  
          archivos = [r for r in self.ws.checkpoints.archivos_desde(grupo) if (self.ws.raiz / r).is_file()]
          hay_tests_build = any(_es_test(a) for a in archivos)
-@@ -734,21 +2024,42 @@ class Orquestador:
+@@ -734,21 +2131,42 @@ class Orquestador:
          self.ui.fase(numero_fase, "Verificación real")
          verif = self.verificar(grupo)
          self._mostrar_verificacion(verif)
@@ -3867,7 +4044,7 @@ index ad78b6b..4e1cd35 100644
          informe.ruta_informe = self._guardar_informe(pedido, informe)
          self._mostrar_cierre(informe)
          return informe
-@@ -769,6 +2080,12 @@ class Orquestador:
+@@ -769,19 +2187,51 @@ class Orquestador:
          else:
              self.ui.error(f"tests: fallaron ({verif.conteo.texto() if verif.conteo.reconocido else verif.tests.comando})")
              self.ui.tenue(recortar(fallos_relevantes(verif.tests.stdout + "\n" + verif.tests.stderr, 2, 1500), 1500))
@@ -3880,7 +4057,26 @@ index ad78b6b..4e1cd35 100644
  
      def _guardar_informe(self, pedido: str, informe: InformeBuild) -> Optional[Path]:
          try:
-@@ -781,7 +2098,14 @@ class Orquestador:
+             diff = self.ws.checkpoints.diff_desde(informe.cid) if informe.cid else ""
+             tests = informe.tests.resumen(4000) if informe.tests else "sin suite de tests"
++            # Sin versión ni motivos, un informe no deja reconstruir qué pasó (caso script_whatsapp: no se podía
++            # saber qué REAPER corrió ni por qué falló la tarea 1). Ahora quedan escritos.
++            entorno = "Termux/Android" if es_termux() else platform.system()
++            juez = ""
++            if getattr(self.settings, "juez", True):
++                juez = "## Juez de entrega\n"
++                if informe.criterios_entrega:
++                    juez += "Contrato:\n" + "\n".join(f"- {c}" for c in informe.criterios_entrega) + "\n"
++                juez += f"Veredicto: {informe.juicio.texto() if informe.juicio is not None else 'sin veredicto'}\n"
++                juez += (f"Intervenciones: {informe.intervenciones_juez} · tokens del juez: "
++                         f"~{informe.tokens_juez} de ~{informe.tokens_build}\n\n")
++            motivos = "".join(f"### Tarea {tid}\n```\n{texto}\n```\n" for tid, texto in informe.motivos_fallo.items())
+             contenido = (
+                 f"# Build REAPER — {informe.estado.upper()}\n\n"
+-                f"Fecha: {datetime.now():%Y-%m-%d %H:%M} · duración: {formatear_duracion(informe.segundos)}\n\n"
++                f"Fecha: {datetime.now():%Y-%m-%d %H:%M} · duración: {formatear_duracion(informe.segundos)}\n"
++                f"Versión: REAPER {__version__} · Python {sys.version.split()[0]} · {entorno}\n\n"
+                 f"## Pedido\n{pedido}\n\n"
                  f"## Plan\n```\n{informe.plan.como_texto() if informe.plan else '-'}\n```\n\n"
                  f"## Archivos\n```\n{_diffstat(diff) or '-'}\n```\n\n"
                  f"## Tests\n```\n{tests}\n```\n\n"
@@ -3892,11 +4088,17 @@ index ad78b6b..4e1cd35 100644
 +                   + ("\n" if informe.tareas_fallidas and informe.tareas_bloqueadas else "")
 +                   + "\n".join(f"- Bloqueada: {t}" for t in informe.tareas_bloqueadas)
 +                   + "\n\n" if (informe.tareas_fallidas or informe.tareas_bloqueadas) else "")
++                + (f"## Por qué fallaron las tareas\n{motivos}\n" if motivos else "")
++                + ("## Trabajo previo restaurado (PRESERVAR)\n" + "\n".join(f"- {r}" for r in informe.restaurados)
++                   + "\n\n" if informe.restaurados else "")
++                + ("## Reemplazos autorizados\n" + "\n".join(f"- {r}" for r in informe.reemplazos_autorizados)
++                   + "\n\n" if informe.reemplazos_autorizados else "")
++                + juez
 +                + ("## Especificación (tests escritos antes de implementar)\n" + "\n".join(f"- {t}" for t in informe.spec_tests) + "\n\n"
                     if informe.spec_tests else "")
                  + (f"## Escaladas al modelo fuerte\n{informe.escaladas}\n\n" if informe.escaladas else "")
                  + ("## Lecciones aprendidas\n" + "\n".join(f"- {l}" for l in informe.lecciones) + "\n\n" if informe.lecciones else "")
-@@ -790,40 +2114,77 @@ class Orquestador:
+@@ -790,40 +2240,77 @@ class Orquestador:
                  + ("## Notas\n" + "\n".join(f"- {n}" for n in informe.notas) + "\n" if informe.notas else "")
              )
              ruta = self.ws.raiz / ".reaper" / "informes" / f"build_{datetime.now():%Y%m%d_%H%M%S}.md"
@@ -4128,10 +4330,102 @@ index 160c31b..42aa50c 100644
      }
      $limpio['nombre'] = $nombre;
 diff --git a/partes/32_doctor.py b/partes/32_doctor.py
-index ea3e85a..d201bd8 100644
+index ea3e85a..4b1f895 100644
 --- a/partes/32_doctor.py
 +++ b/partes/32_doctor.py
-@@ -169,15 +169,28 @@ def instalar_lanzador(ui: UI) -> Optional[Path]:
+@@ -16,6 +16,7 @@ class Chequeo:
+     detalle: str
+     arreglo: str = ""
+     critico: bool = False
++    ayuda: str = ""          # explicación completa (la tabla recorta "cómo arreglarlo"); se imprime debajo si falla
+ 
+ 
+ def es_termux() -> bool:
+@@ -23,13 +24,57 @@ def es_termux() -> bool:
+         or os.path.isdir("/data/data/com.termux")
+ 
+ 
++_RE_SIN_VERSION = re.compile(r"unrecognized option|invalid option|illegal option|unknown option|^usage:",
++                             re.IGNORECASE | re.MULTILINE)
++
++
++def _ruta_corta(ruta: Path) -> str:
++    """~/reaper en vez de /data/data/com.termux/files/home/reaper: más fácil de copiar en el teléfono."""
++    try:
++        return "~/" + ruta.relative_to(Path.home()).as_posix()
++    except ValueError:
++        return str(ruta)
++
++
++def _chequeo_clave(settings: Settings) -> Chequeo:
++    """Clave del proveedor activo. Dice A QUÉ SERVIDOR va (un api_url propio, p. ej. nano-gpt.com, usa la variable
++    del proveedor 'openai' y eso confunde) y cómo dejarla guardada sin que se pierda al cerrar Termux.
++    Nunca muestra la clave."""
++    variable = settings.variable_clave()
++    if not variable:
++        return Chequeo("clave API", True, "no hace falta")
++    try:
++        host = urllib.parse.urlparse(settings.url_api()).hostname or ""
++    except ValueError:
++        host = ""
++    propio = PROVEEDORES.get(settings.proveedor, {}).get("url", "")
++    destino = f" ({host})" if host and host not in propio else ""
++    if obtener_clave_api(settings):
++        return Chequeo("clave API", True, f"{variable} configurada{destino}")
++    archivo = _ruta_corta(BASE_DIR / f".clave_{settings.proveedor}")
++    arreglo = f"printf %s 'TU_KEY' > {archivo}"
++    para = f"la clave de {host}" if host else f"la clave de {settings.proveedor}"
++    ayuda = [f"Guardá {para} (queda guardada aunque cierres Termux):",
++             f"  printf %s 'TU_KEY' > {archivo} && chmod 600 {archivo}",
++             f"o solo para esta sesión:  export {variable}='TU_KEY'"]
++    if (BASE_DIR / ".clave").is_file() and not _duenio_clave_legacy():
++        # Una clave vieja en ~/reaper/.clave sin dueño declarado no se usa (aislamiento por proveedor).
++        ayuda.append(f"Si tu clave ya está en {_ruta_corta(BASE_DIR / '.clave')} y es {para}: "
++                     f"echo {settings.proveedor} > {_ruta_corta(BASE_DIR / '.clave_proveedor')}")
++    return Chequeo("clave API", False, f"falta {variable}{destino}", arreglo, True, "\n".join(ayuda))
++
++
+ def _chequeo_comando(nombre: str, paquete: str, para: str, critico: bool = False) -> Chequeo:
+     ruta = shutil.which(nombre)
+     if ruta:
+         version = ""
+         try:
+             salida = subprocess.run([nombre, "--version"], capture_output=True, text=True, timeout=8)
+-            version = (salida.stdout or salida.stderr).strip().splitlines()[0][:60] if (salida.stdout or salida.stderr) else ""
++            texto = (salida.stdout or salida.stderr or "").strip()
++            # Herramientas sin --version (termux-notification) contestan con un error de getopt: eso no es la
++            # versión. Solo se muestra lo que salió con exit 0 y no parece un mensaje de uso; si no, la ruta.
++            if salida.returncode == 0 and texto and not _RE_SIN_VERSION.search(texto):
++                version = texto.splitlines()[0][:60]
+         except (OSError, subprocess.TimeoutExpired, IndexError):
+             version = ""
+         return Chequeo(nombre, True, version or ruta)
+@@ -87,11 +132,7 @@ def chequeos_sistema(settings: Settings) -> list[Chequeo]:
+     chequeos.append(Chequeo("python", version >= (3, 9), f"{sys.version.split()[0]} ({sys.executable})",
+                             "pkg upgrade python", version < (3, 9)))
+     chequeos.append(Chequeo("sistema", True, "Termux en Android" if es_termux() else f"{platform.system()} {platform.machine()}"))
+-    variable = settings.variable_clave()
+-    clave = obtener_clave_api(settings)
+-    chequeos.append(Chequeo("clave API", bool(clave), (f"{variable} configurada" if clave and variable else
+-                                                        ("no hace falta" if not variable else f"falta {variable}")),
+-                            f'export {variable}="tu_key"  (agregalo a ~/.bashrc)' if not clave else "", not clave))
++    chequeos.append(_chequeo_clave(settings))
+     chequeos.append(_chequeo_red(settings.url_api()))
+     chequeos.append(_chequeo_modulo("httpx", "streaming más robusto; sin él se usa urllib"))
+     chequeos.append(_chequeo_modulo("pyflakes", "nombres indefinidos más precisos (REAPER tiene un detector propio)"))
+@@ -144,6 +185,11 @@ def diagnostico_sistema(ui: UI, settings: Settings, llm=None, probar_modelo: boo
+     criticos = [c for c in chequeos if c.critico and not c.ok]
+     if criticos:
+         ui.error(f"{len(criticos)} problema(s) crítico(s): REAPER no va a poder trabajar hasta arreglarlos.")
++        for c in criticos:
++            # La tabla recorta la columna del arreglo: acá va entero, listo para copiar.
++            ui.info(f"  {c.nombre}:")
++            for linea in (c.ayuda or c.arreglo).splitlines():
++                ui.info(f"    {linea}")
+         return False
+     opcionales = [c for c in chequeos if not c.ok]
+     if opcionales:
+@@ -169,15 +215,28 @@ def instalar_lanzador(ui: UI) -> Optional[Path]:
          return None
      carpeta_app = BASE_DIR / "app"
      carpeta_app.mkdir(parents=True, exist_ok=True)
@@ -4163,7 +4457,7 @@ index ea3e85a..d201bd8 100644
      prefijo = os.getenv("PREFIX")
      bin_dir = Path(prefijo) / "bin" if prefijo and es_termux() else Path.home() / ".local" / "bin"
      bin_dir.mkdir(parents=True, exist_ok=True)
-@@ -187,8 +200,8 @@ def instalar_lanzador(ui: UI) -> Optional[Path]:
+@@ -187,8 +246,8 @@ def instalar_lanzador(ui: UI) -> Optional[Path]:
          "# Lanzador de REAPER (generado por --instalar). Importa el módulo para usar el bytecode cacheado.\n"
          "import sys\n"
          f"sys.path.insert(0, {str(carpeta_app)!r})\n"
@@ -4203,7 +4497,7 @@ index 390095e..919a836 100644
  """
  
 diff --git a/partes/35_cli.py b/partes/35_cli.py
-index 9e5d20f..7d2ec2b 100644
+index 9e5d20f..7c89961 100644
 --- a/partes/35_cli.py
 +++ b/partes/35_cli.py
 @@ -20,6 +20,7 @@ COMANDOS_AYUDA = [
@@ -4449,7 +4743,20 @@ index 9e5d20f..7d2ec2b 100644
          self.ui.linea("")
          self.ui.linea(f"{Tema.agente}{C.BOLD}reaper »{C.RESET}")
          mostrar_markdown(self.ui, res.resumen)
-@@ -287,16 +396,31 @@ class App:
+@@ -280,23 +389,43 @@ class App:
+             detalle.append("con escalada")
+         self.ui.tenue("  " + " · ".join(detalle))
+         claim = getattr(self.principal, "_ultimo_claim", None)
+-        if claim is not None and claim.nivel and claim.nivel != "BEHAVIOR_VERIFIED":
++        if claim is not None and claim.nivel == "UNVERIFIED" and res.cambios:
++            # "UNVERIFIED" en gris pasaba de largo (y en inglés): cambió archivos y NADA lo respalda. Que se vea.
++            self.ui.aviso(f"  ⚠ SIN VERIFICAR: cambió {len(res.cambios)} archivo(s) pero ninguna prueba real lo "
++                          "respalda. No lo tomes como terminado: /tests para probarlo, o /construir para que el "
++                          "juez lo verifique.")
++        elif claim is not None and claim.nivel and claim.nivel != "BEHAVIOR_VERIFIED":
+             self.ui.tenue(f"  verificación: {claim.nivel}" + (f" — {recortar(claim.motivo, 120)}" if claim.motivo else ""))
+         if not res.ok:
+             self.ui.aviso(f"  (terminó con estado: {res.motivo})")
          self.ui.linea("")
          return res.ok
  
@@ -4484,7 +4791,7 @@ index 9e5d20f..7d2ec2b 100644
                  for r in ejecutar_hooks(self.ws, "despues_de_build", {"estado": informe.estado, "pedido": pedido[:200]}):
                      (self.ui.tenue if r.ok else self.ui.aviso)(f"  hook: {r.comando} → {'ok' if r.ok else 'falló'}")
          return informe.ok
-@@ -316,6 +440,7 @@ class App:
+@@ -316,6 +445,7 @@ class App:
              "/history": "historial", "/status": "estado", "/context": "contexto", "/compact": "compactar",
              "/run": "correr", "/test": "tests", "/project": "proyecto", "/model": "modelo", "/mode": "modo",
              "/strong": "modelo_fuerte", "/privacy": "privacidad", "/providers": "proveedores", "/team": "equipo",
@@ -4492,7 +4799,7 @@ index 9e5d20f..7d2ec2b 100644
          }
          nombre = alias.get(cmd, cmd[1:]).replace("-", "_")
          metodo = getattr(self, "cmd_" + nombre, None)
-@@ -347,6 +472,71 @@ class App:
+@@ -347,6 +477,71 @@ class App:
      def cmd_ayuda(self, arg: str) -> None:
          self.ui.linea(texto_ayuda())
  
@@ -4564,7 +4871,7 @@ index 9e5d20f..7d2ec2b 100644
      def cmd_salir(self, arg: str) -> str:
          self._guardar_sesion()
          u = self.llm.uso
-@@ -357,8 +547,35 @@ class App:
+@@ -357,8 +552,35 @@ class App:
  
      # ---------------------------------------------------------------- equipo
      def cmd_construir(self, arg: str) -> None:
@@ -4601,7 +4908,7 @@ index 9e5d20f..7d2ec2b 100644
              return
          self.construir(arg)
  
-@@ -543,15 +760,39 @@ class App:
+@@ -543,15 +765,39 @@ class App:
              f"tests {'OK' if r.ok else 'FALLARON'} (exit {r.codigo}) · {conteo.texto()} · {formatear_duracion(r.duracion)}")
  
      def cmd_validar(self, arg: str) -> None:
@@ -4643,7 +4950,7 @@ index 9e5d20f..7d2ec2b 100644
      def cmd_correr(self, arg: str) -> None:
          try:
              tokens = shlex.split(arg)
-@@ -600,6 +841,10 @@ class App:
+@@ -600,6 +846,10 @@ class App:
              self.ui.info("Reintentando ejecución...")
  
      def cmd_vigilar(self, arg: str) -> None:
@@ -4654,7 +4961,7 @@ index 9e5d20f..7d2ec2b 100644
          vigilar(self.ws, self.ui, comando=arg or None, timeout=self.settings.tests_timeout)
  
      def cmd_diff(self, arg: str) -> None:
-@@ -797,7 +1042,25 @@ class App:
+@@ -797,7 +1047,25 @@ class App:
              self.ui.linea(f"  {Tema.tenue}{hora}{C.RESET} {Tema.ok + '✓' if ok else Tema.error + '✗'}{C.RESET} {texto}")
  
      def cmd_exportar(self, arg: str) -> None:
@@ -4681,7 +4988,7 @@ index 9e5d20f..7d2ec2b 100644
          partes = [f"# Conversación REAPER · {self.ws.raiz.name}\n", f"Fecha: {datetime.now():%Y-%m-%d %H:%M}\n"]
          for m in self.principal.mensajes[1:]:
              quien = "Vos" if m["role"] == "user" else "REAPER"
-@@ -828,7 +1091,7 @@ class App:
+@@ -828,7 +1096,7 @@ class App:
              return
          self.modo_plan = False
          self.settings.modo = arg
@@ -4690,7 +4997,7 @@ index 9e5d20f..7d2ec2b 100644
          self.ui.ok(f"Modo: {arg}")
  
      def cmd_perfil(self, arg: str) -> None:
-@@ -843,7 +1106,7 @@ class App:
+@@ -843,7 +1111,7 @@ class App:
          except KeyError:
              self.ui.error(f"Perfil desconocido: {arg} ({', '.join(PERFILES)})")
              return
@@ -4699,7 +5006,7 @@ index 9e5d20f..7d2ec2b 100644
          self.llm.limitador = LimitadorTasa(self.settings.rpm_efectivo()) if hasattr(self.llm, "limitador") else None
          self.ui.ok(f"Perfil {arg}: " + (", ".join(cambios) or "sin cambios"))
  
-@@ -853,22 +1116,83 @@ class App:
+@@ -853,22 +1121,83 @@ class App:
              return
          nombre = aplicar_tema(arg)
          self.settings.tema = nombre
@@ -4785,7 +5092,7 @@ index 9e5d20f..7d2ec2b 100644
              return
          if len(partes) == 2 and partes[0].lower() in ROLES:
              rol = partes[0].lower()
-@@ -877,12 +1201,13 @@ class App:
+@@ -877,12 +1206,13 @@ class App:
              else:
                  self.settings.modelos_rol[rol] = resolver_modelo(partes[1])
              self.ui.ok(f"{rol} → {self.settings.modelo_para(rol)}")
@@ -4801,7 +5108,7 @@ index 9e5d20f..7d2ec2b 100644
          else:
              self.ui.error("Uso: /modelo [<alias>] | /modelo <rol> <alias>. Demasiados argumentos; no guardé nada.")
  
-@@ -900,7 +1225,7 @@ class App:
+@@ -900,7 +1230,7 @@ class App:
              self.settings.modelo_fuerte = arg
              self.settings.escalar = True
              self.ui.ok(f"Modelo de escalada: {resolver_modelo(arg)}")
@@ -4810,7 +5117,7 @@ index 9e5d20f..7d2ec2b 100644
  
      def cmd_modelos(self, arg: str) -> None:
          partes = (arg or "").split(maxsplit=1)
-@@ -955,12 +1280,12 @@ class App:
+@@ -955,12 +1285,12 @@ class App:
          arg = arg.strip()
          if arg.lower() in ("off", "no", "0", "stop", "salir", "apagar"):
              self.settings.modo_seguridad = False
@@ -4825,7 +5132,7 @@ index 9e5d20f..7d2ec2b 100644
                  self.ui.info(f"  Alcance autorizado: {self.settings.alcance_autorizado}")
              else:
                  self.ui.info("Modo seguridad apagado.")
-@@ -970,7 +1295,7 @@ class App:
+@@ -970,7 +1300,7 @@ class App:
              return
          self.settings.alcance_autorizado = arg
          self.settings.modo_seguridad = True
@@ -4834,7 +5141,7 @@ index 9e5d20f..7d2ec2b 100644
          self.ui.ok("Modo seguridad ACTIVADO (pentest / CTF / lab / estudio).")
          self.ui.info(f"  Alcance autorizado: {arg}")
          self.ui.aviso("  REAPER hará trabajo ofensivo SOLO dentro de ese alcance. Fuera de ahí, frena y avisa.")
-@@ -983,7 +1308,7 @@ class App:
+@@ -983,7 +1313,7 @@ class App:
          if sub in ("estricto", "estricta", "strict"):
              valor = len(partes) > 1 and partes[1].lower() in ("on", "si", "sí", "1", "true")
              self.settings.privacidad_estricta = valor
@@ -4843,7 +5150,7 @@ index 9e5d20f..7d2ec2b 100644
              self.ui.ok(f"Privacidad estricta: {'ON' if valor else 'OFF'}.")
              if valor:
                  self.ui.tenue("  Los modelos externos quedan BLOQUEADOS: solo saldrá tráfico a un proveedor local (ollama).")
-@@ -991,8 +1316,55 @@ class App:
+@@ -991,8 +1321,55 @@ class App:
          self.ui.linea(texto_reporte_privacidad(reporte_privacidad(self.llm, self.settings)))
  
      def cmd_equipo(self, arg: str) -> None:
@@ -4900,7 +5207,7 @@ index 9e5d20f..7d2ec2b 100644
          estado = estado_equipo(self.settings)
          ind = independencia_equipo(estado)
          if sub in ("independencia", "independence"):
-@@ -1008,33 +1380,43 @@ class App:
+@@ -1008,33 +1385,43 @@ class App:
                  self.ui.tenue("  Configurá un proveedor free: export GROQ_API_KEY=... (o NVIDIA/GEMINI/OpenRouter).")
              else:
                  self.settings.modelos_rol.update(asignacion)
@@ -4950,7 +5257,7 @@ index 9e5d20f..7d2ec2b 100644
  
      def cmd_proveedores(self, arg: str) -> None:
          """Estado de proveedores SIN exponer secretos. Las claves salen de env o .clave_<proveedor>."""
-@@ -1077,12 +1459,28 @@ class App:
+@@ -1077,12 +1464,28 @@ class App:
                            f"{c['providers_chat_operational']} · free confirmado: {c['providers_free_confirmed']}")
              self.ui.tenue("  Un gateway (OpenRouter) es 1 proveedor, no cientos. Credencial presente ≠ autenticado.")
              return
@@ -4984,7 +5291,7 @@ index 9e5d20f..7d2ec2b 100644
              return
          self.ui.error("Uso: /proveedores [estado|configurar|estadisticas|probar|sincronizar|diagnostico]")
  
-@@ -1170,7 +1568,11 @@ class App:
+@@ -1170,7 +1573,11 @@ class App:
              self.ui.error("Uso: /muestra <archivo>  (análisis estático; la muestra NUNCA se ejecuta)")
              return
          try:
@@ -4997,7 +5304,7 @@ index 9e5d20f..7d2ec2b 100644
          except (OSError, ValueError, ErrorRuta) as e:
              self.ui.error(f"No pude leer {ruta}: {e}")
              return
-@@ -1333,7 +1735,7 @@ class App:
+@@ -1333,7 +1740,7 @@ class App:
              aplicar_tema(self.settings.tema)
          if clave in ("rpm", "modelo") and hasattr(self.llm, "limitador"):
              self.llm.limitador = LimitadorTasa(self.settings.rpm_efectivo())
@@ -5006,7 +5313,7 @@ index 9e5d20f..7d2ec2b 100644
          self.ui.ok(f"{clave} = {getattr(self.settings, clave)!r}")
  
      def cmd_uso(self, arg: str) -> None:
-@@ -1374,6 +1776,7 @@ class App:
+@@ -1374,6 +1781,7 @@ class App:
  
      def cmd_reset(self, arg: str) -> None:
          self.principal = self._nuevo_principal()
@@ -5014,7 +5321,7 @@ index 9e5d20f..7d2ec2b 100644
          try:
              self._ruta_sesion().unlink()
          except OSError:
-@@ -1399,6 +1802,22 @@ class App:
+@@ -1399,6 +1807,32 @@ class App:
  
      def cmd_doctor(self, arg: str) -> None:
          diagnostico_sistema(self.ui, self.settings, self.llm)
@@ -5025,19 +5332,29 @@ index 9e5d20f..7d2ec2b 100644
 +        texto = diagnostico_texto(self.settings)
 +        self.ui.linea(texto)
 +        destino = arg.strip()
-+        if destino:
-+            try:
-+                ruta = self.ws.ruta(destino, escribir=True)
-+                escritura_atomica(ruta, texto + "\n")
-+                self.ui.ok(f"diagnóstico guardado en {ruta} (sin claves; seguro para compartir)")
-+            except (ErrorRuta, OSError) as e:
-+                self.ui.error(str(e))
-+        else:
++        if not destino:
 +            self.ui.tenue("  Guardalo para compartir: /diagnostico diagnostico.txt (se redactan los secretos)")
++            return
++        try:
++            ruta = self.ws.ruta(destino, escribir=True)
++            if not ruta.suffix:
++                ruta = ruta.with_suffix(".txt")
++            # Caso real (script_whatsapp): `/diagnostico app.py` reemplazó el código del usuario por este reporte y
++            # el proyecto dejó de compilar. El reporte NUNCA pisa un archivo existente ni se escribe en un archivo de
++            # código (sin checkpoint no hay /deshacer): se guarda aparte, en .reaper/, y se avisa.
++            if ruta.exists() or ruta.suffix.lower() not in (".txt", ".md", ".log"):
++                motivo = "ya existe" if ruta.exists() else "no es un archivo de texto"
++                self.ui.aviso(f"  {destino} {motivo}: no lo toco. /diagnostico no analiza archivos, describe tu "
++                              "REAPER (para revisar código: /validar <archivo> o /tests).")
++                ruta = self.ws.raiz / ".reaper" / f"diagnostico_{datetime.now():%Y%m%d_%H%M%S}.txt"
++            escritura_atomica(ruta, texto + "\n")
++            self.ui.ok(f"diagnóstico guardado en {ruta} (sin claves; seguro para compartir)")
++        except (ErrorRuta, OSError) as e:
++            self.ui.error(str(e))
  
      def cmd_instalar(self, arg: str) -> None:
          instalar_lanzador(self.ui)
-@@ -1471,15 +1890,24 @@ class App:
+@@ -1471,15 +1905,24 @@ class App:
  
      def _leer_entrada(self) -> str:
          marca = f"{Tema.aviso}[plan] {C.RESET}" if self.modo_plan else ""
@@ -5069,7 +5386,7 @@ index 9e5d20f..7d2ec2b 100644
  
      def mostrar_inicio(self, animar: bool = True) -> None:
          if not (animar and self.settings.animacion and animar_intro()):
-@@ -1494,24 +1922,44 @@ class App:
+@@ -1494,24 +1937,44 @@ class App:
              funciones.append(f"escalada→{self.settings.modelo_fuerte}")
          if self.settings.lecciones:
              funciones.append("lecciones")
@@ -5430,7 +5747,7 @@ index 0000000..dc0d80e
 +        self.assertEqual(estado_final_build(Verificacion(True, [], None, "", []), inf), "validada")
 +        self.assertEqual(estado_final_build(Verificacion(False, [], None, "", []), inf), "fallida")
 diff --git a/partes/44_autotest_cli.py b/partes/44_autotest_cli.py
-index 4428804..05f3598 100644
+index 4428804..dc9d659 100644
 --- a/partes/44_autotest_cli.py
 +++ b/partes/44_autotest_cli.py
 @@ -149,7 +149,13 @@ class TestCLI(BaseTest):
@@ -5448,7 +5765,72 @@ index 4428804..05f3598 100644
  
      def test_sesion_persistente(self):
          ws = self.proyecto()
-@@ -246,8 +252,13 @@ class TestDoctor(BaseTest):
+@@ -232,6 +238,64 @@ class TestDoctor(BaseTest):
+         diagnostico_sistema(ui, self.ajustes(proveedor="ollama"))
+         self.assertIn("DOCTOR REAPER", ui.texto_registrado())
+ 
++    def _sin_variable(self, variable: str):
++        previa = os.environ.pop(variable, None)
++        self.addCleanup(lambda: os.environ.__setitem__(variable, previa) if previa is not None
++                        else os.environ.pop(variable, None))
++
++    def test_clave_faltante_dice_a_que_servidor_va_y_como_guardarla(self):
++        # Caso real de Termux: proveedor 'openai' apuntado a nano-gpt.com, sin clave. Antes decía solo
++        # "falta OPENAI_API_KEY" y la tabla cortaba el arreglo a la mitad.
++        self._sin_variable("OPENAI_API_KEY")
++        ajustes = self.ajustes(proveedor="openai", api_url="https://nano-gpt.com/api/v1/chat/completions")
++        chequeo = _chequeo_clave(ajustes)
++        self.assertFalse(chequeo.ok)
++        self.assertTrue(chequeo.critico)
++        self.assertIn("nano-gpt.com", chequeo.detalle)
++        self.assertIn(".clave_openai", chequeo.arreglo)
++        self.assertIn("export OPENAI_API_KEY=", chequeo.ayuda)
++        ui = self.ui()
++        diagnostico_sistema(ui, ajustes)
++        salida = ui.texto_registrado()
++        self.assertIn("chmod 600", salida)               # el arreglo completo, no recortado por la tabla
++        self.assertIn(".clave_openai", salida)
++        # Con la clave guardada en el archivo del proveedor, queda OK y la clave nunca se muestra.
++        (BASE_DIR / ".clave_openai").write_text("sk-secreto-de-prueba-123", encoding="utf-8")
++        chequeo = _chequeo_clave(ajustes)
++        self.assertTrue(chequeo.ok)
++        self.assertIn("configurada (nano-gpt.com)", chequeo.detalle)
++        self.assertNotIn("secreto", chequeo.detalle + chequeo.arreglo + chequeo.ayuda)
++
++    def test_clave_heredada_sin_duenio_sugiere_declararla(self):
++        self._sin_variable("OPENAI_API_KEY")
++        self._sin_variable("REAPER_CLAVE_PROVEEDOR")
++        (BASE_DIR / ".clave").write_text("sk-vieja", encoding="utf-8")
++        chequeo = _chequeo_clave(self.ajustes(proveedor="openai"))
++        self.assertFalse(chequeo.ok)
++        self.assertIn("echo openai >", chequeo.ayuda)
++        self.assertIn(".clave_proveedor", chequeo.ayuda)
++        self.assertNotIn("sk-vieja", chequeo.ayuda)
++
++    def test_comando_sin_version_no_muestra_el_error_como_version(self):
++        # termux-notification no tiene --version: contesta "getopt: unrecognized option" y antes salía ✓ con ese texto.
++        binarios = self.dir / "bin"
++        binarios.mkdir()
++        for nombre, guion in (("sinversion", "echo \"getopt: unrecognized option '--version'\" >&2; exit 1"),
++                              ("usoexit0", "echo 'usage: usoexit0 [opciones]'; exit 0"),
++                              ("converso", "echo 'converso 1.2.3'; exit 0")):
++            ruta = binarios / nombre
++            # En Termux no hay /bin/sh: el intérprete sale del PATH ($PREFIX/bin/sh).
++            ruta.write_text(f"#!{shutil.which('sh') or '/bin/sh'}\n{guion}\n", encoding="utf-8")
++            ruta.chmod(0o755)
++        previo = os.environ.get("PATH", "")
++        os.environ["PATH"] = f"{binarios}{os.pathsep}{previo}"
++        self.addCleanup(lambda: os.environ.__setitem__("PATH", previo))
++        for nombre in ("sinversion", "usoexit0"):
++            chequeo = _chequeo_comando(nombre, nombre, "prueba")
++            self.assertTrue(chequeo.ok)
++            self.assertEqual(chequeo.detalle, str(binarios / nombre))
++        self.assertEqual(_chequeo_comando("converso", "converso", "prueba").detalle, "converso 1.2.3")
++
+     def test_instalar_lanzador(self):
+         casa = self.dir / "casa"
+         casa.mkdir()
+@@ -246,8 +310,13 @@ class TestDoctor(BaseTest):
              if es_termux():
                  self.skipTest("en Termux el lanzador va a $PREFIX/bin")
              self.assertTrue(lanzador and lanzador.exists())
@@ -5464,7 +5846,7 @@ index 4428804..05f3598 100644
          finally:
              for k, v in anteriores.items():
                  if v is None:
-@@ -313,7 +324,7 @@ class TestPlantillas(BaseTest):
+@@ -313,7 +382,7 @@ class TestPlantillas(BaseTest):
                  if not plantilla.comando_tests:
                      continue
                  if not plantilla.disponible():
@@ -8188,6 +8570,214 @@ index 0000000..9ec365d
 +        # Y al pasarse del tope, el resto se agrupa (no se pierde): sigue habiendo a lo sumo max_tareas.
 +        muchas = "".join(f'<tarea id="{i}">t{i}</tarea>' for i in range(1, 40))
 +        self.assertEqual(len(parsear_plan(muchas, "p", 12).tareas), 12)
+diff --git a/partes/48zf_autotest_build_real.py b/partes/48zf_autotest_build_real.py
+new file mode 100644
+index 0000000..dc02ba1
+--- /dev/null
++++ b/partes/48zf_autotest_build_real.py
+@@ -0,0 +1,202 @@
++"""
++Autotests de regresión de una corrida REAL que falló en Termux (proyecto script_whatsapp, octubre 2026):
++
++- `/diagnostico app.py` reemplazó el código del usuario por el reporte ("REAPER 8.10 · diagnóstico") y el
++  proyecto dejó de compilar (SyntaxError: invalid character '·').
++- Una instalación con pip murió por "signal 9" y REAPER solo mostraba "exit code: -9".
++- Un plan que decía "reemplazar" app.py chocaba con PRESERVAR: la tarea fallaba siempre (aunque el usuario lo
++  hubiera pedido), el archivo reescrito quedaba igual en disco y el motivo no llegaba ni a la pantalla ni al informe.
++- En el modo conversación, "UNVERIFIED" salía en gris y en inglés aunque se hubieran cambiado archivos.
++"""
++
++
++class TestBuildRealDiagnostico(BaseTest):
++    def _app(self, ws):
++        return App(self.ajustes(), MockLLM([]), self.ui(), ws, persistir=False)
++
++    def test_diagnostico_no_pisa_codigo_existente(self):
++        codigo = "def main():\n    print('hola')\n\nif __name__ == '__main__':\n    main()\n"
++        ws = self.proyecto({"app.py": codigo})
++        app = self._app(ws)
++        app.cmd_diagnostico("app.py")
++        self.assertEqual(ws.leer("app.py"), codigo)                       # el código del usuario intacto
++        guardados = list((ws.raiz / ".reaper").glob("diagnostico_*.txt"))
++        self.assertEqual(len(guardados), 1)
++        self.assertIn("diagnóstico", guardados[0].read_text(encoding="utf-8"))
++        self.assertIn("no lo toco", app.ui.texto_registrado())
++
++    def test_diagnostico_nunca_crea_un_archivo_de_codigo(self):
++        ws = self.proyecto({})
++        self._app(ws).cmd_diagnostico("nuevo.py")
++        self.assertFalse(ws.existe("nuevo.py"))                           # un .py con el reporte no compilaría
++        self.assertTrue(list((ws.raiz / ".reaper").glob("diagnostico_*.txt")))
++
++    def test_diagnostico_sin_extension_va_a_txt(self):
++        ws = self.proyecto({})
++        self._app(ws).cmd_diagnostico("reporte")
++        self.assertTrue(ws.existe("reporte.txt"))
++
++
++class TestBuildRealSenal(BaseTest):
++    def test_proceso_matado_por_sigkill_se_explica(self):
++        if not hasattr(signal, "SIGKILL"):
++            self.skipTest("plataforma sin SIGKILL")
++        r = ejecutar([sys.executable, "-c", "import os, signal; os.kill(os.getpid(), signal.SIGKILL)"],
++                     cwd=self.dir, timeout=20)
++        self.assertFalse(r.ok)
++        self.assertIn("SIGKILL", r.senal())
++        self.assertIn("MATÓ", r.resumen())
++        self.assertIn("SIGKILL", r.linea())
++        self.assertIn("señal 9", anexar_pistas(r.resumen()))
++
++    def test_codigos_de_salida_por_senal(self):
++        self.assertIn("SIGKILL", Resultado(False, "pip install x", 137).senal())   # bash: 128 + 9
++        self.assertIn("SIGTERM", Resultado(False, "x", -15).senal())
++        self.assertEqual(Resultado(False, "x", 1).senal(), "")                     # un error común no es señal
++        self.assertEqual(Resultado(False, "x", 124, timeout=True).senal(), "")     # el timeout ya se informa
++
++    def test_pista_de_memoria_antes_que_instalar_compiladores(self):
++        salida = ("Building wheel for grpcio (pyproject.toml) ... error\n"
++                  "clang: error: unable to execute command: Killed\n"
++                  "error: command 'clang' failed with exit code -9")
++        pistas = pistas_para(salida, 3)
++        self.assertIn("mató el proceso", pistas[0])                # primero: no reintentar igual
++        self.assertTrue(any("grpcio" in p for p in pistas))
++        self.assertFalse(any("pkg install clang" in p for p in pistas[:2]))
++
++
++class TestBuildRealReemplazo(BaseTest):
++    PREVIO = "".join(f"def f{i}():\n    return {i}\n" for i in range(12))
++    PLAN = """<plan>
++<objetivo>Rehacer app.py</objetivo>
++<interfaz>
++- app.py: def nueva() -> int
++</interfaz>
++<tarea id="1" archivos="app.py">Reescribir app.py desde cero: solo def nueva() que devuelve 0.</tarea>
++<criterios>
++- app.py define nueva()
++</criterios>
++</plan>"""
++
++    def _guion(self, mensajes, kw):
++        rol = MockLLM.rol_de(mensajes)
++        if rol == "arquitecto":
++            return terminar_xml(self.PLAN)
++        if rol == "implementador":
++            return herramienta_xml("write_to_file", path="app.py", content="def nueva():\n    return 0\n") \
++                if _turno(mensajes) == 0 else terminar_xml("app.py reescrito")
++        return terminar_xml("ok")
++
++    def _construir(self, pedido, ui=None, confirmar=False):
++        ws = self.proyecto({"app.py": self.PREVIO})
++        ajustes = self.ajustes(tests_primero=False, torneo=False, escalar=False, max_revisiones=0, qa=False,
++                               max_reparaciones=1, juez=False)
++        informe = Orquestador(MockLLM(self._guion), ws, ajustes, ui or self.ui()).construir(pedido,
++                                                                                            confirmar=confirmar)
++        return ws, informe
++
++    def test_reemplazos_del_plan_solo_con_intencion_explicita(self):
++        ws = self.proyecto({"app.py": "a = 1\nb = 2\n", "util.py": "x = 1\n"})
++        plan = Plan(objetivo="", criterios=[], tareas=[Tarea("1", "Reemplazar app.py por la versión nueva", ["app.py"]),
++                                      Tarea("2", "Eliminar espacios duplicados en util.py", ["util.py"]),
++                                      Tarea("3", "Reescribir otro.py", ["otro.py"])])
++        self.assertEqual(reemplazos_del_plan(ws, plan), {"app.py": 2})  # 'eliminar espacios' no es reemplazo
++
++    def test_reemplazo_pedido_por_el_usuario_se_permite(self):
++        # Antes: "reescribí app.py desde cero" → REESCRITURA DESTRUCTIVA ×4, tarea 1 fallida, build parcial.
++        ws, informe = self._construir("Reescribí app.py desde cero: que solo tenga def nueva()")
++        self.assertNotIn("1", informe.tareas_fallidas)
++        self.assertTrue(informe.ok, informe.notas)
++        self.assertEqual(informe.reemplazos_autorizados, ["app.py"])
++        self.assertIn("def nueva", ws.leer("app.py"))
++
++    def test_reemplazo_no_pedido_se_protege_y_se_restaura(self):
++        ui = self.ui()
++        ws, informe = self._construir("Agregá una función nueva() que devuelva 0", ui=ui)
++        self.assertIn("1", informe.tareas_fallidas)
++        self.assertEqual(ws.leer("app.py"), self.PREVIO)                   # el trabajo previo volvió entero
++        self.assertEqual(informe.restaurados, ["app.py"])
++        self.assertIn("REESCRITURA DESTRUCTIVA", informe.motivos_fallo["1"])
++        self.assertTrue(any("→ REESCRITURA DESTRUCTIVA" in n for n in informe.notas))
++        texto = ui.texto_registrado()
++        self.assertIn("REEMPLAZA código que ya existe: app.py (24 líneas)", texto)   # avisado antes de empezar
++        self.assertIn("motivo: REESCRITURA DESTRUCTIVA", texto)                      # y el motivo, en pantalla
++
++    def test_reemplazar_algo_puntual_no_autoriza_reescribir_el_archivo(self):
++        # "reemplazá print por logging" es una edición chica: no habilita a borrar casi todo app.py.
++        ws, informe = self._construir("Reemplazá los return por constantes en app.py")
++        self.assertEqual(informe.reemplazos_autorizados, [])
++        self.assertEqual(ws.leer("app.py"), self.PREVIO)
++
++    def test_pista_killed_no_salta_por_cualquier_palabra(self):
++        self.assertFalse(any("mató el proceso" in p for p in pistas_para("test_killed_worker ... ok\nthe job was killed", 3)))
++        self.assertTrue(any("mató el proceso" in p for p in pistas_para("Building...\nKilled\n", 3)))
++
++    def test_plan_aprobado_autoriza_el_reemplazo(self):
++        ui = self.ui(respuestas=["s"])
++        ws, informe = self._construir("Agregá una función nueva() que devuelva 0", ui=ui, confirmar=True)
++        self.assertIn("REEMPLAZA código que ya existe", ui.texto_registrado())
++        self.assertNotIn("1", informe.tareas_fallidas)                    # lo vio y lo aprobó: es su decisión
++        self.assertIn("def nueva", ws.leer("app.py"))
++
++    def test_informe_guarda_version_motivo_y_restauracion(self):
++        _ws, informe = self._construir("Agregá una función nueva() que devuelva 0")
++        texto = informe.ruta_informe.read_text(encoding="utf-8")
++        self.assertIn(f"Versión: REAPER {__version__}", texto)
++        self.assertIn("## Por qué fallaron las tareas", texto)
++        self.assertIn("REESCRITURA DESTRUCTIVA", texto)
++        self.assertIn("## Trabajo previo restaurado (PRESERVAR)", texto)
++
++
++class TestBuildRealInformeJuez(BaseTest):
++    def test_informe_incluye_contrato_y_veredicto_del_juez(self):
++        plan = """<plan>
++<objetivo>Sumadora</objetivo>
++<interfaz>
++- app.py: def sumar(a, b) -> int
++</interfaz>
++<tarea id="1" archivos="app.py">Crear app.py con def sumar(a, b).</tarea>
++<criterios>
++- sumar(2, 3) == 5
++</criterios>
++</plan>"""
++
++        def guion(mensajes, kw):
++            rol = MockLLM.rol_de(mensajes)
++            if rol == "arquitecto":
++                return terminar_xml(plan)
++            if rol == "implementador":
++                return herramienta_xml("write_to_file", path="app.py",
++                                       content="def sumar(a, b):\n    return a + b\n") \
++                    if _turno(mensajes) == 0 else terminar_xml("listo")
++            if rol == "juez":
++                if "CONTRATO" in mensajes[-1]["content"]:
++                    return '{"criterios": ["sumar(2, 3) devuelve 5"]}'
++                return '{"cumple": true, "faltantes": [], "evidence_ids": ["EV-ESTADO"], "confianza": "high"}'
++            return terminar_xml("ok")
++
++        ajustes = self.ajustes(tests_primero=False, torneo=False, escalar=False, max_revisiones=0, qa=False,
++                               max_reparaciones=0, juez=True)
++        informe = Orquestador(MockLLM(guion), self.proyecto(), ajustes, self.ui()).construir("sumadora",
++                                                                                          confirmar=False)
++        texto = informe.ruta_informe.read_text(encoding="utf-8")
++        self.assertIn("## Juez de entrega", texto)
++        self.assertIn("- sumar(2, 3) devuelve 5", texto)
++        self.assertIn("Veredicto:", texto)
++
++
++class TestBuildRealSinVerificar(BaseTest):
++    def test_cambios_sin_evidencia_se_avisan_en_castellano(self):
++        def guion(mensajes, kw):
++            if _turno(mensajes) == 0:
++                return herramienta_xml("write_to_file", path="app.py", content="def f():\n    return 1\n")
++            return terminar_xml("Listo, app.py funciona perfecto.")
++
++        app = App(self.ajustes(modo="auto"), MockLLM(guion), self.ui(), self.proyecto(), persistir=False)
++        app.turno("creá app.py con f()")
++        texto = app.ui.texto_registrado()
++        claim = getattr(app.principal, "_ultimo_claim", None)
++        if claim is None or claim.nivel != "UNVERIFIED":
++            self.skipTest(f"el Evidence Gate no dejó UNVERIFIED en este cierre ({getattr(claim, 'nivel', None)})")
++        self.assertIn("SIN VERIFICAR", texto)
++        self.assertNotIn("verificación: UNVERIFIED", texto)
 diff --git a/partes/49_autotest_runner.py b/partes/49_autotest_runner.py
 index 541aee7..02a88e9 100644
 --- a/partes/49_autotest_runner.py

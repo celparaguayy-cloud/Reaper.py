@@ -126,3 +126,26 @@ llamadas chicas (contrato + veredicto) y más solo si interviene.
 (2) que `cobertura_criterios` dé falsos "sin cubrir" molestos con sinónimos; (3) que el contrato invente criterios
 que el usuario no pidió (el prompt lo prohíbe, pero medirlo con modelos reales). Tests: `TestJuezContrato` (6),
 `TestJuezCierra` (3). Regresión 953 tests OK en Python 3.11/3.12/3.13.
+
+## 10. Reparación con la corrida REAL de script_whatsapp (Termux, Python 3.14.6)
+
+Tus informes describían síntomas; acá está lo que se pudo **reproducir** en el código de REAPER, la causa y el
+arreglo. Cada punto tiene test de regresión que **falla con el código anterior** (15 de 15) y pasa con este.
+
+| Síntoma que viste | Causa confirmada en REAPER | Arreglo |
+|---|---|---|
+| `app.py` empezaba con `REAPER 8.10 · diagnóstico` y `SyntaxError: invalid character '·' (U+00B7)` | `/diagnostico <archivo>` escribía el reporte **encima** del archivo pasado como argumento, sin checkpoint. `/diagnostico app.py` reproduce exactamente esa primera línea y ese error. | Nunca pisa un archivo existente ni crea uno de código: guarda en `.reaper/diagnostico_<fecha>.txt` y avisa. |
+| `signal 9` instalando dependencias (grpcio) | Un proceso matado se reportaba como `exit code: -9` sin explicación; la única pista era "instalá clang", que lleva a repetir la misma compilación. | `Resultado.senal()` explica SIGKILL (memoria en Android); pistas nuevas para señal 9 y grpcio, con prioridad sobre la de compilar. |
+| Tarea 1 fallida, 2-5 bloqueadas, "el reparador no cambió ningún archivo en 2 intentos" | Con la guardia PRESERVAR, reescribir un archivo previo declarado se rechazaba **siempre**, incluso pedido explícitamente: reproducido con "reescribí app.py desde cero" (REESCRITURA DESTRUCTIVA ×4, mismas notas que tu informe). Además el archivo reescrito quedaba en disco. | El plan avisa antes de aprobar qué archivos existentes reemplaza. La reescritura vale si el pedido la pide ("desde cero", "reescribí") o si aprobaste ese plan; si no, se protege y, si la tarea termina rechazada, **se restaura** el contenido previo. |
+| El informe no decía por qué falló la tarea 1 | El motivo real (`verif.diagnostico`) no llegaba a la pantalla ni a `.reaper/informes/`. | Pantalla: `motivo: …`. Informe: versión de REAPER/Python, "Por qué fallaron las tareas", restauraciones, reemplazos autorizados y contrato/veredicto del juez. |
+| `UNVERIFIED` repetido | En modo conversación salía en gris y en inglés aunque hubiera archivos cambiados. | Aviso visible "SIN VERIFICAR" en castellano. Nunca se convierte en éxito. |
+
+**No verificable desde acá (queda PENDIENTE):** qué versión exacta corrió tu build (el informe viejo no la
+guardaba; desde ahora sí), los "17 tests de WhatsApp" de otra corrida (no hay logs) y si la build de las 16:08
+falló por PRESERVAR o por otro motivo (el informe viejo no guardaba el motivo). Recuperación: el `app.py` previo a la
+build (la app de tareas) está en el checkpoint de esa build (`/checkpoints`, `/deshacer <id>`); el `app.py` que
+escribió la build se perdió con `/diagnostico` (esa escritura no tenía checkpoint).
+
+**Alcance:** se reparó REAPER. La funcionalidad de `script_whatsapp` (números para registrar WhatsApp sacados de
+páginas públicas) no se construye ni se repara. Tests: `TestBuildReal*` (15). Regresión 1005 tests OK en Python
+3.11/3.12/3.13.

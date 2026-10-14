@@ -332,3 +332,36 @@ de verdad lo necesita. Lo nuevo:
 
 Cobertura: `TestJuezRealidad` (9), incluida una build de punta a punta donde el implementador deja vacía la función
 pedida: el juez lo detecta gratis, interviene, queda implementada y el juez gasta menos que la build.
+
+## 16. Reparación con una corrida real fallida (script_whatsapp, Termux)
+
+Método: primero **reproducir** cada fallo con el código anterior, después arreglar y dejar el test de regresión.
+Reproducciones (scripts fuera del repo, contra `reaper_v8.py`):
+
+```text
+$ python3 repro_diagnostico.py .      # antes del arreglo
+primera línea de app.py: REAPER 8.10 · diagnóstico
+py_compile exit: 1
+["SyntaxError: invalid character '·' (U+00B7)"]
+$ python3 repro_diagnostico.py .      # después
+primera línea de app.py: def main():
+py_compile exit: 0
+
+$ python3 repro_senal9.py .           # antes: solo "exit code: -9", sin pista
+$ python3 repro_senal9.py .           # después
+estado: SIGKILL (señal 9): el sistema MATÓ el proceso. En Android casi siempre es falta de memoria; …
+PISTAS DE REAPER: - El sistema mató el proceso (señal 9). …
+
+$ python3 repro_reemplazo.py .        # pedido: "Reescribí app.py desde cero…" — antes
+estado: parcial | fallidas: ['1']
+VERIF: REESCRITURA DESTRUCTIVA: borró 23 de 24 líneas (96%) que ya había en app.py …   (×4, nunca en pantalla)
+$ python3 repro_reemplazo.py .        # después
+estado: validada | fallidas: []
+```
+
+Tests nuevos (`partes/48zf_autotest_build_real.py`, filtro `REAPER_AUTOTEST=buildreal`): 15. Contra el código
+anterior: `Ran 15 tests … FAILED (failures=11, errors=4)` (fallan los 15); con el arreglo, 15 OK. Doctor (`TestDoctor`): +3.
+
+Regresión completa: **1005 tests OK** en Python 3.11, 3.12 y 3.13. `pruebas_fusion/smoke_cli.py`: 0 fallas.
+Lint (`ruff --select F,E9,B`): sin hallazgos nuevos (los 62 existentes son anteriores a esta ronda).
+NO VERIFICADO con modelos reales ni en el teléfono: la prueba en Termux queda para el usuario.

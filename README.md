@@ -17,7 +17,7 @@
 
 ![versión](https://img.shields.io/badge/versión-8.10-8b5cf6?style=flat-square)
 ![python](https://img.shields.io/badge/python-3.11_→_3.14-3776ab?style=flat-square&logo=python&logoColor=white)
-![autotests](https://img.shields.io/badge/autotests-987_OK-2ea44f?style=flat-square)
+![autotests](https://img.shields.io/badge/autotests-1005_OK-2ea44f?style=flat-square)
 ![juez](https://img.shields.io/badge/juez-motor_central-a855f7?style=flat-square)
 ![plataforma](https://img.shields.io/badge/Termux_·_Android-sin_root-10b981?style=flat-square&logo=android&logoColor=white)
 ![distribución](https://img.shields.io/badge/distribución-1_archivo-f59e0b?style=flat-square)
@@ -44,7 +44,7 @@ Su obsesión es la **honestidad**: no declara una build "verificada" sin tests r
 lo entregado **sea lo que pediste, funcione de verdad y no rompa lo que ya tenías**.
 
 > [!NOTE]
-> Proyecto **experimental**. El andamiaje está cubierto por **987 autotests**; la calidad del código que
+> Proyecto **experimental**. El andamiaje está cubierto por **1005 autotests**; la calidad del código que
 > produzca depende del modelo que le conectes. Lee **[Estado honesto](#estado)** antes de esperar magia.
 
 ---
@@ -293,6 +293,15 @@ verificación**, no la opinión de un modelo: un "terminé" sin pruebas no alcan
 
 ## 🆕 Novedades
 
+**Reparado con una corrida real que falló en Termux**
+
+- 🩹 `/diagnostico <archivo>` ya no puede pisar tu código (antes `/diagnostico app.py` lo reemplazaba por el reporte).
+- 💥 Un proceso matado por el sistema (**señal 9**, típico al compilar grpcio en el teléfono) ahora se explica, con
+  pistas para no repetir la misma instalación.
+- 🔁 Si pedís "reescribí X desde cero" (o aprobás un plan que avisa que reemplaza archivos), se respeta; si no,
+  PRESERVAR protege y, si la tarea falla, **restaura** lo que había.
+- 🧾 El informe de cada build guarda la versión de REAPER, el **motivo real** de cada tarea fallida y lo que hizo el juez.
+
 **Construcción fiel (el juez maneja el proyecto)**
 
 - 🎯 **DESVÍO por tarea**: si la tarea pedía `tareas/cli.py` y el cambio fue a otro archivo, se rechaza.
@@ -317,7 +326,7 @@ verificación**, no la opinión de un modelo: un "terminé" sin pruebas no alcan
 > [!IMPORTANT]
 > Lo que **sí** está verificado y lo que **no**, sin maquillaje.
 
-- ✅ **987 autotests OK** en Python **3.11, 3.12 y 3.13** (y en un Termux real con 3.14 en una versión
+- ✅ **1005 autotests OK** en Python **3.11, 3.12 y 3.13** (y en un Termux real con 3.14 en una versión
   anterior). Prueban la **orquestación** de forma determinista: ediciones y procesos reales, parseo de tests,
   gates de honestidad, Ctrl+C, plazos de pared y el juez (contrato, cierre, desvío, preservación, arranque,
   examen de realidad, armado del equipo). La red de modelos se simula con un **MockLLM**.
