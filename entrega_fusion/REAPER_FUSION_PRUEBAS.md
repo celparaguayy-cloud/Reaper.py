@@ -422,6 +422,20 @@ real**, no simulado. Hueco: F↔K no implementado (punto 9).
 
 **Build 4 (con los arreglos):** el juez detectó el plan con problemas y lo hizo replanificar EN VIVO, y la especificación salió sin tests vacíos (0 pasaron, 2 con error). También mostró dos fallos de mi propio arreglo, ya corregidos: «todo» ("verificar que todo funciona") se tomaba como el marcador TODO, y una meta-tarea escrita como viñeta ("- ejecutar las pruebas…") no se detectaba.
 
-Tests: `partes/48zg_autotest_openrouter_real.py` (22). Contra el código anterior: 19 fallan; los 2 que pasan
+**Resultados de cierre:**
+
+| Build | Código de REAPER | Resultado | Tiempo | Tokens (gratis) | Juez |
+|---|---|---|---|---|---|
+| 3 | con arreglos 2, 3, 6 (sin el de meta-tareas) | **✓ VERIFICADA** · 15/15 validadores · 15 tests | 18m01s | ~757k | CUMPLE (high), ~3,6k tokens = 0,5 % |
+| 4 | con todos los arreglos salvo viñetas y #10 | ◐ PARCIAL: todo funciona (13 tests), pero falló la tarea "- ejecutar las pruebas…" | 9m54s | menor | ~0,8k tokens = 0,1 % |
+
+La build 3 es la **primera build completa de REAPER con un modelo real**. El informe guardó versión, contrato y veredicto
+del juez. Buena parte de los ~757k tokens se fue en la meta-tarea (3 reparaciones + 2 rondas de revisión).
+
+**Bug #10 (build 4):** una tarea **sin archivos declarados** que termina limpia con la suite verde fallaba por "SIN
+CAMBIOS" (3 reparaciones inútiles → PARCIAL con todo andando; en la build 3 el reparador creó un archivo para
+"cumplir"). Ahora no falla si la suite pasa; la juzgan la verificación final y el juez. Si la suite falla, sigue fallando.
+
+Tests: `partes/48zg_autotest_openrouter_real.py` (24). Contra el código anterior: 19 fallan; los 2 que pasan
 son guardas de "no excederse" (en proyecto existente no se toca; no se reintenta infinito).
-Regresión: **1032 tests OK** en Python 3.11/3.12/3.13. Smoke CLI: 0 fallas. Lint sin hallazgos nuevos.
+Regresión: **1034 tests OK** en Python 3.11/3.12/3.13. Smoke CLI: 0 fallas. Lint sin hallazgos nuevos.

@@ -2462,7 +2462,7 @@ index 4eba772..e986b98 100644
                  (self.ws.raiz / rel).unlink()
                  self.restaurados.append(f"{rel} (creado por los tests, borrado)")
 diff --git a/partes/25_pipeline.py b/partes/25_pipeline.py
-index ad78b6b..60858c8 100644
+index ad78b6b..117eb1e 100644
 --- a/partes/25_pipeline.py
 +++ b/partes/25_pipeline.py
 @@ -40,6 +40,419 @@ _RE_VEREDICTO = re.compile(r"VEREDICTO\s*:?\s*\**\s*(APROBADO|CAMBIOS|RECHAZADO)
@@ -3935,7 +3935,7 @@ index ad78b6b..60858c8 100644
          """
          Una tarea intermedia no necesita que pasen TODOS los tests (los de tareas
          siguientes todavía fallan): alcanza con validadores OK y que no se rompa
-@@ -609,7 +1869,46 @@ class Orquestador:
+@@ -609,7 +1869,52 @@ class Orquestador:
          validaciones = validar_archivos(self.ws, archivos)
          tests = ejecutar_tests(self.ws, timeout=self.settings.tests_timeout, completo=True)
          conteo = conteo_de_resultado(tests)
@@ -3963,7 +3963,13 @@ index ad78b6b..60858c8 100644
 +            # exigiendo cambios reales.
 +            creados_en_build = bool(declarados) and not faltantes and cid_build is not None and all(
 +                self.ws.checkpoints._origen(rel, cid_build)[0] == "nuevo" for rel in declarados)
-+            if not archivos and not creados_en_build:
++            # Una tarea que NO declara archivos ("- ejecutar las pruebas…") no tiene entrega verificable: si terminó
++            # limpia y la suite pasa, exigirle cambios solo quemaba reparaciones (prueba real: 3 reparaciones inútiles
++            # y build PARCIAL con todo funcionando; en otra corrida el reparador creó un archivo para "cumplir").
++            # El resultado lo juzgan la verificación final y el juez.
++            sin_entrega_declarada = (not declarados and not exigir_progreso
++                                     and tests is not None and tests.ok)
++            if not archivos and not creados_en_build and not sin_entrega_declarada:
 +                problemas.append("SIN CAMBIOS: la tarea no modificó archivos del proyecto. "
 +                                 "No se puede verificar una implementación solo por el texto del modelo.")
 +            # DESVÍO: cambió archivos pero NINGUNO de los que la tarea declaró (p. ej. bumpeó la versión en vez de
@@ -3983,7 +3989,7 @@ index ad78b6b..60858c8 100644
          if tests is not None and not tests.ok and conteo.reconocido:
              # Los tests de la especificación de tareas siguientes fallan a propósito: no son regresión.
              nuevos_fallos = [n for n in conteo.nombres_fallados
-@@ -629,7 +1928,9 @@ class Orquestador:
+@@ -629,7 +1934,9 @@ class Orquestador:
          if exigir_progreso and not problemas:
              # El implementador NO terminó (límite de pasos, error...). "No romper nada" no alcanza:
              # tiene que haber cambios reales y, si hay tests fallando, alguno más tiene que pasar.
@@ -3994,7 +4000,7 @@ index ad78b6b..60858c8 100644
                  problemas.append("SIN PROGRESO: el implementador no terminó y no cambió ningún archivo.")
              elif tests is not None and not tests.ok and conteo.reconocido and conteo.pasados <= antes.pasados:
                  problemas.append(
-@@ -642,30 +1943,225 @@ class Orquestador:
+@@ -642,30 +1949,225 @@ class Orquestador:
              diagnostico = anexar_pistas(diagnostico, 2)
          return Verificacion(not problemas, validaciones, tests, diagnostico, archivos, conteo)
  
@@ -4234,7 +4240,7 @@ index ad78b6b..60858c8 100644
  
          self.ui.fase(numero_fase, "Implementación" + (" · torneo" if self.settings.torneo and self.settings.candidatos > 1 else ""))
          numero_fase += 1
-@@ -676,35 +2172,99 @@ class Orquestador:
+@@ -676,35 +2178,99 @@ class Orquestador:
          if [t.id for t in orden] != [t.id for t in plan.tareas]:
              self.ui.tenue("  Orden por dependencias: " + " → ".join(t.id for t in orden))
              plan.tareas = orden
@@ -4340,7 +4346,7 @@ index ad78b6b..60858c8 100644
                  continue
  
              for ronda in range(self.settings.max_revisiones):
-@@ -722,6 +2282,31 @@ class Orquestador:
+@@ -722,6 +2288,31 @@ class Orquestador:
                      break
                  self.implementar(pedido, plan, i, exploracion, tcid, correcciones=revision,
                                   protegidos=self._protegidos)
@@ -4372,7 +4378,7 @@ index ad78b6b..60858c8 100644
  
          archivos = [r for r in self.ws.checkpoints.archivos_desde(grupo) if (self.ws.raiz / r).is_file()]
          hay_tests_build = any(_es_test(a) for a in archivos)
-@@ -734,21 +2319,42 @@ class Orquestador:
+@@ -734,21 +2325,42 @@ class Orquestador:
          self.ui.fase(numero_fase, "Verificación real")
          verif = self.verificar(grupo)
          self._mostrar_verificacion(verif)
@@ -4419,7 +4425,7 @@ index ad78b6b..60858c8 100644
          informe.ruta_informe = self._guardar_informe(pedido, informe)
          self._mostrar_cierre(informe)
          return informe
-@@ -769,19 +2375,51 @@ class Orquestador:
+@@ -769,19 +2381,51 @@ class Orquestador:
          else:
              self.ui.error(f"tests: fallaron ({verif.conteo.texto() if verif.conteo.reconocido else verif.tests.comando})")
              self.ui.tenue(recortar(fallos_relevantes(verif.tests.stdout + "\n" + verif.tests.stderr, 2, 1500), 1500))
@@ -4473,7 +4479,7 @@ index ad78b6b..60858c8 100644
                     if informe.spec_tests else "")
                  + (f"## Escaladas al modelo fuerte\n{informe.escaladas}\n\n" if informe.escaladas else "")
                  + ("## Lecciones aprendidas\n" + "\n".join(f"- {l}" for l in informe.lecciones) + "\n\n" if informe.lecciones else "")
-@@ -790,40 +2428,77 @@ class Orquestador:
+@@ -790,40 +2434,77 @@ class Orquestador:
                  + ("## Notas\n" + "\n".join(f"- {n}" for n in informe.notas) + "\n" if informe.notas else "")
              )
              ruta = self.ws.raiz / ".reaper" / "informes" / f"build_{datetime.now():%Y%m%d_%H%M%S}.md"
@@ -9228,10 +9234,10 @@ index 0000000..dc02ba1
 +        self.assertNotIn("verificación: UNVERIFIED", texto)
 diff --git a/partes/48zg_autotest_openrouter_real.py b/partes/48zg_autotest_openrouter_real.py
 new file mode 100644
-index 0000000..8368513
+index 0000000..1d45619
 --- /dev/null
 +++ b/partes/48zg_autotest_openrouter_real.py
-@@ -0,0 +1,345 @@
+@@ -0,0 +1,389 @@
 +"""
 +Autotests de regresión de la PRUEBA REAL con OpenRouter (modelos :free, octubre 2026). Lo que apareció con un
 +modelo de verdad y no con el MockLLM:
@@ -9577,6 +9583,50 @@ index 0000000..8368513
 +        self.assertGreaterEqual(pagos[1]["max_tokens"], 2048)            # el respaldo ya va con margen
 +        c.chat([{"role": "user", "content": "y"}], max_tokens=350)
 +        self.assertGreaterEqual(pagos[2]["max_tokens"], 2048)            # y los pedidos siguientes también
++
++
++class TestOpenRouterRealTareaSinArchivos(BaseTest):
++    PLAN = """<plan>
++<objetivo>Sumadora</objetivo>
++<interfaz>
++- calc.py: def sumar(a, b) -> int
++</interfaz>
++<tarea id="1" archivos="calc.py">Crear calc.py con def sumar(a, b).</tarea>
++<tarea id="2" archivos="" deps="1">Repasar que la implementación cumpla la interfaz pedida.</tarea>
++<criterios>
++- sumar(2, 3) == 5
++</criterios>
++</plan>"""
++
++    def _construir(self, tests_pasan=True):
++        def guion(mensajes, kw):
++            rol = MockLLM.rol_de(mensajes)
++            turno = _turno(mensajes)
++            todo = "\n".join(m["content"] for m in mensajes if m["role"] == "user")
++            actual = re.search(r"TU TAREA AHORA \(#(\d+)\)", todo)
++            if rol == "arquitecto":
++                return terminar_xml(self.PLAN)
++            if rol == "implementador" and actual and actual.group(1) == "1":
++                cuerpo = "return a + b" if tests_pasan else "return a - b"
++                return herramienta_xml("write_to_file", path="calc.py", content=f"def sumar(a, b):\n    {cuerpo}\n") \
++                    if turno == 0 else terminar_xml("calc.py listo")
++            return terminar_xml("revisado: cumple la interfaz")
++
++        ws = self.proyecto({"tests/test_calc.py": "import unittest\nfrom calc import sumar\n\n\nclass T(unittest.TestCase):\n"
++                                                  "    def test_suma(self):\n        self.assertEqual(sumar(2, 3), 5)\n"})
++        ajustes = self.ajustes(tests_primero=False, torneo=False, escalar=False, max_revisiones=0, qa=False,
++                               max_reparaciones=1, juez=False)
++        return Orquestador(MockLLM(guion), ws, ajustes, self.ui()).construir("sumadora", confirmar=False)
++
++    def test_tarea_sin_archivos_que_termina_limpia_no_falla(self):
++        # Build real 4: "- ejecutar las pruebas…" sin archivos → SIN CAMBIOS → 3 reparaciones → PARCIAL con todo OK.
++        informe = self._construir(tests_pasan=True)
++        self.assertEqual(informe.tareas_fallidas, [], informe.notas)
++        self.assertTrue(informe.ok, informe.notas)
++
++    def test_si_la_suite_falla_no_se_regala_nada(self):
++        informe = self._construir(tests_pasan=False)                    # sumar resta: la suite falla
++        self.assertFalse(informe.ok)
 diff --git a/partes/49_autotest_runner.py b/partes/49_autotest_runner.py
 index 541aee7..02a88e9 100644
 --- a/partes/49_autotest_runner.py
