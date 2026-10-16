@@ -15074,6 +15074,9 @@ _RE_META_TAREA = re.compile(
     r"(?:(?:las?|los|the)\s+)?(?:pruebas|tests?|suite|unit\s*tests?)\b", re.IGNORECASE)
 
 
+_RE_CONTEXTO_TEST = re.compile(r"\btests?\b|\btestead|prueba|unittest|pytest|fixture|node:test", re.I)
+
+
 def problemas_del_plan(plan, pedido: str = "") -> list:
     """Determinista (0 tokens): tareas que planean simular o que no entregan nada. → mensajes para replanificar.
     "Datos de ejemplo" no cuenta si el PEDIDO los pide ("la base arranca con 3 recetas de ejemplo")."""
@@ -15082,7 +15085,9 @@ def problemas_del_plan(plan, pedido: str = "") -> list:
     for tarea in getattr(plan, "tareas", []) or []:
         texto = tarea.descripcion or ""
         m = _RE_TAREA_SIMULADA.search(texto) or _RE_TODO.search(texto)
-        if m and pide_ejemplos and re.search(r"ejemplo", m.group(0), re.I):
+        if m and re.search(r"ejemplo|fictici", m.group(0), re.I) and (
+                pide_ejemplos or _RE_CONTEXTO_TEST.search(texto[max(0, m.start() - 80):m.end() + 80])):
+            # "testeadas con datos de ejemplo" es lo normal en un test (prueba real: hizo replanificar sin motivo).
             m = _RE_TODO.search(texto)
         if m:
             salida.append(f"la tarea {tarea.id} planea una simulación («{m.group(0)}»): tiene que implementar "
@@ -50248,6 +50253,54 @@ class TestCarpetaDeProyectoNuevo(BaseTest):
             self._restaurar(previo)
 
 
+class TestPlanMaestroDeLaPruebaReal(BaseTest):
+    """Primera prueba REAL de /grande (Termux, modelos :free, octubre 2026): el plan maestro tenía 10 etapas (un CRUD
+    por tabla), una etapa solo de tests, ninguna etapa creaba la web que el pedido nombraba, y el juez tomó "testeadas
+    con datos de ejemplo" por una simulación (replanificación de más)."""
+
+    PEDIDO = "Almacén con API JSON y una página web en web/ (index.html, app.js, style.css). Tests con unittest."
+
+    def test_cobertura_de_archivos_nombrados_y_etapas_de_solo_tests(self):
+        m = parsear_maestro('<etapa id="1"><objetivo>datos</objetivo><archivos>almacen/db.py, tests/test_db.py'
+                            '</archivos></etapa><etapa id="2" deps="1"><objetivo>e2e</objetivo>'
+                            '<archivos>tests/test_integracion.py</archivos></etapa>')
+        obs = observaciones_maestro(m, self.PEDIDO)
+        self.assertTrue(any("index.html, app.js, style.css" in o for o in obs), obs)
+        self.assertTrue(any("etapa 2 solo tiene tests" in o for o in obs), obs)
+        bien = parsear_maestro('<etapa id="1"><objetivo>x</objetivo><archivos>almacen/api.py, web/index.html, '
+                               'web/app.js, web/style.css, tests/test_api.py</archivos></etapa>')
+        self.assertEqual(observaciones_maestro(bien, self.PEDIDO), [])
+
+    def test_plan_fragmentado(self):
+        texto = "".join(f'<etapa id="{i}"><objetivo>crud {i}</objetivo><archivos>a/m{i}.py, tests/test_m{i}.py'
+                        f'</archivos></etapa>' for i in range(1, 9))
+        self.assertTrue(any("fragmentado" in o for o in observaciones_maestro(parsear_maestro(texto), "")))
+
+    def test_datos_de_ejemplo_en_tests_no_es_simulacion(self):
+        en_tests = Plan("x", [Tarea("1", "Reportes por día, testeadas con datos de ejemplo en una base temporal",
+                                    ["r.py"])], [])
+        self.assertEqual(problemas_del_plan(en_tests), [])
+        simulado = Plan("x", [Tarea("1", "Devolver datos de ejemplo hasta tener la API real", ["r.py"])], [])
+        self.assertTrue(problemas_del_plan(simulado))
+
+    def test_observacion_replanifica_una_vez_y_no_frena_si_el_modelo_insiste(self):
+        plan_sin_web = ('<maestro><vision>v</vision><etapa id="1"><objetivo>api</objetivo><archivos>almacen/api.py, '
+                        'tests/test_api.py</archivos></etapa></maestro>')
+        respuestas = []
+
+        def responder(mensajes, kw):
+            respuestas.append(MockLLM.ultimo_usuario(mensajes))
+            return plan_sin_web
+        ui = self.ui()
+        grande = ConstructorGrande(MockLLM(responder), self.proyecto({}), self.ajustes(), ui)
+        grande.consultar_cuenta = lambda: None
+        maestro = grande.planificar(self.PEDIDO, confirmar=False)
+        self.assertIsNotNone(maestro)                                               # no se frena por esto
+        self.assertEqual(len(respuestas), 2)                                        # UNA replanificación
+        self.assertIn("NINGUNA etapa los crea", respuestas[1])                      # con la razón concreta
+        self.assertIn("lo vuelve a revisar la integración final", ui.texto_registrado())
+
+
 # ======================================================================
 # MÓDULO: autotest_cupo
 # ======================================================================
@@ -57136,7 +57189,11 @@ Reglas:
   para completar después": lo que una etapa crea, lo termina.
 - Orden por dependencias: primero la base (modelo de datos, núcleo, configuración), después lo que la usa. Preferí
   porciones verticales que funcionen de punta a punta antes que capas sueltas.
-- Cada etapa entra en un plan de ~4 a 10 tareas: si es más grande, partila.
+- Cada etapa entra en un plan de ~4 a 10 tareas: si es más grande, partila. Si es más chica, AGRUPALA con otra:
+  apuntá a 3–6 etapas en un proyecto mediano (varios CRUD o varias tablas en UNA etapa, no una etapa por archivo).
+- Cada etapa trae SUS tests. NO hagas etapas de solo tests ("pruebas de integración"): REAPER ya verifica el
+  proyecto entero al final.
+- Si el pedido NOMBRA archivos (p. ej. web/index.html, app.js, style.css), alguna etapa tiene que crearlos.
 - Definí la ARQUITECTURA una sola vez (stack, carpetas, cómo se corren los tests y la app, convenciones) y que
   todas las etapas la respeten.
 - La INTERFAZ de cada etapa (archivos, funciones/clases/endpoints con firmas exactas) es un contrato: las etapas
@@ -57326,6 +57383,40 @@ def problemas_maestro(maestro: PlanMaestro, max_etapas: int, pedido: str = "") -
     como_plan = Plan(maestro.vision, [Tarea(e.id, f"{e.objetivo}\n{e.interfaz}", e.archivos, e.deps)
                                       for e in maestro.etapas], [])
     salida.extend(p.replace("la tarea", "la etapa") for p in problemas_del_plan(como_plan, pedido))
+    return salida
+
+
+_RE_ARCHIVO_PEDIDO = re.compile(r"(?<![\w/.-])((?:[\w-]+/)*[\w-]+\.(?:py|js|mjs|cjs|jsx|ts|tsx|html|htm|css))\b", re.I)
+
+
+def archivos_nombrados(pedido: str) -> list:
+    """Archivos de código/web que el PEDIDO nombra explícitamente (sin los de tests: sus nombres son libres)."""
+    salida = []
+    for m in _RE_ARCHIVO_PEDIDO.finditer(pedido or ""):
+        rel = m.group(1)
+        if not _es_test(rel) and rel not in salida:
+            salida.append(rel)
+    return salida
+
+
+def observaciones_maestro(maestro: PlanMaestro, pedido: str = "") -> list:
+    """Determinista (0 tokens): defectos que valen UNA replanificación pero no frenan el proyecto si el modelo insiste
+    (la integración final contra el pedido igual los atrapa). Vistos en la primera prueba REAL de /grande: el pedido
+    nombraba web/index.html, app.js y style.css y ninguna de las 10 etapas los creaba; una etapa era solo de tests;
+    y había una etapa por cada CRUD."""
+    salida = []
+    planeados = {Path(rel).name.lower() for e in maestro.etapas for rel in e.archivos}
+    faltan = [rel for rel in archivos_nombrados(pedido) if Path(rel).name.lower() not in planeados]
+    if faltan:
+        salida.append("el pedido nombra " + ", ".join(faltan[:8]) + " y NINGUNA etapa los crea: agregalos a la etapa "
+                      "que corresponda")
+    for e in maestro.etapas:
+        if e.archivos and all(_es_test(rel) for rel in e.archivos):
+            salida.append(f"la etapa {e.id} solo tiene tests: los tests van con el código de cada etapa; fusionala")
+    codigo = sorted(sum(1 for rel in e.archivos if not _es_test(rel)) for e in maestro.etapas)
+    if len(maestro.etapas) > 6 and codigo and codigo[len(codigo) // 2] <= 1:
+        salida.append(f"el plan está muy fragmentado ({len(maestro.etapas)} etapas, la mayoría de un solo archivo): "
+                      "agrupá piezas relacionadas y apuntá a 3–6 etapas")
     return salida
 
 
@@ -57540,13 +57631,17 @@ class ConstructorGrande:
         self.ui.fase("G", "Plan maestro (proyecto grande por etapas)")
         maestro = self._pedir_maestro(pedido)
         problemas = problemas_maestro(maestro, self.settings.max_etapas, pedido)
-        if problemas:
+        observaciones = observaciones_maestro(maestro, pedido) if maestro.etapas else []
+        if problemas or observaciones:
             # Juez (0 tokens): una sola replanificación con las razones; si sigue mal, no se arranca a ciegas.
             self.ui.aviso("  Juez · el plan maestro tiene problemas: lo hago rehacer una vez.")
-            for p in problemas[:5]:
+            for p in (problemas + observaciones)[:6]:
                 self.ui.tenue(f"    • {p}")
-            maestro = self._pedir_maestro(pedido, "\n".join(f"- {p}" for p in problemas), maestro)
+            maestro = self._pedir_maestro(pedido, "\n".join(f"- {p}" for p in problemas + observaciones), maestro)
             problemas = problemas_maestro(maestro, self.settings.max_etapas, pedido)
+            for o in observaciones_maestro(maestro, pedido) if not problemas else []:
+                # Lo que no frena: queda avisado y la integración final contra el pedido lo vuelve a mirar.
+                self.ui.aviso(f"  Juez · sigue: {o} (lo vuelve a revisar la integración final)")
             if problemas:
                 self.ui.error("El plan maestro sigue sin servir: " + "; ".join(problemas[:4]))
                 if any("tope es" in p for p in problemas):

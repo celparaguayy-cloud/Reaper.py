@@ -137,6 +137,9 @@ _RE_META_TAREA = re.compile(
     r"(?:(?:las?|los|the)\s+)?(?:pruebas|tests?|suite|unit\s*tests?)\b", re.IGNORECASE)
 
 
+_RE_CONTEXTO_TEST = re.compile(r"\btests?\b|\btestead|prueba|unittest|pytest|fixture|node:test", re.I)
+
+
 def problemas_del_plan(plan, pedido: str = "") -> list:
     """Determinista (0 tokens): tareas que planean simular o que no entregan nada. → mensajes para replanificar.
     "Datos de ejemplo" no cuenta si el PEDIDO los pide ("la base arranca con 3 recetas de ejemplo")."""
@@ -145,7 +148,9 @@ def problemas_del_plan(plan, pedido: str = "") -> list:
     for tarea in getattr(plan, "tareas", []) or []:
         texto = tarea.descripcion or ""
         m = _RE_TAREA_SIMULADA.search(texto) or _RE_TODO.search(texto)
-        if m and pide_ejemplos and re.search(r"ejemplo", m.group(0), re.I):
+        if m and re.search(r"ejemplo|fictici", m.group(0), re.I) and (
+                pide_ejemplos or _RE_CONTEXTO_TEST.search(texto[max(0, m.start() - 80):m.end() + 80])):
+            # "testeadas con datos de ejemplo" es lo normal en un test (prueba real: hizo replanificar sin motivo).
             m = _RE_TODO.search(texto)
         if m:
             salida.append(f"la tarea {tarea.id} planea una simulación («{m.group(0)}»): tiene que implementar "

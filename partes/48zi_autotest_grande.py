@@ -652,3 +652,51 @@ class TestCarpetaDeProyectoNuevo(BaseTest):
             self.assertFalse(otra.exists())
         finally:
             self._restaurar(previo)
+
+
+class TestPlanMaestroDeLaPruebaReal(BaseTest):
+    """Primera prueba REAL de /grande (Termux, modelos :free, octubre 2026): el plan maestro tenía 10 etapas (un CRUD
+    por tabla), una etapa solo de tests, ninguna etapa creaba la web que el pedido nombraba, y el juez tomó "testeadas
+    con datos de ejemplo" por una simulación (replanificación de más)."""
+
+    PEDIDO = "Almacén con API JSON y una página web en web/ (index.html, app.js, style.css). Tests con unittest."
+
+    def test_cobertura_de_archivos_nombrados_y_etapas_de_solo_tests(self):
+        m = parsear_maestro('<etapa id="1"><objetivo>datos</objetivo><archivos>almacen/db.py, tests/test_db.py'
+                            '</archivos></etapa><etapa id="2" deps="1"><objetivo>e2e</objetivo>'
+                            '<archivos>tests/test_integracion.py</archivos></etapa>')
+        obs = observaciones_maestro(m, self.PEDIDO)
+        self.assertTrue(any("index.html, app.js, style.css" in o for o in obs), obs)
+        self.assertTrue(any("etapa 2 solo tiene tests" in o for o in obs), obs)
+        bien = parsear_maestro('<etapa id="1"><objetivo>x</objetivo><archivos>almacen/api.py, web/index.html, '
+                               'web/app.js, web/style.css, tests/test_api.py</archivos></etapa>')
+        self.assertEqual(observaciones_maestro(bien, self.PEDIDO), [])
+
+    def test_plan_fragmentado(self):
+        texto = "".join(f'<etapa id="{i}"><objetivo>crud {i}</objetivo><archivos>a/m{i}.py, tests/test_m{i}.py'
+                        f'</archivos></etapa>' for i in range(1, 9))
+        self.assertTrue(any("fragmentado" in o for o in observaciones_maestro(parsear_maestro(texto), "")))
+
+    def test_datos_de_ejemplo_en_tests_no_es_simulacion(self):
+        en_tests = Plan("x", [Tarea("1", "Reportes por día, testeadas con datos de ejemplo en una base temporal",
+                                    ["r.py"])], [])
+        self.assertEqual(problemas_del_plan(en_tests), [])
+        simulado = Plan("x", [Tarea("1", "Devolver datos de ejemplo hasta tener la API real", ["r.py"])], [])
+        self.assertTrue(problemas_del_plan(simulado))
+
+    def test_observacion_replanifica_una_vez_y_no_frena_si_el_modelo_insiste(self):
+        plan_sin_web = ('<maestro><vision>v</vision><etapa id="1"><objetivo>api</objetivo><archivos>almacen/api.py, '
+                        'tests/test_api.py</archivos></etapa></maestro>')
+        respuestas = []
+
+        def responder(mensajes, kw):
+            respuestas.append(MockLLM.ultimo_usuario(mensajes))
+            return plan_sin_web
+        ui = self.ui()
+        grande = ConstructorGrande(MockLLM(responder), self.proyecto({}), self.ajustes(), ui)
+        grande.consultar_cuenta = lambda: None
+        maestro = grande.planificar(self.PEDIDO, confirmar=False)
+        self.assertIsNotNone(maestro)                                               # no se frena por esto
+        self.assertEqual(len(respuestas), 2)                                        # UNA replanificación
+        self.assertIn("NINGUNA etapa los crea", respuestas[1])                      # con la razón concreta
+        self.assertIn("lo vuelve a revisar la integración final", ui.texto_registrado())
