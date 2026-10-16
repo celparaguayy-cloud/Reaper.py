@@ -168,6 +168,14 @@ $ reaper --proyecto ~/mi_app
 ❯ /equipo juez        estado + qué roles reasignaría en la próxima build y por qué
 ```
 
+**Prueba grande en UN comando (Termux)**: baja y verifica la última versión, la instala, muestra tu cupo, construye
+un almacén completo por etapas (o lo retoma si ya había empezado) y deja el ZIP de `/reporte` en Descargas:
+
+```bash
+curl -fsSL -o ~/probar_grande.sh https://raw.githubusercontent.com/celparaguayy-cloud/Reaper.py/ccr-6e025352-3tb6n4/pruebas_fusion/probar_grande.sh
+bash ~/probar_grande.sh
+```
+
 **Paso 4 · Proyectos grandes: por etapas (opcional)**
 
 Si el proyecto no entra en un solo plan (backend + base de datos + web + reportes…), usá `/grande`: arma un plan
