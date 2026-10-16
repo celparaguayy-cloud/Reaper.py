@@ -609,6 +609,11 @@ def _palabras_clave(texto: str) -> set:
     return {p for p in re.findall(r"[a-záéíóúñ0-9/._-]{4,}", (texto or "").lower())}
 
 
+_RE_RESTRICCION = re.compile(r"únicamente|unicamente|solo (?:la )?(?:biblioteca|librer)|sin dependencias|"
+                             r"no se (?:incluy|requier|us)|todavía no|no (?:usar|incluir|agregar)|standard library|"
+                             r"no external|without (?:external|dependencies)", re.I)
+
+
 def cobertura_criterios(criterios: list, plan) -> list:
     """Determinista (0 llamadas al modelo): criterios del contrato que NINGUNA tarea del plan parece cubrir, por
     solape de palabras/archivos. Es una señal temprana de desvío para el juez, NO un veredicto: lo real lo decide
@@ -620,6 +625,8 @@ def cobertura_criterios(criterios: list, plan) -> list:
     palabras = _palabras_clave(texto)
     sin_cubrir = []
     for c in criterios:
+        if _RE_RESTRICCION.search(c):
+            continue                    # "solo la biblioteca estándar", "todavía no": restricción, no una tarea
         pc = _palabras_clave(c)
         if pc and not (pc & palabras):
             sin_cubrir.append(c)

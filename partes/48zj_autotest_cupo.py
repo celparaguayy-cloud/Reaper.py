@@ -259,3 +259,67 @@ class TestReporteParaMejorar(BaseTest):
         self.assertGreater(len(llamadas), antes)
         free_vivos(llm, ["c/otro:free"], cache=cache)                               # catálogo distinto: sondea
         self.assertIn("c/otro:free", llamadas)
+
+
+def _error_400(mensaje: str) -> LLMError:
+    try:
+        _lanzar_http(400, json.dumps({"error": {"code": 400, "message": mensaje}}), None, {})
+    except LLMError as e:
+        return e
+    raise AssertionError("no lanzó")
+
+
+_SOLO_RAZONA = {"choices": [{"delta": {"reasoning": "pienso y pienso " * 50}, "finish_reason": "length"}]}
+
+
+class TestModelosDeLaPruebaRealGrande(BaseTest):
+    """Primera prueba REAL de /grande en Termux: el juez apuntaba a un ID inexistente (400 en cada pedido antes del
+    respaldo) y cohere/north-mini-code:free pensaba 25 000 caracteres sin responder en cada pedido."""
+
+    def _cliente(self, eventos, **ajustes):
+        pedidos = []
+        base = transporte_falso(eventos)
+
+        def transporte(url, headers, payload, timeout):
+            pedidos.append((payload.get("model"), (payload.get("reasoning") or {}).get("effort")))
+            return base(url, headers, payload, timeout)
+        c = LLMClient("clave", self.ajustes(**ajustes), url="http://falso", transporte=transporte)
+        c.dormir = lambda s: None
+        return c, pedidos
+
+    def test_id_de_modelo_invalido_se_retira_al_primer_intento(self):
+        c, pedidos = self._cliente([_error_400("x/invalido is not a valid model ID"), "ok", "otra vez"],
+                                   modelo="x/invalido", fallbacks=["b/ok"], respaldo_equipo=False, rpm=0)
+        self.assertEqual(c.chat([{"role": "user", "content": "1"}]).texto, "ok")
+        self.assertEqual(c.chat([{"role": "user", "content": "2"}]).texto, "otra vez")
+        self.assertEqual([m for m, _ in pedidos], ["x/invalido", "b/ok", "b/ok"])     # no se lo vuelve a intentar
+        self.assertNotIn("contexto demasiado largo", str(_error_400("x is not a valid model ID")))
+
+    def test_modelo_que_solo_piensa_baja_el_razonamiento_y_despues_se_deja(self):
+        eventos = [_SOLO_RAZONA, "r1", _SOLO_RAZONA, "r2", _SOLO_RAZONA, "r3", "r4"]
+        c, pedidos = self._cliente(eventos, modelo="a/piensa:free", fallbacks=["b/ok:free"],
+                                   respaldo_equipo=False, rpm=0)
+        for esperado in ("r1", "r2", "r3", "r4"):
+            self.assertEqual(c.chat([{"role": "user", "content": "x"}]).texto, esperado)
+        del_que_piensa = [efecto for m, efecto in pedidos if m == "a/piensa:free"]
+        self.assertEqual(del_que_piensa, [None, "low", "none"])                  # y a la 4.ª ya no se lo usa
+
+    def test_razonamiento_obligatorio_rechaza_none_y_se_usa_minimal(self):
+        c, pedidos = self._cliente([_error_400("Reasoning is mandatory for this endpoint and cannot be disabled."),
+                                    "ok"], modelo="a/piensa:free", fallbacks=[], respaldo_equipo=False, rpm=0)
+        c._nivel_razonamiento["a/piensa:free"] = "none"
+        self.assertEqual(c.chat([{"role": "user", "content": "x"}]).texto, "ok")
+        self.assertEqual(pedidos, [("a/piensa:free", "none"), ("a/piensa:free", "minimal")])
+
+    def test_perfil_gratis_no_deja_roles_en_modelos_que_no_son_gratis(self):
+        s = self.ajustes(proveedor="openrouter", modelos_rol={"juez": "nanogpt:qwen/qwen3.8-27b-uncensored",
+                                                              "reparador": "nvidia/nemotron-3-super-120b-a12b:free"})
+        cambios = aplicar_perfil(s, "gratis", ["a/uno:free", "b/dos:free"])
+        self.assertEqual(s.modelos_rol, {"reparador": "nvidia/nemotron-3-super-120b-a12b:free"})
+        self.assertTrue(any("juez: nanogpt:qwen" in c for c in cambios))
+
+    def test_restricciones_no_son_criterios_sin_cubrir(self):
+        plan = Plan("x", [Tarea("1", "Crear storage.py con init_db y sus tests", ["almacen/storage.py"])], [])
+        sin = cobertura_criterios(["Todo el código utiliza únicamente la biblioteca estándar de Python",
+                                   "No se incluyen todavía módulos de CRUD", "Existe un endpoint /api/ventas"], plan)
+        self.assertEqual(sin, ["Existe un endpoint /api/ventas"])

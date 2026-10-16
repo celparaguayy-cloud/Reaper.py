@@ -452,6 +452,12 @@ def aplicar_perfil(settings: Settings, nombre: str, catalogo: Optional[list] = N
         settings.modelo = catalogo[0]
         settings.fallbacks = list(catalogo[1:5])
         cambios.append(f"modelo={catalogo[0]} (catálogo real de OpenRouter)")
+        # "Gratis" es TODO el equipo: un rol que apunta a un modelo pago o de otro proveedor (prueba real /grande: el
+        # juez en "nanogpt:qwen/…-uncensored", un ID que ya no existe) usa el modelo gratis principal.
+        for rol, asignado in sorted((settings.modelos_rol or {}).items()):
+            if not str(asignado).endswith(":free"):
+                del settings.modelos_rol[rol]
+                cambios.append(f"{rol}: {asignado} → modelo gratis principal")
         if settings.fallbacks:
             cambios.append(f"respaldos={', '.join(settings.fallbacks)}")
     settings.validar()

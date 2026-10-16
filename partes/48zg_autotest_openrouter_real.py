@@ -513,4 +513,7 @@ class TestOpenRouterRealPerfilGratisProbado(BaseTest):
         self.assertEqual(app.settings.fallbacks, ["c/ok:free"])
         texto = app.ui.texto_registrado()
         self.assertIn("Probando los modelos gratis", texto)
-        self.assertIn("pueden ser PAGOS: juez=anthropic/caro", texto)      # avisa del rol que puede cobrar
+        # Un rol en un modelo pago ya no queda como aviso: "gratis" es todo el equipo (prueba real /grande: el juez
+        # quedaba en un ID que ni existía y fallaba en cada pedido antes del respaldo).
+        self.assertIn("juez: anthropic/caro → modelo gratis principal", texto)
+        self.assertNotIn("juez", app.settings.modelos_rol)

@@ -84,7 +84,7 @@ class Uso:
 
 
 MENSAJES_HTTP = {
-    400: "Pedido rechazado por el proveedor (¿contexto demasiado largo?).",
+    400: "Pedido rechazado por el proveedor.",
     401: "Clave API inválida, revocada o ausente.",
     402: "La cuenta no tiene crédito suficiente para este modelo.",
     403: "Acceso denegado por el proveedor (moderación o permisos).",
@@ -105,7 +105,10 @@ _RE_MODELO_RETIRADO = re.compile(
     r"\b404\b|model_not_found|does not exist|no such model|modelo o endpoint no disponible|model.*not found"
     # 403 permanente para esta cuenta/cliente (prueba real: "inkling:free is only available on agentic
     # harnesses"): reintentarlo en cada pedido solo gasta tiempo; se retira como un 404.
-    r"|only available (?:on|in|for|to)\b|not available (?:on|for|to) (?:this|your)",
+    r"|only available (?:on|in|for|to)\b|not available (?:on|for|to) (?:this|your)"
+    # 400 de un ID que no existe (prueba real /grande: "nanogpt:qwen/qwen3.8-27b-uncensored is not a valid model ID"
+    # en CADA pedido del juez antes de caer al respaldo).
+    r"|not a valid model|invalid model|unknown model|model .{0,60}not supported",
     re.I,
 )
 
@@ -191,6 +194,8 @@ def _lanzar_http(status: int, cuerpo: str, retry_after: Optional[str], cabeceras
         saturado = status == 429 and bool(_RE_POOL_SATURADO.search(cuerpo or ""))
         raise _Transitorio(f"{motivo} HTTP {status}. {detalle}".strip(), espera, saturado=saturado)
     excedido = status in (400, 413) and bool(_RE_CONTEXTO.search(cuerpo or ""))
+    if excedido and status == 400:
+        motivo = "Pedido rechazado por el proveedor: contexto demasiado largo."
     raise LLMError(
         f"{motivo} HTTP {status}. {detalle}".strip(),
         probar_otro_modelo=status in (400, 402, 403, 404, 413, 422) and not excedido,
@@ -335,6 +340,11 @@ class LLMClient:
         # Cupo diario de modelos gratis de OpenRouter agotado: hasta cuándo (epoch; 0 = no se sabe, se asume que
         # sigue agotado en esta sesión). Mientras dure, los :free de OpenRouter se saltean sin tocar la red.
         self.cupo_free_hasta: Optional[float] = None
+        # Razonamiento POR MODELO (prueba real /grande: cohere/north-mini-code:free pensaba 25 000 caracteres sin
+        # responder en cada pedido, ignorando effort "low", y se lo volvía a probar primero cada vez). Escalera:
+        # sin parámetro → "low" → "none" (lo apaga) → se deja de usar en la sesión.
+        self._nivel_razonamiento: dict = {}
+        self._solo_razona: collections.Counter = collections.Counter()
 
     def _es_free_openrouter(self, modelo: str) -> bool:
         try:
@@ -527,13 +537,31 @@ class LLMClient:
         }
         if proveedor == "openrouter":
             payload["usage"] = {"include": True}
-            if ampliar:
+            nivel = self._nivel_razonamiento.get(modelo) if hasattr(self, "_nivel_razonamiento") else None
+            if nivel:
+                payload["reasoning"] = {"effort": nivel}
+            elif ampliar:
                 payload["reasoning"] = {"effort": "low"}
         elif proveedor == "openai":
             payload["stream_options"] = {"include_usage": True}
         if stop:
             payload["stop"] = stop[:4]
         return payload
+
+    def _modelo_solo_razona(self, modelo: str) -> None:
+        """El modelo gastó todo pensando sin responder: la próxima vez se le pide pensar menos ("low") o nada ("none");
+        si ni así responde (o ya falló 3 veces), se deja de usar en la sesión."""
+        self._solo_razona[modelo] += 1
+        actual = self._nivel_razonamiento.get(modelo)
+        siguiente = {None: "low", "low": "none"}.get(actual)
+        if siguiente and self._solo_razona[modelo] < 3:
+            self._nivel_razonamiento[modelo] = siguiente
+            if self.on_evento:
+                self.on_evento(f"{modelo} piensa sin responder: la próxima vez le pido razonamiento '{siguiente}'")
+            return
+        self.disyuntor.retirar(modelo)
+        if self.on_evento:
+            self.on_evento(f"{modelo} sigue pensando sin responder: lo dejo de usar en esta sesión")
 
     def _con_reintentos(self, modelo, mensajes, temperatura, max_tokens, stop, on_progress,
                         hay_alternativa: bool = False, reintentos: Optional[int] = None):
@@ -551,7 +579,17 @@ class LLMClient:
                 # Modelo de razonamiento que se quedó sin tokens PENSANDO (finish=length, sin texto): con los pedidos
                 # cortos del juez (~350 tokens) pasaba casi siempre con los :free de hoy, que razonan todos. Un
                 # reintento en el mismo modelo con margen para pensar y razonamiento corto; si igual falla, otro modelo.
-                if not (e.solo_razonamiento and "finish=length" in str(e)) or ampliado:
+                if (self._nivel_razonamiento.get(modelo) == "none" and not e.solo_razonamiento
+                        and re.search(r"reason|effort|thinking|mandatory", str(e), re.I)):
+                    # Razonamiento obligatorio: rechaza "none". Se lo deja en "minimal" y se reintenta una vez.
+                    self._nivel_razonamiento[modelo] = "minimal"
+                    payload = self._payload(modelo, mensajes, temperatura, max_tokens, stop,
+                                            self._destino(modelo).proveedor)
+                    continue
+                if not (e.solo_razonamiento and "finish=length" in str(e)):
+                    raise
+                self._modelo_solo_razona(modelo)
+                if ampliado:
                     raise
                 self._ampliar_razonamiento = True           # de acá en más, margen para pensar en pedidos cortos
                 if hay_alternativa:
