@@ -576,3 +576,39 @@ modelo gratis). Lo natural es repetir el mismo comando, y REAPER respondía "ya 
 
 Tests: +5 (los 5 fallan con el código anterior). Regresión: **1080 tests OK** en Python 3.10/3.11/3.12/3.13.
 
+## 20. Preparación para la prueba grande con modelos gratis reales (NO VERIFICADO con un modelo real)
+
+**Límites reales verificados en la documentación de OpenRouter** (docs/api-reference/limits): modelos `:free` con
+20 pedidos por minuto y **50 por día si nunca se compraron créditos** (1000 por día con al menos 10 de crédito); al
+pasarse, HTTP 429 con `X-RateLimit-*`; `GET /api/v1/key` informa `is_free_tier` y `free_model_daily_requests`
+(used/limit/remaining). Un `/grande` de 5 etapas necesita, según la estimación de REAPER, ~135–325 pedidos sin
+torneo: **con 50 por día no termina en un día**; con 1000 sí.
+
+| Problema que habría aparecido en la prueba real | Arreglo |
+|---|---|
+| Un 429 de cupo DIARIO se reintentaba como pasajero y se probaban los otros `:free` (comparten el cupo): minutos perdidos y el mensaje no decía qué pasaba | Se detecta (texto "per-day" o `Remaining: 0` con reinicio lejano): no se reintenta, se saltean los `:free`, se usa otro proveedor del equipo si hay, mientras dure se falla al instante sin red, y el mensaje dice a qué hora se renueva |
+| Las fases "opcionales" (juez, explorador, forense, torneo, escritor largo) se tragaban el error y seguían | `LLMError.detiene_todo` (presupuesto o cupo): se propaga y la build queda guardada para retomar |
+| Nada avisaba ANTES que el cupo no alcanzaba | `/doctor` y `/grande` consultan la cuenta (no gasta cupo): estimación de pedidos y aviso; con 50/día, `/grande` corre sin torneo ni revisor (solo esa corrida) |
+| Un corte por límite o Ctrl+C contaba como intento fallido de la etapa (a los 4, bloqueada) | Solo cuentan las builds que terminaron |
+| Ante "todos los modelos en enfriamiento" `/grande` se detenía | Espera sola 2, 5 y 10 min (tope `espera_limites_min`, 30 por defecto) y sigue; si el cupo diario se renueva dentro del tope, espera hasta la renovación |
+| `--perfil gratis` desde la terminal no sondeaba qué `:free` responden (solo `/perfil gratis`) | Sondea con memoria de 6 h por catálogo (cada sondeo es un pedido del cupo) |
+| Plan maestro de un modelo real con `<stage>`/`<objective>`, `deps="ninguna"`, `deps="E1"` o `"etapa 2"` | Se aceptan; la respuesta cortada (etapa abierta sin cerrar o `finish_reason=length`) se detecta (antes la última etapa se perdía en silencio) y se replanifica |
+
+**Simulación realista nueva (modelo simulado, código real):** almacén en 5 etapas — SQLite, ventas con control de
+stock (todo o nada), reportes y CSV, API HTTP real (`http.server`, tests con servidor en un puerto libre) y web con
+módulos ES + tests de node. Termina VERIFICADO con 12 tests reales (9 Python + 3 node). Variante "modelo flojo":
+`<script src="app.js">` sin `type="module"` → la validación lo detecta (SyntaxError en el navegador) y el reparador
+lo corrige.
+
+**Bug que encontró la simulación:** una etapa que "de paso" borra una función de una etapa anterior deja lo
+verificado ROTO en el disco (la preservación no salta con un borrado chico) y el cierre no lo decía. Ahora, al
+detenerse, REAPER corre los tests y nombra qué tests de etapas verificadas rompió; `/grande deshacer` vuelve al
+último estado verificado (revierte la etapa, descarta su build) y `/grande continuar` la rehace. Probado de punta a
+punta. También: el veredicto CUMPLE del juez salía con ⚠ en el cierre.
+
+**Para el ciclo de mejora:** `/reporte` y `--reporte` arman un ZIP sin claves (informes, estado, logs, árbol y
+código; nunca .env, .clave*, *.key, id_rsa). `prueba_real.py`: cupo antes/después, `--continuar <carpeta>` para
+retomar una corrida cortada y un ZIP por proyecto.
+
+Tests: +19. Regresión: **1099 tests OK** en Python 3.10/3.11/3.12/3.13. Lint (pyflakes/ruff): sin hallazgos.
+

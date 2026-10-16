@@ -210,3 +210,15 @@ Regresión 1075 tests OK en Python 3.10/3.11/3.12/3.13.
 `--construir continuar|estado` y `--grande continuar|estado`; al cortarse se imprime el comando exacto para seguir.
 Regresión 1080 tests OK en Python 3.10/3.11/3.12/3.13.
 
+## 14. Preparación para la prueba grande real (NO VERIFICADO con un modelo real)
+
+Detalle en `REAPER_FUSION_PRUEBAS.md` §20. Cupo diario de OpenRouter (`es_cupo_diario`, `LLMClient.cupo_free_hasta`,
+`LLMError.detiene_todo`), cuenta (`cuenta_openrouter`, `/doctor`), estimación y ahorro de pedidos en `/grande`,
+esperas acotadas ante límites pasajeros, plan maestro tolerante a formatos y a respuestas cortadas, `/grande
+deshacer`, `/reporte`, simulación del almacén en 5 etapas (API + web).
+
+**A auditar:** (a) `_RE_LIMITE_PASAJERO` decide qué errores merecen esperar: un error de configuración con la palabra
+"rate" esperaría en vano hasta 30 min; (b) la detección de cupo diario sin texto explícito usa `Remaining: 0` + reinicio
+a más de 10 min; (c) la estimación de pedidos es gruesa (25–60 por etapa) y solo sirve para avisar.
+Regresión 1099 tests OK en Python 3.10/3.11/3.12/3.13.
+
