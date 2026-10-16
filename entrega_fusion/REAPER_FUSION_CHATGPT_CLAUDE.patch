@@ -102,7 +102,40 @@
  def degradado(texto: str, desde: tuple, hasta: tuple) -> str:
      """Pinta 'texto' con un degradado horizontal (si hay color)."""
      if not _USAR_COLOR or not texto:
-@@ -732,7 +790,7 @@
+@@ -535,6 +593,24 @@
+ }
+ 
+ 
++def _partir_para_caja(lineas: list, ancho: int, maximo: int = 6) -> list:
++    """Las líneas de texto largas se PARTEN en renglones en vez de recortarse: en el teléfono (Termux angosto) la caja
++    de /grande cortaba justo "Se renueva mañana a las …" o el comando para seguir. Las que traen colores ANSI (tablas,
++    barras) se dejan para ajustar() como antes."""
++    salida = []
++    for linea in lineas:
++        if ancho_visible(linea) <= ancho or "\x1b" in linea:
++            salida.append(linea)
++            continue
++        sangria = " " * (len(linea) - len(linea.lstrip(" ")))
++        partes = textwrap.wrap(linea.strip(), width=max(10, ancho - len(sangria)), break_long_words=True,
++                               break_on_hyphens=False) or [""]
++        if len(partes) > maximo:
++            partes = partes[:maximo - 1] + [partes[maximo - 1] + " …"]
++        salida.extend(sangria + parte for parte in partes)
++    return salida
++
++
+ def caja(lineas: Sequence[str], titulo: str = "", color: str = "", estilo: str = "redondo",
+          ancho: Optional[int] = None, relleno: int = 1) -> str:
+     """Devuelve una caja dibujada con bordes alrededor de las líneas."""
+@@ -546,6 +622,7 @@
+         interior = max(10, min(ancho - 2 - 2 * relleno, maximo))
+     else:
+         interior = min(interior, maximo)
++    lineas = _partir_para_caja(lineas, interior)
+     reset = C.RESET if color else ""
+     pad = " " * relleno
+     if titulo:
+@@ -732,7 +809,7 @@
          try:
              self.log.parent.mkdir(parents=True, exist_ok=True)
              with open(self.log, "a", encoding="utf-8") as f:
@@ -111,7 +144,7 @@
          except OSError:
              self.log = None
  
-@@ -759,7 +817,10 @@
+@@ -759,7 +836,10 @@
          self.linea(f"{Tema.ok}✓ {texto}{C.RESET}")
  
      def aviso(self, texto: str) -> None:
@@ -123,7 +156,7 @@
  
      def error(self, texto: str) -> None:
          self.linea(f"{Tema.error}✗ {texto}{C.RESET}")
-@@ -768,14 +829,16 @@
+@@ -768,14 +848,16 @@
          self.linea(f"{Tema.tenue}{texto}{C.RESET}")
  
      def titulo(self, texto: str) -> None:
@@ -144,7 +177,7 @@
  
      def separador(self, caracter: str = "─") -> None:
          self.linea(f"{Tema.tenue}{caracter * min(ancho_terminal(), 72)}{C.RESET}")
-@@ -816,10 +879,11 @@
+@@ -816,10 +898,11 @@
  
      def herramienta(self, etiqueta: str, nombre: str, detalle: str = "") -> None:
          detalle = detalle.replace("\n", " ")
@@ -157,7 +190,7 @@
  
      def resultado_herramienta(self, ok: bool, texto: str) -> None:
          primera = (texto or "").strip().splitlines()[0] if (texto or "").strip() else ""
-@@ -1511,10 +1575,14 @@
+@@ -1511,10 +1594,14 @@
      "github-models": {
          "url": "https://models.inference.ai.azure.com/chat/completions",
          "clave": "GITHUB_MODELS_TOKEN",
@@ -173,7 +206,7 @@
  
  @dataclass(frozen=True)
  class InfoModelo:
-@@ -1557,20 +1625,47 @@
+@@ -1557,20 +1644,47 @@
                                        "DeepSeek R1 gratis en OpenRouter (con límites de uso)", "openrouter", True),
      "or-llama70-free": InfoModelo("meta-llama/llama-3.3-70b-instruct:free", 131072, "fuerte",
                                    "Llama 3.3 70B gratis en OpenRouter (con límites)", "openrouter", True),
@@ -231,7 +264,7 @@
  
  MODOS = ("confirmar", "auto-edicion", "auto")
  
-@@ -1623,6 +1718,16 @@
+@@ -1623,6 +1737,16 @@
      respaldo_equipo: bool = True
      # REAPER X: equipo de 10 roles (director, supervisor, integrador, seguridad defensiva, auditor de entrega)
      roles_x: bool = False
@@ -248,7 +281,7 @@
      proveedor: str = "openrouter"
      api_url: str = ""
  
-@@ -1646,7 +1751,18 @@
+@@ -1646,7 +1770,18 @@
      max_llamadas_turno: int = 4
      max_reparaciones: int = 3
      max_revisiones: int = 2
@@ -268,7 +301,7 @@
      paralelo: int = 2
      qa: bool = True
  
-@@ -1751,8 +1867,12 @@
+@@ -1751,8 +1886,12 @@
          acotar("max_profundidad", 0, 3)
          acotar("max_llamadas_turno", 1, 10)
          acotar("max_reparaciones", 0, 10)
@@ -282,7 +315,7 @@
          acotar("paralelo", 1, 8)
          acotar("candidatos", 1, 6)
          acotar("paralelo_torneo", 1, 6)
-@@ -1802,7 +1922,8 @@
+@@ -1802,7 +1941,8 @@
          "descripcion": "modelos :free, 2 candidatos, sin escalada paga, 16 solicitudes/min y tope de costo ~0",
          # R-010: el perfil gratis impone un techo de costo casi cero. Los modelos :free reportan costo 0, así
          # que no estorba; pero si por error se usa uno pago, el presupuesto de la sesión corta enseguida.
@@ -292,7 +325,7 @@
                      "candidatos": 2, "rpm": 16, "escalar": False, "costo_maximo": 0.01},
      },
      "rapido": {
-@@ -1822,7 +1943,9 @@
+@@ -1822,7 +1962,9 @@
  }
  
  
@@ -303,7 +336,7 @@
      perfil = PERFILES.get((nombre or "").strip().lower())
      if not perfil:
          raise KeyError(nombre)
-@@ -1831,6 +1954,18 @@
+@@ -1831,6 +1973,18 @@
          if getattr(settings, clave) != valor:
              setattr(settings, clave, copy.deepcopy(valor))
              cambios.append(f"{clave}={valor}")
@@ -322,7 +355,7 @@
      settings.validar()
      return cambios
  
-@@ -1894,16 +2029,47 @@
+@@ -1894,16 +2048,47 @@
      os.replace(tmp, ruta)
  
  
@@ -372,7 +405,7 @@
  def cargar_estado() -> dict:
      try:
          data = json.loads(ESTADO_FILE.read_text(encoding="utf-8"))
-@@ -2127,22 +2293,33 @@
+@@ -2127,22 +2312,33 @@
  
  class LLMError(RuntimeError):
      def __init__(self, mensaje: str, *, probar_otro_modelo: bool = False, contexto_excedido: bool = False,
@@ -408,7 +441,7 @@
  
  
  @dataclass
-@@ -2188,7 +2365,7 @@
+@@ -2188,7 +2384,7 @@
  
  
  MENSAJES_HTTP = {
@@ -417,7 +450,7 @@
      401: "Clave API inválida, revocada o ausente.",
      402: "La cuenta no tiene crédito suficiente para este modelo.",
      403: "Acceso denegado por el proveedor (moderación o permisos).",
-@@ -2206,22 +2383,100 @@
+@@ -2206,22 +2402,100 @@
  )
  # Modelo inexistente/retirado para esta cuenta (404): se retira de la ruta, no se reintenta (Ω §5.2).
  _RE_MODELO_RETIRADO = re.compile(
@@ -522,7 +555,7 @@
      raise LLMError(
          f"{motivo} HTTP {status}. {detalle}".strip(),
          probar_otro_modelo=status in (400, 402, 403, 404, 413, 422) and not excedido,
-@@ -2241,7 +2496,7 @@
+@@ -2241,7 +2515,7 @@
              if r.status_code >= 400:
                  # En streaming hay que leer el cuerpo antes de usarlo.
                  cuerpo = r.read().decode("utf-8", "replace")
@@ -531,7 +564,7 @@
              for linea in r.iter_lines():
                  yield linea
      except httpx.TimeoutException as e:
-@@ -2257,7 +2512,7 @@
+@@ -2257,7 +2531,7 @@
          respuesta = urllib.request.urlopen(pedido, timeout=timeout)
      except urllib.error.HTTPError as e:
          cuerpo = e.read().decode("utf-8", "replace") if e.fp else ""
@@ -540,7 +573,7 @@
          return
      except (urllib.error.URLError, socket.timeout, TimeoutError, ConnectionError) as e:
          raise _Transitorio(f"Error de red hablando con el proveedor: {e}") from e
-@@ -2349,6 +2604,9 @@
+@@ -2349,6 +2623,9 @@
          transporte: Optional[Transporte] = None,
      ):
          self.api_key = api_key
@@ -550,7 +583,7 @@
          self.settings = settings
          self.url = url or settings.url_api()
          self.uso = Uso()
-@@ -2360,16 +2618,44 @@
+@@ -2360,16 +2637,44 @@
                                            enfriamiento=getattr(settings, "disyuntor_enfriamiento", 45.0))
          self._claves_proveedor: dict = {}       # proveedor → clave (cache; Fase 6, ruteo multi-proveedor)
          self.on_evento: Optional[Callable[[str], None]] = None
@@ -600,7 +633,7 @@
  
      def _respaldos_equipo(self, principal: str, ya: list) -> list:
          """
-@@ -2411,7 +2697,10 @@
+@@ -2411,7 +2716,10 @@
          on_progress: Optional[Callable[[int], None]] = None,
          rol: str = "",
          sin_respaldo: bool = False,
@@ -611,7 +644,7 @@
          self._verificar_presupuesto()
          principal = resolver_modelo(modelo or self.settings.modelo)
          candidatos = [principal]
-@@ -2436,6 +2725,16 @@
+@@ -2436,6 +2744,16 @@
                      probar_otro_modelo=False)
              candidatos = locales
  
@@ -628,7 +661,7 @@
          # Disyuntor (Ω §5.2): EXCLUIR los modelos abiertos/retirados; no "probar igual" contra algo caído.
          orden = self.disyuntor.elegibles(candidatos)
          if not orden:
-@@ -2446,9 +2745,12 @@
+@@ -2446,9 +2764,12 @@
  
          ultimo: Optional[LLMError] = None
          for n, candidato in enumerate(orden):
@@ -642,7 +675,7 @@
                  )
                  self.disyuntor.exito(candidato)
                  if candidato != principal:
-@@ -2460,6 +2762,10 @@
+@@ -2460,6 +2781,10 @@
                  ultimo = e
                  with self._lock:
                      self.uso.errores += 1
@@ -653,7 +686,22 @@
                  if not e.probar_otro_modelo:
                      raise
                  if _RE_MODELO_RETIRADO.search(str(e)):      # 404 model_not_found → cuarentena de esa ruta
-@@ -2495,8 +2801,14 @@
+@@ -2468,8 +2793,12 @@
+                         self.on_evento(f"{candidato} retirado (no disponible/404): no lo vuelvo a intentar hasta que responda")
+                 elif self.disyuntor.fallo(candidato) and self.on_evento:
+                     self.on_evento(f"disyuntor ABIERTO para {candidato}: lo salteo un rato ({self.disyuntor.enfriamiento:.0f}s)")
+-                if self.on_evento and n + 1 < len(orden):
+-                    self.on_evento(f"{candidato} falló ({e}); pruebo con {orden[n + 1]}")
++                # El que de verdad se va a intentar: con el cupo diario agotado, los :free siguientes se saltean (antes
++                # decía "pruebo con nemotron…:free" y no lo probaba).
++                siguiente = next((c for c in orden[n + 1:]
++                                  if not (self.cupo_free_agotado() and self._es_free_openrouter(c))), None)
++                if self.on_evento and siguiente:
++                    self.on_evento(f"{candidato} falló ({e}); pruebo con {siguiente}")
+         assert ultimo is not None
+         raise ultimo
+ 
+@@ -2495,8 +2824,14 @@
      def _payload(self, modelo, mensajes, temperatura, max_tokens, stop, proveedor=None) -> dict:
          info = info_modelo(modelo)
          proveedor = proveedor or self._destino(modelo).proveedor
@@ -669,7 +717,7 @@
          payload = {
              "model": self._destino(modelo).modelo,
              "messages": mensajes,
-@@ -2506,25 +2818,79 @@
+@@ -2506,25 +2841,79 @@
          }
          if proveedor == "openrouter":
              payload["usage"] = {"include": True}
@@ -753,7 +801,7 @@
                  if vacias >= 2 and intento < intentos:
                      # Dos respuestas vacías seguidas: ese modelo no está respondiendo (típico de :free saturados);
                      # mejor pasar a otra IA del equipo que esperar ~30 s más de reintentos.
-@@ -2534,14 +2900,32 @@
+@@ -2534,14 +2923,32 @@
                          f"{e} (después de {intentos + 1} intentos)",
                          probar_otro_modelo=True,
                      ) from e
@@ -787,7 +835,7 @@
      def _headers(self, destino: Optional["DestinoModelo"] = None) -> dict:
          proveedor = destino.proveedor if destino is not None else self.settings.proveedor
          clave = self._clave_de(destino) if destino is not None else self.api_key
-@@ -2567,17 +2951,25 @@
+@@ -2567,19 +2974,33 @@
              raise LLMError(
                  f"falta la clave del proveedor '{destino.proveedor}' (variable {destino.clave_env}) para el modelo "
                  f"{modelo}. Exportala como variable de entorno.", probar_otro_modelo=True)
@@ -812,8 +860,16 @@
 +                    pass
                  if _RE_CONTEXTO.search(mensaje or ""):
                      raise LLMError(f"Contexto excedido: {mensaje}", contexto_excedido=True)
++                if codigo in (429, None) and _RE_CUPO_DIARIO.search(mensaje or ""):
++                    # El cupo diario también puede llegar como evento de error DENTRO del stream (HTTP 200): como
++                    # pasajero se reintentaba hasta agotar los intentos en vez de frenar con la hora de reinicio.
++                    meta = err.get("metadata") if isinstance(err, dict) else None
++                    cab = (meta or {}).get("headers") if isinstance(meta, dict) else None
++                    _lanzar_http(429, mensaje, None, cab if isinstance(cab, dict) else None)
                  if codigo is None or codigo in TRANSITORIOS:
-@@ -2614,6 +3006,10 @@
+                     raise _Transitorio(f"Error del proveedor durante el streaming: {mensaje}")
+                 raise LLMError(f"Error del proveedor: {mensaje}", probar_otro_modelo=True)
+@@ -2614,6 +3035,10 @@
              por.segundos += duracion
  
          texto = "".join(partes)
@@ -824,7 +880,7 @@
          if not texto.strip():
              if razonamiento:
                  # Modelo con razonamiento que se quedó sin salida antes de responder: reintentar igual no sirve,
-@@ -2839,6 +3235,7 @@
+@@ -2839,6 +3264,7 @@
      params: dict = field(default_factory=dict)
      completa: bool = True
      crudo: str = ""
@@ -832,7 +888,7 @@
  
  
  @dataclass
-@@ -2908,7 +3305,7 @@
+@@ -2908,7 +3334,7 @@
      return salida
  
  
@@ -841,7 +897,7 @@
      params: dict = {}
      completa = True
      enmascarado = cuerpo
-@@ -2938,6 +3335,8 @@
+@@ -2938,6 +3364,8 @@
                  else:
                      fin_valor = fin_total = len(enmascarado)
                      completa = False
@@ -850,7 +906,7 @@
                  params[nombre] = limpiar_largo(cuerpo[ap.end():fin_valor])
                  enmascarado = (
                      enmascarado[:ap.start()]
-@@ -2990,8 +3389,15 @@
+@@ -2990,8 +3418,15 @@
              return {}
      if not isinstance(args, dict):
          return {}
@@ -868,7 +924,7 @@
  
  
  _RE_FUNCION_LLAMA = re.compile(r"<\s*function\s*=\s*([A-Za-z_][\w-]*)\s*>(.*?)(?:<\s*/\s*function\s*>|\Z)", re.S | re.I)
-@@ -3051,7 +3457,8 @@
+@@ -3051,7 +3486,8 @@
                  pos = fin
  
          definicion = esquemas.get(real, [])
@@ -878,7 +934,7 @@
          if not completa and not autocerrada and c_encontrado:
              # Falta el cierre del parámetro (</content>) pero el de la herramienta está: el valor queda
              # delimitado por </herramienta>, así que la llamada se entiende entera.
-@@ -3061,7 +3468,7 @@
+@@ -3061,7 +3497,7 @@
              params.setdefault(canon, valor)
          if not params and cuerpo.strip() and definicion:
              completa = completa and True
@@ -887,7 +943,7 @@
  
      if not llamadas:
          for m in _RE_FUNCION_LLAMA.finditer(limpio):
-@@ -3086,9 +3493,54 @@
+@@ -3086,9 +3522,54 @@
          if llamadas:
              fuera = []
  
@@ -942,7 +998,7 @@
  def contenido_parcial(llamada: Llamada, esquemas: Esquemas) -> Optional[tuple[str, str]]:
      """
      Si la llamada quedó cortada dentro de un parámetro largo (típico cuando el
-@@ -3536,10 +3988,12 @@
+@@ -3536,10 +4017,12 @@
  }
  
  ARCHIVOS_SENSIBLES = {
@@ -957,7 +1013,7 @@
  }
  # Plantillas/ejemplos SIN secretos reales: se permiten (no rechazar algo inocuo por coincidencia parcial).
  _SUFIJOS_ENV_EJEMPLO = (".example", ".sample", ".template", ".dist", ".ejemplo", ".defaults")
-@@ -3560,7 +4014,8 @@
+@@ -3560,7 +4043,8 @@
          return True
      if base.endswith(".pub"):                      # clave pública: no es secreto
          return False
@@ -967,7 +1023,7 @@
          return not any(base.endswith(suf) for suf in _SUFIJOS_ENV_EJEMPLO)
      if Path(base).suffix in _EXT_SENSIBLES:
          return True
-@@ -3582,11 +4037,22 @@
+@@ -3582,11 +4066,22 @@
      "LICENSE", ".gitignore", "REAPER.md",
  }
  
@@ -995,7 +1051,7 @@
  ]
  
  # Complementa el filtro clave=valor con claves entrecomilladas de JSON.
-@@ -3597,14 +4063,21 @@
+@@ -3597,14 +4092,21 @@
  
  MAX_BYTES_LECTURA = 1_000_000
  
@@ -1019,7 +1075,7 @@
          limpio = patron.sub("[REDACTADO]", limpio)
      limpio = _PATRON_JSON_SECRETO.sub(lambda m: m.group(1) + "[REDACTADO]", limpio)
      return limpio
-@@ -3620,7 +4093,13 @@
+@@ -3620,7 +4122,13 @@
              os.fsync(f.fileno())
          if ruta.exists():
              try:
@@ -1034,7 +1090,7 @@
              except OSError:
                  pass
          os.replace(temporal, ruta)
-@@ -3687,6 +4166,9 @@
+@@ -3687,6 +4195,9 @@
                  raise ErrorRuta(f"Archivo sensible protegido: {rel}")
              if relativa.parts and relativa.parts[0] == ".git":
                  raise ErrorRuta("No se escribe dentro de .git")
@@ -1044,7 +1100,7 @@
              if destino == self.raiz:
                  raise ErrorRuta("La ruta apunta a la raíz del workspace, no a un archivo.")
          return destino
-@@ -3735,11 +4217,16 @@
+@@ -3735,11 +4246,16 @@
          hacia = self.ruta(destino, escribir=True)
          if not desde.is_file():
              raise FileNotFoundError(origen)
@@ -1064,7 +1120,7 @@
          return hacia
  
      def existe(self, rel: str) -> bool:
-@@ -4284,6 +4771,7 @@
+@@ -4284,6 +4800,7 @@
          """Aplica los cambios de la copia al workspace real, registrando checkpoints."""
          excluidos = set(excluir)
          aplicados = []
@@ -1072,7 +1128,7 @@
          for c in cambios if cambios is not None else self.cambios():
              if c.rel in excluidos:
                  continue
-@@ -4293,6 +4781,12 @@
+@@ -4293,6 +4810,12 @@
                          destino.borrar(c.rel)
                          aplicados.append(c.rel)
                  elif c.despues is not None:
@@ -1085,7 +1141,7 @@
                      destino.escribir(c.rel, c.despues)
                      aplicados.append(c.rel)
              except (ErrorRuta, OSError):
-@@ -4359,7 +4853,12 @@
+@@ -4359,7 +4882,12 @@
  except ImportError:  # pragma: no cover - opcional
      _pyflakes_api = None
  
@@ -1099,7 +1155,7 @@
  _CACHE_MODULOS: dict[str, bool] = {}
  _LOCK_IMPORTS = threading.Lock()
  MAX_SALIDA_PROCESO = 400_000
-@@ -4377,10 +4876,31 @@
+@@ -4377,10 +4905,31 @@
      archivo: str = ""
      duracion: float = 0.0
  
@@ -1131,7 +1187,7 @@
          if self.stdout.strip():
              partes.append("STDOUT:\n" + recortar(self.stdout.strip(), limite))
          if self.stderr.strip():
-@@ -4392,6 +4912,9 @@
+@@ -4392,6 +4941,9 @@
              return f"↷ {self.comando}: {(self.stdout or self.stderr).strip()[:120]}"
          if self.ok:
              return f"✓ {self.comando}"
@@ -1141,7 +1197,7 @@
          detalle = (self.stderr or self.stdout).strip().splitlines()
          return f"✗ {self.comando}: {detalle[-1][:160] if detalle else 'exit ' + str(self.codigo)}"
  
-@@ -4409,6 +4932,35 @@
+@@ -4409,6 +4961,35 @@
      return env
  
  
@@ -1177,7 +1233,7 @@
  def ejecutar(
      cmd: Union[str, list],
      *,
-@@ -4416,46 +4968,84 @@
+@@ -4416,46 +4997,84 @@
      timeout: int = 60,
      shell: bool = False,
      entrada: Optional[str] = None,
@@ -1296,7 +1352,7 @@
  
  
  # ==================================================================
-@@ -5159,28 +5749,121 @@
+@@ -5159,28 +5778,121 @@
  _RECURSOS_HTML = re.compile(r"""<(?:script|link|img|source)\b[^>]*?\b(?:src|href)\s*=\s*["']([^"'#?]+)""", re.I)
  
  
@@ -1424,7 +1480,84 @@
      if not shutil.which("node"):
          return resultados
      for numero, m in enumerate(_SCRIPT_HTML.finditer(texto), start=1):
-@@ -5567,33 +6250,37 @@
+@@ -5502,6 +6214,15 @@
+     quedan, esperados, clasificaciones = [], [], []
+     for r in resultados:
+         tipo = r.comando.split(" ")[0]
++        es_test_js = bool(_RE_TEST_JS.match((r.archivo or "").rsplit("/", 1)[-1])) or (
++            r.archivo or "").startswith(("tests/", "test/", "__tests__/"))
++        if tipo == "imports-js" and not r.ok and ws is not None and es_test_js:
++            # tests/logica.test.mjs importa ../web/logica.js antes de que exista: el ImportError de JS.
++            _sigue, pendientes = faltantes_planeados(ws, [r], texto_plan)
++            if pendientes:
++                clasificaciones.extend(ClasificacionImport(r.archivo, x, "MODULO_PROPIO_AUSENTE") for x in pendientes)
++                esperados.append(r)
++                continue
+         if r.ok or tipo not in ("imports", "imports-locales") or not es_archivo_de_test(r.archivo or ""):
+             quedan.append(r)
+             continue
+@@ -5534,6 +6255,60 @@
+     return quedan, esperados, clasificaciones
+ 
+ 
++_RE_FALTANTE_REF = re.compile(r"(?:no existe el archivo importado|referencia a) '([^']+)'")
++_RE_RUTA_PLAN = re.compile(r"(?<![\w/.-])((?:[\w.-]+/)*[\w-][\w.-]*\.[A-Za-z0-9]{1,5})(?![\w/-])")
++
++
++def _rutas_del_plan(texto_plan: str) -> set:
++    return {os.path.normpath(r).replace("\\", "/") for r in _RE_RUTA_PLAN.findall(texto_plan or "")}
++
++
++def _referencia_planeada(ws: Workspace, archivo_rel: str, destino: str, planeadas: set) -> Optional[str]:
++    """La ruta del plan a la que apunta un import/src/href que todavía no existe; None si el plan no la nombra."""
++    base = (ws.raiz / archivo_rel).parent
++    limpio = destino.lstrip("/")
++    absolutas = [ws.raiz / limpio, base / limpio] + [ws.raiz / d / limpio for d in _RAICES_WEB]
++    for c in (absolutas if destino.startswith("/") else [base / destino]):
++        try:
++            rel = os.path.relpath(os.path.normpath(c), ws.raiz).replace("\\", "/")
++        except ValueError:
++            continue
++        variantes = [rel] if Path(rel).suffix else [rel] + [rel + ext for ext in _EXTENSIONES_JS]
++        for v in variantes:
++            if v in planeadas:
++                return v
++    return None
++
++
++def faltantes_planeados(ws: Workspace, resultados: list[Resultado], texto_plan: str) -> tuple:
++    """
++    Un HTML que referencia app.js/style.css, o un módulo JS que importa otro, escritos ANTES que esos archivos: si
++    todos los que faltan están en el plan, no es un error sino trabajo pendiente (corrida E2E de /grande: el
++    implementador escribía web/index.html primero, veía "VALIDACIÓN FALLÓ (corregilo antes de seguir)" y un modelo
++    real podía "arreglarlo" sacando el <script>). → (resultados que siguen, rutas del plan pendientes de crear).
++    """
++    planeadas = _rutas_del_plan(texto_plan)
++    quedan, pendientes = [], []
++    for r in resultados:
++        tipo = r.comando.split(" ")[0]
++        if r.ok or tipo not in ("imports-js", "recursos-html") or not planeadas:
++            quedan.append(r)
++            continue
++        propias = []
++        for linea in (l for l in (r.stderr or "").splitlines() if l.strip()):
++            m = _RE_FALTANTE_REF.search(linea)
++            destino = _referencia_planeada(ws, r.archivo or "", m.group(1), planeadas) if m and r.archivo else None
++            if destino is None:
++                propias = []
++                break
++            propias.append(destino)
++        if propias:
++            pendientes.extend(x for x in propias if x not in pendientes)
++            continue
++        quedan.append(r)
++    return quedan, pendientes
++
++
+ def fallos(resultados: list[Resultado]) -> list[Resultado]:
+     return [r for r in resultados if not r.ok]
+ 
+@@ -5567,33 +6342,37 @@
          or any(raiz.glob("test_*.py"))
          or any(raiz.glob("*_test.py"))
      )
@@ -1483,7 +1616,7 @@
      if (raiz / "go.mod").is_file() and shutil.which("go"):
          return "go test ./...", "go test"
      if (raiz / "Cargo.toml").is_file() and shutil.which("cargo"):
-@@ -5608,6 +6295,33 @@
+@@ -5608,6 +6387,33 @@
      return _detectar_tests_otros(raiz)
  
  
@@ -1517,7 +1650,7 @@
  def _detectar_tests_otros(raiz: Path) -> Optional[tuple[str, str]]:
      """Ruby (minitest), Perl (prove), PHP (phpunit o runner propio), Bash y Java sin build tool."""
      if shutil.which("ruby"):
-@@ -5643,12 +6357,12 @@
+@@ -5643,12 +6449,12 @@
      comando, _nombre = detectado
      r = ejecutar(comando, cwd=ws.raiz, timeout=timeout, shell=True)
      combinado = r.stdout + r.stderr
@@ -1533,7 +1666,7 @@
          r.ok, r.omitido = True, True
          r.stdout = "No se encontraron tests para ejecutar. " + r.stdout
      return r
-@@ -5744,7 +6458,10 @@
+@@ -5744,7 +6550,10 @@
  
  
  def _pytest(salida: str) -> Optional[ConteoTests]:
@@ -1545,7 +1678,7 @@
                and re.search(r"\bin\s+[\d.]+s", l) and not l.lstrip().startswith("test result:")]  # cargo
      if not lineas:
          if "no tests ran" in salida.lower():
-@@ -5897,6 +6614,16 @@
+@@ -5897,6 +6706,16 @@
          except (ValueError, IndexError):
              conteo = None
          if conteo is not None:
@@ -1562,7 +1695,7 @@
              if codigo not in (None, 0) and conteo.ok and conteo.total and not conteo.fallados:
                  # El runner dijo que todo pasó pero salió con error (p. ej. crash al final): cuenta como error.
                  conteo.errores += 1
-@@ -7622,6 +8349,19 @@
+@@ -7622,6 +8441,19 @@
      Pista(r"error: externally-managed-environment",
            "pip se niega a instalar en el Python del sistema: usá un venv (`python3 -m venv .venv`) o "
            "`pip install --user`.", "pip"),
@@ -1582,7 +1715,7 @@
      Pista(r"Failed building wheel for (\w+)|error: command '(?:gcc|clang)' failed",
            "El paquete necesita compilarse. En Termux: `pkg install clang make pkg-config` (y libs como "
            "libxml2, libjpeg-turbo según el paquete) o buscá una alternativa pura en Python.", "pip"),
-@@ -7636,9 +8376,14 @@
+@@ -7636,9 +8468,14 @@
      Pista(r"CONFLICT \(content\)|Automatic merge failed",
            "Conflicto de merge: editá los archivos marcados con <<<<<<< ======= >>>>>>> y hacé commit.", "git"),
      # ------------------------------------------------------------ HTML/CSS/web
@@ -1599,7 +1732,7 @@
      Pista(r"css-llaves",
            "Llaves desbalanceadas en el CSS: buscá un bloque sin cerrar (la línea indicada o la regla anterior).",
            "web"),
-@@ -8724,6 +9469,14 @@
+@@ -8724,6 +9561,14 @@
              "en esta tarea. Cambiá el código para que esos tests pasen."
          )
      if ctx.permitidos and not any(fnmatch.fnmatch(rel, patron) for patron in ctx.permitidos):
@@ -1614,7 +1747,18 @@
          raise ErrorHerramienta(
              f"En este rol solo podés escribir archivos que coincidan con: {', '.join(ctx.permitidos)}. "
              f"{rel} no está permitido."
-@@ -8913,7 +9666,14 @@
+@@ -8766,6 +9611,10 @@
+         if tdd:
+             notas = list(notas) + ["importa módulos que todavía no existen (esperado en tests primero: "
+                                    "los crea la implementación)"]
++    resultados, pendientes = faltantes_planeados(ctx.ws, resultados, ctx.pedido)
++    if pendientes:
++        notas = list(notas) + [f"referencia archivos del plan que todavía no existen ({', '.join(pendientes)}): "
++                               "crealos a continuación"]
+     malos = fallos(resultados)
+     accion = accion or ("Creé" if antes is None else "Modifiqué")
+     texto = f"{accion} {rel} ({lineas} líneas)."
+@@ -8913,7 +9762,14 @@
          for ruta in ctx.ws.iterar(p.get("path") or ".", limite=3000):
              if filtro and not Path(ruta.name).match(filtro):
                  continue
@@ -1630,7 +1774,7 @@
                  continue
              try:
                  texto = ruta.read_text(encoding="utf-8", errors="replace")
-@@ -8921,7 +9681,8 @@
+@@ -8921,7 +9777,8 @@
                  continue
              for n, linea in enumerate(texto.splitlines(), start=1):
                  if rx.search(linea):
@@ -1640,7 +1784,7 @@
                      if len(hallazgos) >= 80:
                          return hallazgos
          return hallazgos
-@@ -9244,6 +10005,10 @@
+@@ -9244,6 +10101,10 @@
      timeout = min(600, _entero(p.get("timeout"), ctx.settings.exec_timeout) or ctx.settings.exec_timeout)
      entrada = _entrada_estandar(p)
      r = ejecutar(comando, cwd=ctx.ws.raiz, timeout=timeout, shell=True, entrada=entrada)
@@ -1651,7 +1795,7 @@
      texto = r.resumen(limite=MAX_SALIDA // 2)
      if entrada is not None:
          texto = texto.replace("\n", f"\n(stdin: {len(entrada.splitlines())} línea(s))\n", 1)
-@@ -9285,6 +10050,14 @@
+@@ -9285,6 +10146,23 @@
      if conteo.nombres_fallados:
          texto += "Fallaron: " + ", ".join(conteo.nombres_fallados[:10]) + "\n"
      texto += "DETALLE DE LOS PRIMEROS FALLOS:\n" + detalle
@@ -1659,6 +1803,15 @@
 +        faltan = sorted({m.split(".")[0] for m in re.findall(r"No module named '([\w.]+)'", combinado)
 +                         if not (ctx.ws.raiz / m.split(".")[0]).exists()
 +                         and not (ctx.ws.raiz / (m.split(".")[0] + ".py")).exists()})
++        # El ImportError de node (tests/*.test.mjs que importan ../web/logica.js antes de que exista).
++        for ruta in re.findall(r"Cannot find module '([^']+)'", combinado):
++            destino = Path(ruta)
++            try:
++                rel = destino.resolve().relative_to(ctx.ws.raiz.resolve()).as_posix() if destino.is_absolute() else ""
++            except (ValueError, OSError):
++                rel = ""
++            if rel and not destino.exists() and rel not in faltan:
++                faltan.append(rel)
 +        if faltan:
 +            texto = ("ESPERADO (tests primero): fallan porque " + ", ".join(f"'{m}'" for m in faltan)
 +                     + " todavía no existe; lo crea el IMPLEMENTADOR después de vos. No intentes crearlo: si tus "
@@ -1666,7 +1819,7 @@
      if ctx.settings.pistas_errores:
          texto = anexar_pistas(texto, 2)
      return texto
-@@ -9348,6 +10121,22 @@
+@@ -9348,6 +10226,22 @@
          marca = {"x": "✓", ">": "▸"}.get(estado, "○")
          ctx.ui.tenue(f"      {marca} {texto}")
      hechos = sum(1 for e, _ in items if e == "x")
@@ -1689,7 +1842,7 @@
      return f"Lista actualizada: {hechos}/{len(items)} hechas."
  
  
-@@ -9957,6 +10746,7 @@
+@@ -9957,6 +10851,7 @@
          # Con entrada para input(): el código va por -c (sys.path[0] sigue siendo el proyecto) y stdin queda libre.
          r = ejecutar([sys.executable, "-c", codigo], cwd=ctx.ws.raiz, timeout=60, entrada=entrada)
      r.comando = "run_python"
@@ -1697,7 +1850,7 @@
      texto = r.resumen(limite=MAX_SALIDA // 2).replace('File "<stdin>"', 'File "<fragmento>"').replace(
          'File "<string>"', 'File "<fragmento>"')
      if not r.ok and parece_interactivo(f"{r.stdout}\n{r.stderr}"):
-@@ -10132,6 +10922,11 @@
+@@ -10132,6 +11027,11 @@
  Definí la INTERFAZ pública (archivos, funciones/clases y firmas exactas): con ella se escriben los tests
  ANTES de implementar, así que tiene que ser precisa e importable.
  Si un archivo nuevo va a ser largo (más de ~250 líneas), dividilo en varios módulos o en varias tareas.
@@ -1709,7 +1862,7 @@
  Tu attempt_completion DEBE contener el plan EXACTAMENTE con este formato:
  <plan>
  <objetivo>una frase</objetivo>
-@@ -10384,6 +11179,28 @@
+@@ -10384,6 +11284,28 @@
          0.1,
          solo_lectura=True,
      ),
@@ -1738,7 +1891,7 @@
  }
  
  ROLES_DELEGABLES = ("explorador", "implementador", "revisor", "qa", "reparador", "arquitecto", "especificador",
-@@ -10594,6 +11411,105 @@
+@@ -10594,6 +11516,105 @@
      pass
  
  
@@ -1844,7 +1997,7 @@
  @dataclass
  class ResultadoAgente:
      ok: bool
-@@ -11001,6 +11917,10 @@
+@@ -11001,6 +12022,10 @@
          for paso in range(1, self.max_pasos + 1):
              if CANCELAR.is_set():
                  raise Cancelado()
@@ -1855,7 +2008,7 @@
              self._compactar()
              respuesta = self._llamar_con_recuperacion()
              analisis = analizar(respuesta.texto, self._esquemas)
-@@ -11245,12 +12165,36 @@
+@@ -11245,12 +12270,36 @@
          if h is None or nombre not in self.rol.herramientas:
              disponibles = ", ".join(self.rol.herramientas)
              self.ui.resultado_herramienta(False, f"herramienta no disponible: {nombre}")
@@ -1894,7 +2047,7 @@
          if not llamada.completa:
              self.ui.resultado_herramienta(False, f"{nombre}: llamada incompleta")
              self.ctx.tropiezo("llamada_incompleta")
-@@ -12184,22 +13128,22 @@
+@@ -12184,22 +13233,22 @@
              raise
          except Exception as e:
              res = ResultadoAgente(False, f"{type(e).__name__}: {e}", sorted(agente.ctx.cambios), 0, "error", rol)
@@ -1927,7 +2080,7 @@
  
  
  # ======================================================================
-@@ -12571,7 +13515,7 @@
+@@ -12571,7 +13620,7 @@
                  return grupo, self._pedir_relleno(rel, lenguaje, especificacion, texto_base, grupo,
                                                    "\n".join(errores.get(s.nombre_completo, "") for s in grupo).strip())
              except LLMError as e:
@@ -1936,7 +2089,7 @@
                      raise
                  return grupo, {}
  
-@@ -12580,27 +13524,25 @@
+@@ -12580,27 +13629,25 @@
                  break
              fallidos: list[Simbolo] = []
              base = texto
@@ -1983,7 +2136,7 @@
              if not fallidos:
                  break
              self.ui.tenue(f"  [{self.etiqueta}] ronda {ronda + 2}: reintento {len(fallidos)} función(es) con el error real")
-@@ -12835,6 +13777,17 @@
+@@ -12835,6 +13882,17 @@
          return self.ganador is not None and not self.ganador.error and self.ganador.validaciones_ok \
              and bool(self.aplicados or self.ganador.cambios)
  
@@ -2001,7 +2154,7 @@
      def informe(self) -> str:
          if not self.ganador:
              return "Ningún candidato produjo un resultado utilizable."
-@@ -12908,6 +13861,8 @@
+@@ -12908,6 +13966,8 @@
          except (Cancelado, KeyboardInterrupt):
              raise
          except LLMError as e:
@@ -2010,7 +2163,7 @@
              cand.error = f"modelo: {e}"
          except Exception as e:  # un candidato roto no tumba el torneo
              cand.error = f"{type(e).__name__}: {e}"
-@@ -12954,15 +13909,8 @@
+@@ -12954,15 +14014,8 @@
                  for cand in candidatos:
                      self._correr_candidato(cand, tarea, archivos, rol, protegidos, existentes, True)
              else:
@@ -2028,7 +2181,21 @@
              return self._decidir(candidatos, cid, protegidos)
          finally:
              for cand in candidatos:
-@@ -12989,6 +13937,10 @@
+@@ -12979,7 +14032,12 @@
+         resultado = ResultadoTorneo(ganador, candidatos)
+         if ganador is None:
+             resultado.notas.append("Ningún candidato cambió archivos sin errores.")
+-            self.ui.error("Ningún candidato produjo cambios utilizables.")
++            if resultado.termino_sin_cambios:
++                # Terminaron bien sin tocar nada (p. ej. al retomar tras un corte, el trabajo ya estaba en disco): no es
++                # un error, lo decide la verificación real. Antes salía "✗ Ningún candidato…" en una corrida sana.
++                self.ui.tenue("  Ningún candidato necesitó cambiar archivos.")
++            else:
++                self.ui.error("Ningún candidato produjo cambios utilizables.")
+             return resultado
+         if cid is not None:
+             self.ws.checkpoints.actual = cid
+@@ -12989,6 +14047,10 @@
          indice_de(self.ws).invalidar()
          self.ui.ok(f"Ganó el candidato #{ganador.indice + 1} (t={ganador.temperatura:.1f}): "
                     f"{len(resultado.aplicados)} archivo(s) aplicados al proyecto")
@@ -2039,7 +2206,7 @@
          return resultado
  
      def _simple(self, tarea: str, archivos: str, titulo: str, rol: str,
-@@ -13602,8 +14554,11 @@
+@@ -13602,8 +14664,11 @@
          self.restaurados: list[str] = []
  
      def __enter__(self) -> "FotoProyecto":
@@ -2051,7 +2218,7 @@
                  if ruta.stat().st_size <= self.max_bytes:
                      self.contenidos[self.ws.rel(ruta)] = ruta.read_bytes()
              except OSError:
-@@ -13612,10 +14567,16 @@
+@@ -13612,10 +14677,16 @@
  
      def __exit__(self, *exc) -> None:
          actuales = {self.ws.rel(r) for r in self.ws.iterar(limite=self.limite)}
@@ -2069,7 +2236,7 @@
                  (self.ws.raiz / rel).unlink()
                  self.restaurados.append(f"{rel} (creado por los tests, borrado)")
              except OSError:
-@@ -14076,6 +15037,599 @@
+@@ -14076,6 +15147,599 @@
  EXTENSIONES_TESTEABLES = (".py", ".js", ".mjs", ".cjs", ".ts")
  
  
@@ -2669,7 +2836,7 @@
  @dataclass
  class Tarea:
      id: str
-@@ -14144,10 +15698,13 @@
+@@ -14144,10 +15808,13 @@
  
      if len(tareas) > max_tareas:
          sobrantes = tareas[max_tareas - 1:]
@@ -2683,7 +2850,27 @@
          )]
  
      criterios = []
-@@ -14232,11 +15789,11 @@
+@@ -14213,6 +15880,19 @@
+     return es_peor(despues.conteo, antes.conteo)
+ 
+ 
++REVISION_SIN_DICTAMEN = "VEREDICTO: CAMBIOS\nLa revisión no entregó un dictamen verificable (APROBADO o CAMBIOS)."
++_RE_ITEM_REVISION = re.compile(r"(?m)^\s*(?:\d+[.)]|[-*•])\s+\S")
++_RE_PROBLEMA_REVISION = re.compile(r"\b(?:falta|faltan|error|errores|bug|falla|fallan|corregi|correg|deber[íi]a|"
++                                   r"no (?:valida|maneja|cubre|funciona|controla|verifica)|problema|incorrect|"
++                                   r"missing|should|fix|wrong|broken)", re.I)
++
++
++def observaciones_concretas(informe: str) -> bool:
++    """Una revisión sin la línea VEREDICTO puede igual traer puntos accionables (lista + un problema nombrado)."""
++    texto = informe or ""
++    return bool(_RE_ITEM_REVISION.search(texto) and _RE_PROBLEMA_REVISION.search(texto))
++
++
+ def veredicto(informe: str) -> tuple[bool, bool]:
+     """(aprobado, claro). Un dictamen malformado NO equivale a una aprobación."""
+     m = _RE_VEREDICTO.search(informe or "")
+@@ -14232,11 +15912,11 @@
      return Resultado(False, 'aceptacion_independiente', 1, stderr=str(mensaje))
  
  
@@ -2698,7 +2885,7 @@
      if cfg.is_symlink() or not cfg.is_file():
          raise ValueError('El manifiesto de aceptación no puede ser un enlace simbólico.')
      if cfg.stat().st_size > 16_384:
-@@ -14249,9 +15806,9 @@
+@@ -14249,9 +15929,9 @@
      if not isinstance(spec, dict) or set(spec) - {'suite_dir', 'min_tests', 'timeout'}:
          raise ValueError('El manifiesto acepta solo suite_dir, min_tests y timeout.')
      suite_str = spec.get('suite_dir')
@@ -2710,7 +2897,7 @@
      raiz = ws.raiz.resolve()
      if os.path.commonpath((str(suite), str(raiz))) == str(raiz):
          raise ValueError('La suite independiente debe estar FUERA del proyecto editado por REAPER.')
-@@ -14263,27 +15820,93 @@
+@@ -14263,27 +15943,93 @@
          raise ValueError('min_tests debe ser un entero entre 1 y 10000.')
      if isinstance(tiempo, bool) or not isinstance(tiempo, int) or not 1 <= tiempo <= 180:
          raise ValueError('timeout debe ser un entero entre 1 y 180.')
@@ -2812,7 +2999,7 @@
      """
      try:
          huella_actual = huella_aceptacion(ws)
-@@ -14291,22 +15914,34 @@
+@@ -14291,22 +16037,34 @@
              return _aceptacion_error('Evaluador independiente cambiado o eliminado durante la build.')
          if huella_actual == 'sin-evaluador':
              return None
@@ -2860,7 +3047,7 @@
              if efectivos < minimo:
                  resultado.ok = False
                  resultado.stderr += (f'\nACEPTACIÓN: solo {efectivos}/{minimo} pruebas ejecutadas '
-@@ -14319,6 +15954,35 @@
+@@ -14319,6 +16077,35 @@
          return _aceptacion_error(f'ACEPTACIÓN inválida: {exc}')
  
  
@@ -2896,7 +3083,7 @@
  @dataclass
  class Verificacion:
      ok: bool
-@@ -14349,6 +16013,14 @@
+@@ -14349,6 +16136,14 @@
      segundos: float = 0.0
      tareas_fallidas: list = field(default_factory=list)    # quedaron con fallos tras reparar
      tareas_bloqueadas: list = field(default_factory=list)  # no se ejecutaron: dependen de una fallida
@@ -2911,7 +3098,7 @@
  
      @property
      def ok(self) -> bool:
-@@ -14379,10 +16051,36 @@
+@@ -14379,10 +16174,64 @@
      return "\n".join(f"  {a}  +{m} -{n}" for a, (m, n) in stats.items())
  
  
@@ -2936,6 +3123,34 @@
      return any(fnmatch.fnmatch(rel, p) for p in PATRONES_TESTS)
  
  
++FASE_BUILD = "fase:"
++
++
++def _marcar_fase(registro_build: "RegistroBuild", previo: dict, nombre: str, cid: int) -> None:
++    """Una FASE que escribe archivos (tests primero, verificación final y reparación) queda anotada en el diario como
++    la tarea activa: si se corta ahí (cupo diario, Ctrl+C, Termux cerrado), sus cambios tienen dueño y la build se
++    puede retomar. Antes solo las tareas lo tenían: la corrida E2E de /grande cortada por el cupo mientras el
++    especificador escribía tests/test_api.py quedaba en "Cambios externos…" y la etapa no se podía seguir nunca."""
++    previo["tarea_activa"] = FASE_BUILD + nombre
++    previo["tcid"] = cid
++    previo["huellas_inicio"] = registro_build.huellas()
++    registro_build.guardar(previo)
++
++
++def _cerrar_fase(previo: dict) -> None:
++    for clave in ("tarea_activa", "tcid", "huellas_inicio"):
++        previo.pop(clave, None)
++
++
++def mismo_pedido(guardado, actual: str) -> bool:
++    """¿El pedido guardado en un diario/estado es este? Los diarios se escriben REDACTADOS (un pedido con
++    "password: admin123" queda "password: [REDACTADO]"), así que se compara también contra la forma redactada:
++    si no, la build a medio hacer de ese pedido no se reconocía nunca más y /grande quedaba trabado."""
++    def norma(texto) -> str:
++        return " ".join(str(texto or "").split())
++    return norma(guardado) in (norma(actual), norma(redactar_secretos(actual or "")))
++
++
 +def fallos_tolerables_al_reintentar(fallan_ahora: set, fallaban_al_inicio: Sequence[str], tarea, tareas) -> set:
 +    """Al RE-EJECUTAR una tarea que falló o se cortó, ¿qué tests en rojo no son culpa suya? Los que ya fallaban al
 +    empezar la build y los de archivos de test que declaran OTRAS tareas (en una corrida normal también se
@@ -2948,7 +3163,18 @@
  def _es_de_especificacion(nombre_test: str, protegidos: dict) -> bool:
      """¿El test que falla pertenece a un archivo de la especificación? (pytest usa ruta::test, unittest modulo.Clase.test)"""
      for rel in protegidos:
-@@ -14612,6 +16310,9 @@
+@@ -14513,6 +16362,10 @@
+         registrados = set(self.ws.checkpoints.archivos_desde(tcid))
+         if not cambiados or not cambiados.issubset(registrados):
+             return False
++        if activo == FASE_BUILD + "cierre":
++            # Cortada en la verificación final o la reparación: el reparador SÍ toca archivos de tareas verificadas,
++            # y al retomar la verificación final se repite entera (no se omite nada con evidencia vieja).
++            return True
+         # Una tarea a medio hacer no debe invalidar en silencio otra ya validada.
+         verificados = previo.get("archivos_verificados", {})
+         if any(antes.get(p) != ahora.get(p) for p in verificados):
+@@ -14612,6 +16465,9 @@
          self.escalador = Escalador(llm, settings, ui)
          self._protegidos: dict[str, Optional[str]] = {}
          self._huella_aceptacion: Optional[str] = None
@@ -2958,7 +3184,7 @@
  
      def _sub(self, rol: str, tarea: str, cid: Optional[int], archivos: str = "", titulo: str = "",
               **opciones) -> ResultadoAgente:
-@@ -14630,7 +16331,7 @@
+@@ -14630,7 +16486,7 @@
          try:
              return self._sub(rol, tarea, cid, **kw)
          except LLMError as e:
@@ -2967,7 +3193,7 @@
                  raise
              self.ui.aviso(f"  {rol}: el modelo no respondió ({recortar(str(e), 180)}). Sigo sin esa fase.")
              return None
-@@ -14670,7 +16371,7 @@
+@@ -14670,7 +16526,7 @@
          try:
              resultados = ejecutar_subagentes(specs, self.llm, self.ws, self.settings, self.ui, profundidad=1)
          except LLMError as e:
@@ -2976,7 +3202,7 @@
                  raise
              self.ui.aviso(f"  explorador: el modelo no respondió ({recortar(str(e), 180)}). Sigo con el mapa local.")
              return mapa or "(exploración no disponible: el modelo no respondió)"
-@@ -14685,7 +16386,10 @@
+@@ -14685,7 +16541,10 @@
              f"PEDIDO DEL USUARIO:\n{pedido}\n\n"
              f"INFORME DE EXPLORACIÓN (código real):\n{recortar(exploracion, 7000)}\n\n"
              f"Comando de tests detectado: {detectado[0] if detectado else 'ninguno (habrá que crear tests)'}\n"
@@ -2988,7 +3214,7 @@
          )
          if self.settings.tests_primero:
              tarea += ("\nLos tests se escriben ANTES de implementar a partir de tu <interfaz> y tus <criterios>: "
-@@ -14700,6 +16404,11 @@
+@@ -14700,6 +16559,11 @@
          if not _RE_TAREA.search(texto) and _RE_TAREA.search(res.contexto):
              texto = res.contexto + "\n" + texto
          plan = parsear_plan(texto, pedido, self.settings.max_tareas)
@@ -3000,20 +3226,39 @@
          if not res.ok:
              self.ui.aviso("El arquitecto no terminó limpio; uso lo que produjo.")
          motivo = plan_degenerado(plan, pedido, texto)
-@@ -14755,6 +16464,25 @@
+@@ -14740,7 +16604,10 @@
+             "falta de implementación (ImportError/AttributeError/assert) y pasar cuando el plan esté hecho."
+         )
+         res = self._sub("especificador", texto, cid, titulo="escribe los tests ANTES de implementar")
+-        tests = [r for r in res.cambios if _es_test(r) and (self.ws.raiz / r).is_file()]
++        # También cuentan los tests que esta MISMA build ya había escrito antes de un corte (cupo diario, Ctrl+C): al
++        # retomar, el especificador los encuentra hechos y no los reescribe; sin esto se descartaba la especificación.
++        escritos = sorted(set(res.cambios) | set(self.ws.checkpoints.archivos_desde(cid)))
++        tests = [r for r in escritos if _es_test(r) and (self.ws.raiz / r).is_file()]
+         if not tests:
+             self.ui.aviso("  El especificador no dejó archivos de test: sigo sin especificación ejecutable.")
+             return {}
+@@ -14755,11 +16622,39 @@
                  return {}
          r = ejecutar_tests(self.ws, timeout=self.settings.tests_timeout, completo=True)
          conteo = conteo_de_resultado(r)
 +        codigo_plan = [a for a in plan.archivos() if not _es_test(a)]
 +        proyecto_nuevo = bool(codigo_plan) and not any(self.ws.existe(a) for a in codigo_plan)
-+        if r is not None and conteo.reconocido and conteo.pasados and not conteo.ok and proyecto_nuevo:
++        # Los tests que YA pasaban antes de la build (etapas anteriores de /grande, el proyecto existente) no son de
++        # esta especificación: la corrida E2E de /grande acusaba al especificador en cada etapa desde la 2 ("3 tests
++        # YA pasan sin el código" = los de la etapa 1) y le hacía reescribir tests buenos.
++        base = getattr(self, "_base_tests", None)
++        conteo_base = conteo_de_resultado(base) if base is not None else None
++        ya_pasaban = conteo_base.pasados if conteo_base is not None and conteo_base.reconocido else 0
++        pasan_sin_codigo = max(0, conteo.pasados - ya_pasaban)
++        if r is not None and conteo.reconocido and pasan_sin_codigo and not conteo.ok and proyecto_nuevo:
 +            # Prueba real con OpenRouter: 3 tests "de error" pasaban SIN que existiera el código (solo miraban
 +            # returncode != 0 y stderr no vacío; "No module named conversor" también cumple). Después darían verde
 +            # aunque el CLI se rompiera por cualquier otra cosa. En un proyecto nuevo, un test que ya pasa no prueba nada.
-+            self.ui.aviso(f"  {conteo.pasados} test(s) de la especificación YA pasan sin que exista el código: no "
++            self.ui.aviso(f"  {pasan_sin_codigo} test(s) de la especificación YA pasan sin que exista el código: no "
 +                          "prueban la función. Le pido al especificador que los ajuste.")
 +            self._sub("especificador",
-+                      f"{conteo.pasados} de tus tests YA PASAN y la implementación todavía no existe "
++                      f"{pasan_sin_codigo} de tus tests YA PASAN y la implementación todavía no existe "
 +                      f"({conteo.texto()}): esos tests no prueban nada. Un test de aceptación tiene que FALLAR ahora. "
 +                      "Típico: un test de error que solo mira returncode != 0 o stderr no vacío también pasa si el "
 +                      "módulo ni existe. Comprobá el error CONCRETO (el tipo, p. ej. 'ValueError' en stderr, o el "
@@ -3026,7 +3271,15 @@
          if r is not None and conteo.reconocido:
              if conteo.ok and conteo.pasados:
                  self.ui.aviso(f"  Ojo: la especificación ya pasa entera ({conteo.texto()}); quizá la función ya existía.")
-@@ -14798,14 +16526,19 @@
+             else:
+-                self.ui.ok(f"especificación lista: {len(tests)} archivo(s) de test, {conteo.texto()} (esperado: fallan)")
++                previos = f"; {ya_pasaban} ya pasaban de antes" if ya_pasaban else ""
++                self.ui.ok(f"especificación lista: {len(tests)} archivo(s) de test, {conteo.texto()}{previos} "
++                           "(esperado: fallan los nuevos)")
+         else:
+             self.ui.ok(f"especificación lista: {len(tests)} archivo(s) de test")
+         return copiar_contenidos(self.ws, tests)
+@@ -14798,14 +16693,19 @@
          return torneo.correr(texto, archivos=", ".join(tarea.archivos), titulo=titulo,
                               n=self.settings.candidatos if usar_torneo else 1, protegidos=protegidos, cid=cid)
  
@@ -3047,7 +3300,21 @@
              "Leé los archivos completos si necesitás contexto. Empezá tu informe con la línea VEREDICTO."
          )
          res = self._sub_opcional("revisor", texto, cid, titulo=f"revisa el diff de la tarea {tarea.id}")
-@@ -14853,6 +16586,11 @@
+@@ -14816,8 +16716,12 @@
+             return True, "(revisión omitida: el revisor no respondió; la validación real pasa)"
+         aprobado, claro = veredicto(res.resumen)
+         if not claro:
++            if observaciones_concretas(res.resumen):
++                # Sin la línea VEREDICTO pero con puntos concretos ("1. falta validar…"): se pasan tal cual.
++                self.ui.aviso("  Revisión sin la línea VEREDICTO, pero con observaciones concretas: las paso como CAMBIOS.")
++                return False, "VEREDICTO: CAMBIOS\n" + res.resumen
+             self.ui.aviso("  Revisión SIN VEREDICTO: no se considera aprobada; la verificación real decidirá el resultado.")
+-            return False, "VEREDICTO: CAMBIOS\nLa revisión no entregó un dictamen verificable (APROBADO o CAMBIOS)."
++            return False, REVISION_SIN_DICTAMEN
+         if aprobado and validacion and not validacion.startswith(("OK", "sin validadores")):
+             self.ui.aviso("  El revisor aprobó, pero la validación real falla: lo tomo como CAMBIOS.")
+             return False, ("VEREDICTO: CAMBIOS\n1. La validación automática falla (corregilo antes que nada):\n"
+@@ -14853,6 +16757,11 @@
          elif tests is not None and not tests.ok:
              partes.append("TESTS: " + conteo.texto() + "\n" + fallos_relevantes(f"{tests.stdout}\n{tests.stderr}",
                                                                                  maximo=3, limite=5000))
@@ -3059,7 +3326,7 @@
          # Evaluador externo, colocado FUERA del directorio editable del proyecto.
          # Si falla, no se puede declarar la build verificada aunque el LLM diga que terminó.
          aceptacion = ejecutar_aceptacion_independiente(
-@@ -14861,10 +16599,13 @@
+@@ -14861,10 +16770,13 @@
          if not aceptacion_ok:
              partes.append('PRUEBAS DE ACEPTACIÓN INDEPENDIENTES:\n'
                            + aceptacion.resumen(4500))
@@ -3074,7 +3341,7 @@
                              tests, diagnostico, archivos, conteo, aceptacion)
  
      def reparar(self, pedido: str, verif: Verificacion, cid: int, base_fallaba: bool,
-@@ -14911,7 +16652,17 @@
+@@ -14911,7 +16823,17 @@
          intentos_txt: list[str] = []
          forense_hecho = False
          informe_forense = ""
@@ -3092,7 +3359,7 @@
              firma = _firma_error(verif.diagnostico)
              if diagnosticos_vistos.count(firma) >= 3:
                  informe.notas.append(f"{etiqueta}: la reparación no logró avances (mismo diagnóstico repetido).")
-@@ -14947,6 +16698,7 @@
+@@ -14947,6 +16869,7 @@
                                       + "\n---\n".join(intentos_txt[-2:]))
              res = self.reparar(pedido, verif, rcid, base_fallaba, experto, contexto_intento.strip())
              intentos_txt.append(recortar(res.resumen, 1200))
@@ -3100,7 +3367,7 @@
              verif = verificador()
              self._mostrar_verificacion(verif)
              if verif.ok:
-@@ -14965,7 +16717,7 @@
+@@ -14965,7 +16888,7 @@
          return verif
  
      # ------------------------------------------------------------ REAPER X (10 roles)
@@ -3109,7 +3376,7 @@
          """
          Rol de dirección/auditoría por TEXTO (sin herramientas): devuelve (texto|None, modelo_pedido, modelo_servido).
          Si respondió otro modelo (respaldo del equipo), se declara: nada de degradación silenciosa.
-@@ -14975,12 +16727,16 @@
+@@ -14975,12 +16898,16 @@
                      {"role": "user", "content": prompt}]
          try:
              resp = self.llm.chat(mensajes, modelo=pedido_modelo, temperatura=ROLES[rol].temperatura,
@@ -3128,7 +3395,7 @@
          servido = str(getattr(resp, "modelo", "") or "unknown")
          if servido not in ("unknown", "mock", pedido_modelo) and resolver_modelo(servido) != resolver_modelo(pedido_modelo):
              self.ui.tenue(f"  {rol}: pedido {pedido_modelo} → respondió {servido} (respaldo del equipo)")
-@@ -15055,6 +16811,126 @@
+@@ -15055,6 +16982,126 @@
              informe.estado, notas = estado_controlado(informe.estado, dictamen)
              informe.notas.extend(notas)
  
@@ -3255,7 +3522,7 @@
      # ------------------------------------------------------------ flujos
      def _mostrar_plan(self, plan: Plan) -> None:
          self.ui.titulo("PLAN")
-@@ -15077,9 +16953,34 @@
+@@ -15077,9 +17124,34 @@
                  plan = self.planificar(pedido_plan, exploracion,
                                         "Observaciones del supervisor:\n" + "\n".join(f"- {r}" for r in dictamen.reasons),
                                         plan)
@@ -3291,7 +3558,7 @@
                  return plan, exploracion
              feedback = self.ui.preguntar("¿Qué cambiarías del plan? (Enter vacío = cancelar)")
              if not feedback:
-@@ -15099,9 +17000,64 @@
+@@ -15099,19 +17171,81 @@
          ))
          return ruta
  
@@ -3353,11 +3620,16 @@
 -                         archivos_esperados: Sequence[str] = ()) -> Verificacion:
 +                         archivos_esperados: Sequence[str] = (),
 +                         archivos_planeados: Sequence[str] = (),
-+                         cid_build: Optional[int] = None) -> Verificacion:
++                         cid_build: Optional[int] = None,
++                         spec_ajena: Optional[Iterable[str]] = None) -> Verificacion:
          """
          Una tarea intermedia no necesita que pasen TODOS los tests (los de tareas
          siguientes todavía fallan): alcanza con validadores OK y que no se rompa
-@@ -15111,7 +17067,12 @@
+-        nada que antes pasaba.
++        nada que antes pasaba. `spec_ajena`: los archivos de la especificación que son de OTRAS tareas (los únicos
++        cuyo rojo se tolera); None = toda la especificación (comportamiento anterior).
+         """
+         archivos = [r for r in self.ws.checkpoints.archivos_desde(tcid) if (self.ws.raiz / r).is_file()]
          validaciones = validar_archivos(self.ws, archivos)
          tests = ejecutar_tests(self.ws, timeout=self.settings.tests_timeout, completo=True)
          conteo = conteo_de_resultado(tests)
@@ -3371,7 +3643,7 @@
          if verificar_entrega:
              # La palabra "listo" del modelo NO es evidencia. Cada tarea debe
              # materializar sus objetivos declarados y producir cambios reales.
-@@ -15122,9 +17083,36 @@
+@@ -15122,13 +17256,41 @@
              if faltantes:
                  problemas.append("ENTREGA INCOMPLETA: faltan archivos declarados por la tarea: "
                                   + ", ".join(map(str, faltantes[:10])))
@@ -3408,8 +3680,14 @@
 +            problemas.extend(mensaje for _rel, mensaje in self._violaciones_preservar(tcid, cid_build, declarados))
          if tests is not None and not tests.ok and conteo.reconocido:
              # Los tests de la especificación de tareas siguientes fallan a propósito: no son regresión.
++            tolerables = self._protegidos if spec_ajena is None else {rel: None for rel in spec_ajena}
              nuevos_fallos = [n for n in conteo.nombres_fallados
-@@ -15144,7 +17132,9 @@
+-                             if n not in nombres_antes and not _es_de_especificacion(n, self._protegidos)]
++                             if n not in nombres_antes and not _es_de_especificacion(n, tolerables)]
+             retroceso = conteo.pasados < antes.pasados
+             mas_errores = conteo.errores > antes.errores
+             if retroceso or mas_errores or nuevos_fallos:
+@@ -15144,7 +17306,9 @@
          if exigir_progreso and not problemas:
              # El implementador NO terminó (límite de pasos, error...). "No romper nada" no alcanza:
              # tiene que haber cambios reales y, si hay tests fallando, alguno más tiene que pasar.
@@ -3420,7 +3698,7 @@
                  problemas.append("SIN PROGRESO: el implementador no terminó y no cambió ningún archivo.")
              elif tests is not None and not tests.ok and conteo.reconocido and conteo.pasados <= antes.pasados:
                  problemas.append(
-@@ -15158,8 +17148,58 @@
+@@ -15158,8 +17322,58 @@
          return Verificacion(not problemas, validaciones, tests, diagnostico, archivos, conteo)
  
      def construir(self, pedido: str, confirmar: bool = True, reanudar: bool = False) -> InformeBuild:
@@ -3432,7 +3710,7 @@
 +            except ValueError:
 +                previo = None                          # _construir informa el diario dañado con su mensaje
 +            if (previo and previo.get("estado") not in ("verificada", "validada")
-+                    and " ".join(str(previo.get("pedido", "")).split()) == " ".join(pedido.split())):
++                    and mismo_pedido(previo.get("pedido"), pedido)):
 +                self.ui.info("Esta misma build había quedado a medias: la retomo donde quedó (no empiezo de cero).")
 +                reanudar = True
 +        restaurar_equipo = self._equipo_del_juez()
@@ -3479,16 +3757,18 @@
          registro_build = RegistroBuild(self.ws)
          try:
              previo = registro_build.leer()
-@@ -15168,7 +17208,7 @@
+@@ -15167,8 +17381,9 @@
+             self.ui.error(str(e) + ". Usá /construir estado y revisá el registro antes de descartarlo.")
              return InformeBuild("cancelada")
          base = ejecutar_tests(self.ws, timeout=self.settings.tests_timeout, completo=True)
++        self._base_tests = base
          base_fallaba = base is not None and not base.ok
 -        if base_fallaba:
 +        if base_fallaba and not reanudar:
              self.ui.aviso("Atención: la suite de tests YA falla antes de empezar; se tendrá en cuenta.")
          # La huella original es ajena al LLM: si sus tests cambian durante la
          # construcción, el verificador fallará sin conceder un falso verde.
-@@ -15214,6 +17254,12 @@
+@@ -15214,6 +17429,12 @@
                  self.ui.error("El checkpoint original ya no existe; no puedo reanudar con evidencia.")
                  return InformeBuild("cancelada")
              huella_guardada = previo.get('huella_aceptacion')
@@ -3501,7 +3781,7 @@
              if huella_guardada is not None and huella_actual != huella_guardada:
                  self.ui.error('Cambió el evaluador independiente desde el checkpoint; no reanudo.')
                  return InformeBuild('cancelada')
-@@ -15240,10 +17286,21 @@
+@@ -15240,10 +17461,21 @@
                      self.ui.error("Los tests de especificación cambiaron: " + rel)
                      return InformeBuild("cancelada")
                  self._protegidos[rel] = self.ws.leer(rel)
@@ -3520,11 +3800,11 @@
              if previo and previo.get("estado") not in ("verificada", "validada"):
 -                self.ui.error("Ya hay una build incompleta. Usá /construir continuar o "
 +                self.ui.error("Ya hay OTRA build incompleta en esta carpeta. Seguila con /construir continuar "
-+                              f"(o `{comando_para_seguir(self.ws, 'construir')}`) o descartala con "
++                              f"(o `{comando_para_seguir(self.ws, 'construir', self.settings)}`) o descartala con "
                                "/construir descartar para comenzar otra (sin borrar archivos).")
                  return InformeBuild("cancelada")
              plan, exploracion = self.obtener_plan(pedido, confirmar)
-@@ -15262,15 +17319,62 @@
+@@ -15262,15 +17494,62 @@
                        "tests_protegidos": {}, "archivos_verificados": {}, "estado": "en_curso",
                        "especificacion_completa": False,
                        "tests_primero": bool(self.settings.tests_primero),
@@ -3591,18 +3871,20 @@
          # Si se interrumpió la etapa de especificación, reanudarla (no
          # saltarla silenciosamente). Para registros antiguos, los hashes de
          # los tests permiten reconocer la etapa como completada.
-@@ -15280,13 +17384,15 @@
+@@ -15280,13 +17559,17 @@
          if tests_primero_build and testeable and not spec_completa:
              self.ui.fase(numero_fase, "Tests primero (especificación ejecutable)")
              numero_fase += 1
 -            self._protegidos = self.especificar(pedido, plan, grupo)
 -            informe.spec_tests = list(self._protegidos)
++            _marcar_fase(registro_build, previo, "especificacion", grupo)
 +            espec = self.especificar(pedido, plan, grupo)
 +            self._protegidos.update(espec)
 +            informe.spec_tests = list(espec)
 +            previo["spec_tests"] = list(espec)
              previo["tests_protegidos"] = {p: self.ws.hash(p) for p in self._protegidos}
              previo["especificacion_completa"] = True
++            _cerrar_fase(previo)
              registro_build.guardar(previo)
          elif reanudar:
 -            informe.spec_tests = list(self._protegidos)
@@ -3610,7 +3892,7 @@
  
          self.ui.fase(numero_fase, "Implementación" + (" · torneo" if self.settings.torneo and self.settings.candidatos > 1 else ""))
          numero_fase += 1
-@@ -15297,9 +17403,13 @@
+@@ -15297,9 +17580,13 @@
          if [t.id for t in orden] != [t.id for t in plan.tareas]:
              self.ui.tenue("  Orden por dependencias: " + " → ".join(t.id for t in orden))
              plan.tareas = orden
@@ -3624,7 +3906,7 @@
              self.ui.info(f"\n▸ Tarea {i + 1}/{len(plan.tareas)}: {recortar(tarea.descripcion.splitlines()[0], 120)}")
              if reanudar and previo["estados"].get(tarea.id) == "verificada":
                  self.ui.ok(f"Tarea {tarea.id}: conservada (verificada antes de la interrupción)")
-@@ -15314,38 +17424,71 @@
+@@ -15314,38 +17601,79 @@
                  previo["estados"][tarea.id] = "bloqueada"
                  registro_build.guardar(previo)
                  continue
@@ -3661,17 +3943,25 @@
 +            termino_sin_cambios = getattr(resultado, "termino_sin_cambios", False)
 +            if not resultado.ok and not termino_sin_cambios:
                  informe.notas.append(f"Tarea {tarea.id}: la implementación no terminó limpia.")
+-
+-            exigir = not resultado.ok
 +            elif termino_sin_cambios:
 +                self.ui.tenue(f"  Tarea {tarea.id}: el implementador terminó sin cambios (ya estaba hecho); "
 +                              "lo confirma la verificación real.")
- 
--            exigir = not resultado.ok
++
 +            exigir = not resultado.ok and not termino_sin_cambios
++            # Solo se tolera el rojo de la especificación de las tareas SIGUIENTES. Antes se toleraba toda: con una
++            # venta que no controlaba el stock, el test de la propia tarea fallaba y la tarea quedaba "verificada"
++            # (pasaba al revisor y lo atajaba recién la verificación final; corrida E2E de /grande, modelo flojo).
++            # Los tests que existían antes de la build (etapas anteriores) tampoco: romperlos es regresión.
++            spec_ajena = set() if i == len(plan.tareas) - 1 else (
++                set(informe.spec_tests or []) - {a for a in tarea.archivos if _es_test(a)})
              verif_tarea = self._verificar_tarea(tcid, conteo_antes, nombres_antes,
                                                   exigir_progreso=exigir, verificar_entrega=True,
 -                                                 archivos_esperados=tarea.archivos)
 +                                                 archivos_esperados=tarea.archivos,
-+                                                 archivos_planeados=planeados_despues, cid_build=grupo)
++                                                 archivos_planeados=planeados_despues, cid_build=grupo,
++                                                 spec_ajena=spec_ajena)
              if not verif_tarea.ok:
                  self.ui.aviso(f"  La tarea {tarea.id} no pasó su verificación: la reparo con el error real.")
 +                self.ui.tenue(f"    motivo: {_primera_linea_util(verif_tarea.diagnostico)}")
@@ -3682,7 +3972,8 @@
                                                   exigir_progreso=exigir, verificar_entrega=True,
 -                                                 archivos_esperados=tarea.archivos),
 +                                                 archivos_esperados=tarea.archivos,
-+                                                 archivos_planeados=planeados_despues, cid_build=grupo),
++                                                 archivos_planeados=planeados_despues, cid_build=grupo,
++                                                 spec_ajena=spec_ajena),
                      contexto=f"TAREA EN CURSO (#{tarea.id}): {tarea.descripcion}",
                  )
                  if not verif_tarea.ok:
@@ -3701,7 +3992,7 @@
  
              if not verif_tarea.ok and self.settings.max_revisiones:
                  # Revisar código que no pasa su verificación no tiene sentido (y un revisor de 24B
-@@ -15364,7 +17507,10 @@
+@@ -15364,10 +17692,18 @@
                  if not diff.strip():
                      informe.notas.append(f"Tarea {tarea.id}: sin cambios en archivos.")
                      break
@@ -3713,17 +4004,26 @@
                  if aprobado:
                      self.ui.ok(f"Revisor aprobó la tarea {tarea.id}")
                      break
-@@ -15378,7 +17524,8 @@
++                if revision == REVISION_SIN_DICTAMEN:
++                    # Nada que aplicar: una ronda de "corrección" sin observaciones gastaba 1 implementador + 1
++                    # revisor por tarea (corrida E2E de /grande: 28 pedidos de 112 en revisiones vacías).
++                    informe.notas.append(f"Tarea {tarea.id}: el revisor no dio un dictamen; decide la verificación real.")
++                    break
+                 self.ui.aviso(f"  Revisor pidió cambios en la tarea {tarea.id} (ronda {ronda + 1})")
+                 if ronda + 1 >= self.settings.max_revisiones:
+                     informe.notas.append(f"Tarea {tarea.id}: quedaron observaciones del revisor sin resolver.")
+@@ -15378,7 +17714,9 @@
              # registrar la tarea como hecha: tests verdes previos no bastan.
              verif_post = self._verificar_tarea(tcid, conteo_antes, nombres_antes,
                                                exigir_progreso=exigir, verificar_entrega=True,
 -                                              archivos_esperados=tarea.archivos)
 +                                              archivos_esperados=tarea.archivos,
-+                                              archivos_planeados=planeados_despues, cid_build=grupo)
++                                              archivos_planeados=planeados_despues, cid_build=grupo,
++                                              spec_ajena=spec_ajena)
              if verif_post.ok:
                  previo["estados"][tarea.id] = "verificada"
                  # Archivo verificado por primera vez: no permitir que una tarea
-@@ -15391,11 +17538,13 @@
+@@ -15391,11 +17729,14 @@
                  previo["estados"][tarea.id] = "fallida"
                  if tarea.id not in informe.tareas_fallidas:
                      informe.tareas_fallidas.append(tarea.id)
@@ -3734,10 +4034,11 @@
              previo.pop("huellas_inicio", None)
              registro_build.guardar(previo)
 +        PLAZO.cerrar(token_tarea)
++        _marcar_fase(registro_build, previo, "cierre", grupo)
  
          archivos = [r for r in self.ws.checkpoints.archivos_desde(grupo) if (self.ws.raiz / r).is_file()]
          hay_tests_build = any(_es_test(a) for a in archivos)
-@@ -15420,8 +17569,13 @@
+@@ -15420,8 +17761,13 @@
          informe.aceptacion = verif.aceptacion
          informe.diagnostico = verif.diagnostico
          informe.estado = estado_final_build(verif, informe)
@@ -3752,16 +4053,18 @@
          elif informe.ok:
              if self.settings.git_snapshots and es_repo_git(self.ws):
                  try:
-@@ -15433,6 +17587,8 @@
+@@ -15433,7 +17779,10 @@
              self.ui.fase(numero_fase + 1, "Auditoría REAPER X (seguridad defensiva · entrega · supervisor)")
              self._auditoria_x(pedido, plan, verif, informe)
          informe.segundos = time.monotonic() - inicio
 +        informe.tokens_juez = getattr(self, "_tokens_juez", 0)
 +        informe.tokens_build = max(0, _tokens_usados(self.llm) - getattr(self, "_tokens_inicio", 0))
          previo["estado"] = informe.estado
++        _cerrar_fase(previo)
          registro_build.guardar(previo)
          if informe.ok:
-@@ -15468,9 +17624,22 @@
+             registro_build.borrar()
+@@ -15468,9 +17817,22 @@
          try:
              diff = self.ws.checkpoints.diff_desde(informe.cid) if informe.cid else ""
              tests = informe.tests.resumen(4000) if informe.tests else "sin suite de tests"
@@ -3785,7 +4088,7 @@
                  f"## Pedido\n{pedido}\n\n"
                  f"## Plan\n```\n{informe.plan.como_texto() if informe.plan else '-'}\n```\n\n"
                  f"## Archivos\n```\n{_diffstat(diff) or '-'}\n```\n\n"
-@@ -15482,6 +17651,12 @@
+@@ -15482,6 +17844,12 @@
                     + ("\n" if informe.tareas_fallidas and informe.tareas_bloqueadas else "")
                     + "\n".join(f"- Bloqueada: {t}" for t in informe.tareas_bloqueadas)
                     + "\n\n" if (informe.tareas_fallidas or informe.tareas_bloqueadas) else "")
@@ -3798,7 +4101,7 @@
                  + ("## Especificación (tests escritos antes de implementar)\n" + "\n".join(f"- {t}" for t in informe.spec_tests) + "\n\n"
                     if informe.spec_tests else "")
                  + (f"## Escaladas al modelo fuerte\n{informe.escaladas}\n\n" if informe.escaladas else "")
-@@ -15499,39 +17674,72 @@
+@@ -15499,39 +17867,72 @@
              self.ui.aviso(f"No pude guardar el informe: {e}")
              return None
  
@@ -3891,7 +4194,7 @@
  
      def revisar_proyecto(self, foco: str = "") -> str:
          archivos = [a for a in self.ws.archivos_codigo(limite=400)
-@@ -15708,7 +17916,46 @@
+@@ -15708,7 +18109,46 @@
      requiere: tuple = ()
  
      def disponible(self) -> bool:
@@ -3939,7 +4242,7 @@
  
  
  PLANTILLAS: dict[str, Plantilla] = {}
-@@ -25455,6 +27702,7 @@
+@@ -25455,6 +27895,7 @@
      detalle: str
      arreglo: str = ""
      critico: bool = False
@@ -3947,7 +4250,7 @@
  
  
  def es_termux() -> bool:
-@@ -25462,13 +27710,57 @@
+@@ -25462,13 +27903,57 @@
          or os.path.isdir("/data/data/com.termux")
  
  
@@ -4006,7 +4309,7 @@
          except (OSError, subprocess.TimeoutExpired, IndexError):
              version = ""
          return Chequeo(nombre, True, version or ruta)
-@@ -25520,18 +27812,33 @@
+@@ -25520,18 +28005,34 @@
                         "export REAPER_TMP=$HOME/.cache/reaper (almacenamiento interno)")
  
  
@@ -4019,8 +4322,9 @@
 +    if cuenta is None or cuenta.cupo_dia is None:
 +        return None
 +    poco = cuenta.quedan_hoy is not None and cuenta.quedan_hoy < 40
-+    return Chequeo("cupo gratis OpenRouter", not poco, cuenta.resumen(),
-+                   "esperá a mañana o cargá crédito" if poco else "",
++    return Chequeo("cupo gratis", not poco, cuenta.resumen_corto(),
++                   "esperá a mañana o cargá crédito" if poco else
++                   ("sin crédito: 50/día" if cuenta.sin_credito else ""),
 +                   ayuda=("Con 50 pedidos por día un /grande no termina en un día: REAPER se detiene limpio cuando "
 +                          "se agota y sigue con --grande continuar. Con al menos 10 de crédito comprado el cupo de "
 +                          "modelos :free sube a 1000 por día." if cuenta.sin_credito else ""))
@@ -4045,7 +4349,7 @@
      chequeos.append(_chequeo_modulo("httpx", "streaming más robusto; sin él se usa urllib"))
      chequeos.append(_chequeo_modulo("pyflakes", "nombres indefinidos más precisos (REAPER tiene un detector propio)"))
      chequeos.append(_chequeo_modulo("readline", "historial y autocompletado en el REPL", "gnureadline"))
-@@ -25583,6 +27890,11 @@
+@@ -25583,6 +28084,11 @@
      criticos = [c for c in chequeos if c.critico and not c.ok]
      if criticos:
          ui.error(f"{len(criticos)} problema(s) crítico(s): REAPER no va a poder trabajar hasta arreglarlos.")
@@ -4057,7 +4361,7 @@
          return False
      opcionales = [c for c in chequeos if not c.ok]
      if opcionales:
-@@ -27382,7 +29694,10 @@
+@@ -27382,7 +29888,10 @@
      ]),
      ("EQUIPO", [
          ("/construir <pedido>", "exploradores → arquitecto → tests primero → torneo por tarea → verificación → reparador"),
@@ -4068,7 +4372,7 @@
          ("/plan <pedido>", "solo exploración + plan (se guarda en .reaper/planes)"),
          ("/modo plan", "modo plan: propone un plan en solo lectura y lo ejecuta cuando lo aprobás"),
          ("/torneo <tarea>", "N implementadores compiten en copias aisladas; gana el que pasa más tests"),
-@@ -27396,7 +29711,7 @@
+@@ -27396,7 +29905,7 @@
          ("/nuevo <plantilla> <carpeta>", "crea un proyecto listo y testeado desde una plantilla"),
          ("/plantillas", "lista las plantillas disponibles"),
          ("/auditar-web", "auditoría local de HTML y recursos sin ejecutar código"),
@@ -4077,7 +4381,7 @@
          ("/correr <archivo> [args]", "ejecuta y ofrece reparar si crashea"),
          ("/vigilar [comando]", "corre los tests cada vez que cambia un archivo (Ctrl+C para salir)"),
          ("/diff · /deshacer [id] · /rehacer", "cambios del último pedido, revertir, volver a aplicar"),
-@@ -27429,7 +29744,8 @@
+@@ -27429,7 +29938,8 @@
          ("/modelos · /config [clave valor] · /tema [nombre]", "catálogo, configuración, colores"),
          ("/uso · /contexto · /compactar · /estado", "consumo, contexto del agente, estado general"),
          ("/desempeno · /pentest <alcance>", "ranking de modelos por rol; modo seguridad (pentest/CTF/lab) con gate"),
@@ -4087,7 +4391,7 @@
          ("/evaluar comportamiento [ids]", "mide si el agente responde directo, no repite herramientas, no miente..."),
          ("/todo · /reset · /salir", "lista de tareas, reiniciar conversación, salir"),
      ]),
-@@ -27443,10 +29759,13 @@
+@@ -27443,10 +29953,13 @@
  
  
  def texto_ayuda() -> str:
@@ -4103,7 +4407,7 @@
          for comando, descripcion in comandos:
              if ancho < 70:
                  lineas.append(f"  {Tema.ok}{comando}{C.RESET}")
-@@ -27456,18 +29775,26 @@
+@@ -27456,18 +29969,26 @@
      return "\n".join(lineas)
  
  
@@ -4135,7 +4439,7 @@
      return ruta
  
  
-@@ -27553,7 +29880,10 @@
+@@ -27553,7 +30074,10 @@
              mensajes = self.principal.mensajes[1:][-60:]
              while mensajes and mensajes[0]["role"] != "user":
                  mensajes = mensajes[1:]
@@ -4147,7 +4451,7 @@
              datos = {"mensajes": mensajes, "todo": self.principal.ctx.todo,
                       "historial": self.historial[-50:], "pendiente": self.pendiente,
                       "guardado": datetime.now().isoformat(timespec="seconds")}
-@@ -27744,7 +30074,15 @@
+@@ -27744,7 +30268,15 @@
              detalle.append("con escalada")
          self.ui.tenue("  " + " · ".join(detalle))
          claim = getattr(self.principal, "_ultimo_claim", None)
@@ -4164,7 +4468,7 @@
              self.ui.tenue(f"  verificación: {claim.nivel}" + (f" — {recortar(claim.motivo, 120)}" if claim.motivo else ""))
          if not res.ok:
              self.ui.aviso(f"  (terminó con estado: {res.motivo})")
-@@ -27752,6 +30090,10 @@
+@@ -27752,6 +30284,10 @@
          return res.ok
  
      def construir(self, pedido: str, confirmar: bool = True, reanudar: bool = False) -> bool:
@@ -4175,7 +4479,7 @@
          if reanudar:
              try:
                  previo = RegistroBuild(self.ws).leer()
-@@ -27760,25 +30102,27 @@
+@@ -27760,25 +30296,27 @@
                  return False
              if not previo:
                  self.ui.aviso("No hay ninguna construcción pendiente.")
@@ -4208,7 +4512,7 @@
  
      # ------------------------------------------------------------ comandos
      def comando(self, entrada: str) -> Optional[str]:
-@@ -27795,6 +30139,7 @@
+@@ -27795,6 +30333,7 @@
              "/history": "historial", "/status": "estado", "/context": "contexto", "/compact": "compactar",
              "/run": "correr", "/test": "tests", "/project": "proyecto", "/model": "modelo", "/mode": "modo",
              "/strong": "modelo_fuerte", "/privacy": "privacidad", "/providers": "proveedores", "/team": "equipo",
@@ -4216,7 +4520,7 @@
          }
          nombre = alias.get(cmd, cmd[1:]).replace("-", "_")
          metodo = getattr(self, "cmd_" + nombre, None)
-@@ -28025,8 +30370,17 @@
+@@ -28025,8 +30564,17 @@
          try:
              ruta = resolver_workspace(arg)
          except ErrorRuta as e:
@@ -4236,7 +4540,7 @@
          self.cambiar_workspace(ruta)
          detectado = detectar_comando_tests(self.ws)
          self.ui.ok(f"Proyecto: {self.ws.raiz}")
-@@ -28114,15 +30468,39 @@
+@@ -28114,15 +30662,39 @@
              f"tests {'OK' if r.ok else 'FALLARON'} (exit {r.codigo}) · {conteo.texto()} · {formatear_duracion(r.duracion)}")
  
      def cmd_validar(self, arg: str) -> None:
@@ -4278,7 +4582,7 @@
      def cmd_correr(self, arg: str) -> None:
          try:
              tokens = shlex.split(arg)
-@@ -28432,13 +30810,31 @@
+@@ -28432,13 +31004,31 @@
                            f"tests_primero={self.settings.tests_primero}, escalar={self.settings.escalar}")
              return
          try:
@@ -4311,7 +4615,7 @@
  
      def cmd_tema(self, arg: str) -> None:
          if not arg:
-@@ -28449,13 +30845,63 @@
+@@ -28449,13 +31039,63 @@
          self._guardar_settings()
          self.ui.ok(f"Tema: {nombre}")
  
@@ -4375,7 +4679,7 @@
              return
          # Ω §5.1: solo /modelo <alias> o /modelo <rol> <alias> con rol conocido. Nada más se guarda.
          if len(partes) == 1:
-@@ -28600,14 +31046,51 @@
+@@ -28600,14 +31240,51 @@
          sub = (arg or "").strip().lower()
          if sub.startswith("x"):
              partes_x = sub.split()
@@ -4430,7 +4734,7 @@
          estado = estado_equipo(self.settings)
          ind = independencia_equipo(estado)
          if sub in ("independencia", "independence"):
-@@ -28648,6 +31131,11 @@
+@@ -28648,6 +31325,11 @@
          for e in estado:
              marca = "✓ clave" if e["tiene_clave"] else "⚠ FALTA CLAVE"
              self.ui.info(f"  {e['rol']:<13} → {e['proveedor']}/{e.get('modelo_real') or e['modelo']}   {marca}")
@@ -4442,7 +4746,7 @@
          self.ui.tenue(f"  proveedores distintos: {ind['proveedores_distintos']} · "
                        f"modelos distintos: {ind['modelos_distintos']}"
                        + ("  · independencia REDUCIDA" if ind["reducida"] else ""))
-@@ -28699,7 +31187,8 @@
+@@ -28699,7 +31381,8 @@
              return
          if sub == "probar":
              candidatos = [p for p, d in PROVEEDORES.items()
@@ -4452,7 +4756,7 @@
              if not candidatos:
                  self.ui.aviso("Ningún proveedor tiene credencial configurada. Configurá con /proveedores configurar.")
                  return
-@@ -29039,6 +31528,32 @@
+@@ -29039,6 +31722,32 @@
  
      def cmd_doctor(self, arg: str) -> None:
          diagnostico_sistema(self.ui, self.settings, self.llm)
@@ -4485,7 +4789,7 @@
  
      def cmd_instalar(self, arg: str) -> None:
          instalar_lanzador(self.ui)
-@@ -29111,7 +31626,7 @@
+@@ -29111,7 +31820,7 @@
  
      def _leer_entrada(self) -> str:
          marca = f"{Tema.aviso}[plan] {C.RESET}" if self.modo_plan else ""
@@ -4494,7 +4798,7 @@
          if entrada.strip().lower() not in ('"""', '/pegar'):
              return entrada.strip()
          lineas = []
-@@ -29143,25 +31658,44 @@
+@@ -29143,25 +31852,44 @@
              funciones.append(f"escalada→{self.settings.modelo_fuerte}")
          if self.settings.lecciones:
              funciones.append("lecciones")
@@ -4550,7 +4854,17 @@
              for r in ejecutar_hooks(self.ws, "al_iniciar", {"proyecto": str(self.ws.raiz)}):
                  (self.ui.tenue if r.ok else self.ui.aviso)(f"  hook al_iniciar: {r.comando} → {'ok' if r.ok else r.salida[-200:]}")
          while True:
-@@ -33617,7 +36151,7 @@
+@@ -29187,7 +31915,8 @@
+             except (KeyboardInterrupt, Cancelado):
+                 CANCELAR.set()
+                 self.ui.fin_progreso()
+-                self.ui.aviso("\n⏹ Interrumpido. Lo ya escrito queda en disco; /diff para ver, /deshacer para revertir.")
++                self.ui.linea("")
++                self.ui.aviso("⏹ Interrumpido. Lo ya escrito queda en disco; /diff para ver, /deshacer para revertir.")
+                 self._guardar_sesion()
+             except LLMError as e:
+                 self.ui.error(f"Modelo: {e}")
+@@ -33617,7 +36346,7 @@
      comando_tests="ruby -Ilib -Itest test/test_biblioteca.rb",
      comando_ejecutar="ruby bin/biblioteca",
      etiquetas=("ruby", "cli", "json"),
@@ -4559,7 +4873,7 @@
  )
  
  # ======================================================================
-@@ -33762,7 +36296,7 @@
+@@ -33762,7 +36491,7 @@
  eval { convertir(-1, 'm', 'cm') };
  like($@, qr/negativo/, 'longitud negativa');
  
@@ -4568,7 +4882,7 @@
  like($salida, qr/100 c = 212 f/, 'REPL por stdin convierte');
  like($salida, qr/error: no se puede convertir/, 'REPL por stdin informa errores');
  
-@@ -36762,7 +39296,8 @@
+@@ -36762,7 +39491,8 @@
          for nombre in _RUTAS_GLOBALES:
              self._previas[nombre] = g[nombre]
              g[nombre] = nuevas[nombre]
@@ -4578,7 +4892,7 @@
              self._env_previo[variable] = os.environ.get(variable)
              os.environ[variable] = valor
          (self.base / "tmp").mkdir(parents=True, exist_ok=True)
-@@ -36856,6 +39391,26 @@
+@@ -36856,6 +39586,26 @@
          self.assertEqual(ancho_visible(ajustar("abcdef", 4)), 4)
          self.assertEqual(ajustar("ab", 4), "ab  ")
  
@@ -4605,7 +4919,7 @@
      def test_caja_y_tabla(self):
          dibujo = sin_ansi(caja(["uno", "dos"], titulo="T"))
          lineas = dibujo.splitlines()
-@@ -37928,6 +40483,45 @@
+@@ -37928,6 +40678,45 @@
          self.assertIn("operativos", c.disyuntor.resumen())
  
  
@@ -4651,7 +4965,7 @@
  # ======================================================================
  # MÓDULO: autotest_registro
  # ======================================================================
-@@ -39189,6 +41783,12 @@
+@@ -39189,6 +41978,12 @@
          texto = self.salida(app)
          self.assertIn("proyecto", texto)
          self.assertIn(__version__, texto)
@@ -4664,7 +4978,7 @@
  
      def test_sesion_persistente(self):
          ws = self.proyecto()
-@@ -39271,6 +41871,64 @@
+@@ -39271,6 +42066,64 @@
          diagnostico_sistema(ui, self.ajustes(proveedor="ollama"))
          self.assertIn("DOCTOR REAPER", ui.texto_registrado())
  
@@ -4729,7 +5043,7 @@
      def test_instalar_lanzador(self):
          casa = self.dir / "casa"
          casa.mkdir()
-@@ -39357,7 +42015,7 @@
+@@ -39357,7 +42210,7 @@
                  if not plantilla.comando_tests:
                      continue
                  if not plantilla.disponible():
@@ -4738,7 +5052,7 @@
                  if set(plantilla.requiere) & {"go", "cargo", "javac", "make"} and not os.getenv("REAPER_AUTOTEST_COMPLETO"):
                      continue  # compilar Go/Rust/Java/C tarda: solo con REAPER_AUTOTEST_COMPLETO=1
                  destino = self.dir / "plantillas_generadas" / nombre.replace("-", "_")
-@@ -39527,6 +42185,8 @@
+@@ -39527,6 +42380,8 @@
              "antes_de_comando": ["echo {comando} | grep -qv prohibido"],
          }})})
          ctx = self.contexto(ws)
@@ -4747,7 +5061,7 @@
          salida = self.herramienta(ctx, "write_to_file", path="a.py", content="x = 1")
          self.assertIn("un hook del proyecto modificó a.py", salida)
          self.assertIn("# formateado", ws.leer("a.py"))
-@@ -39535,6 +42195,14 @@
+@@ -39535,6 +42390,14 @@
              self.herramienta(ctx, "execute_command", command="echo prohibido")
          self.assertIn("hook", str(cm.exception))
  
@@ -4762,7 +5076,7 @@
      def test_eventos_y_desactivados(self):
          ws = self.proyecto({".reaper/config.json": '{"hooks": {"despues_de_build": "echo {estado}"}}'})
          resultados = ejecutar_hooks(ws, "despues_de_build", {"estado": "verificada"})
-@@ -39547,8 +42215,9 @@
+@@ -39547,8 +42410,9 @@
  
  class TestRenombrar(BaseTest):
      def test_python_no_toca_strings_ni_comentarios(self):
@@ -4773,7 +5087,7 @@
          self.assertEqual(n, 3)
          self.assertIn("def suma(x):", nuevo)
          self.assertIn("# total sin cambiar", nuevo)
-@@ -39556,9 +42225,23 @@
+@@ -39556,9 +42420,23 @@
          self.assertIn("obj.suma = 1", nuevo)
          self.assertNotIn("subtotal", renombrar_en_texto("b.py", "subtotal = total\n", "total", "suma")[0].replace("subtotal", "ok"))
  
@@ -4798,7 +5112,7 @@
          self.assertEqual(n, 2)
          self.assertIn("const suma = 1; // total", nuevo)
          self.assertIn("subtotal, suma)", nuevo)
-@@ -39586,6 +42269,32 @@
+@@ -39586,6 +42464,32 @@
          self.assertIn("def nueva", ws.leer("m.py"))
          self.assertIn("No encontré", self.herramienta(ctx, "rename_symbol", old="inexistente", new="x"))
  
@@ -4831,7 +5145,7 @@
  
  class TestIngles(BaseTest):
      def test_prompt_en(self):
-@@ -40176,6 +42885,24 @@
+@@ -40176,6 +43080,24 @@
          self.assertIn("SIN PROGRESO", verif.diagnostico)
          self.assertTrue(orq._verificar_tarea(tcid, ConteoTests(), set()).ok)
  
@@ -4856,7 +5170,7 @@
      def test_revisor_no_aprueba_una_tarea_que_rompe_tests(self):
          ws = self.proyecto({
              "calc.py": "def suma(a, b):\n    return a + b\n",
-@@ -40517,8 +43244,9 @@
+@@ -40517,8 +43439,9 @@
          self.assertIsNone(self._detectar({"README.md": "hola"}))
  
      def test_plantilla_ruby_se_detecta_sin_config(self):
@@ -4868,7 +5182,7 @@
          destino = self.dir / "bib"
          crear_desde_plantilla("ruby-biblioteca", destino)
          (destino / ".reaper" / "config.json").unlink(missing_ok=True)
-@@ -43233,11 +45961,20 @@
+@@ -43233,11 +46156,20 @@
          self.assertEqual(destino.read_text(encoding="utf-8"), "previo")   # no lo pisó
  
      def test_ruta_destino_cae_a_interna_sin_sdcard(self):
@@ -4891,7 +5205,7 @@
  
  class TestDeshacerEntrega(BaseTest):
      def test_deshace_si_no_cambio(self):
-@@ -44268,6 +47005,45 @@
+@@ -44268,6 +47200,45 @@
          self.assertTrue(any("descartado" in n for n in informe.notas))
  
  
@@ -4937,7 +5251,7 @@
  class TestReaper810(BaseTest):
      """Regresiones de permisos, identificación e informes del propio REAPER."""
  
-@@ -44300,8 +47076,11 @@
+@@ -44300,8 +47271,11 @@
  # ======================================================================
  class TestReaper810Mejoras(BaseTest):
      def test_alias_heredados_resuelven_sin_id_invalido(self):
@@ -4950,7 +5264,7 @@
          self.assertEqual(resolver_modelo("groq:openai/gpt-oss-120b"), "groq:openai/gpt-oss-120b")
          self.assertEqual(resolver_modelo("openrouter:cohere/north-mini-code:free"),
                           "openrouter:cohere/north-mini-code:free")
-@@ -44501,6 +47280,3664 @@
+@@ -44501,6 +47475,3956 @@
  
  
  # ======================================================================
@@ -8612,10 +8926,302 @@
 +
 +
 +# ======================================================================
++# MÓDULO: autotest_e2e
++# ======================================================================
++"""
++Bugs que cazó la corrida de PUNTA A PUNTA de /grande contra un OpenRouter simulado por HTTP (pruebas_fusion/e2e/):
++la CLI real, el transporte real con SSE, el perfil gratis y el pipeline entero (tests primero, torneo, revisor, juez).
++
++- Desde la etapa 2, los tests de las etapas anteriores (que ya pasan) se contaban como "tests de la especificación
++  que YA pasan sin el código" y el especificador tenía que reescribir tests buenos.
++- Una revisión sin la línea VEREDICTO disparaba rondas de "corrección" sin nada que corregir (28 de 112 pedidos).
++- Un test de JS que importa ../web/logica.js antes de que exista, o un index.html escrito antes que app.js, salían ✗.
++- Cortada por el cupo diario (o Ctrl+C) en la fase "tests primero", QA o reparación, la build no se podía retomar:
++  "Cambios externos o tareas ya verificadas alteradas" y /grande quedaba DETENIDO para siempre.
++- Los diarios se guardan redactados: un pedido con "password: admin123" no se reconocía al retomar.
++- El cupo diario también puede llegar como evento de error DENTRO del stream (HTTP 200).
++"""
++
++_E2E_TEST_DB = ("import unittest\n\nfrom almacen import db\n\n\nclass TestDb(unittest.TestCase):\n"
++                "    def test_uno(self):\n        self.assertEqual(db.uno(), 1)\n\n"
++                "    def test_dos(self):\n        self.assertEqual(db.uno() + 1, 2)\n\n"
++                "    def test_tres(self):\n        self.assertTrue(db.uno())\n")
++_E2E_TEST_VENTAS = ("import unittest\n\nfrom almacen.ventas import total\n\n\nclass TestVentas(unittest.TestCase):\n"
++                    "    def test_total(self):\n        self.assertEqual(total([2, 3]), 5)\n")
++_E2E_TEST_CALC = ("import unittest\n\nfrom calc import sumar\n\n\nclass TestCalc(unittest.TestCase):\n"
++                  "    def test_sumar(self):\n        self.assertEqual(sumar(2, 3), 5)\n\n"
++                  "    def test_negativos(self):\n        self.assertEqual(sumar(-2, -3), -5)\n")
++_E2E_CALC = "def sumar(a, b):\n    return a + b\n"
++_E2E_PLAN_CALC = ('<plan><objetivo>Calculadora</objetivo><criterios>- sumar funciona</criterios>'
++                  '<tarea id="1" archivos="calc.py, tests/test_calc.py">sumar(a, b) con sus tests</tarea></plan>')
++
++
++class TestEspecificadorEnProyectoConTests(BaseTest):
++    def test_los_tests_que_ya_pasaban_no_cuentan_como_especificacion(self):
++        ws = self.proyecto({"almacen/__init__.py": "", "almacen/db.py": "def uno():\n    return 1\n",
++                            "tests/__init__.py": "", "tests/test_db.py": _E2E_TEST_DB})
++        llamadas = []
++
++        def guion(mensajes, kw):
++            if MockLLM.rol_de(mensajes) == "especificador":
++                llamadas.append(MockLLM.turnos_asistente(mensajes))
++                if MockLLM.turnos_asistente(mensajes) == 0:
++                    return herramienta_xml("write_to_file", path="tests/test_ventas.py", content=_E2E_TEST_VENTAS)
++            return terminar_xml("tests escritos")
++        ui = self.ui()
++        orq = Orquestador(MockLLM(guion), ws, self.ajustes(tests_primero=True), ui)
++        orq._base_tests = ejecutar_tests(ws, completo=True)
++        self.assertTrue(orq._base_tests.ok)                                          # 3 tests viejos en verde
++        plan = Plan("Ventas", [Tarea("1", "total(items)", ["almacen/ventas.py", "tests/test_ventas.py"])], [])
++        espec = orq.especificar("Ventas del almacén", plan, ws.checkpoints.iniciar("espec"))
++        texto = ui.texto_registrado()
++        self.assertIn("tests/test_ventas.py", espec)
++        self.assertNotIn("YA pasan", texto)
++        self.assertEqual(llamadas, [0, 1])                                           # un solo especificador
++        self.assertIn("3 ya pasaban de antes", texto)
++
++
++class TestRevisionSinDictamen(BaseTest):
++    def _build(self, revision: str):
++        ws = self.proyecto({})
++        impl = []
++
++        def guion(mensajes, kw):
++            rol, turno = MockLLM.rol_de(mensajes), MockLLM.turnos_asistente(mensajes)
++            if rol == "arquitecto":
++                return terminar_xml(_E2E_PLAN_CALC)
++            if rol == "implementador":
++                if turno == 0:
++                    impl.append(MockLLM.ultimo_usuario(mensajes))
++                archivos = [("calc.py", _E2E_CALC), ("tests/test_calc.py", _E2E_TEST_CALC)]
++                if turno < len(archivos):
++                    return herramienta_xml("write_to_file", path=archivos[turno][0], content=archivos[turno][1])
++                return terminar_xml("listo, tests en verde")
++            if rol == "revisor":
++                return terminar_xml(revision)
++            return terminar_xml("sin cambios")
++        ui = self.ui()
++        orq = Orquestador(MockLLM(guion), ws, self.ajustes(max_revisiones=2, juez=False), ui)
++        informe = orq.construir("Una calculadora con sumar", confirmar=False)
++        return informe, impl, ui.texto_registrado()
++
++    def test_sin_veredicto_ni_observaciones_no_hay_ronda_vacia(self):
++        informe, impl, texto = self._build("revisado: todo bien, sin cambios necesarios")
++        self.assertTrue(informe.ok, texto[-2500:])
++        self.assertEqual(len(impl), 1)                                               # antes: 1 + 1 corrección vacía
++        self.assertIn("SIN VEREDICTO", texto)
++        self.assertNotIn("Revisor pidió cambios", texto)
++
++    def test_sin_veredicto_pero_con_puntos_concretos_se_pasan(self):
++        informe, impl, texto = self._build("Observaciones:\n1. falta validar que a y b sean números")
++        self.assertTrue(informe.ok, texto[-2500:])
++        self.assertEqual(len(impl), 2)
++        self.assertIn("falta validar que a y b sean números", impl[1])
++        self.assertTrue(observaciones_concretas("- falta un test de negativos"))
++        self.assertFalse(observaciones_concretas("Todo correcto, buen trabajo."))
++        self.assertFalse(observaciones_concretas("1. Implementa sumar\n2. Tiene tests"))
++
++
++class TestReferenciasAArchivosDelPlan(BaseTest):
++    PLAN = ("[ ] 1. Lógica (T5a). [web/logica.js, tests/logica.test.mjs]\n"
++            "[ ] 2. Página (T5b). [web/index.html, web/app.js, web/style.css]")
++
++    def test_html_escrito_antes_que_su_js_y_css(self):
++        ws = self.proyecto({"web/index.html": _GuionAlmacen.ARCHIVOS["web/index.html"]})
++        quedan, pendientes = faltantes_planeados(ws, validar_archivos(ws, ["web/index.html"]), self.PLAN)
++        self.assertEqual(fallos(quedan), [])
++        self.assertEqual(sorted(pendientes), ["web/app.js", "web/style.css"])
++        quedan, pendientes = faltantes_planeados(ws, validar_archivos(ws, ["web/index.html"]), "[web/index.html]")
++        self.assertEqual([r.comando.split()[0] for r in fallos(quedan)], ["recursos-html"])   # fuera del plan: error
++        self.assertEqual(pendientes, [])
++
++    def test_escribir_el_html_no_sale_como_fallo(self):
++        ws = self.proyecto({})
++        ctx = self.contexto(ws)
++        ctx.pedido = "TU TAREA AHORA (#2):\nPágina\n\nPLAN GENERAL:\n" + self.PLAN
++        salida = self.herramienta(ctx, "write_to_file", path="web/index.html",
++                                  content=_GuionAlmacen.ARCHIVOS["web/index.html"])
++        self.assertNotIn("VALIDACIÓN FALLÓ", salida)
++        self.assertIn("referencia archivos del plan que todavía no existen", salida)
++
++    def test_test_de_js_que_importa_un_modulo_planeado_es_rojo_esperado(self):
++        ws = self.proyecto({"tests/logica.test.mjs": _GuionAlmacen.ARCHIVOS["tests/logica.test.mjs"]})
++        quedan, esperados, clases = separar_imports_tdd(validar_archivos(ws, ["tests/logica.test.mjs"]), self.PLAN, ws)
++        self.assertEqual(fallos(quedan), [])
++        self.assertEqual(len(esperados), 1)
++        self.assertEqual([(c.modulo, c.causa) for c in clases], [("web/logica.js", "MODULO_PROPIO_AUSENTE")])
++        quedan, esperados, _c = separar_imports_tdd(validar_archivos(ws, ["tests/logica.test.mjs"]), "[web/otro.js]", ws)
++        self.assertEqual(len(fallos(quedan)), 1)                                     # no está en el plan: error real
++
++    def test_run_tests_del_especificador_explica_el_modulo_js_que_falta(self):
++        if not shutil.which("node"):
++            self.skipTest("node no está instalado")
++        ws = self.proyecto({"tests/logica.test.mjs": _GuionAlmacen.ARCHIVOS["tests/logica.test.mjs"]})
++        ctx = self.contexto(ws)
++        ctx.rol = "especificador"
++        salida = run_tests(ctx, {})
++        self.assertTrue(salida.startswith("ESPERADO (tests primero)"), salida[:400])
++        self.assertIn("web/logica.js", salida)
++
++
++class TestCupoDentroDelStream(BaseTest):
++    def test_evento_de_error_con_cupo_diario_frena_sin_reintentar(self):
++        evento = {"error": {"code": 429, "message": "Rate limit exceeded: free-models-per-day",
++                            "metadata": {"headers": {"X-RateLimit-Remaining": "0", "X-RateLimit-Reset":
++                                                     str(int((time.time() + 5 * 3600) * 1000))}}}}
++        c = LLMClient("clave", self.ajustes(modelo="a/uno:free", reintentos=3, fallbacks=[], respaldo_equipo=False),
++                      url="http://falso", transporte=transporte_falso([evento, "no debía llegar acá"]))
++        c.dormir = lambda s: self.fail(f"no debía esperar {s}s")
++        with self.assertRaises(LLMError) as ctx:
++            c.chat([{"role": "user", "content": "x"}])
++        self.assertTrue(ctx.exception.cupo_diario)
++        self.assertIn("Se renueva", str(ctx.exception))
++
++
++_E2E_PLAN_SOLO_CODIGO = ('<plan><objetivo>Calculadora</objetivo><criterios>- sumar funciona</criterios>'
++                         '<tarea id="1" archivos="calc.py">sumar(a, b)</tarea></plan>')
++
++
++def _e2e_corte(rol_corte: str, turno_corte: int, plan: str = _E2E_PLAN_CALC, impl_tests: bool = False):
++    """Guion de calculadora que tira el cupo diario UNA vez en `rol_corte`, turno `turno_corte`."""
++    estado = {"cortado": False}
++    escritos = [("calc.py", _E2E_CALC)] + ([("tests/test_calc.py", _E2E_TEST_CALC)] if impl_tests else [])
++
++    def guion(mensajes, kw):
++        rol, turno = MockLLM.rol_de(mensajes), MockLLM.turnos_asistente(mensajes)
++        if rol == rol_corte and turno == turno_corte and not estado["cortado"]:
++            estado["cortado"] = True
++            raise _cupo_agotado(6 * 3600)
++        if rol == "arquitecto":
++            return terminar_xml(plan)
++        if rol in ("especificador", "qa"):
++            if turno == 0:
++                return herramienta_xml("write_to_file", path="tests/test_calc.py", content=_E2E_TEST_CALC)
++            return terminar_xml("tests escritos")
++        if rol == "implementador":
++            if turno < len(escritos):
++                return herramienta_xml("write_to_file", path=escritos[turno][0], content=escritos[turno][1])
++            return terminar_xml("listo")
++        return terminar_xml("sin cambios")
++    return guion, estado
++
++
++class TestCorteEnUnaFase(BaseTest):
++    def _cortar_y_retomar(self, rol_corte: str, plan: str = _E2E_PLAN_CALC, **ajustes):
++        ws = self.proyecto({})
++        guion, estado = _e2e_corte(rol_corte, 1, plan=plan)
++        llm = MockLLM(guion)
++        with self.assertRaises(LLMError):
++            Orquestador(llm, ws, self.ajustes(**ajustes), self.ui()).construir("Calculadora con sumar",
++                                                                             confirmar=False)
++        self.assertTrue(estado["cortado"])
++        self.assertTrue(ws.existe("tests/test_calc.py"))                             # lo escrito antes del corte
++        ui = self.ui()
++        informe = Orquestador(llm, ws, self.ajustes(**ajustes), ui).construir("Calculadora con sumar",
++                                                                            confirmar=False)
++        texto = ui.texto_registrado()
++        self.assertNotIn("Cambios externos", texto)
++        self.assertIn("la retomo donde quedó", texto)
++        self.assertTrue(informe.ok, texto[-2500:])
++        return informe, texto
++
++    def test_cortada_en_tests_primero_se_retoma_y_conserva_la_especificacion(self):
++        informe, texto = self._cortar_y_retomar("especificador", tests_primero=True)
++        self.assertEqual(informe.spec_tests, ["tests/test_calc.py"])
++        self.assertNotIn("no dejó archivos de test", texto)
++
++    def test_cortada_en_qa_se_retoma(self):
++        # Sin tests primero y con un implementador que no escribe tests: corre la fase QA (de cierre).
++        self._cortar_y_retomar("qa", plan=_E2E_PLAN_SOLO_CODIGO, qa=True)
++
++    def test_pedido_con_algo_que_parece_una_clave_se_reconoce_al_retomar(self):
++        self.assertTrue(mismo_pedido("login con password: [REDACTADO]", "login con  password: admin123"))
++        self.assertTrue(mismo_pedido("hola mundo", " hola   mundo "))
++        self.assertFalse(mismo_pedido("login con password: [REDACTADO]", "otra cosa"))
++        ws = self.proyecto({})
++        guion, _estado = _e2e_corte("implementador", 0, impl_tests=True)
++        llm = MockLLM(guion)
++        pedido = "Calculadora con sumar; el admin entra con password: admin123"
++        with self.assertRaises(LLMError):
++            Orquestador(llm, ws, self.ajustes(), self.ui()).construir(pedido, confirmar=False)
++        self.assertNotIn("admin123", (ws.raiz / ".reaper" / "build_pendiente.json").read_text(encoding="utf-8"))
++        ui = self.ui()
++        self.assertTrue(Orquestador(llm, ws, self.ajustes(), ui).construir(pedido, confirmar=False).ok)
++        self.assertIn("la retomo donde quedó", ui.texto_registrado())
++
++
++class TestAvisosDeParada(BaseTest):
++    def test_comando_para_seguir_conserva_el_perfil_gratis(self):
++        ws = self.proyecto({})
++        gratis = self.ajustes(modelo="cohere/north-mini-code:free")
++        self.assertIn("--perfil gratis --grande continuar", comando_para_seguir(ws, "grande", gratis))
++        self.assertNotIn("--perfil", comando_para_seguir(ws, "grande", self.ajustes(modelo="openai/gpt-pago")))
++        self.assertNotIn("--perfil", comando_para_seguir(ws, "grande"))
++
++    def test_la_caja_parte_las_lineas_largas_en_vez_de_cortarlas(self):
++        motivo = ("Me detengo: se agotó el cupo diario de pedidos gratis. Se renueva mañana a las 07:48. " * 3).strip()
++        dibujada = re.sub(r"\x1b\[[0-9;]*m", "", caja([motivo], "Proyecto grande · DETENIDO"))
++        lineas = dibujada.splitlines()
++        self.assertTrue(all(ancho_visible(l) <= ancho_terminal() for l in lineas))
++        interior = " ".join(l.strip("│ ").strip() for l in lineas[1:-1])
++        self.assertIn("Se renueva mañana a las 07:48.", interior)
++        self.assertNotIn("…", interior)
++
++    def test_cupo_diario_en_grande_muestra_la_hora_entera(self):
++        ws = self.proyecto({})
++        guion = _GuionAlmacen(ws)
++        cortes = [1]
++
++        def responder(mensajes, kw):
++            if MockLLM.rol_de(mensajes) == "arquitecto" and cortes[0]:
++                cortes[0] -= 1
++                raise _cupo_agotado(6 * 3600)
++            return guion(mensajes, kw)
++        ui = self.ui()
++        grande = ConstructorGrande(MockLLM(responder), ws, self.ajustes(juez=False), ui)
++        grande.consultar_cuenta = lambda: None
++        grande.dormir = lambda s: self.fail(f"no debía esperar {s}s")
++        self.assertFalse(grande.iniciar(TestGrandeAlmacen.PEDIDO, confirmar=False))
++        motivo = grande.leer()["motivo"]
++        self.assertTrue(motivo.startswith("se agotó el cupo diario de pedidos gratis.\nSe renueva"), motivo)
++        self.assertIn("Cuando se renueve el cupo", ui.texto_registrado())
++
++
++class TestVerificacionDeTareaConSuEspecificacion(BaseTest):
++    def test_el_test_propio_en_rojo_no_deja_la_tarea_verificada(self):
++        # Modelo flojo: sumar resta. Antes el rojo de la especificación se toleraba entero ("es de tareas siguientes")
++        # y la tarea única quedaba verificada; lo atajaba recién la verificación final.
++        ws = self.proyecto({})
++        pasos = []
++
++        def guion(mensajes, kw):
++            rol, turno = MockLLM.rol_de(mensajes), MockLLM.turnos_asistente(mensajes)
++            if turno == 0:
++                pasos.append(rol)
++            if rol == "arquitecto":
++                return terminar_xml(_E2E_PLAN_CALC)
++            if rol == "especificador" and turno == 0:
++                return herramienta_xml("write_to_file", path="tests/test_calc.py", content=_E2E_TEST_CALC)
++            if rol == "implementador" and turno == 0:
++                return herramienta_xml("write_to_file", path="calc.py", content="def sumar(a, b):\n    return a - b\n")
++            if rol == "reparador" and turno == 0:
++                return herramienta_xml("write_to_file", path="calc.py", content=_E2E_CALC)
++            return terminar_xml("listo")
++        ui = self.ui()
++        informe = Orquestador(MockLLM(guion), ws, self.ajustes(tests_primero=True, max_revisiones=1, juez=False),
++                              ui).construir("Calculadora con sumar", confirmar=False)
++        texto = ui.texto_registrado()
++        self.assertTrue(informe.ok, texto[-2500:])
++        self.assertIn("La tarea 1 no pasó su verificación", texto)
++        self.assertLess(pasos.index("reparador"), pasos.index("revisor"))          # se repara ANTES de revisar
++        self.assertNotIn("REPARACIÓN final", texto)
++
++
++# ======================================================================
  # MÓDULO: autotest_runner
  # ======================================================================
  """Ejecutor del autotest interno."""
-@@ -44514,6 +50951,44 @@
+@@ -44514,6 +51438,44 @@
      )
  
  
@@ -8660,7 +9266,7 @@
  def correr_autotest(filtro: Optional[str] = None, verbosidad: Optional[int] = None) -> int:
      filtro = (filtro if filtro is not None else os.getenv("REAPER_AUTOTEST", "")).lower()
      verbosidad = verbosidad if verbosidad is not None else (2 if os.getenv("REAPER_AUTOTEST_V") else 1)
-@@ -44525,13 +51000,39 @@
+@@ -44525,13 +51487,39 @@
          suite.addTests(cargador.loadTestsFromTestCase(clase))
      total = suite.countTestCases()
      if total == 0:
@@ -8702,7 +9308,7 @@
      if resultado.wasSuccessful():
          print(f"{Tema.ok}✓ {resultado.testsRun} tests OK en {duracion}"
                f"{f' ({len(resultado.skipped)} salteados)' if resultado.skipped else ''}{C.RESET}")
-@@ -45345,6 +51846,33 @@
+@@ -45345,6 +52333,33 @@
      return [c for c in comandos if isinstance(c, str) and c.strip()]
  
  
@@ -8736,7 +9342,7 @@
  def ejecutar_hooks(ws: Workspace, evento: str, variables: Optional[dict] = None, timeout: int = 60) -> list[ResultadoHook]:
      if evento not in EVENTOS_HOOK:
          raise ValueError(f"evento de hook desconocido: {evento}")
-@@ -45360,7 +51888,7 @@
+@@ -45360,7 +52375,7 @@
  
  def _hook_post_escritura(ctx: Contexto, rel: str) -> str:
      """Corre los hooks despues_de_escribir; devuelve texto para el agente si alguno falló o cambió algo."""
@@ -8745,7 +9351,7 @@
          return ""
      antes = ctx.ws.hash(rel)
      resultados = ejecutar_hooks(ctx.ws, "despues_de_escribir", {"archivo": rel})
-@@ -45377,7 +51905,7 @@
+@@ -45377,7 +52392,7 @@
  
  def _hook_antes_de_comando(ctx: Contexto, comando: str) -> Optional[str]:
      """Devuelve el motivo si un hook bloquea el comando."""
@@ -8754,7 +9360,7 @@
          return None
      for r in ejecutar_hooks(ctx.ws, "antes_de_comando", {"comando": comando}):
          if not r.ok:
-@@ -45404,27 +51932,84 @@
+@@ -45404,27 +52419,84 @@
  import tokenize as _tokenize
  
  _RE_IDENT_VALIDO = re.compile(r"^[A-Za-z_$][\w$]*$")
@@ -8846,7 +9452,7 @@
      largo = len(viejo)
      while i < n:
          ch = texto[i]
-@@ -45455,27 +52040,33 @@
+@@ -45455,27 +52527,33 @@
              antes = texto[i - 1] if i > 0 else ""
              despues = texto[i + largo] if i + largo < n else ""
              if not (antes.isalnum() or antes in "_$") and not (despues.isalnum() or despues in "_$"):
@@ -8888,7 +9494,7 @@
  
  
  @dataclass
-@@ -45484,6 +52075,7 @@
+@@ -45484,6 +52562,7 @@
      nuevo: str
      cambios: dict = field(default_factory=dict)  # rel → (antes, despues, cantidad)
      conflictos: list = field(default_factory=list)
@@ -8896,7 +9502,7 @@
  
      @property
      def total(self) -> int:
-@@ -45507,6 +52099,10 @@
+@@ -45507,6 +52586,10 @@
          raise ValueError(f"'{nuevo}' es una palabra reservada de Python")
      plan = PlanRenombrado(viejo, nuevo)
      candidatos = list(archivos) if archivos else ws.archivos_codigo(limite=3000)
@@ -8907,7 +9513,7 @@
      for rel in candidatos:
          try:
              texto = ws.leer(rel)
-@@ -45514,7 +52110,13 @@
+@@ -45514,7 +52597,13 @@
              continue
          if viejo not in texto:
              continue
@@ -8922,7 +9528,7 @@
          if cantidad > 0:
              if re.search(r"(?<![\w$])" + re.escape(nuevo) + r"(?![\w$])", texto):
                  plan.conflictos.append(f"{rel}: ya existe el nombre '{nuevo}'")
-@@ -45570,6 +52172,10 @@
+@@ -45570,6 +52659,10 @@
      texto = plan.resumen()
      if plan.conflictos:
          texto += "\nOjo, el nombre nuevo ya existía en: " + "; ".join(plan.conflictos)
@@ -8933,7 +9539,7 @@
      return texto + "\nValidación: " + resumen_validacion(resultados)
  
  
-@@ -45675,6 +52281,11 @@
+@@ -45675,6 +52768,11 @@
  Define the public INTERFACE (files, functions/classes and exact signatures): tests are written from it BEFORE
  implementing, so it must be precise and importable.
  If a new file will be long (more than ~250 lines), split it into several modules or tasks.
@@ -8945,7 +9551,7 @@
  Your attempt_completion MUST contain the plan EXACTLY in this format:
  <plan>
  <objetivo>one sentence</objetivo>
-@@ -45788,6 +52399,23 @@
+@@ -45788,6 +52886,23 @@
  A criterion is MET only if you cite evidence that proves it; without evidence it is UNKNOWN.
  Reply ONLY a JSON object: {"criteria": [{"criterion": "...", "status": "MET|NOT_MET|UNKNOWN",
  "evidence_ids": ["EV-..."]}]}""",
@@ -8969,7 +9575,7 @@
  }
  
  DOCS_EN = {
-@@ -46847,17 +53475,17 @@
+@@ -46847,17 +53962,17 @@
  
  
  _PROCESOS: dict[str, ProcesoFondo] = {}
@@ -8990,7 +9596,7 @@
          procesos = list(_PROCESOS.values())
          _PROCESOS.clear()
      detenidos = 0
-@@ -46873,7 +53501,7 @@
+@@ -46873,7 +53988,7 @@
  
  def _proceso(ctx: Contexto, p: dict) -> ProcesoFondo:
      id_ = (p.get("id") or "").strip()
@@ -8999,7 +9605,7 @@
          if not id_ and len(_PROCESOS) == 1:
              return next(iter(_PROCESOS.values()))
          proceso = _PROCESOS.get(id_)
-@@ -46921,7 +53549,7 @@
+@@ -46921,7 +54036,7 @@
          proceso = ProcesoFondo(id_, comando, ctx.ws.raiz, _entrada_estandar(p))
      except OSError as e:
          raise ErrorHerramienta(f"No pude iniciar el proceso: {e}")
@@ -9008,7 +9614,7 @@
          _PROCESOS[id_] = proceso
      listo = proceso.esperar_texto(patron, timeout if patron else min(timeout, 0.8))
      salida = proceso.nuevas(80)
-@@ -46974,7 +53602,7 @@
+@@ -46974,7 +54089,7 @@
      proceso = _proceso(ctx, p)
      estaba_vivo = proceso.vivo
      codigo = proceso.detener()
@@ -9017,7 +9623,7 @@
          _PROCESOS.pop(proceso.id, None)
      finales = proceso.nuevas(60) or proceso.ultimas(20)
      estado = "detenido" if estaba_vivo else f"ya había terminado (código {codigo})"
-@@ -47018,7 +53646,7 @@
+@@ -47018,7 +54133,7 @@
          if objetivo == "todos":
              self.ui.ok(f"Detenidos {detener_todos_los_procesos()} proceso(s).")
              return
@@ -9026,7 +9632,7 @@
              proceso = _PROCESOS.pop(objetivo, None)
          if proceso is None:
              self.ui.error(f"No existe el proceso {objetivo}.")
-@@ -47140,6 +53768,49 @@
+@@ -47140,6 +54255,49 @@
      modo: no es censura, protegen el celular de un error del modelo.
  """)
  
@@ -9076,7 +9682,7 @@
  capitulo("construir", "/construir: el pipeline completo", """
      # /construir
  
-@@ -49171,6 +55842,314 @@
+@@ -49171,6 +56329,325 @@
      return salida
  
  
@@ -9256,7 +9862,10 @@
 +
 +# Catálogo REAL de OpenRouter (público: sin clave y sin costo). La lista fija de modelos gratis se pudre: en la
 +# prueba real (2026-10) el perfil "gratis" apuntaba a dolphin…:free, que ya no existía, y llama-3.3-70b:free tampoco.
-+URL_CATALOGO_OPENROUTER = "https://openrouter.ai/api/v1/models"
++# REAPER_OPENROUTER_BASE apunta catálogo y cuenta a otro servidor (el OpenRouter simulado de las pruebas de punta a
++# punta, junto con REAPER_API_URL para el chat); sin la variable, el OpenRouter de verdad.
++_BASE_OPENROUTER = (os.getenv("REAPER_OPENROUTER_BASE") or "https://openrouter.ai/api/v1").rstrip("/")
++URL_CATALOGO_OPENROUTER = f"{_BASE_OPENROUTER}/models"
 +_RE_NO_SIRVE_PARA_CODIGO = re.compile(r"safety|guard|lyria|embed|tts|whisper|moderation|^openrouter/", re.I)
 +_RE_MODELO_DIMINUTO = re.compile(r"[-_/](?:0?\.\d+|[0-6](?:\.\d+)?)b\b", re.I)   # ≤ 6B: no sirven para programar
 +
@@ -9288,7 +9897,7 @@
 +    return [mid for _p, _c, mid in sorted(elegidos)]
 +
 +
-+URL_CUENTA_OPENROUTER = "https://openrouter.ai/api/v1/key"
++URL_CUENTA_OPENROUTER = f"{_BASE_OPENROUTER}/key"
 +
 +
 +@dataclass
@@ -9306,6 +9915,14 @@
 +        cupo = f"{self.cupo_dia} pedidos gratis por día" if self.cupo_dia is not None else ""
 +        hoy = f" (hoy: usados {self.usados_hoy}, quedan {self.quedan_hoy})" if self.quedan_hoy is not None else ""
 +        return ", ".join(x for x in (tipo, cupo) if x) + hoy
++
++    def resumen_corto(self) -> str:
++        """Para la tabla del doctor (en el teléfono la columna es angosta y se cortaba antes de "quedan")."""
++        if self.quedan_hoy is not None and self.cupo_dia is not None:
++            return f"quedan {self.quedan_hoy} de {self.cupo_dia} hoy"
++        if self.cupo_dia is not None:
++            return f"{self.cupo_dia} pedidos por día"
++        return self.resumen()
 +
 +
 +def _entero_o_nada(valor) -> Optional[int]:
@@ -9391,7 +10008,7 @@
  def modelos_potentes_free() -> list:
      """Alias curados de modelos free POTENTES (del catálogo estático), como (alias, info)."""
      return [(alias, info) for alias, info in INFO_MODELOS.items() if info.free]
-@@ -49209,9 +56188,11 @@
+@@ -49209,9 +56686,11 @@
      """Petición mínima REAL a un modelo concreto (sin fallback): dice si responde de verdad."""
      t0 = time.monotonic()
      try:
@@ -9404,7 +10021,7 @@
          ms = round((time.monotonic() - t0) * 1000)
          visible = str(getattr(resp, "texto", "") or "").strip()
          if "REAPER_OK" not in visible.upper():
-@@ -49227,6 +56208,48 @@
+@@ -49227,6 +56706,51 @@
          return {"estado": "FALLA", "detalle": f"{type(e).__name__}: {e}"[:120]}
  
  
@@ -9420,6 +10037,9 @@
 +            vivos.append(modelo)
 +            if len(vivos) >= cuantos:
 +                break
++        agotado = getattr(llm, "cupo_free_agotado", None)
++        if callable(agotado) and agotado():
++            break                   # comparten el cupo diario: los demás :free tampoco van a responder hoy
 +    return vivos
 +
 +
@@ -9453,7 +10073,7 @@
  def probar_equipo(llm, settings) -> list:
      """
      Prueba de verdad cada uno de los seis roles con una petición mínima. Dedup por modelo (no gasta de más).
-@@ -49254,7 +56277,8 @@
+@@ -49254,7 +56778,8 @@
      ind = independencia_equipo(estado)
      con_clave = sum(1 for e in estado if e["tiene_clave"])
      aviso = "" if con_clave == len(estado) else f" · {len(estado) - con_clave} sin clave"
@@ -9463,7 +10083,7 @@
              f" · conectividad NO VERIFICADA (/equipo probar)")
  
  
-@@ -49593,7 +56617,8 @@
+@@ -49593,7 +57118,8 @@
      return h.hexdigest(), tam
  
  
@@ -9473,7 +10093,7 @@
      """
      Elige una ruta de salida REAL y legible. Prefiere la autorizada; si no hay acceso a almacenamiento
      compartido, cae a una carpeta interna de REAPER (sin fingir que llegó a /sdcard). Devuelve (ruta, externo).
-@@ -49601,7 +56626,8 @@
+@@ -49601,7 +57127,8 @@
      candidatas = []
      if preferida:
          candidatas.append(Path(preferida).expanduser())
@@ -9483,7 +10103,7 @@
      for base in candidatas:
          try:
              if base.is_dir() and os.access(base, os.W_OK):
-@@ -49938,7 +56964,8 @@
+@@ -49938,7 +57465,8 @@
      """Prueba cada proveedor pedido (o todos los que tengan credencial). Dedup implícito por proveedor."""
      if not proveedores:
          proveedores = [p for p, d in PROVEEDORES.items()
@@ -9493,7 +10113,7 @@
      return [probar_proveedor(llm, p, settings) for p in proveedores]
  
  
-@@ -50198,6 +57225,65 @@
+@@ -50198,6 +57726,65 @@
      return salida
  
  
@@ -9559,7 +10179,7 @@
  def conteo_equipo_x(settings, probados: Optional[dict] = None) -> dict:
      """
      Conteos honestos y separados: roles, modelos distintos configurados, modelos distintos VERIFICADOS (solo los
-@@ -50216,6 +57302,1085 @@
+@@ -50216,6 +57803,1111 @@
  
  
  # ======================================================================
@@ -9880,8 +10500,10 @@
 +    return "\n\n".join(partes)
 +
 +
-+def comando_para_seguir(ws, modo: str) -> str:
-+    """El comando exacto para retomar desde la terminal (lo que hay que tipear después de un corte)."""
++def comando_para_seguir(ws, modo: str, settings: Optional[Settings] = None) -> str:
++    """El comando exacto para retomar desde la terminal (lo que hay que tipear después de un corte). Si la corrida usa
++    modelos :free de OpenRouter, lleva --perfil gratis: sin eso, retomar con la config de siempre podía caer en un
++    modelo PAGO (o en uno gratis viejo que ya no existe)."""
 +    ruta = str(getattr(ws, "raiz", ws))
 +    casa = str(Path.home())
 +    if ruta == casa or ruta.startswith(casa + os.sep):
@@ -9889,18 +10511,19 @@
 +        visible = ruta if not re.search(r"[^\w./~-]", ruta) else '~/' + shlex.quote(ruta[2:])
 +    else:
 +        visible = shlex.quote(ruta)
-+    return f"reaper --proyecto {visible} --{modo} continuar"
++    perfil = " --perfil gratis" if settings is not None and usa_free_openrouter(settings) else ""
++    return f"reaper --proyecto {visible}{perfil} --{modo} continuar"
 +
 +
-+def pista_para_seguir(ws: Workspace) -> str:
++def pista_para_seguir(ws: Workspace, settings: Optional[Settings] = None) -> str:
 +    """Si en la carpeta quedó un /grande o un /construir sin terminar, cómo seguirlo ('' si no hay nada)."""
 +    try:
 +        grande = ConstructorGrande(None, ws, Settings(), None).leer()
 +        if grande and grande.get("estado") != "terminado":
-+            return f"El proyecto grande quedó guardado. Para seguir: {comando_para_seguir(ws, 'grande')}"
++            return f"El proyecto grande quedó guardado. Para seguir: {comando_para_seguir(ws, 'grande', settings)}"
 +        build = RegistroBuild(ws).leer()
 +        if build and build.get("estado") not in ESTADOS_OK_ETAPA:
-+            return f"La build quedó guardada. Para seguir: {comando_para_seguir(ws, 'construir')}"
++            return f"La build quedó guardada. Para seguir: {comando_para_seguir(ws, 'construir', settings)}"
 +    except (ValueError, OSError, KeyError, TypeError):
 +        return ""
 +    return ""
@@ -9963,7 +10586,7 @@
 +        if cuenta.quedan_hoy is not None and cuenta.quedan_hoy < minimo:
 +            self.ui.aviso("  Con lo que queda hoy no alcanza para todo: avanzo lo que se pueda y, cuando se agote el "
 +                          "cupo, me detengo limpio (nada queda a medias sin guardar). Seguí después con: "
-+                          + comando_para_seguir(self.ws, "grande"))
++                          + comando_para_seguir(self.ws, "grande", self.settings))
 +
 +    def _ahorro_de_pedidos(self) -> Callable[[], None]:
 +        """Cuenta con 50 pedidos gratis por día: sin torneo ni revisor en ESTA corrida (cada candidato del torneo es
@@ -10118,14 +10741,15 @@
 +            self.ui.error(str(e))
 +            return False
 +        if previo and previo.get("estado") != "terminado":
-+            if " ".join(str(previo.get("pedido", "")).split()) == " ".join(pedido.split()):
++            if mismo_pedido(previo.get("pedido"), pedido):
 +                # Repetir el MISMO comando después de un corte (Termux cerrado, teléfono bloqueado, límite del
 +                # modelo) es la forma natural de "seguir": antes daba error y había que saber /grande continuar.
 +                self.ui.info("Este mismo proyecto grande había quedado a medias: lo retomo donde quedó.")
 +                return self.continuar()
 +            self.ui.error("Ya hay OTRO proyecto grande sin terminar en esta carpeta. Seguilo con "
-+                          f"`{comando_para_seguir(self.ws, 'grande')}`, miralo con /grande estado o descartalo con "
-+                          "/grande descartar (no borra archivos). Para uno nuevo usá otra carpeta (--proyecto).")
++                          f"`{comando_para_seguir(self.ws, 'grande', self.settings)}`, miralo con /grande estado o "
++                          "descartalo con /grande descartar (no borra archivos). Para uno nuevo usá otra carpeta "
++                          "(--proyecto).")
 +            return False
 +        try:
 +            pendiente = RegistroBuild(self.ws).leer()
@@ -10170,6 +10794,13 @@
 +        return self._ejecutar(estado, maestro)
 +
 +    def _ejecutar(self, estado: dict, maestro: PlanMaestro) -> bool:
++        # Con qué modelos y ajustes corrió de verdad (con --perfil gratis no coincide con la config guardada): lo usa
++        # /reporte, que si no mostraba el modelo de la config y no el que construyó.
++        s = self.settings
++        estado["ajustes_corrida"] = {"modelo": s.modelo, "respaldos": list(s.fallbacks or []),
++                                     "roles": dict(s.modelos_rol or {}), "torneo": s.torneo,
++                                     "candidatos": s.candidatos, "tests_primero": s.tests_primero, "rpm": s.rpm,
++                                     "juez": getattr(s, "juez", None), "fecha": datetime.now().isoformat(timespec="seconds")}
 +        restaurar = self._ahorro_de_pedidos()
 +        try:
 +            return self._ejecutar_etapas(estado, maestro)
@@ -10202,14 +10833,15 @@
 +                        # Límite pasajero (o cupo que se renueva pronto): esperar y seguir SOLO, sin perder lo hecho.
 +                        self.ui.aviso(f"  {recortar(_primera_linea_util(str(e)), 140)}")
 +                        self.ui.aviso(f"  Espero {formatear_duracion(espera)} y sigo solo (Ctrl+C corta; después: "
-+                                      f"{comando_para_seguir(self.ws, 'grande')}).")
++                                      f"{comando_para_seguir(self.ws, 'grande', self.settings)}).")
 +                        self.dormir(espera)
 +                        esperado, esperas = esperado + espera, esperas + 1
 +                        continue
 +                    etapa.estado, etapa.motivo = "pendiente", recortar(str(e), 400)
 +                    if e.cupo_diario:
-+                        return self._detener(estado, maestro, "se agotó el cupo diario de pedidos gratis. "
-+                                             + recortar(str(e), 220))
++                        # Corto y con la HORA: el error entero en la caja se recortaba justo antes de "Se renueva…".
++                        return self._detener(estado, maestro, "se agotó el cupo diario de pedidos gratis.\n"
++                                             + (_texto_reinicio(e.reinicio) or " Se renueva en unas horas.").strip())
 +                    return self._detener(estado, maestro, f"el modelo no responde ({recortar(str(e), 160)})")
 +                terminadas += 1
 +                if etapa.ok or informe.estado == "cancelada" or terminadas >= 2:
@@ -10232,7 +10864,7 @@
 +        except ValueError as e:
 +            raise LLMError(f"diario de build ilegible: {e}", probar_otro_modelo=False)
 +        reanudar = bool(pendiente and pendiente.get("estado") not in ESTADOS_OK_ETAPA)
-+        if reanudar and pendiente.get("pedido") != pedido_etapa:
++        if reanudar and not mismo_pedido(pendiente.get("pedido"), pedido_etapa):
 +            etapa.estado, etapa.motivo = "pendiente", "hay otro /construir sin terminar en la carpeta"
 +            self.guardar(estado, maestro)
 +            self.ui.error("Hay un /construir sin terminar que no es de esta etapa: terminalo o descartalo "
@@ -10297,7 +10929,7 @@
 +        etapa = next((e for e in maestro.etapas if not e.ok and e.estado != "pendiente"), None) or next(
 +            (e for e in maestro.etapas if not e.ok), None)
 +        if not build or build.get("estado") in ESTADOS_OK_ETAPA or etapa is None \
-+                or build.get("pedido") != pedido_de_etapa(estado["pedido"], maestro, etapa):
++                or not mismo_pedido(build.get("pedido"), pedido_de_etapa(estado["pedido"], maestro, etapa)):
 +            self.ui.aviso("No hay una etapa a medias para deshacer (todo lo que está en disco ya quedó verificado o "
 +                          "la build pendiente no es de este proyecto grande).")
 +            return False
@@ -10310,7 +10942,7 @@
 +        self.guardar(estado, maestro)
 +        indice_de(self.ws).invalidar()
 +        self.ui.ok(f"Etapa {etapa.id} deshecha: {len(tocados)} archivo(s) vuelven al último estado verificado.")
-+        self.ui.tenue(f"  Para rehacerla: /grande continuar  ·  {comando_para_seguir(self.ws, 'grande')}")
++        self.ui.tenue(f"  Para rehacerla: /grande continuar  ·  {comando_para_seguir(self.ws, 'grande', self.settings)}")
 +        return True
 +
 +    def _detener(self, estado: dict, maestro: PlanMaestro, motivo: str) -> bool:
@@ -10327,9 +10959,13 @@
 +        self.guardar(estado, maestro)
 +        hechas = sum(1 for e in maestro.etapas if e.ok)
 +        self.ui.linea("")
++        cupo = motivo.startswith("se agotó el cupo diario")
++        primera, *resto = recortar(motivo, 300).splitlines() or [""]
 +        self.ui.caja([f"Etapas verificadas: {hechas}/{len(maestro.etapas)}",
-+                      f"Me detengo: {recortar(motivo, 300)}",
++                      f"Me detengo: {primera}", *resto,
++                      "Lo hecho queda guardado: nada se pierde." if cupo else
 +                      "No construyo encima de algo que no está verificado.",
++                      "Cuando se renueve el cupo, seguí con: /grande continuar" if cupo else
 +                      "Revisá el informe de la etapa y seguí con: /grande continuar"],
 +                     titulo="Proyecto grande · DETENIDO", color=Tema.aviso)
 +        if rotas:
@@ -10337,7 +10973,7 @@
 +            self.ui.aviso(f"  Los cambios de esta etapa ROMPIERON lo que ya estaba verificado ({detalle}).")
 +            self.ui.aviso("  Para volver al último estado verificado: /grande deshacer  (y después /grande continuar)")
 +        # Fuera de la caja: adentro se recorta al ancho de la terminal y el comando no se podía copiar entero.
-+        self.ui.info(f"  Desde la terminal: {comando_para_seguir(self.ws, 'grande')}")
++        self.ui.info(f"  Desde la terminal: {comando_para_seguir(self.ws, 'grande', self.settings)}")
 +        return False
 +
 +    # ------------------------------------------------------------ integración
@@ -10369,7 +11005,9 @@
 +            resultado = self._verificar_integracion(estado, maestro)
 +        estado["integracion"].update({k: resultado[k] for k in ("ok", "estado", "faltantes", "juicio")})
 +        estado["estado"] = "terminado" if resultado["ok"] else "integracion_pendiente"
-+        if not resultado["ok"]:
++        if resultado["ok"]:
++            estado.pop("motivo", None)              # el motivo de una parada anterior ya no vale (salía en /reporte)
++        else:
 +            estado["motivo"] = "la integración final no quedó verificada: " + (
 +                "; ".join(resultado["faltantes"][:3]) or _primera_linea_util(resultado["diagnostico"]))
 +        self.guardar(estado, maestro)
@@ -10414,7 +11052,7 @@
 +        self.ui.caja(lineas, titulo="Proyecto grande · " + ("✓ TERMINADO Y VERIFICADO" if ok else "INCOMPLETO"),
 +                     color=Tema.ok if ok else Tema.aviso)
 +        if not ok:
-+            self.ui.info(f"  Desde la terminal: {comando_para_seguir(self.ws, 'grande')}")
++            self.ui.info(f"  Desde la terminal: {comando_para_seguir(self.ws, 'grande', self.settings)}")
 +        ruta = self._guardar_informe(estado, maestro)
 +        if ruta:
 +            self.ui.tenue(f"  Informe: {ruta}")
@@ -10546,14 +11184,22 @@
 +        for e in etapas:
 +            lineas.append(f"  - etapa {e.get('id')} · {e.get('titulo')}: {e.get('estado')} · intentos "
 +                          f"{e.get('intentos')} · {e.get('pedidos', '?')} pedidos")
-+        if grande.get("motivo"):
-+            lineas.append(f"  motivo de parada: {grande.get('motivo')}")
++        if grande.get("motivo") and grande.get("estado") != "terminado":
++            lineas.append(f"  motivo de parada: {' '.join(str(grande.get('motivo')).split())}")
++        corrida = grande.get("ajustes_corrida")
++        if isinstance(corrida, dict):
++            lineas.append(f"  última corrida ({corrida.get('fecha', '?')}): modelo {corrida.get('modelo')} · respaldos "
++                          f"{', '.join(corrida.get('respaldos') or []) or '—'} · roles "
++                          f"{json.dumps(corrida.get('roles') or {}, ensure_ascii=False)} · torneo={corrida.get('torneo')} "
++                          f"candidatos={corrida.get('candidatos')} tests_primero={corrida.get('tests_primero')} "
++                          f"rpm={corrida.get('rpm')} juez={corrida.get('juez')}")
 +    try:
 +        build = RegistroBuild(ws).leer()
 +    except (ValueError, OSError):
 +        build = {"estado": "ilegible"}
 +    if build:
-+        lineas.append(f"/construir pendiente: {build.get('estado')} · {recortar(str(build.get('pedido', '')), 160)}")
++        pedido = " ".join(str(build.get("pedido", "")).split())          # en una línea (el de una etapa trae varias)
++        lineas.append(f"/construir pendiente: {build.get('estado')} · {pedido[:160]}{'…' if len(pedido) > 160 else ''}")
 +        for tid, est in (build.get("estados") or {}).items():
 +            lineas.append(f"  - tarea {tid}: {est}")
 +    return lineas or ["sin /grande ni /construir pendientes"]
@@ -10645,7 +11291,7 @@
  # MÓDULO: main
  # ======================================================================
  """Punto de entrada."""
-@@ -50227,7 +58392,13 @@
+@@ -50227,7 +58919,13 @@
          description=f"REAPER {__version__} · agente de programación autónomo para Termux",
      )
      parser.add_argument("-p", "--pedido", help="ejecuta un pedido con el agente principal y sale")
@@ -10660,7 +11306,7 @@
      parser.add_argument("--plan", help="solo exploración + plan y sale")
      parser.add_argument("--torneo", help="corre un torneo de implementadores para una tarea y sale")
      parser.add_argument("--escribir", nargs=2, metavar=("RUTA", "DESCRIPCION"), help="genera un archivo largo y sale")
-@@ -50263,7 +58434,9 @@
+@@ -50263,7 +58961,9 @@
  def aplicar_flags_cli(settings: Settings, args) -> Settings:
      """Flags de línea de comandos ("solo esta ejecución"): tienen la máxima precedencia."""
      if args.perfil:
@@ -10671,7 +11317,7 @@
      if args.modelo:
          settings.modelo = resolver_modelo(args.modelo)
      if args.modelo_fuerte:
-@@ -50308,7 +58481,7 @@
+@@ -50308,7 +59008,7 @@
      aplicar_tema(settings.tema)
      aplicar_flags_cli(settings, args)
  
@@ -10680,7 +11326,7 @@
                            or args.evaluar is not None or args.comportamiento is not None or args.aceptacion)
      log = LOGS_DIR / f"{datetime.now():%Y%m%d}.log" if settings.log else None
      ui = UI(interactivo=not no_interactivo or sys.stdin.isatty(), log=log,
-@@ -50375,7 +58548,14 @@
+@@ -50375,7 +59075,14 @@
          cargar_plugins(ui=ui)
      try:
          if args.proyecto:
@@ -10696,7 +11342,7 @@
          else:
              guardado = cargar_estado().get("proyecto")
              raiz = Path(guardado) if guardado and Path(guardado).is_dir() else PROJECTS_DIR
-@@ -50387,12 +58567,26 @@
+@@ -50387,12 +59094,26 @@
      # R-011: aplicar los overrides de .reaper/config.json del proyecto ANTES de construir el cliente, para que
      # candidatos/torneo/rpm/modelo/temperatura del proyecto manden de verdad (antes se definían y se ignoraban).
      if ws.config_local().get("settings"):
@@ -10724,7 +11370,7 @@
      app = App(settings, llm, ui, ws)
      if args.proyecto:
          guardar_estado(proyecto=str(ws.raiz))
-@@ -50403,11 +58597,34 @@
+@@ -50403,11 +59124,34 @@
              return 0 if correr_evaluacion(llm, settings, ui, cantidad=args.evaluar or None) else 2
          if args.comportamiento is not None:
              return 0 if correr_comportamiento(llm, settings, ui, ids=args.comportamiento) else 2
@@ -10759,17 +11405,20 @@
          if args.torneo:
              app.cmd_torneo(args.torneo)
              return 0
-@@ -50423,9 +58640,15 @@
+@@ -50422,10 +59166,17 @@
+         return app.repl(animar=settings.animacion)
      except (KeyboardInterrupt, Cancelado):
          CANCELAR.set()
-         ui.aviso("\n⏹ Interrumpido.")
-+        pista = pista_para_seguir(ws)
+-        ui.aviso("\n⏹ Interrumpido.")
++        ui.linea("")
++        ui.aviso("⏹ Interrumpido.")
++        pista = pista_para_seguir(ws, settings)
 +        if pista:
 +            ui.info(pista)
          return 130
      except LLMError as e:
          ui.error(f"Modelo: {e}")
-+        pista = pista_para_seguir(ws)
++        pista = pista_para_seguir(ws, settings)
 +        if pista:
 +            ui.info(pista)
          return 1
