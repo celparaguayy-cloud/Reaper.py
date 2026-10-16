@@ -414,6 +414,33 @@ def free_que_responden(llm, candidatos: list, cuantos: int = 4, max_probar: int 
     return vivos
 
 
+def free_vivos(llm, catalogo: list, on_probar=None, horas: float = 6.0, refrescar: bool = False,
+               cache: Optional[Path] = None) -> list:
+    """free_que_responden con memoria: el resultado vale `horas` para ESE catálogo. Cada sondeo es un pedido real que
+    cuenta para el cupo diario (50 sin crédito), así que no se repite en cada corrida de --perfil gratis."""
+    if cache is None:
+        if os.getenv("REAPER_SIN_RED"):
+            return free_que_responden(llm, catalogo, on_probar=on_probar)
+        cache = CACHE_DIR / "openrouter_free_vivos.json"
+    clave = list(catalogo[:8])
+    if not refrescar:
+        try:
+            datos = json.loads(cache.read_text(encoding="utf-8"))
+            if (datos.get("catalogo") == clave and time.time() - float(datos.get("ts", 0)) < horas * 3600
+                    and datos.get("vivos")):
+                return list(datos["vivos"])
+        except (OSError, ValueError, TypeError, AttributeError):
+            pass
+    vivos = free_que_responden(llm, catalogo, on_probar=on_probar)
+    if vivos:
+        try:
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            escritura_atomica(cache, json.dumps({"ts": time.time(), "catalogo": clave, "vivos": vivos}))
+        except OSError:
+            pass
+    return vivos
+
+
 def probar_equipo(llm, settings) -> list:
     """
     Prueba de verdad cada uno de los seis roles con una petición mínima. Dedup por modelo (no gasta de más).

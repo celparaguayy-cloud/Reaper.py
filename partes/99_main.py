@@ -12,6 +12,8 @@ def construir_parser() -> argparse.ArgumentParser:
     parser.add_argument("--grande", help="proyecto grande por etapas verificadas (plan maestro + un /construir por "
                                          "etapa + integración final) y sale. 'continuar' / 'estado' retoman o "
                                          "muestran el que quedó a medias")
+    parser.add_argument("--reporte", action="store_true",
+                        help="arma un ZIP para mandar (informes, estado, logs, árbol y código; sin claves) y sale")
     parser.add_argument("--plan", help="solo exploración + plan y sale")
     parser.add_argument("--torneo", help="corre un torneo de implementadores para una tarea y sale")
     parser.add_argument("--escribir", nargs=2, metavar=("RUTA", "DESCRIPCION"), help="genera un archivo largo y sale")
@@ -94,7 +96,7 @@ def main(argv: Optional[list] = None) -> int:
     aplicar_tema(settings.tema)
     aplicar_flags_cli(settings, args)
 
-    no_interactivo = bool(args.pedido or args.construir or args.grande or args.plan or args.torneo or args.escribir
+    no_interactivo = bool(args.pedido or args.construir or args.grande or args.reporte or args.plan or args.torneo or args.escribir
                           or args.evaluar is not None or args.comportamiento is not None or args.aceptacion)
     log = LOGS_DIR / f"{datetime.now():%Y%m%d}.log" if settings.log else None
     ui = UI(interactivo=not no_interactivo or sys.stdin.isatty(), log=log,
@@ -183,6 +185,16 @@ def main(argv: Optional[list] = None) -> int:
 
     llm = LLMClient(api_key, settings)
     llm.on_evento = lambda texto: ui.tenue(f"  ↻ {texto}")
+    if (args.perfil or "").strip().lower() == "gratis" and settings.proveedor == "openrouter" and api_key \
+            and (args.construir or args.grande):
+        # Igual que /perfil gratis: solo los :free que RESPONDEN hoy (el catálogo no dice cuáles dan 403 o están
+        # caídos). Con memoria de 6 h: cada sondeo es un pedido del cupo diario.
+        catalogo = catalogo_free_openrouter()
+        if catalogo:
+            vivos = free_vivos(llm, catalogo, on_probar=lambda m: ui.tenue(f"  probando {m}"))
+            if vivos:
+                aplicar_perfil(settings, "gratis", vivos)
+                ui.tenue(f"  Modelos gratis que responden: {', '.join(vivos)}")
     app = App(settings, llm, ui, ws)
     if args.proyecto:
         guardar_estado(proyecto=str(ws.raiz))
@@ -193,6 +205,9 @@ def main(argv: Optional[list] = None) -> int:
             return 0 if correr_evaluacion(llm, settings, ui, cantidad=args.evaluar or None) else 2
         if args.comportamiento is not None:
             return 0 if correr_comportamiento(llm, settings, ui, ids=args.comportamiento) else 2
+        if args.reporte:
+            app.cmd_reporte("")
+            return 0
         if args.construir and args.construir.strip().lower() in ("continuar", "estado"):
             # Después de un corte: `reaper --proyecto X --construir continuar` (sin entrar al modo interactivo).
             if args.construir.strip().lower() == "estado":

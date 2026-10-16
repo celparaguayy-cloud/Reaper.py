@@ -201,3 +201,61 @@ class TestGrandeConLimites(BaseTest):
         self.assertTrue(m.cortado)
         self.assertEqual(len(m.etapas), 1)                                          # la 2 se perdía en silencio
         self.assertTrue(any("CORTÓ" in p for p in problemas_maestro(m, 10)))
+
+
+class TestReporteParaMejorar(BaseTest):
+    def test_reporte_incluye_lo_util_y_nunca_claves(self):
+        clave = "sk-or-v1-" + "0123456789abcdef" * 3
+        ws = self.proyecto({"app.py": f"API = '{clave}'\ndef f():\n    return 1\n",
+                            ".env": f"OPENROUTER_API_KEY={clave}\n", "deploy/server.key": "-----BEGIN KEY-----\n",
+                            "tests/test_app.py": "import unittest\n"})
+        (ws.carpeta_reaper() / "informes").mkdir(parents=True, exist_ok=True)
+        (ws.carpeta_reaper() / "informes" / "build_1.md").write_text("# Build REAPER — fallida\n", encoding="utf-8")
+        ConstructorGrande(None, ws, Settings(), None).guardar(
+            {"esquema": 1, "pedido": "un almacén", "estado": "detenido", "motivo": "cupo diario"},
+            parsear_maestro(_GuionBiblioteca.MAESTRO))
+        destino = Path(self.dir) / "salida"
+        ruta, incluidos = armar_reporte(ws, self.ajustes(), destino=destino, con_doctor=False)
+        with zipfile.ZipFile(ruta) as z:
+            nombres = z.namelist()
+            todo = "\n".join(z.read(n).decode("utf-8", "replace") for n in nombres)
+        self.assertIn("proyecto/app.py", nombres)
+        self.assertIn("reaper/informes/build_1.md", nombres)
+        self.assertIn("reaper/proyecto_grande.json", nombres)
+        self.assertNotIn("proyecto/.env", nombres)
+        self.assertNotIn("proyecto/deploy/server.key", nombres)
+        self.assertNotIn("0123456789abcdef0123456789abcdef", todo)                  # ni dentro del código
+        self.assertIn("/grande: detenido · 0/3 etapas", todo)
+        self.assertIn("motivo de parada: cupo diario", todo)
+        sin, _ = armar_reporte(ws, self.ajustes(), destino=destino, con_codigo=False, con_doctor=False)
+        with zipfile.ZipFile(sin) as z:
+            self.assertFalse(any(n.startswith("proyecto/") for n in z.namelist()))
+            self.assertIn("arbol.txt", z.namelist())
+
+    def test_comando_reporte(self):
+        app = App(self.ajustes(), MockLLM([]), self.ui(), self.proyecto({"a.py": "x = 1\n"}), persistir=False)
+        g = globals()
+        original = g["armar_reporte"]
+        g["armar_reporte"] = lambda ws, s, **k: (Path(self.dir) / "r.zip", ["a"])
+        try:
+            app.cmd_reporte("")
+        finally:
+            g["armar_reporte"] = original
+        self.assertIn("Reporte listo", app.ui.texto_registrado())
+
+    def test_sondeo_de_gratis_se_recuerda(self):
+        cache = Path(self.dir) / "vivos.json"
+        llamadas = []
+
+        def responder(m, k):
+            llamadas.append(k.get("modelo"))
+            return "REAPER_OK" if k.get("modelo") == "b/ok:free" else "no"
+        llm = MockLLM(responder)
+        self.assertEqual(free_vivos(llm, ["a/no:free", "b/ok:free"], cache=cache), ["b/ok:free"])
+        antes = len(llamadas)
+        self.assertEqual(free_vivos(llm, ["a/no:free", "b/ok:free"], cache=cache), ["b/ok:free"])
+        self.assertEqual(len(llamadas), antes)                                      # sin gastar cupo otra vez
+        free_vivos(llm, ["a/no:free", "b/ok:free"], cache=cache, refrescar=True)
+        self.assertGreater(len(llamadas), antes)
+        free_vivos(llm, ["c/otro:free"], cache=cache)                               # catálogo distinto: sondea
+        self.assertIn("c/otro:free", llamadas)

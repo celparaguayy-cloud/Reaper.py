@@ -118,6 +118,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field, fields, replace
 from datetime import datetime, timedelta
@@ -29621,6 +29622,7 @@ COMANDOS_AYUDA = [
         ("/grande <pedido>", "proyecto grande: plan maestro por etapas, cada etapa un /construir verificado"),
         ("/grande estado · continuar", "ver el avance por etapa y retomar donde quedó (aunque se haya cortado)"),
         ("/pendiente · /continuar", "revisar y reanudar con control tareas que agotaron pasos"),
+        ("/reporte [sin-codigo]", "ZIP para mandar y mejorar REAPER: informes, estado, logs, árbol y código (sin claves)"),
         ("/plan <pedido>", "solo exploración + plan (se guarda en .reaper/planes)"),
         ("/modo plan", "modo plan: propone un plan en solo lectura y lo ejecuta cuando lo aprobás"),
         ("/torneo <tarea>", "N implementadores compiten en copias aisladas; gana el que pasa más tests"),
@@ -30721,7 +30723,8 @@ class App:
             if catalogo and clave_de_proveedor("openrouter", self.settings):
                 # Con clave: se prueba cada candidato con un pedido mínimo ($0) y quedan solo los que responden.
                 self.ui.info("  Probando los modelos gratis de hoy (pedido mínimo, no cuesta nada)…")
-                vivos = free_que_responden(self.llm, catalogo, on_probar=lambda m: self.ui.tenue(f"    · {m}"))
+                vivos = free_vivos(self.llm, catalogo, on_probar=lambda m: self.ui.tenue(f"    · {m}"),
+                                   refrescar=True)
                 if vivos:
                     catalogo = vivos
                 else:
@@ -50352,6 +50355,64 @@ class TestGrandeConLimites(BaseTest):
         self.assertTrue(any("CORTÓ" in p for p in problemas_maestro(m, 10)))
 
 
+class TestReporteParaMejorar(BaseTest):
+    def test_reporte_incluye_lo_util_y_nunca_claves(self):
+        clave = "sk-or-v1-" + "0123456789abcdef" * 3
+        ws = self.proyecto({"app.py": f"API = '{clave}'\ndef f():\n    return 1\n",
+                            ".env": f"OPENROUTER_API_KEY={clave}\n", "deploy/server.key": "-----BEGIN KEY-----\n",
+                            "tests/test_app.py": "import unittest\n"})
+        (ws.carpeta_reaper() / "informes").mkdir(parents=True, exist_ok=True)
+        (ws.carpeta_reaper() / "informes" / "build_1.md").write_text("# Build REAPER — fallida\n", encoding="utf-8")
+        ConstructorGrande(None, ws, Settings(), None).guardar(
+            {"esquema": 1, "pedido": "un almacén", "estado": "detenido", "motivo": "cupo diario"},
+            parsear_maestro(_GuionBiblioteca.MAESTRO))
+        destino = Path(self.dir) / "salida"
+        ruta, incluidos = armar_reporte(ws, self.ajustes(), destino=destino, con_doctor=False)
+        with zipfile.ZipFile(ruta) as z:
+            nombres = z.namelist()
+            todo = "\n".join(z.read(n).decode("utf-8", "replace") for n in nombres)
+        self.assertIn("proyecto/app.py", nombres)
+        self.assertIn("reaper/informes/build_1.md", nombres)
+        self.assertIn("reaper/proyecto_grande.json", nombres)
+        self.assertNotIn("proyecto/.env", nombres)
+        self.assertNotIn("proyecto/deploy/server.key", nombres)
+        self.assertNotIn("0123456789abcdef0123456789abcdef", todo)                  # ni dentro del código
+        self.assertIn("/grande: detenido · 0/3 etapas", todo)
+        self.assertIn("motivo de parada: cupo diario", todo)
+        sin, _ = armar_reporte(ws, self.ajustes(), destino=destino, con_codigo=False, con_doctor=False)
+        with zipfile.ZipFile(sin) as z:
+            self.assertFalse(any(n.startswith("proyecto/") for n in z.namelist()))
+            self.assertIn("arbol.txt", z.namelist())
+
+    def test_comando_reporte(self):
+        app = App(self.ajustes(), MockLLM([]), self.ui(), self.proyecto({"a.py": "x = 1\n"}), persistir=False)
+        g = globals()
+        original = g["armar_reporte"]
+        g["armar_reporte"] = lambda ws, s, **k: (Path(self.dir) / "r.zip", ["a"])
+        try:
+            app.cmd_reporte("")
+        finally:
+            g["armar_reporte"] = original
+        self.assertIn("Reporte listo", app.ui.texto_registrado())
+
+    def test_sondeo_de_gratis_se_recuerda(self):
+        cache = Path(self.dir) / "vivos.json"
+        llamadas = []
+
+        def responder(m, k):
+            llamadas.append(k.get("modelo"))
+            return "REAPER_OK" if k.get("modelo") == "b/ok:free" else "no"
+        llm = MockLLM(responder)
+        self.assertEqual(free_vivos(llm, ["a/no:free", "b/ok:free"], cache=cache), ["b/ok:free"])
+        antes = len(llamadas)
+        self.assertEqual(free_vivos(llm, ["a/no:free", "b/ok:free"], cache=cache), ["b/ok:free"])
+        self.assertEqual(len(llamadas), antes)                                      # sin gastar cupo otra vez
+        free_vivos(llm, ["a/no:free", "b/ok:free"], cache=cache, refrescar=True)
+        self.assertGreater(len(llamadas), antes)
+        free_vivos(llm, ["c/otro:free"], cache=cache)                               # catálogo distinto: sondea
+        self.assertIn("c/otro:free", llamadas)
+
+
 # ======================================================================
 # MÓDULO: autotest_runner
 # ======================================================================
@@ -55626,6 +55687,33 @@ def free_que_responden(llm, candidatos: list, cuantos: int = 4, max_probar: int 
     return vivos
 
 
+def free_vivos(llm, catalogo: list, on_probar=None, horas: float = 6.0, refrescar: bool = False,
+               cache: Optional[Path] = None) -> list:
+    """free_que_responden con memoria: el resultado vale `horas` para ESE catálogo. Cada sondeo es un pedido real que
+    cuenta para el cupo diario (50 sin crédito), así que no se repite en cada corrida de --perfil gratis."""
+    if cache is None:
+        if os.getenv("REAPER_SIN_RED"):
+            return free_que_responden(llm, catalogo, on_probar=on_probar)
+        cache = CACHE_DIR / "openrouter_free_vivos.json"
+    clave = list(catalogo[:8])
+    if not refrescar:
+        try:
+            datos = json.loads(cache.read_text(encoding="utf-8"))
+            if (datos.get("catalogo") == clave and time.time() - float(datos.get("ts", 0)) < horas * 3600
+                    and datos.get("vivos")):
+                return list(datos["vivos"])
+        except (OSError, ValueError, TypeError, AttributeError):
+            pass
+    vivos = free_que_responden(llm, catalogo, on_probar=on_probar)
+    if vivos:
+        try:
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            escritura_atomica(cache, json.dumps({"ts": time.time(), "catalogo": clave, "vivos": vivos}))
+        except OSError:
+            pass
+    return vivos
+
+
 def probar_equipo(llm, settings) -> list:
     """
     Prueba de verdad cada uno de los seis roles con una petición mínima. Dedup por modelo (no gasta de más).
@@ -57505,6 +57593,152 @@ App._build_de_etapa = _build_de_etapa
 
 
 # ======================================================================
+# MÓDULO: reporte
+# ======================================================================
+"""
+/reporte: un ZIP para mandar cuando algo sale mal (o bien) y hay que mejorar REAPER, en vez de copiar la terminal a
+mano desde el teléfono. Junta lo que hace falta para diagnosticar sin volver a correr nada:
+
+- LEEME.txt: versión, Python, sistema, modelo/equipo (sin claves), estado de /grande y del /construir pendiente;
+- diagnostico.txt (lo mismo que /diagnostico), informes de las builds, el estado de /grande, el diario pendiente,
+  los informes forenses y la cola de los logs de hoy y ayer;
+- arbol.txt (qué archivos quedaron) y, salvo `sin-codigo`, el CÓDIGO del proyecto: lo que construyó REAPER.
+
+Todo pasa por redactar_secretos y, al final, un escaneo de patrones de claves conocidas: si quedara alguna, se borra
+del ZIP. Nunca entra .env, .clave*, *.pem/*.key, id_rsa ni la carpeta de claves de REAPER.
+"""
+
+_EXCLUIR_REPORTE = re.compile(r"(^|/)(\.env[^/]*|\.clave[^/]*|[^/]*\.(?:pem|key|p12|pfx|keystore|jks)|id_(?:rsa|ed25519|"
+                              r"ecdsa)[^/]*|\.netrc|\.pypirc|\.npmrc|credentials[^/]*|secrets?\.[^/]+)$", re.I)
+_PATRON_CLAVE_REPORTE = re.compile(r"(sk-or-v1-[A-Za-z0-9_-]{8,}|sk-ant-[A-Za-z0-9_-]{8,}|sk-[A-Za-z0-9]{20,}|"
+                                   r"gsk_[A-Za-z0-9]{20,}|AIza[0-9A-Za-z_-]{20,}|nvapi-[A-Za-z0-9_-]{12,}|"
+                                   r"github_pat_[A-Za-z0-9_]{12,}|ghp_[A-Za-z0-9]{20,})")
+MAX_REPORTE_BYTES = 15 * 1024 * 1024
+MAX_ARCHIVO_REPORTE = 300 * 1024
+
+
+def _limpiar_texto_reporte(texto: str) -> str:
+    texto = redactar_secretos(texto or "")
+    return _PATRON_CLAVE_REPORTE.sub("[REDACTADO]", texto)
+
+
+def _cola(ruta: Path, lineas: int = 3000) -> str:
+    try:
+        contenido = ruta.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return ""
+    return "\n".join(contenido[-lineas:]) + "\n"
+
+
+def _resumen_estado_reporte(ws: Workspace) -> list:
+    lineas = []
+    try:
+        grande = ConstructorGrande(None, ws, Settings(), None).leer()
+    except (ValueError, OSError):
+        grande = {"estado": "ilegible"}
+    if grande:
+        etapas = (grande.get("maestro") or {}).get("etapas", [])
+        hechas = sum(1 for e in etapas if e.get("estado") in ESTADOS_OK_ETAPA)
+        lineas.append(f"/grande: {grande.get('estado')} · {hechas}/{len(etapas)} etapas verificadas")
+        for e in etapas:
+            lineas.append(f"  - etapa {e.get('id')} · {e.get('titulo')}: {e.get('estado')} · intentos "
+                          f"{e.get('intentos')} · {e.get('pedidos', '?')} pedidos")
+        if grande.get("motivo"):
+            lineas.append(f"  motivo de parada: {grande.get('motivo')}")
+    try:
+        build = RegistroBuild(ws).leer()
+    except (ValueError, OSError):
+        build = {"estado": "ilegible"}
+    if build:
+        lineas.append(f"/construir pendiente: {build.get('estado')} · {recortar(str(build.get('pedido', '')), 160)}")
+        for tid, est in (build.get("estados") or {}).items():
+            lineas.append(f"  - tarea {tid}: {est}")
+    return lineas or ["sin /grande ni /construir pendientes"]
+
+
+def armar_reporte(ws: Workspace, settings: Settings, destino: Optional[Path] = None, con_codigo: bool = True,
+                  con_doctor: bool = True) -> tuple:
+    """Crea el ZIP. → (ruta, lista de lo incluido)."""
+    nombre = re.sub(r"[^\w.-]+", "_", ws.raiz.name)[:40] or "proyecto"
+    destino = destino or Path.home()
+    destino.mkdir(parents=True, exist_ok=True)
+    ruta = destino / f"reaper_reporte_{nombre}_{datetime.now():%Y%m%d_%H%M%S}.zip"
+    incluidos, total = [], 0
+
+    def agregar(z, arcname: str, texto: str) -> None:
+        nonlocal total
+        datos = _limpiar_texto_reporte(texto).encode("utf-8")
+        if total + len(datos) > MAX_REPORTE_BYTES:
+            return
+        z.writestr(arcname, datos)
+        total += len(datos)
+        incluidos.append(arcname)
+
+    with zipfile.ZipFile(ruta, "w", zipfile.ZIP_DEFLATED) as z:
+        leeme = [f"REAPER {__version__} · reporte {datetime.now():%Y-%m-%d %H:%M}",
+                 f"Python {sys.version.split()[0]} · {platform.system()} {platform.machine()}"
+                 + (" · Termux" if es_termux() else ""),
+                 f"Proyecto: {_ruta_corta(ws.raiz)}",
+                 f"Modelo: {settings.modelo} · proveedor: {settings.proveedor} · respaldos: {', '.join(settings.fallbacks) or '—'}",
+                 f"Roles: {json.dumps(settings.modelos_rol, ensure_ascii=False)}",
+                 f"torneo={settings.torneo} candidatos={settings.candidatos} tests_primero={settings.tests_primero} "
+                 f"max_tareas={settings.max_tareas} max_etapas={getattr(settings, 'max_etapas', '?')} "
+                 f"rpm={settings.rpm} juez={getattr(settings, 'juez', '?')}",
+                 "", *_resumen_estado_reporte(ws), "",
+                 "Las claves se redactan; no entran .env, .clave*, *.key/*.pem ni id_rsa."]
+        agregar(z, "LEEME.txt", "\n".join(leeme) + "\n")
+        try:
+            agregar(z, "diagnostico.txt", diagnostico_texto(settings) if con_doctor else "(omitido)")
+        except (OSError, ValueError, RuntimeError) as e:
+            agregar(z, "diagnostico.txt", f"no se pudo generar: {e}")
+        carpeta = ws.carpeta_reaper()
+        for patron, cuantos in (("informes/*.md", 25), ("forense/*.md", 5)):
+            for archivo in sorted(carpeta.glob(patron))[-cuantos:]:
+                agregar(z, f"reaper/{archivo.relative_to(carpeta).as_posix()}", _cola(archivo, 4000))
+        for nombre_estado in ("proyecto_grande.json", "build_pendiente.json"):
+            archivo = carpeta / nombre_estado
+            if archivo.is_file():
+                agregar(z, f"reaper/{nombre_estado}", _cola(archivo, 20000))
+        for log in sorted(LOGS_DIR.glob("*.log"))[-2:] if LOGS_DIR.is_dir() else []:
+            agregar(z, f"logs/{log.name}", _cola(log, 3000))
+        arbol = []
+        for p in ws.iterar(limite=3000):
+            rel = ws.rel(p)
+            try:
+                tam = p.stat().st_size
+            except OSError:
+                continue
+            arbol.append(f"{tam:>9}  {rel}")
+            if (con_codigo and not _EXCLUIR_REPORTE.search(rel) and tam <= MAX_ARCHIVO_REPORTE
+                    and ws.es_texto(p) and not rel.startswith(".reaper/")):
+                try:
+                    agregar(z, f"proyecto/{rel}", p.read_text(encoding="utf-8", errors="replace"))
+                except OSError:
+                    pass
+        agregar(z, "arbol.txt", "\n".join(arbol) + "\n")
+    return ruta, incluidos
+
+
+def _cmd_reporte(self: "App", arg: str) -> None:
+    """/reporte [sin-codigo] — ZIP para mandar y mejorar REAPER (informes, estado, logs, árbol y código; sin claves)."""
+    con_codigo = "sin-codigo" not in arg.lower() and "sin codigo" not in arg.lower()
+    try:
+        ruta, incluidos = armar_reporte(self.ws, self.settings, con_codigo=con_codigo)
+    except (OSError, zipfile.BadZipFile) as e:
+        self.ui.error(f"No pude armar el reporte: {e}")
+        return
+    self.ui.ok(f"Reporte listo: {_ruta_corta(ruta)} ({len(incluidos)} archivos, sin claves)")
+    if not con_codigo:
+        self.ui.tenue("  Sin el código del proyecto (pediste sin-codigo).")
+    if es_termux():
+        self.ui.tenue("  Para subirlo desde el teléfono: termux-setup-storage (una vez) y "
+                      f"cp {_ruta_corta(ruta)} ~/storage/downloads/")
+
+
+App.cmd_reporte = _cmd_reporte
+
+
+# ======================================================================
 # MÓDULO: main
 # ======================================================================
 """Punto de entrada."""
@@ -57521,6 +57755,8 @@ def construir_parser() -> argparse.ArgumentParser:
     parser.add_argument("--grande", help="proyecto grande por etapas verificadas (plan maestro + un /construir por "
                                          "etapa + integración final) y sale. 'continuar' / 'estado' retoman o "
                                          "muestran el que quedó a medias")
+    parser.add_argument("--reporte", action="store_true",
+                        help="arma un ZIP para mandar (informes, estado, logs, árbol y código; sin claves) y sale")
     parser.add_argument("--plan", help="solo exploración + plan y sale")
     parser.add_argument("--torneo", help="corre un torneo de implementadores para una tarea y sale")
     parser.add_argument("--escribir", nargs=2, metavar=("RUTA", "DESCRIPCION"), help="genera un archivo largo y sale")
@@ -57603,7 +57839,7 @@ def main(argv: Optional[list] = None) -> int:
     aplicar_tema(settings.tema)
     aplicar_flags_cli(settings, args)
 
-    no_interactivo = bool(args.pedido or args.construir or args.grande or args.plan or args.torneo or args.escribir
+    no_interactivo = bool(args.pedido or args.construir or args.grande or args.reporte or args.plan or args.torneo or args.escribir
                           or args.evaluar is not None or args.comportamiento is not None or args.aceptacion)
     log = LOGS_DIR / f"{datetime.now():%Y%m%d}.log" if settings.log else None
     ui = UI(interactivo=not no_interactivo or sys.stdin.isatty(), log=log,
@@ -57692,6 +57928,16 @@ def main(argv: Optional[list] = None) -> int:
 
     llm = LLMClient(api_key, settings)
     llm.on_evento = lambda texto: ui.tenue(f"  ↻ {texto}")
+    if (args.perfil or "").strip().lower() == "gratis" and settings.proveedor == "openrouter" and api_key \
+            and (args.construir or args.grande):
+        # Igual que /perfil gratis: solo los :free que RESPONDEN hoy (el catálogo no dice cuáles dan 403 o están
+        # caídos). Con memoria de 6 h: cada sondeo es un pedido del cupo diario.
+        catalogo = catalogo_free_openrouter()
+        if catalogo:
+            vivos = free_vivos(llm, catalogo, on_probar=lambda m: ui.tenue(f"  probando {m}"))
+            if vivos:
+                aplicar_perfil(settings, "gratis", vivos)
+                ui.tenue(f"  Modelos gratis que responden: {', '.join(vivos)}")
     app = App(settings, llm, ui, ws)
     if args.proyecto:
         guardar_estado(proyecto=str(ws.raiz))
@@ -57702,6 +57948,9 @@ def main(argv: Optional[list] = None) -> int:
             return 0 if correr_evaluacion(llm, settings, ui, cantidad=args.evaluar or None) else 2
         if args.comportamiento is not None:
             return 0 if correr_comportamiento(llm, settings, ui, ids=args.comportamiento) else 2
+        if args.reporte:
+            app.cmd_reporte("")
+            return 0
         if args.construir and args.construir.strip().lower() in ("continuar", "estado"):
             # Después de un corte: `reaper --proyecto X --construir continuar` (sin entrar al modo interactivo).
             if args.construir.strip().lower() == "estado":

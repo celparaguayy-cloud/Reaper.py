@@ -23,6 +23,7 @@ COMANDOS_AYUDA = [
         ("/grande <pedido>", "proyecto grande: plan maestro por etapas, cada etapa un /construir verificado"),
         ("/grande estado · continuar", "ver el avance por etapa y retomar donde quedó (aunque se haya cortado)"),
         ("/pendiente · /continuar", "revisar y reanudar con control tareas que agotaron pasos"),
+        ("/reporte [sin-codigo]", "ZIP para mandar y mejorar REAPER: informes, estado, logs, árbol y código (sin claves)"),
         ("/plan <pedido>", "solo exploración + plan (se guarda en .reaper/planes)"),
         ("/modo plan", "modo plan: propone un plan en solo lectura y lo ejecuta cuando lo aprobás"),
         ("/torneo <tarea>", "N implementadores compiten en copias aisladas; gana el que pasa más tests"),
@@ -1123,7 +1124,8 @@ class App:
             if catalogo and clave_de_proveedor("openrouter", self.settings):
                 # Con clave: se prueba cada candidato con un pedido mínimo ($0) y quedan solo los que responden.
                 self.ui.info("  Probando los modelos gratis de hoy (pedido mínimo, no cuesta nada)…")
-                vivos = free_que_responden(self.llm, catalogo, on_probar=lambda m: self.ui.tenue(f"    · {m}"))
+                vivos = free_vivos(self.llm, catalogo, on_probar=lambda m: self.ui.tenue(f"    · {m}"),
+                                   refrescar=True)
                 if vivos:
                     catalogo = vivos
                 else:
