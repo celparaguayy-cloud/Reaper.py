@@ -12,7 +12,12 @@ Garantías (las mismas de las pruebas reales de octubre 2026):
   aparecer en ningún lado).
 
 Uso:  OPENROUTER_API_KEY=... python3 pruebas_fusion/prueba_real.py [juego] [web] [script] [grande] [--minutos N]
-      (sin nombres corre juego, web y script; "grande" va aparte porque tarda mucho más: usa --grande, por etapas)
+      OPENROUTER_API_KEY=... python3 pruebas_fusion/prueba_real.py grande --continuar ~/reaper_pruebas_real/<fecha>
+      (sin nombres corre juego, web y script; "grande" va aparte porque tarda mucho más: usa --grande, por etapas.
+       --continuar reusa una carpeta de una corrida cortada: repetir el mismo pedido RETOMA donde quedó.)
+
+Cupo: los :free de OpenRouter tienen 50 pedidos por día sin crédito comprado (1000 con al menos 10): se muestra el
+cupo antes y después, y REAPER se detiene limpio si se agota (después: --continuar con la misma carpeta).
 """
 import json
 import os
@@ -21,6 +26,7 @@ import subprocess
 import sys
 import time
 import urllib.request
+import zipfile
 from datetime import datetime
 from pathlib import Path
 
@@ -104,7 +110,9 @@ def _configurar(home: Path, clave: str) -> dict:
         home.mkdir(parents=True, exist_ok=True)
         (home / ".clave_openrouter").write_text(clave, encoding="utf-8")
         cliente = r.LLMClient(clave, r.Settings(proveedor="openrouter", costo_maximo=0.01))
-        vivos = r.free_que_responden(cliente, catalogo, on_probar=lambda m: print(f"  probando {m}", flush=True))
+        # Con memoria (6 h): al --continuar no se vuelve a gastar cupo sondeando los mismos modelos.
+        vivos = r.free_vivos(cliente, catalogo, on_probar=lambda m: print(f"  probando {m}", flush=True),
+                             cache=home / "cache_vivos.json")
         if vivos:
             catalogo = vivos
     s = r.Settings(proveedor="openrouter")
@@ -118,6 +126,14 @@ def _configurar(home: Path, clave: str) -> dict:
     archivo.write_text(clave, encoding="utf-8")
     archivo.chmod(0o600)
     return {"modelo": s.modelo, "respaldos": s.fallbacks, "juez": s.modelos_rol["juez"]}
+
+
+def _cupo(clave: str) -> str:
+    """Pedidos gratis de HOY según /api/v1/key (no gasta cupo)."""
+    sys.path.insert(0, str(RAIZ))
+    import reaper_v8 as r                                              # noqa: E402
+    cuenta = r.cuenta_openrouter(clave)
+    return cuenta.resumen() if cuenta is not None else "sin datos de la cuenta"
 
 
 def _estado(proyecto: Path) -> str:
@@ -142,28 +158,35 @@ def main() -> int:
     if "--minutos" in sys.argv:
         minutos = int(sys.argv[sys.argv.index("--minutos") + 1])
         args = [a for a in args if a != str(minutos)]
+    continuar = None
+    if "--continuar" in sys.argv:
+        continuar = Path(sys.argv[sys.argv.index("--continuar") + 1]).expanduser()
+        args = [a for a in args if Path(a).expanduser() != continuar]
+        if not (continuar / "home").is_dir():
+            sys.exit(f"No es una carpeta de prueba real: {continuar}")
     elegidos = args or [p for p in PROYECTOS if p not in MODO_GRANDE]
     desconocidos = [a for a in elegidos if a not in PROYECTOS]
     if desconocidos:
         sys.exit(f"Proyectos desconocidos: {desconocidos}. Opciones: {', '.join(PROYECTOS)}")
     clave = _key()
-    base = Path.home() / "reaper_pruebas_real" / datetime.now().strftime("%Y%m%d_%H%M%S")
+    base = continuar or Path.home() / "reaper_pruebas_real" / datetime.now().strftime("%Y%m%d_%H%M%S")
     home = base / "home"
     modelos = _configurar(home, clave)
     antes = _gasto(clave)
-    print(f"Carpeta: {base}\nModelos (gratis): {modelos}\nGasto inicial USD: {antes}", flush=True)
+    print(f"Carpeta: {base}\nModelos (gratis): {modelos}\nGasto inicial USD: {antes}\n"
+          f"Cupo gratis: {_cupo(clave)}", flush=True)
     filas = []
     try:
         for nombre in elegidos:
             proyecto = base / nombre
-            proyecto.mkdir(parents=True)
+            proyecto.mkdir(parents=True, exist_ok=True)                # --continuar: el mismo pedido retoma
             log = base / f"{nombre}.log"
             inicio = time.monotonic()
             print(f"\n▶ {nombre}: construyendo (log en {log})", flush=True)
             env = {**os.environ, "REAPER_HOME": str(home), "REAPER_SIN_ANIMACION": "1", "NO_COLOR": "1"}
             env.pop("OPENROUTER_API_KEY", None)                        # REAPER la lee del archivo del HOME aislado
             try:
-                with open(log, "w", encoding="utf-8") as salida:
+                with open(log, "a", encoding="utf-8") as salida:
                     modo = "--grande" if nombre in MODO_GRANDE else "--construir"
                     tope = minutos * 60 * (4 if nombre in MODO_GRANDE else 1)   # varias builds, una por etapa
                     rc = subprocess.run([sys.executable, str(REAPER), "--proyecto", str(proyecto), "--sin-animacion",
@@ -173,15 +196,28 @@ def main() -> int:
                 rc = "TIMEOUT"
             filas.append((nombre, rc, _estado(proyecto), round((time.monotonic() - inicio) / 60, 1)))
             print(f"  {nombre}: exit={rc} · {filas[-1][2]} · {filas[-1][3]} min", flush=True)
+            # Un ZIP por proyecto (informes, estado, logs, código; sin claves) para analizarlo después.
+            subprocess.run([sys.executable, str(REAPER), "--proyecto", str(proyecto), "--sin-animacion", "--reporte"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=600,
+                           env={**env, "HOME": str(base)})
     finally:
         (home / ".clave_openrouter").unlink(missing_ok=True)           # la clave no queda en disco
     despues = _gasto(clave)
     fugas = [str(p) for p in base.rglob("*") if p.is_file() and p.stat().st_size < 20_000_000
              and clave in p.read_text(encoding="utf-8", errors="ignore")]
+    for z in base.rglob("*.zip"):                                     # comprimido: se mira adentro de cada ZIP
+        try:
+            with zipfile.ZipFile(z) as archivo:
+                fugas += [f"{z}:{n}" for n in archivo.namelist()
+                          if clave in archivo.read(n).decode("utf-8", errors="ignore")]
+        except (OSError, zipfile.BadZipFile):
+            fugas.append(f"{z}: ZIP ilegible (no se pudo revisar)")
     print("\n=== RESUMEN ===")
     for nombre, rc, estado, mins in filas:
         print(f"{nombre:<8} exit={rc!s:<7} {estado:<12} {mins} min   código en: {base / nombre}")
     print(f"Gasto USD: antes {antes} · después {despues} (debe ser igual: solo modelos gratis)")
+    print(f"Cupo gratis después: {_cupo(clave)}")
+    print(f"Reportes ZIP: {', '.join(str(z) for z in sorted(base.glob('reaper_reporte_*.zip'))) or 'ninguno'}")
     print(f"Clave en archivos generados: {'NINGUNO' if not fugas else fugas}")
     shutil.rmtree(home / "tmp", ignore_errors=True)
     return 1 if fugas else 0

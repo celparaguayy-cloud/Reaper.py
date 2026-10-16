@@ -112,7 +112,19 @@ capitulo("grande", "/grande: proyectos grandes por etapas verificadas", """
     - `/grande <pedido>` arma el plan maestro y arranca (con `--auto` o `reaper --grande "..."` no pregunta).
     - `/grande estado` muestra qué etapas están verificadas y por qué paró la última.
     - `/grande continuar` retoma donde quedó, aunque se haya cortado a mitad de una etapa (no replanifica).
+    - `/grande deshacer` vuelve al último estado verificado: revierte la etapa que falló (aunque haya roto algo de
+      una etapa anterior) y la deja para rehacer con `/grande continuar`.
     - `/grande descartar` borra solo el estado; tus archivos quedan.
+    - `/reporte` arma un ZIP (sin claves) con informes, estado, logs y código para mandar y mejorar REAPER.
+
+    ## Modelos gratis (OpenRouter)
+
+    - Cupo: 20 pedidos por minuto y **50 por día sin crédito comprado** (1000 con al menos 10 de crédito). Antes de
+      arrancar, `/grande` te dice cuántos pedidos estima y cuántos te quedan hoy; con 50/día corre sin torneo.
+    - Si el cupo del día se agota, REAPER se detiene limpio y dice a qué hora se renueva; seguí con
+      `/grande continuar` (o repitiendo el mismo comando).
+    - Ante límites pasajeros (todos los modelos ocupados un rato) espera solo 2, 5 y 10 minutos
+      (`/config espera_limites_min`, 0 = no espera).
     - `/config max_etapas 15` sube el tope de etapas (2 a 30; cada etapa hasta `max_tareas` tareas).
 
     ## Lo que NO hace

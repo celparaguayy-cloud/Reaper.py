@@ -657,9 +657,64 @@ class ConstructorGrande:
         orq.pedido_usuario = pedido_usuario
         return orq.construir("" if reanudar else pedido_etapa, confirmar=False, reanudar=reanudar)
 
+    def rotas_de_etapas_previas(self, maestro: PlanMaestro) -> dict:
+        """{etapa_id: [tests]} de etapas YA verificadas cuyos tests fallan ahora (corrida real, 0 tokens). Pasa cuando
+        una etapa nueva toca código anterior y la build falla: lo verificado quedó roto en el disco."""
+        verificados = {e.id: {rel: None for rel in e.archivos if _es_test(rel)} for e in maestro.etapas if e.ok}
+        if not any(verificados.values()):
+            return {}
+        r = ejecutar_tests(self.ws, timeout=self.settings.tests_timeout, completo=True)
+        fallan = conteo_de_resultado(r).nombres_fallados if r is not None and not r.ok else []
+        salida = {}
+        for eid, tests in verificados.items():
+            nombres = [n for n in fallan if tests and _es_de_especificacion(n, tests)]
+            if nombres:
+                salida[eid] = nombres
+        return salida
+
+    def deshacer_etapa(self) -> bool:
+        """Vuelve al ÚLTIMO ESTADO VERIFICADO: revierte los cambios de la etapa que quedó a medias o fallida, descarta
+        su build pendiente y la deja para rehacer con /grande continuar. Las etapas verificadas no se tocan."""
+        try:
+            estado = self.leer()
+            build = RegistroBuild(self.ws).leer()
+        except ValueError as e:
+            self.ui.error(str(e))
+            return False
+        if not estado:
+            self.ui.aviso("No hay ningún proyecto grande en esta carpeta.")
+            return False
+        maestro = self.maestro_de(estado)
+        etapa = next((e for e in maestro.etapas if not e.ok and e.estado != "pendiente"), None) or next(
+            (e for e in maestro.etapas if not e.ok), None)
+        if not build or build.get("estado") in ESTADOS_OK_ETAPA or etapa is None \
+                or build.get("pedido") != pedido_de_etapa(estado["pedido"], maestro, etapa):
+            self.ui.aviso("No hay una etapa a medias para deshacer (todo lo que está en disco ya quedó verificado o "
+                          "la build pendiente no es de este proyecto grande).")
+            return False
+        grupo = build.get("grupo")
+        tocados = self.ws.checkpoints.deshacer(grupo) if grupo in self.ws.checkpoints.ids() else []
+        RegistroBuild(self.ws).borrar()
+        etapa.estado, etapa.motivo = "pendiente", f"deshecha a pedido ({len(tocados)} archivo(s) revertidos)"
+        estado["estado"] = "detenido"
+        estado["motivo"] = f"la etapa {etapa.id} se deshizo: /grande continuar la rehace desde el último estado verificado"
+        self.guardar(estado, maestro)
+        indice_de(self.ws).invalidar()
+        self.ui.ok(f"Etapa {etapa.id} deshecha: {len(tocados)} archivo(s) vuelven al último estado verificado.")
+        self.ui.tenue(f"  Para rehacerla: /grande continuar  ·  {comando_para_seguir(self.ws, 'grande')}")
+        return True
+
     def _detener(self, estado: dict, maestro: PlanMaestro, motivo: str) -> bool:
         estado["estado"] = "detenido"
         estado["motivo"] = motivo
+        rotas = {}
+        if "quedó" in motivo:                       # falló una etapa (no un corte del modelo): ¿rompió lo anterior?
+            try:
+                rotas = self.rotas_de_etapas_previas(maestro)
+            except (OSError, ValueError):
+                rotas = {}
+            if rotas:
+                estado["rotas_previas"] = rotas
         self.guardar(estado, maestro)
         hechas = sum(1 for e in maestro.etapas if e.ok)
         self.ui.linea("")
@@ -668,6 +723,10 @@ class ConstructorGrande:
                       "No construyo encima de algo que no está verificado.",
                       "Revisá el informe de la etapa y seguí con: /grande continuar"],
                      titulo="Proyecto grande · DETENIDO", color=Tema.aviso)
+        if rotas:
+            detalle = "; ".join(f"etapa {eid}: {', '.join(n[:60] for n in nombres[:3])}" for eid, nombres in rotas.items())
+            self.ui.aviso(f"  Los cambios de esta etapa ROMPIERON lo que ya estaba verificado ({detalle}).")
+            self.ui.aviso("  Para volver al último estado verificado: /grande deshacer  (y después /grande continuar)")
         # Fuera de la caja: adentro se recorta al ancho de la terminal y el comando no se podía copiar entero.
         self.ui.info(f"  Desde la terminal: {comando_para_seguir(self.ws, 'grande')}")
         return False
@@ -806,8 +865,13 @@ def _cmd_grande(self: "App", arg: str) -> None:
     if modo == "continuar":
         grande.continuar()
         return
+    if modo in ("deshacer", "volver"):
+        if self.ui.confirmar("¿Deshacer la etapa a medias y volver al último estado verificado? (las etapas "
+                             "verificadas no se tocan)", defecto=True):
+            grande.deshacer_etapa()
+        return
     if not arg.strip():
-        self.ui.tenue("Uso: /grande <pedido> | estado | continuar | descartar   "
+        self.ui.tenue("Uso: /grande <pedido> | estado | continuar | deshacer | descartar   "
                       f"(hasta {self.settings.max_etapas} etapas; cada una es un /construir verificado)")
         return
     grande.iniciar(arg.strip(), confirmar=self.ui.interactivo and self.settings.modo != "auto")

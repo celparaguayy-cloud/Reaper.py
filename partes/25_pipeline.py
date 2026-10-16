@@ -2724,7 +2724,10 @@ class Orquestador:
         if detalle:
             self.ui.tenue(detalle)
         for nota in informe.notas:
-            self.ui.aviso(f"  • {nota}")
+            if nota.startswith("Juez de entrega: CUMPLE"):
+                self.ui.ok(f"  ✓ {nota}")                  # un veredicto a favor no es una advertencia
+            else:
+                self.ui.aviso(f"  • {nota}")
         if informe.ruta_informe:
             self.ui.tenue(f"  informe: {informe.ruta_informe}")
         self.ui.tenue("  /diff ver cambios · /deshacer revierte toda la build\n")

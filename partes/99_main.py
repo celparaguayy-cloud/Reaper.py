@@ -214,11 +214,13 @@ def main(argv: Optional[list] = None) -> int:
                 app.cmd_construir("estado")
                 return 0
             return 0 if app.construir("", confirmar=False, reanudar=True) else 2
-        if args.grande and args.grande.strip().lower() in ("continuar", "estado"):
+        if args.grande and args.grande.strip().lower() in ("continuar", "estado", "deshacer"):
             grande = ConstructorGrande(llm, app.ws, settings, ui, construir_build=app._build_de_etapa)
             if args.grande.strip().lower() == "estado":
                 grande.mostrar_estado()
                 return 0
+            if args.grande.strip().lower() == "deshacer":          # lo tipeó a propósito: no se vuelve a preguntar
+                return 0 if grande.deshacer_etapa() else 2
             return 0 if grande.continuar() else 2
         if args.construir:
             ok = app.construir(args.construir, confirmar=not args.auto)
