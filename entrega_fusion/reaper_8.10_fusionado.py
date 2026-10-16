@@ -1958,6 +1958,12 @@ def aplicar_perfil(settings: Settings, nombre: str, catalogo: Optional[list] = N
         settings.modelo = catalogo[0]
         settings.fallbacks = list(catalogo[1:5])
         cambios.append(f"modelo={catalogo[0]} (catálogo real de OpenRouter)")
+        # "Gratis" es TODO el equipo: un rol que apunta a un modelo pago o de otro proveedor (prueba real /grande: el
+        # juez en "nanogpt:qwen/…-uncensored", un ID que ya no existe) usa el modelo gratis principal.
+        for rol, asignado in sorted((settings.modelos_rol or {}).items()):
+            if not str(asignado).endswith(":free"):
+                del settings.modelos_rol[rol]
+                cambios.append(f"{rol}: {asignado} → modelo gratis principal")
         if settings.fallbacks:
             cambios.append(f"respaldos={', '.join(settings.fallbacks)}")
     settings.validar()
@@ -2359,7 +2365,7 @@ class Uso:
 
 
 MENSAJES_HTTP = {
-    400: "Pedido rechazado por el proveedor (¿contexto demasiado largo?).",
+    400: "Pedido rechazado por el proveedor.",
     401: "Clave API inválida, revocada o ausente.",
     402: "La cuenta no tiene crédito suficiente para este modelo.",
     403: "Acceso denegado por el proveedor (moderación o permisos).",
@@ -2380,7 +2386,10 @@ _RE_MODELO_RETIRADO = re.compile(
     r"\b404\b|model_not_found|does not exist|no such model|modelo o endpoint no disponible|model.*not found"
     # 403 permanente para esta cuenta/cliente (prueba real: "inkling:free is only available on agentic
     # harnesses"): reintentarlo en cada pedido solo gasta tiempo; se retira como un 404.
-    r"|only available (?:on|in|for|to)\b|not available (?:on|for|to) (?:this|your)",
+    r"|only available (?:on|in|for|to)\b|not available (?:on|for|to) (?:this|your)"
+    # 400 de un ID que no existe (prueba real /grande: "nanogpt:qwen/qwen3.8-27b-uncensored is not a valid model ID"
+    # en CADA pedido del juez antes de caer al respaldo).
+    r"|not a valid model|invalid model|unknown model|model .{0,60}not supported",
     re.I,
 )
 
@@ -2466,6 +2475,8 @@ def _lanzar_http(status: int, cuerpo: str, retry_after: Optional[str], cabeceras
         saturado = status == 429 and bool(_RE_POOL_SATURADO.search(cuerpo or ""))
         raise _Transitorio(f"{motivo} HTTP {status}. {detalle}".strip(), espera, saturado=saturado)
     excedido = status in (400, 413) and bool(_RE_CONTEXTO.search(cuerpo or ""))
+    if excedido and status == 400:
+        motivo = "Pedido rechazado por el proveedor: contexto demasiado largo."
     raise LLMError(
         f"{motivo} HTTP {status}. {detalle}".strip(),
         probar_otro_modelo=status in (400, 402, 403, 404, 413, 422) and not excedido,
@@ -2610,6 +2621,11 @@ class LLMClient:
         # Cupo diario de modelos gratis de OpenRouter agotado: hasta cuándo (epoch; 0 = no se sabe, se asume que
         # sigue agotado en esta sesión). Mientras dure, los :free de OpenRouter se saltean sin tocar la red.
         self.cupo_free_hasta: Optional[float] = None
+        # Razonamiento POR MODELO (prueba real /grande: cohere/north-mini-code:free pensaba 25 000 caracteres sin
+        # responder en cada pedido, ignorando effort "low", y se lo volvía a probar primero cada vez). Escalera:
+        # sin parámetro → "low" → "none" (lo apaga) → se deja de usar en la sesión.
+        self._nivel_razonamiento: dict = {}
+        self._solo_razona: collections.Counter = collections.Counter()
 
     def _es_free_openrouter(self, modelo: str) -> bool:
         try:
@@ -2802,13 +2818,31 @@ class LLMClient:
         }
         if proveedor == "openrouter":
             payload["usage"] = {"include": True}
-            if ampliar:
+            nivel = self._nivel_razonamiento.get(modelo) if hasattr(self, "_nivel_razonamiento") else None
+            if nivel:
+                payload["reasoning"] = {"effort": nivel}
+            elif ampliar:
                 payload["reasoning"] = {"effort": "low"}
         elif proveedor == "openai":
             payload["stream_options"] = {"include_usage": True}
         if stop:
             payload["stop"] = stop[:4]
         return payload
+
+    def _modelo_solo_razona(self, modelo: str) -> None:
+        """El modelo gastó todo pensando sin responder: la próxima vez se le pide pensar menos ("low") o nada ("none");
+        si ni así responde (o ya falló 3 veces), se deja de usar en la sesión."""
+        self._solo_razona[modelo] += 1
+        actual = self._nivel_razonamiento.get(modelo)
+        siguiente = {None: "low", "low": "none"}.get(actual)
+        if siguiente and self._solo_razona[modelo] < 3:
+            self._nivel_razonamiento[modelo] = siguiente
+            if self.on_evento:
+                self.on_evento(f"{modelo} piensa sin responder: la próxima vez le pido razonamiento '{siguiente}'")
+            return
+        self.disyuntor.retirar(modelo)
+        if self.on_evento:
+            self.on_evento(f"{modelo} sigue pensando sin responder: lo dejo de usar en esta sesión")
 
     def _con_reintentos(self, modelo, mensajes, temperatura, max_tokens, stop, on_progress,
                         hay_alternativa: bool = False, reintentos: Optional[int] = None):
@@ -2826,7 +2860,17 @@ class LLMClient:
                 # Modelo de razonamiento que se quedó sin tokens PENSANDO (finish=length, sin texto): con los pedidos
                 # cortos del juez (~350 tokens) pasaba casi siempre con los :free de hoy, que razonan todos. Un
                 # reintento en el mismo modelo con margen para pensar y razonamiento corto; si igual falla, otro modelo.
-                if not (e.solo_razonamiento and "finish=length" in str(e)) or ampliado:
+                if (self._nivel_razonamiento.get(modelo) == "none" and not e.solo_razonamiento
+                        and re.search(r"reason|effort|thinking|mandatory", str(e), re.I)):
+                    # Razonamiento obligatorio: rechaza "none". Se lo deja en "minimal" y se reintenta una vez.
+                    self._nivel_razonamiento[modelo] = "minimal"
+                    payload = self._payload(modelo, mensajes, temperatura, max_tokens, stop,
+                                            self._destino(modelo).proveedor)
+                    continue
+                if not (e.solo_razonamiento and "finish=length" in str(e)):
+                    raise
+                self._modelo_solo_razona(modelo)
+                if ampliado:
                     raise
                 self._ampliar_razonamiento = True           # de acá en más, margen para pensar en pedidos cortos
                 if hay_alternativa:
@@ -15546,6 +15590,11 @@ def _palabras_clave(texto: str) -> set:
     return {p for p in re.findall(r"[a-záéíóúñ0-9/._-]{4,}", (texto or "").lower())}
 
 
+_RE_RESTRICCION = re.compile(r"únicamente|unicamente|solo (?:la )?(?:biblioteca|librer)|sin dependencias|"
+                             r"no se (?:incluy|requier|us)|todavía no|no (?:usar|incluir|agregar)|standard library|"
+                             r"no external|without (?:external|dependencies)", re.I)
+
+
 def cobertura_criterios(criterios: list, plan) -> list:
     """Determinista (0 llamadas al modelo): criterios del contrato que NINGUNA tarea del plan parece cubrir, por
     solape de palabras/archivos. Es una señal temprana de desvío para el juez, NO un veredicto: lo real lo decide
@@ -15557,6 +15606,8 @@ def cobertura_criterios(criterios: list, plan) -> list:
     palabras = _palabras_clave(texto)
     sin_cubrir = []
     for c in criterios:
+        if _RE_RESTRICCION.search(c):
+            continue                    # "solo la biblioteca estándar", "todavía no": restricción, no una tarea
         pc = _palabras_clave(c)
         if pc and not (pc & palabras):
             sin_cubrir.append(c)
@@ -49465,7 +49516,10 @@ class TestOpenRouterRealPerfilGratisProbado(BaseTest):
         self.assertEqual(app.settings.fallbacks, ["c/ok:free"])
         texto = app.ui.texto_registrado()
         self.assertIn("Probando los modelos gratis", texto)
-        self.assertIn("pueden ser PAGOS: juez=anthropic/caro", texto)      # avisa del rol que puede cobrar
+        # Un rol en un modelo pago ya no queda como aviso: "gratis" es todo el equipo (prueba real /grande: el juez
+        # quedaba en un ID que ni existía y fallaba en cada pedido antes del respaldo).
+        self.assertIn("juez: anthropic/caro → modelo gratis principal", texto)
+        self.assertNotIn("juez", app.settings.modelos_rol)
 
 
 # ======================================================================
@@ -50565,6 +50619,70 @@ class TestReporteParaMejorar(BaseTest):
         self.assertGreater(len(llamadas), antes)
         free_vivos(llm, ["c/otro:free"], cache=cache)                               # catálogo distinto: sondea
         self.assertIn("c/otro:free", llamadas)
+
+
+def _error_400(mensaje: str) -> LLMError:
+    try:
+        _lanzar_http(400, json.dumps({"error": {"code": 400, "message": mensaje}}), None, {})
+    except LLMError as e:
+        return e
+    raise AssertionError("no lanzó")
+
+
+_SOLO_RAZONA = {"choices": [{"delta": {"reasoning": "pienso y pienso " * 50}, "finish_reason": "length"}]}
+
+
+class TestModelosDeLaPruebaRealGrande(BaseTest):
+    """Primera prueba REAL de /grande en Termux: el juez apuntaba a un ID inexistente (400 en cada pedido antes del
+    respaldo) y cohere/north-mini-code:free pensaba 25 000 caracteres sin responder en cada pedido."""
+
+    def _cliente(self, eventos, **ajustes):
+        pedidos = []
+        base = transporte_falso(eventos)
+
+        def transporte(url, headers, payload, timeout):
+            pedidos.append((payload.get("model"), (payload.get("reasoning") or {}).get("effort")))
+            return base(url, headers, payload, timeout)
+        c = LLMClient("clave", self.ajustes(**ajustes), url="http://falso", transporte=transporte)
+        c.dormir = lambda s: None
+        return c, pedidos
+
+    def test_id_de_modelo_invalido_se_retira_al_primer_intento(self):
+        c, pedidos = self._cliente([_error_400("x/invalido is not a valid model ID"), "ok", "otra vez"],
+                                   modelo="x/invalido", fallbacks=["b/ok"], respaldo_equipo=False, rpm=0)
+        self.assertEqual(c.chat([{"role": "user", "content": "1"}]).texto, "ok")
+        self.assertEqual(c.chat([{"role": "user", "content": "2"}]).texto, "otra vez")
+        self.assertEqual([m for m, _ in pedidos], ["x/invalido", "b/ok", "b/ok"])     # no se lo vuelve a intentar
+        self.assertNotIn("contexto demasiado largo", str(_error_400("x is not a valid model ID")))
+
+    def test_modelo_que_solo_piensa_baja_el_razonamiento_y_despues_se_deja(self):
+        eventos = [_SOLO_RAZONA, "r1", _SOLO_RAZONA, "r2", _SOLO_RAZONA, "r3", "r4"]
+        c, pedidos = self._cliente(eventos, modelo="a/piensa:free", fallbacks=["b/ok:free"],
+                                   respaldo_equipo=False, rpm=0)
+        for esperado in ("r1", "r2", "r3", "r4"):
+            self.assertEqual(c.chat([{"role": "user", "content": "x"}]).texto, esperado)
+        del_que_piensa = [efecto for m, efecto in pedidos if m == "a/piensa:free"]
+        self.assertEqual(del_que_piensa, [None, "low", "none"])                  # y a la 4.ª ya no se lo usa
+
+    def test_razonamiento_obligatorio_rechaza_none_y_se_usa_minimal(self):
+        c, pedidos = self._cliente([_error_400("Reasoning is mandatory for this endpoint and cannot be disabled."),
+                                    "ok"], modelo="a/piensa:free", fallbacks=[], respaldo_equipo=False, rpm=0)
+        c._nivel_razonamiento["a/piensa:free"] = "none"
+        self.assertEqual(c.chat([{"role": "user", "content": "x"}]).texto, "ok")
+        self.assertEqual(pedidos, [("a/piensa:free", "none"), ("a/piensa:free", "minimal")])
+
+    def test_perfil_gratis_no_deja_roles_en_modelos_que_no_son_gratis(self):
+        s = self.ajustes(proveedor="openrouter", modelos_rol={"juez": "nanogpt:qwen/qwen3.8-27b-uncensored",
+                                                              "reparador": "nvidia/nemotron-3-super-120b-a12b:free"})
+        cambios = aplicar_perfil(s, "gratis", ["a/uno:free", "b/dos:free"])
+        self.assertEqual(s.modelos_rol, {"reparador": "nvidia/nemotron-3-super-120b-a12b:free"})
+        self.assertTrue(any("juez: nanogpt:qwen" in c for c in cambios))
+
+    def test_restricciones_no_son_criterios_sin_cubrir(self):
+        plan = Plan("x", [Tarea("1", "Crear storage.py con init_db y sus tests", ["almacen/storage.py"])], [])
+        sin = cobertura_criterios(["Todo el código utiliza únicamente la biblioteca estándar de Python",
+                                   "No se incluyen todavía módulos de CRUD", "Existe un endpoint /api/ventas"], plan)
+        self.assertEqual(sin, ["Existe un endpoint /api/ventas"])
 
 
 # ======================================================================
