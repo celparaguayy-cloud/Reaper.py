@@ -2769,7 +2769,7 @@ index 4eba772..e986b98 100644
                  (self.ws.raiz / rel).unlink()
                  self.restaurados.append(f"{rel} (creado por los tests, borrado)")
 diff --git a/partes/25_pipeline.py b/partes/25_pipeline.py
-index ad78b6b..8314c7d 100644
+index ad78b6b..ae6bce3 100644
 --- a/partes/25_pipeline.py
 +++ b/partes/25_pipeline.py
 @@ -40,6 +40,587 @@ _RE_VEREDICTO = re.compile(r"VEREDICTO\s*:?\s*\**\s*(APROBADO|CAMBIOS|RECHAZADO)
@@ -4522,12 +4522,23 @@ index ad78b6b..8314c7d 100644
                  problemas.append("SIN PROGRESO: el implementador no terminó y no cambió ningún archivo.")
              elif tests is not None and not tests.ok and conteo.reconocido and conteo.pasados <= antes.pasados:
                  problemas.append(
-@@ -642,30 +2138,240 @@ class Orquestador:
+@@ -642,30 +2138,252 @@ class Orquestador:
              diagnostico = anexar_pistas(diagnostico, 2)
          return Verificacion(not problemas, validaciones, tests, diagnostico, archivos, conteo)
  
 -    def construir(self, pedido: str, confirmar: bool = True) -> InformeBuild:
 +    def construir(self, pedido: str, confirmar: bool = True, reanudar: bool = False) -> InformeBuild:
++        if not reanudar and pedido.strip():
++            # Repetir el MISMO /construir después de un corte (Termux cerrado, plazo, límite del modelo) lo RETOMA:
++            # antes respondía "ya hay una build incompleta" y había que saber /construir continuar.
++            try:
++                previo = RegistroBuild(self.ws).leer()
++            except ValueError:
++                previo = None                          # _construir informa el diario dañado con su mensaje
++            if (previo and previo.get("estado") not in ("verificada", "validada")
++                    and " ".join(str(previo.get("pedido", "")).split()) == " ".join(pedido.split())):
++                self.ui.info("Esta misma build había quedado a medias: la retomo donde quedó (no empiezo de cero).")
++                reanudar = True
 +        restaurar_equipo = self._equipo_del_juez()
 +        try:
 +            with PLAZO.limitar(self.settings.tiempo_max_build, "la build"):
@@ -4669,7 +4680,8 @@ index ad78b6b..8314c7d 100644
 +            self.ui.info("Retomo la build desde el checkpoint guardado, sin replanificar.")
 +        else:
 +            if previo and previo.get("estado") not in ("verificada", "validada"):
-+                self.ui.error("Ya hay una build incompleta. Usá /construir continuar o "
++                self.ui.error("Ya hay OTRA build incompleta en esta carpeta. Seguila con /construir continuar "
++                              f"(o `{comando_para_seguir(self.ws, 'construir')}`) o descartala con "
 +                              "/construir descartar para comenzar otra (sin borrar archivos).")
 +                return InformeBuild("cancelada")
 +            plan, exploracion = self.obtener_plan(pedido, confirmar)
@@ -4778,7 +4790,7 @@ index ad78b6b..8314c7d 100644
  
          self.ui.fase(numero_fase, "Implementación" + (" · torneo" if self.settings.torneo and self.settings.candidatos > 1 else ""))
          numero_fase += 1
-@@ -676,35 +2382,103 @@ class Orquestador:
+@@ -676,35 +2394,103 @@ class Orquestador:
          if [t.id for t in orden] != [t.id for t in plan.tareas]:
              self.ui.tenue("  Orden por dependencias: " + " → ".join(t.id for t in orden))
              plan.tareas = orden
@@ -4888,7 +4900,7 @@ index ad78b6b..8314c7d 100644
                  continue
  
              for ronda in range(self.settings.max_revisiones):
-@@ -712,7 +2486,10 @@ class Orquestador:
+@@ -712,7 +2498,10 @@ class Orquestador:
                  if not diff.strip():
                      informe.notas.append(f"Tarea {tarea.id}: sin cambios en archivos.")
                      break
@@ -4900,7 +4912,7 @@ index ad78b6b..8314c7d 100644
                  if aprobado:
                      self.ui.ok(f"Revisor aprobó la tarea {tarea.id}")
                      break
-@@ -722,6 +2499,31 @@ class Orquestador:
+@@ -722,6 +2511,31 @@ class Orquestador:
                      break
                  self.implementar(pedido, plan, i, exploracion, tcid, correcciones=revision,
                                   protegidos=self._protegidos)
@@ -4932,7 +4944,7 @@ index ad78b6b..8314c7d 100644
  
          archivos = [r for r in self.ws.checkpoints.archivos_desde(grupo) if (self.ws.raiz / r).is_file()]
          hay_tests_build = any(_es_test(a) for a in archivos)
-@@ -734,21 +2536,42 @@ class Orquestador:
+@@ -734,21 +2548,42 @@ class Orquestador:
          self.ui.fase(numero_fase, "Verificación real")
          verif = self.verificar(grupo)
          self._mostrar_verificacion(verif)
@@ -4979,7 +4991,7 @@ index ad78b6b..8314c7d 100644
          informe.ruta_informe = self._guardar_informe(pedido, informe)
          self._mostrar_cierre(informe)
          return informe
-@@ -769,19 +2592,51 @@ class Orquestador:
+@@ -769,19 +2604,51 @@ class Orquestador:
          else:
              self.ui.error(f"tests: fallaron ({verif.conteo.texto() if verif.conteo.reconocido else verif.tests.comando})")
              self.ui.tenue(recortar(fallos_relevantes(verif.tests.stdout + "\n" + verif.tests.stderr, 2, 1500), 1500))
@@ -5033,7 +5045,7 @@ index ad78b6b..8314c7d 100644
                     if informe.spec_tests else "")
                  + (f"## Escaladas al modelo fuerte\n{informe.escaladas}\n\n" if informe.escaladas else "")
                  + ("## Lecciones aprendidas\n" + "\n".join(f"- {l}" for l in informe.lecciones) + "\n\n" if informe.lecciones else "")
-@@ -790,40 +2645,77 @@ class Orquestador:
+@@ -790,40 +2657,77 @@ class Orquestador:
                  + ("## Notas\n" + "\n".join(f"- {n}" for n in informe.notas) + "\n" if informe.notas else "")
              )
              ruta = self.ws.raiz / ".reaper" / "informes" / f"build_{datetime.now():%Y%m%d_%H%M%S}.md"
@@ -10548,10 +10560,10 @@ index 0000000..9a0ba17
 +        self.assertIn(nombre, ("pytest", "unittest"))
 diff --git a/partes/48zi_autotest_grande.py b/partes/48zi_autotest_grande.py
 new file mode 100644
-index 0000000..3f09d48
+index 0000000..af2338e
 --- /dev/null
 +++ b/partes/48zi_autotest_grande.py
-@@ -0,0 +1,492 @@
+@@ -0,0 +1,573 @@
 +"""
 +Autotests de /grande (proyecto grande por etapas) con un modelo SIMULADO que escribe código de verdad: un gestor de
 +biblioteca en 3 etapas (almacenamiento SQLite → préstamos → CLI). Los tests del proyecto se ejecutan de verdad en
@@ -11044,6 +11056,87 @@ index 0000000..3f09d48
 +        fallan = {"test_calc.T.test_doble", "test_web.T.test_ruta", "test_viejo.T.test_x"}
 +        self.assertEqual(fallos_tolerables_al_reintentar(fallan, ["test_viejo.T.test_x"], tareas[0], tareas),
 +                         {"test_web.T.test_ruta", "test_viejo.T.test_x"})            # el suyo no se tolera
++
++
++class TestSeguirDespuesDeUnCorte(BaseTest):
++    """En el teléfono la corrida se corta (Termux cerrado, pantalla bloqueada, límite del modelo gratis). Lo natural
++    es repetir el mismo comando: antes respondía "ya hay una build incompleta" y había que saber el subcomando."""
++
++    def _ajustes(self):
++        return self.ajustes(tests_primero=False, torneo=False, escalar=False, max_revisiones=0, qa=False,
++                            max_reparaciones=1, juez=False, git_snapshots=False)
++
++    def test_repetir_el_mismo_grande_lo_retoma(self):
++        ws = self.proyecto({})
++        guion = _GuionBiblioteca(ws, prestamos_roto=True)
++        ui = self.ui()
++        grande = ConstructorGrande(MockLLM(guion), ws, self._ajustes(), ui)
++        pedido = "Un gestor de biblioteca con préstamos y CLI"
++        self.assertFalse(grande.iniciar(pedido, confirmar=False))
++        self.assertRegex(ui.texto_registrado(),                                     # entero, sin recortar
++                         re.escape(f"Desde la terminal: {comando_para_seguir(ws, 'grande')}") + r"(\n|$)")
++        guion.prestamos_roto = False
++        self.assertTrue(grande.iniciar("  Un gestor de biblioteca   con préstamos y CLI ", confirmar=False))
++        self.assertIn("lo retomo donde quedó", ui.texto_registrado())
++        self.assertEqual(guion.llamadas["maestro"], 1)                              # no se replanificó
++        self.assertEqual(grande.leer()["estado"], "terminado")
++
++    def test_otro_pedido_no_pisa_el_proyecto_a_medias(self):
++        ws = self.proyecto({})
++        ui = self.ui()
++        grande = ConstructorGrande(MockLLM(_GuionBiblioteca(ws, prestamos_roto=True)), ws, self._ajustes(), ui)
++        grande.iniciar("Un gestor de biblioteca con préstamos y CLI", confirmar=False)
++        self.assertFalse(grande.iniciar("otra cosa distinta", confirmar=False))
++        self.assertIn("Ya hay OTRO proyecto grande", ui.texto_registrado())
++        self.assertIn("--grande continuar", ui.texto_registrado())
++        self.assertEqual(grande.leer()["pedido"], "Un gestor de biblioteca con préstamos y CLI")
++
++    def test_repetir_el_mismo_construir_lo_retoma(self):
++        ws = self.proyecto({})
++        roto = [True]
++        guion = TestReanudarNoRegalaVerdes()._guion(roto)
++        llamadas = collections.Counter()
++
++        def contar(mensajes, kw):
++            llamadas[MockLLM.rol_de(mensajes)] += 1
++            return guion(mensajes, kw)
++        ajustes = self.ajustes(tests_primero=False, torneo=False, escalar=False, max_revisiones=0, qa=False,
++                               max_reparaciones=0, juez=False, git_snapshots=False)
++        self.assertFalse(Orquestador(MockLLM(contar), ws, ajustes, self.ui()).construir("calculadora", confirmar=False).ok)
++        roto[0] = False
++        ui = self.ui()
++        self.assertTrue(Orquestador(MockLLM(contar), ws, ajustes, ui).construir("calculadora", confirmar=False).ok)
++        self.assertIn("la retomo donde quedó", ui.texto_registrado())
++        self.assertEqual(llamadas["arquitecto"], 1)                                 # no se replanificó
++
++    def test_pista_y_comando_para_seguir(self):
++        ws = self.proyecto({})
++        self.assertEqual(pista_para_seguir(ws), "")
++        self.assertTrue(comando_para_seguir(ws, "grande").endswith("--grande continuar"))
++        casa = Path.home() / "mi proyecto"
++        self.assertEqual(comando_para_seguir(casa, "construir"),
++                         "reaper --proyecto ~/'mi proyecto' --construir continuar")
++
++    def test_cli_estado_y_continuar_sin_nada_pendiente(self):
++        ws = self.proyecto({})
++        previos = {k: os.environ.get(k) for k in ("REAPER_LIBRE", "OPENROUTER_API_KEY")}
++        os.environ.update({"REAPER_LIBRE": "1", "OPENROUTER_API_KEY": "clave-de-prueba-0123456789"})
++        try:
++            salida = io.StringIO()
++            with contextlib.redirect_stdout(salida):
++                self.assertEqual(main(["--proyecto", str(ws.raiz), "--sin-animacion", "--grande", "estado"]), 0)
++                self.assertEqual(main(["--proyecto", str(ws.raiz), "--sin-animacion", "--construir", "estado"]), 0)
++                self.assertEqual(main(["--proyecto", str(ws.raiz), "--sin-animacion", "--grande", "continuar"]), 2)
++            texto = salida.getvalue()
++            self.assertIn("No hay ningún proyecto grande", texto)
++            self.assertIn("No hay ninguna build pendiente", texto)
++            self.assertFalse(ConstructorGrande(None, ws, Settings(), None).ruta.exists())   # no arrancó nada
++        finally:
++            for k, v in previos.items():
++                if v is None:
++                    os.environ.pop(k, None)
++                else:
++                    os.environ[k] = v
 diff --git a/partes/49_autotest_runner.py b/partes/49_autotest_runner.py
 index 541aee7..02a88e9 100644
 --- a/partes/49_autotest_runner.py
@@ -12591,10 +12684,10 @@ index 0000000..15f8d02
 +            "proveedores": len(proveedores), "independencia_reducida": len(proveedores) <= 1}
 diff --git a/partes/76_grande.py b/partes/76_grande.py
 new file mode 100644
-index 0000000..9f97374
+index 0000000..881e7c3
 --- /dev/null
 +++ b/partes/76_grande.py
-@@ -0,0 +1,612 @@
+@@ -0,0 +1,648 @@
 +"""
 +Proyectos GRANDES por etapas (/grande).
 +
@@ -12808,6 +12901,32 @@ index 0000000..9f97374
 +    return "\n\n".join(partes)
 +
 +
++def comando_para_seguir(ws, modo: str) -> str:
++    """El comando exacto para retomar desde la terminal (lo que hay que tipear después de un corte)."""
++    ruta = str(getattr(ws, "raiz", ws))
++    casa = str(Path.home())
++    if ruta == casa or ruta.startswith(casa + os.sep):
++        ruta = "~" + ruta[len(casa):]
++        visible = ruta if not re.search(r"[^\w./~-]", ruta) else '~/' + shlex.quote(ruta[2:])
++    else:
++        visible = shlex.quote(ruta)
++    return f"reaper --proyecto {visible} --{modo} continuar"
++
++
++def pista_para_seguir(ws: Workspace) -> str:
++    """Si en la carpeta quedó un /grande o un /construir sin terminar, cómo seguirlo ('' si no hay nada)."""
++    try:
++        grande = ConstructorGrande(None, ws, Settings(), None).leer()
++        if grande and grande.get("estado") != "terminado":
++            return f"El proyecto grande quedó guardado. Para seguir: {comando_para_seguir(ws, 'grande')}"
++        build = RegistroBuild(ws).leer()
++        if build and build.get("estado") not in ESTADOS_OK_ETAPA:
++            return f"La build quedó guardada. Para seguir: {comando_para_seguir(ws, 'construir')}"
++    except (ValueError, OSError, KeyError, TypeError):
++        return ""
++    return ""
++
++
 +def _redactar_textos(valor):
 +    """Copia con redactar_secretos aplicado a cada string (las claves y los números quedan como están)."""
 +    if isinstance(valor, str):
@@ -12935,8 +13054,14 @@ index 0000000..9f97374
 +            self.ui.error(str(e))
 +            return False
 +        if previo and previo.get("estado") != "terminado":
-+            self.ui.error("Ya hay un proyecto grande sin terminar en esta carpeta. Usá /grande continuar, "
-+                          "/grande estado o /grande descartar (no borra archivos).")
++            if " ".join(str(previo.get("pedido", "")).split()) == " ".join(pedido.split()):
++                # Repetir el MISMO comando después de un corte (Termux cerrado, teléfono bloqueado, límite del
++                # modelo) es la forma natural de "seguir": antes daba error y había que saber /grande continuar.
++                self.ui.info("Este mismo proyecto grande había quedado a medias: lo retomo donde quedó.")
++                return self.continuar()
++            self.ui.error("Ya hay OTRO proyecto grande sin terminar en esta carpeta. Seguilo con "
++                          f"`{comando_para_seguir(self.ws, 'grande')}`, miralo con /grande estado o descartalo con "
++                          "/grande descartar (no borra archivos). Para uno nuevo usá otra carpeta (--proyecto).")
 +            return False
 +        try:
 +            pendiente = RegistroBuild(self.ws).leer()
@@ -13060,6 +13185,8 @@ index 0000000..9f97374
 +                      "No construyo encima de algo que no está verificado.",
 +                      "Revisá el informe de la etapa y seguí con: /grande continuar"],
 +                     titulo="Proyecto grande · DETENIDO", color=Tema.aviso)
++        # Fuera de la caja: adentro se recorta al ancho de la terminal y el comando no se podía copiar entero.
++        self.ui.info(f"  Desde la terminal: {comando_para_seguir(self.ws, 'grande')}")
 +        return False
 +
 +    # ------------------------------------------------------------ integración
@@ -13129,11 +13256,13 @@ index 0000000..9f97374
 +        lineas.append(f"Integración final: {integ.get('estado', '?')} · {recortar(str(integ.get('juicio', '')), 90)}")
 +        if not ok:
 +            lineas.append("Pendiente: " + recortar(str(estado.get("motivo", "")), 200))
-+            lineas.append("Seguí con: /grande continuar")
++            lineas.append("Seguí con: /grande continuar (el comando completo va debajo)")
 +        lineas.append(f"Tiempo de esta corrida: {formatear_duracion(segundos)}")
 +        self.ui.linea("")
 +        self.ui.caja(lineas, titulo="Proyecto grande · " + ("✓ TERMINADO Y VERIFICADO" if ok else "INCOMPLETO"),
 +                     color=Tema.ok if ok else Tema.aviso)
++        if not ok:
++            self.ui.info(f"  Desde la terminal: {comando_para_seguir(self.ws, 'grande')}")
 +        ruta = self._guardar_informe(estado, maestro)
 +        if ruta:
 +            self.ui.tenue(f"  Informe: {ruta}")
@@ -13208,10 +13337,10 @@ index 0000000..9f97374
 +App.cmd_grande = _cmd_grande
 +App._build_de_etapa = _build_de_etapa
 diff --git a/partes/99_main.py b/partes/99_main.py
-index 8196bf8..64934cb 100644
+index 8196bf8..0472c6a 100644
 --- a/partes/99_main.py
 +++ b/partes/99_main.py
-@@ -4,15 +4,20 @@
+@@ -4,15 +4,22 @@
  def construir_parser() -> argparse.ArgumentParser:
      parser = argparse.ArgumentParser(
          prog="reaper",
@@ -13219,9 +13348,12 @@ index 8196bf8..64934cb 100644
 +        description=f"REAPER {__version__} · agente de programación autónomo para Termux",
      )
      parser.add_argument("-p", "--pedido", help="ejecuta un pedido con el agente principal y sale")
-     parser.add_argument("--construir", help="corre el pipeline completo (tests primero + torneo) y sale")
+-    parser.add_argument("--construir", help="corre el pipeline completo (tests primero + torneo) y sale")
++    parser.add_argument("--construir", help="corre el pipeline completo (tests primero + torneo) y sale. "
++                                            "'continuar' / 'estado' retoman o muestran la build que quedó a medias")
 +    parser.add_argument("--grande", help="proyecto grande por etapas verificadas (plan maestro + un /construir por "
-+                                         "etapa + integración final) y sale")
++                                         "etapa + integración final) y sale. 'continuar' / 'estado' retoman o "
++                                         "muestran el que quedó a medias")
      parser.add_argument("--plan", help="solo exploración + plan y sale")
      parser.add_argument("--torneo", help="corre un torneo de implementadores para una tarea y sale")
      parser.add_argument("--escribir", nargs=2, metavar=("RUTA", "DESCRIPCION"), help="genera un archivo largo y sale")
@@ -13233,7 +13365,7 @@ index 8196bf8..64934cb 100644
      parser.add_argument("--modelo", help="alias o id de OpenRouter (solo esta ejecución)")
      parser.add_argument("--modelo-fuerte", help="modelo para la escalada (solo esta ejecución)")
      parser.add_argument("--perfil", choices=list(PERFILES), help="preset de configuración (solo esta ejecución)")
-@@ -24,30 +29,25 @@ def construir_parser() -> argparse.ArgumentParser:
+@@ -24,30 +31,25 @@ def construir_parser() -> argparse.ArgumentParser:
      parser.add_argument("--doctor", action="store_true", help="diagnóstico del entorno y sale")
      parser.add_argument("--instalar", action="store_true", help="crea el comando `reaper` y sale")
      parser.add_argument("--autotest", action="store_true", help="corre los tests internos de REAPER (sin API) y sale")
@@ -13274,7 +13406,7 @@ index 8196bf8..64934cb 100644
      if args.modelo:
          settings.modelo = resolver_modelo(args.modelo)
      if args.modelo_fuerte:
-@@ -61,9 +61,39 @@ def main(argv: Optional[list] = None) -> int:
+@@ -61,9 +63,39 @@ def main(argv: Optional[list] = None) -> int:
          settings.torneo = False
      if args.sin_animacion:
          settings.animacion = False
@@ -13316,7 +13448,7 @@ index 8196bf8..64934cb 100644
      log = LOGS_DIR / f"{datetime.now():%Y%m%d}.log" if settings.log else None
      ui = UI(interactivo=not no_interactivo or sys.stdin.isatty(), log=log,
              detalle=0 if args.silencioso else settings.detalle)
-@@ -71,6 +101,46 @@ def main(argv: Optional[list] = None) -> int:
+@@ -71,6 +103,46 @@ def main(argv: Optional[list] = None) -> int:
      if args.instalar:
          return 0 if instalar_lanzador(ui) else 1
  
@@ -13363,7 +13495,7 @@ index 8196bf8..64934cb 100644
      api_key = obtener_clave_api(settings)
      if args.doctor:
          llm = LLMClient(api_key, settings) if api_key else None
-@@ -81,19 +151,13 @@ def main(argv: Optional[list] = None) -> int:
+@@ -81,19 +153,13 @@ def main(argv: Optional[list] = None) -> int:
          variable = settings.variable_clave() or "OPENROUTER_API_KEY"
          ui.error(f"Falta {variable}.")
          ui.tenue(f'  export {variable}="tu_key"      (agregalo a ~/.bashrc para no repetirlo)')
@@ -13384,7 +13516,7 @@ index 8196bf8..64934cb 100644
          if args.proyecto:
              raiz = resolver_workspace(args.proyecto)
          else:
-@@ -104,6 +168,17 @@ def main(argv: Optional[list] = None) -> int:
+@@ -104,6 +170,17 @@ def main(argv: Optional[list] = None) -> int:
          ui.error(str(e) if not isinstance(e, KeyError) else f"No existe la plantilla {e}")
          return 1
  
@@ -13402,7 +13534,24 @@ index 8196bf8..64934cb 100644
      llm = LLMClient(api_key, settings)
      llm.on_evento = lambda texto: ui.tenue(f"  ↻ {texto}")
      app = App(settings, llm, ui, ws)
-@@ -121,6 +196,12 @@ def main(argv: Optional[list] = None) -> int:
+@@ -116,11 +193,29 @@ def main(argv: Optional[list] = None) -> int:
+             return 0 if correr_evaluacion(llm, settings, ui, cantidad=args.evaluar or None) else 2
+         if args.comportamiento is not None:
+             return 0 if correr_comportamiento(llm, settings, ui, ids=args.comportamiento) else 2
++        if args.construir and args.construir.strip().lower() in ("continuar", "estado"):
++            # Después de un corte: `reaper --proyecto X --construir continuar` (sin entrar al modo interactivo).
++            if args.construir.strip().lower() == "estado":
++                app.cmd_construir("estado")
++                return 0
++            return 0 if app.construir("", confirmar=False, reanudar=True) else 2
++        if args.grande and args.grande.strip().lower() in ("continuar", "estado"):
++            grande = ConstructorGrande(llm, app.ws, settings, ui, construir_build=app._build_de_etapa)
++            if args.grande.strip().lower() == "estado":
++                grande.mostrar_estado()
++                return 0
++            return 0 if grande.continuar() else 2
+         if args.construir:
+             ok = app.construir(args.construir, confirmar=not args.auto)
              if time.monotonic() - inicio > 120:
                  notificar("REAPER", f"Build {'verificada ✓' if ok else 'fallida ✗'}: {args.construir[:80]}")
              return 0 if ok else 2
@@ -13415,7 +13564,19 @@ index 8196bf8..64934cb 100644
          if args.torneo:
              app.cmd_torneo(args.torneo)
              return 0
-@@ -142,5 +223,830 @@ def main(argv: Optional[list] = None) -> int:
+@@ -136,11 +231,842 @@ def main(argv: Optional[list] = None) -> int:
+     except (KeyboardInterrupt, Cancelado):
+         CANCELAR.set()
+         ui.aviso("\n⏹ Interrumpido.")
++        pista = pista_para_seguir(ws)
++        if pista:
++            ui.info(pista)
+         return 130
+     except LLMError as e:
+         ui.error(f"Modelo: {e}")
++        pista = pista_para_seguir(ws)
++        if pista:
++            ui.info(pista)
          return 1
  
  
