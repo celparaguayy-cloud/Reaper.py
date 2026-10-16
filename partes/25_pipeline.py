@@ -2139,6 +2139,17 @@ class Orquestador:
         return Verificacion(not problemas, validaciones, tests, diagnostico, archivos, conteo)
 
     def construir(self, pedido: str, confirmar: bool = True, reanudar: bool = False) -> InformeBuild:
+        if not reanudar and pedido.strip():
+            # Repetir el MISMO /construir después de un corte (Termux cerrado, plazo, límite del modelo) lo RETOMA:
+            # antes respondía "ya hay una build incompleta" y había que saber /construir continuar.
+            try:
+                previo = RegistroBuild(self.ws).leer()
+            except ValueError:
+                previo = None                          # _construir informa el diario dañado con su mensaje
+            if (previo and previo.get("estado") not in ("verificada", "validada")
+                    and " ".join(str(previo.get("pedido", "")).split()) == " ".join(pedido.split())):
+                self.ui.info("Esta misma build había quedado a medias: la retomo donde quedó (no empiezo de cero).")
+                reanudar = True
         restaurar_equipo = self._equipo_del_juez()
         try:
             with PLAZO.limitar(self.settings.tiempo_max_build, "la build"):
@@ -2279,7 +2290,8 @@ class Orquestador:
             self.ui.info("Retomo la build desde el checkpoint guardado, sin replanificar.")
         else:
             if previo and previo.get("estado") not in ("verificada", "validada"):
-                self.ui.error("Ya hay una build incompleta. Usá /construir continuar o "
+                self.ui.error("Ya hay OTRA build incompleta en esta carpeta. Seguila con /construir continuar "
+                              f"(o `{comando_para_seguir(self.ws, 'construir')}`) o descartala con "
                               "/construir descartar para comenzar otra (sin borrar archivos).")
                 return InformeBuild("cancelada")
             plan, exploracion = self.obtener_plan(pedido, confirmar)

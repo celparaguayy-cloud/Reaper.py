@@ -7,9 +7,11 @@ def construir_parser() -> argparse.ArgumentParser:
         description=f"REAPER {__version__} · agente de programación autónomo para Termux",
     )
     parser.add_argument("-p", "--pedido", help="ejecuta un pedido con el agente principal y sale")
-    parser.add_argument("--construir", help="corre el pipeline completo (tests primero + torneo) y sale")
+    parser.add_argument("--construir", help="corre el pipeline completo (tests primero + torneo) y sale. "
+                                            "'continuar' / 'estado' retoman o muestran la build que quedó a medias")
     parser.add_argument("--grande", help="proyecto grande por etapas verificadas (plan maestro + un /construir por "
-                                         "etapa + integración final) y sale")
+                                         "etapa + integración final) y sale. 'continuar' / 'estado' retoman o "
+                                         "muestran el que quedó a medias")
     parser.add_argument("--plan", help="solo exploración + plan y sale")
     parser.add_argument("--torneo", help="corre un torneo de implementadores para una tarea y sale")
     parser.add_argument("--escribir", nargs=2, metavar=("RUTA", "DESCRIPCION"), help="genera un archivo largo y sale")
@@ -191,6 +193,18 @@ def main(argv: Optional[list] = None) -> int:
             return 0 if correr_evaluacion(llm, settings, ui, cantidad=args.evaluar or None) else 2
         if args.comportamiento is not None:
             return 0 if correr_comportamiento(llm, settings, ui, ids=args.comportamiento) else 2
+        if args.construir and args.construir.strip().lower() in ("continuar", "estado"):
+            # Después de un corte: `reaper --proyecto X --construir continuar` (sin entrar al modo interactivo).
+            if args.construir.strip().lower() == "estado":
+                app.cmd_construir("estado")
+                return 0
+            return 0 if app.construir("", confirmar=False, reanudar=True) else 2
+        if args.grande and args.grande.strip().lower() in ("continuar", "estado"):
+            grande = ConstructorGrande(llm, app.ws, settings, ui, construir_build=app._build_de_etapa)
+            if args.grande.strip().lower() == "estado":
+                grande.mostrar_estado()
+                return 0
+            return 0 if grande.continuar() else 2
         if args.construir:
             ok = app.construir(args.construir, confirmar=not args.auto)
             if time.monotonic() - inicio > 120:
@@ -217,9 +231,15 @@ def main(argv: Optional[list] = None) -> int:
     except (KeyboardInterrupt, Cancelado):
         CANCELAR.set()
         ui.aviso("\n⏹ Interrumpido.")
+        pista = pista_para_seguir(ws)
+        if pista:
+            ui.info(pista)
         return 130
     except LLMError as e:
         ui.error(f"Modelo: {e}")
+        pista = pista_para_seguir(ws)
+        if pista:
+            ui.info(pista)
         return 1
 
 

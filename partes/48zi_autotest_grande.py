@@ -490,3 +490,84 @@ class TestReanudarNoRegalaVerdes(BaseTest):
         fallan = {"test_calc.T.test_doble", "test_web.T.test_ruta", "test_viejo.T.test_x"}
         self.assertEqual(fallos_tolerables_al_reintentar(fallan, ["test_viejo.T.test_x"], tareas[0], tareas),
                          {"test_web.T.test_ruta", "test_viejo.T.test_x"})            # el suyo no se tolera
+
+
+class TestSeguirDespuesDeUnCorte(BaseTest):
+    """En el teléfono la corrida se corta (Termux cerrado, pantalla bloqueada, límite del modelo gratis). Lo natural
+    es repetir el mismo comando: antes respondía "ya hay una build incompleta" y había que saber el subcomando."""
+
+    def _ajustes(self):
+        return self.ajustes(tests_primero=False, torneo=False, escalar=False, max_revisiones=0, qa=False,
+                            max_reparaciones=1, juez=False, git_snapshots=False)
+
+    def test_repetir_el_mismo_grande_lo_retoma(self):
+        ws = self.proyecto({})
+        guion = _GuionBiblioteca(ws, prestamos_roto=True)
+        ui = self.ui()
+        grande = ConstructorGrande(MockLLM(guion), ws, self._ajustes(), ui)
+        pedido = "Un gestor de biblioteca con préstamos y CLI"
+        self.assertFalse(grande.iniciar(pedido, confirmar=False))
+        self.assertRegex(ui.texto_registrado(),                                     # entero, sin recortar
+                         re.escape(f"Desde la terminal: {comando_para_seguir(ws, 'grande')}") + r"(\n|$)")
+        guion.prestamos_roto = False
+        self.assertTrue(grande.iniciar("  Un gestor de biblioteca   con préstamos y CLI ", confirmar=False))
+        self.assertIn("lo retomo donde quedó", ui.texto_registrado())
+        self.assertEqual(guion.llamadas["maestro"], 1)                              # no se replanificó
+        self.assertEqual(grande.leer()["estado"], "terminado")
+
+    def test_otro_pedido_no_pisa_el_proyecto_a_medias(self):
+        ws = self.proyecto({})
+        ui = self.ui()
+        grande = ConstructorGrande(MockLLM(_GuionBiblioteca(ws, prestamos_roto=True)), ws, self._ajustes(), ui)
+        grande.iniciar("Un gestor de biblioteca con préstamos y CLI", confirmar=False)
+        self.assertFalse(grande.iniciar("otra cosa distinta", confirmar=False))
+        self.assertIn("Ya hay OTRO proyecto grande", ui.texto_registrado())
+        self.assertIn("--grande continuar", ui.texto_registrado())
+        self.assertEqual(grande.leer()["pedido"], "Un gestor de biblioteca con préstamos y CLI")
+
+    def test_repetir_el_mismo_construir_lo_retoma(self):
+        ws = self.proyecto({})
+        roto = [True]
+        guion = TestReanudarNoRegalaVerdes()._guion(roto)
+        llamadas = collections.Counter()
+
+        def contar(mensajes, kw):
+            llamadas[MockLLM.rol_de(mensajes)] += 1
+            return guion(mensajes, kw)
+        ajustes = self.ajustes(tests_primero=False, torneo=False, escalar=False, max_revisiones=0, qa=False,
+                               max_reparaciones=0, juez=False, git_snapshots=False)
+        self.assertFalse(Orquestador(MockLLM(contar), ws, ajustes, self.ui()).construir("calculadora", confirmar=False).ok)
+        roto[0] = False
+        ui = self.ui()
+        self.assertTrue(Orquestador(MockLLM(contar), ws, ajustes, ui).construir("calculadora", confirmar=False).ok)
+        self.assertIn("la retomo donde quedó", ui.texto_registrado())
+        self.assertEqual(llamadas["arquitecto"], 1)                                 # no se replanificó
+
+    def test_pista_y_comando_para_seguir(self):
+        ws = self.proyecto({})
+        self.assertEqual(pista_para_seguir(ws), "")
+        self.assertTrue(comando_para_seguir(ws, "grande").endswith("--grande continuar"))
+        casa = Path.home() / "mi proyecto"
+        self.assertEqual(comando_para_seguir(casa, "construir"),
+                         "reaper --proyecto ~/'mi proyecto' --construir continuar")
+
+    def test_cli_estado_y_continuar_sin_nada_pendiente(self):
+        ws = self.proyecto({})
+        previos = {k: os.environ.get(k) for k in ("REAPER_LIBRE", "OPENROUTER_API_KEY")}
+        os.environ.update({"REAPER_LIBRE": "1", "OPENROUTER_API_KEY": "clave-de-prueba-0123456789"})
+        try:
+            salida = io.StringIO()
+            with contextlib.redirect_stdout(salida):
+                self.assertEqual(main(["--proyecto", str(ws.raiz), "--sin-animacion", "--grande", "estado"]), 0)
+                self.assertEqual(main(["--proyecto", str(ws.raiz), "--sin-animacion", "--construir", "estado"]), 0)
+                self.assertEqual(main(["--proyecto", str(ws.raiz), "--sin-animacion", "--grande", "continuar"]), 2)
+            texto = salida.getvalue()
+            self.assertIn("No hay ningún proyecto grande", texto)
+            self.assertIn("No hay ninguna build pendiente", texto)
+            self.assertFalse(ConstructorGrande(None, ws, Settings(), None).ruta.exists())   # no arrancó nada
+        finally:
+            for k, v in previos.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v

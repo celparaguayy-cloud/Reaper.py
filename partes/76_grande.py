@@ -211,6 +211,32 @@ def pedido_de_etapa(pedido: str, maestro: PlanMaestro, etapa: Etapa) -> str:
     return "\n\n".join(partes)
 
 
+def comando_para_seguir(ws, modo: str) -> str:
+    """El comando exacto para retomar desde la terminal (lo que hay que tipear después de un corte)."""
+    ruta = str(getattr(ws, "raiz", ws))
+    casa = str(Path.home())
+    if ruta == casa or ruta.startswith(casa + os.sep):
+        ruta = "~" + ruta[len(casa):]
+        visible = ruta if not re.search(r"[^\w./~-]", ruta) else '~/' + shlex.quote(ruta[2:])
+    else:
+        visible = shlex.quote(ruta)
+    return f"reaper --proyecto {visible} --{modo} continuar"
+
+
+def pista_para_seguir(ws: Workspace) -> str:
+    """Si en la carpeta quedó un /grande o un /construir sin terminar, cómo seguirlo ('' si no hay nada)."""
+    try:
+        grande = ConstructorGrande(None, ws, Settings(), None).leer()
+        if grande and grande.get("estado") != "terminado":
+            return f"El proyecto grande quedó guardado. Para seguir: {comando_para_seguir(ws, 'grande')}"
+        build = RegistroBuild(ws).leer()
+        if build and build.get("estado") not in ESTADOS_OK_ETAPA:
+            return f"La build quedó guardada. Para seguir: {comando_para_seguir(ws, 'construir')}"
+    except (ValueError, OSError, KeyError, TypeError):
+        return ""
+    return ""
+
+
 def _redactar_textos(valor):
     """Copia con redactar_secretos aplicado a cada string (las claves y los números quedan como están)."""
     if isinstance(valor, str):
@@ -338,8 +364,14 @@ class ConstructorGrande:
             self.ui.error(str(e))
             return False
         if previo and previo.get("estado") != "terminado":
-            self.ui.error("Ya hay un proyecto grande sin terminar en esta carpeta. Usá /grande continuar, "
-                          "/grande estado o /grande descartar (no borra archivos).")
+            if " ".join(str(previo.get("pedido", "")).split()) == " ".join(pedido.split()):
+                # Repetir el MISMO comando después de un corte (Termux cerrado, teléfono bloqueado, límite del
+                # modelo) es la forma natural de "seguir": antes daba error y había que saber /grande continuar.
+                self.ui.info("Este mismo proyecto grande había quedado a medias: lo retomo donde quedó.")
+                return self.continuar()
+            self.ui.error("Ya hay OTRO proyecto grande sin terminar en esta carpeta. Seguilo con "
+                          f"`{comando_para_seguir(self.ws, 'grande')}`, miralo con /grande estado o descartalo con "
+                          "/grande descartar (no borra archivos). Para uno nuevo usá otra carpeta (--proyecto).")
             return False
         try:
             pendiente = RegistroBuild(self.ws).leer()
@@ -463,6 +495,8 @@ class ConstructorGrande:
                       "No construyo encima de algo que no está verificado.",
                       "Revisá el informe de la etapa y seguí con: /grande continuar"],
                      titulo="Proyecto grande · DETENIDO", color=Tema.aviso)
+        # Fuera de la caja: adentro se recorta al ancho de la terminal y el comando no se podía copiar entero.
+        self.ui.info(f"  Desde la terminal: {comando_para_seguir(self.ws, 'grande')}")
         return False
 
     # ------------------------------------------------------------ integración
@@ -532,11 +566,13 @@ class ConstructorGrande:
         lineas.append(f"Integración final: {integ.get('estado', '?')} · {recortar(str(integ.get('juicio', '')), 90)}")
         if not ok:
             lineas.append("Pendiente: " + recortar(str(estado.get("motivo", "")), 200))
-            lineas.append("Seguí con: /grande continuar")
+            lineas.append("Seguí con: /grande continuar (el comando completo va debajo)")
         lineas.append(f"Tiempo de esta corrida: {formatear_duracion(segundos)}")
         self.ui.linea("")
         self.ui.caja(lineas, titulo="Proyecto grande · " + ("✓ TERMINADO Y VERIFICADO" if ok else "INCOMPLETO"),
                      color=Tema.ok if ok else Tema.aviso)
+        if not ok:
+            self.ui.info(f"  Desde la terminal: {comando_para_seguir(self.ws, 'grande')}")
         ruta = self._guardar_informe(estado, maestro)
         if ruta:
             self.ui.tenue(f"  Informe: {ruta}")
