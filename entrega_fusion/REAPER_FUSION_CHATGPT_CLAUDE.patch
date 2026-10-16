@@ -3451,11 +3451,11 @@
 +                              "pediste ni aprobaste el plan: se protegen (no se pierde lo que ya tenías).")
              registro_build.guardar(previo)
 +        self._reemplazos_autorizados = set(previo.get("reemplazos_autorizados", []))
- 
--        informe = InformeBuild("fallida", plan=plan, cid=grupo)
++
 +        informe = InformeBuild("fallida", plan=plan, cid=grupo,
 +                               reemplazos_autorizados=sorted(self._reemplazos_autorizados))
-+
+ 
+-        informe = InformeBuild("fallida", plan=plan, cid=grupo)
 +        # Motor central: el juez fija el CONTRATO (criterios del pedido) antes de construir. En reanudación se
 +        # reutiliza el que ya quedó en el diario: no se gasta otra llamada.
 +        if not reanudar:
@@ -4007,7 +4007,39 @@
          for comando, descripcion in comandos:
              if ancho < 70:
                  lineas.append(f"  {Tema.ok}{comando}{C.RESET}")
-@@ -27553,7 +29800,10 @@
+@@ -27456,18 +29703,26 @@
+     return "\n".join(lineas)
+ 
+ 
+-def resolver_workspace(texto: str) -> Path:
++def resolver_workspace(texto: str, crear: bool = False) -> Path:
++    """Carpeta del proyecto (siempre dentro de tu home, salvo REAPER_LIBRE=1). Con crear=True, si no existe la crea:
++    para un proyecto NUEVO lo normal es que todavía no exista (prueba real en Termux: `reaper --proyecto ~/almacen
++    --grande "..."` terminaba en "No existe" sin hacer nada)."""
+     ruta = Path(os.path.expandvars(texto.strip())).expanduser().resolve()
+-    if not ruta.exists():
+-        raise ErrorRuta(f"No existe: {ruta}")
+-    if not ruta.is_dir():
+-        raise ErrorRuta(f"No es una carpeta: {ruta}")
+     if not os.getenv("REAPER_LIBRE"):
+         home = Path.home().resolve()
+         if ruta != home and home not in ruta.parents:
+             raise ErrorRuta(
+                 f"Por seguridad el proyecto debe estar dentro de {home} (o exportá REAPER_LIBRE=1)."
+             )
++    if not ruta.exists():
++        if not crear:
++            raise ErrorRuta(f"No existe: {ruta}")
++        try:
++            ruta.mkdir(parents=True)
++        except OSError as e:
++            raise ErrorRuta(f"No pude crear la carpeta {ruta}: {e}") from e
++    if not ruta.is_dir():
++        raise ErrorRuta(f"No es una carpeta: {ruta}")
+     return ruta
+ 
+ 
+@@ -27553,7 +29808,10 @@
              mensajes = self.principal.mensajes[1:][-60:]
              while mensajes and mensajes[0]["role"] != "user":
                  mensajes = mensajes[1:]
@@ -4019,7 +4051,7 @@
              datos = {"mensajes": mensajes, "todo": self.principal.ctx.todo,
                       "historial": self.historial[-50:], "pendiente": self.pendiente,
                       "guardado": datetime.now().isoformat(timespec="seconds")}
-@@ -27744,7 +29994,15 @@
+@@ -27744,7 +30002,15 @@
              detalle.append("con escalada")
          self.ui.tenue("  " + " · ".join(detalle))
          claim = getattr(self.principal, "_ultimo_claim", None)
@@ -4036,7 +4068,7 @@
              self.ui.tenue(f"  verificación: {claim.nivel}" + (f" — {recortar(claim.motivo, 120)}" if claim.motivo else ""))
          if not res.ok:
              self.ui.aviso(f"  (terminó con estado: {res.motivo})")
-@@ -27752,6 +30010,10 @@
+@@ -27752,6 +30018,10 @@
          return res.ok
  
      def construir(self, pedido: str, confirmar: bool = True, reanudar: bool = False) -> bool:
@@ -4047,7 +4079,7 @@
          if reanudar:
              try:
                  previo = RegistroBuild(self.ws).leer()
-@@ -27760,25 +30022,27 @@
+@@ -27760,25 +30030,27 @@
                  return False
              if not previo:
                  self.ui.aviso("No hay ninguna construcción pendiente.")
@@ -4080,7 +4112,7 @@
  
      # ------------------------------------------------------------ comandos
      def comando(self, entrada: str) -> Optional[str]:
-@@ -27795,6 +30059,7 @@
+@@ -27795,6 +30067,7 @@
              "/history": "historial", "/status": "estado", "/context": "contexto", "/compact": "compactar",
              "/run": "correr", "/test": "tests", "/project": "proyecto", "/model": "modelo", "/mode": "modo",
              "/strong": "modelo_fuerte", "/privacy": "privacidad", "/providers": "proveedores", "/team": "equipo",
@@ -4088,7 +4120,27 @@
          }
          nombre = alias.get(cmd, cmd[1:]).replace("-", "_")
          metodo = getattr(self, "cmd_" + nombre, None)
-@@ -28114,15 +30379,39 @@
+@@ -28025,8 +30298,17 @@
+         try:
+             ruta = resolver_workspace(arg)
+         except ErrorRuta as e:
+-            self.ui.error(str(e))
+-            return
++            nueva = Path(os.path.expandvars(arg.strip())).expanduser()
++            if str(e).startswith("No existe") and self.ui.confirmar(f"No existe {nueva}. ¿La creo como proyecto "
++                                                                     "nuevo?", defecto=True):
++                try:
++                    ruta = resolver_workspace(arg, crear=True)
++                except ErrorRuta as e2:
++                    self.ui.error(str(e2))
++                    return
++            else:
++                self.ui.error(str(e))
++                return
+         self.cambiar_workspace(ruta)
+         detectado = detectar_comando_tests(self.ws)
+         self.ui.ok(f"Proyecto: {self.ws.raiz}")
+@@ -28114,15 +30396,39 @@
              f"tests {'OK' if r.ok else 'FALLARON'} (exit {r.codigo}) · {conteo.texto()} · {formatear_duracion(r.duracion)}")
  
      def cmd_validar(self, arg: str) -> None:
@@ -4130,7 +4182,7 @@
      def cmd_correr(self, arg: str) -> None:
          try:
              tokens = shlex.split(arg)
-@@ -28432,13 +30721,31 @@
+@@ -28432,13 +30738,31 @@
                            f"tests_primero={self.settings.tests_primero}, escalar={self.settings.escalar}")
              return
          try:
@@ -4163,7 +4215,7 @@
  
      def cmd_tema(self, arg: str) -> None:
          if not arg:
-@@ -28449,13 +30756,63 @@
+@@ -28449,13 +30773,63 @@
          self._guardar_settings()
          self.ui.ok(f"Tema: {nombre}")
  
@@ -4227,7 +4279,7 @@
              return
          # Ω §5.1: solo /modelo <alias> o /modelo <rol> <alias> con rol conocido. Nada más se guarda.
          if len(partes) == 1:
-@@ -28600,14 +30957,51 @@
+@@ -28600,14 +30974,51 @@
          sub = (arg or "").strip().lower()
          if sub.startswith("x"):
              partes_x = sub.split()
@@ -4282,7 +4334,7 @@
          estado = estado_equipo(self.settings)
          ind = independencia_equipo(estado)
          if sub in ("independencia", "independence"):
-@@ -28648,6 +31042,11 @@
+@@ -28648,6 +31059,11 @@
          for e in estado:
              marca = "✓ clave" if e["tiene_clave"] else "⚠ FALTA CLAVE"
              self.ui.info(f"  {e['rol']:<13} → {e['proveedor']}/{e.get('modelo_real') or e['modelo']}   {marca}")
@@ -4294,7 +4346,7 @@
          self.ui.tenue(f"  proveedores distintos: {ind['proveedores_distintos']} · "
                        f"modelos distintos: {ind['modelos_distintos']}"
                        + ("  · independencia REDUCIDA" if ind["reducida"] else ""))
-@@ -28699,7 +31098,8 @@
+@@ -28699,7 +31115,8 @@
              return
          if sub == "probar":
              candidatos = [p for p, d in PROVEEDORES.items()
@@ -4304,7 +4356,7 @@
              if not candidatos:
                  self.ui.aviso("Ningún proveedor tiene credencial configurada. Configurá con /proveedores configurar.")
                  return
-@@ -29039,6 +31439,32 @@
+@@ -29039,6 +31456,32 @@
  
      def cmd_doctor(self, arg: str) -> None:
          diagnostico_sistema(self.ui, self.settings, self.llm)
@@ -4337,7 +4389,7 @@
  
      def cmd_instalar(self, arg: str) -> None:
          instalar_lanzador(self.ui)
-@@ -29111,7 +31537,7 @@
+@@ -29111,7 +31554,7 @@
  
      def _leer_entrada(self) -> str:
          marca = f"{Tema.aviso}[plan] {C.RESET}" if self.modo_plan else ""
@@ -4346,7 +4398,7 @@
          if entrada.strip().lower() not in ('"""', '/pegar'):
              return entrada.strip()
          lineas = []
-@@ -29143,25 +31569,44 @@
+@@ -29143,25 +31586,44 @@
              funciones.append(f"escalada→{self.settings.modelo_fuerte}")
          if self.settings.lecciones:
              funciones.append("lecciones")
@@ -4402,7 +4454,7 @@
              for r in ejecutar_hooks(self.ws, "al_iniciar", {"proyecto": str(self.ws.raiz)}):
                  (self.ui.tenue if r.ok else self.ui.aviso)(f"  hook al_iniciar: {r.comando} → {'ok' if r.ok else r.salida[-200:]}")
          while True:
-@@ -33617,7 +36062,7 @@
+@@ -33617,7 +36079,7 @@
      comando_tests="ruby -Ilib -Itest test/test_biblioteca.rb",
      comando_ejecutar="ruby bin/biblioteca",
      etiquetas=("ruby", "cli", "json"),
@@ -4411,7 +4463,7 @@
  )
  
  # ======================================================================
-@@ -33762,7 +36207,7 @@
+@@ -33762,7 +36224,7 @@
  eval { convertir(-1, 'm', 'cm') };
  like($@, qr/negativo/, 'longitud negativa');
  
@@ -4420,7 +4472,7 @@
  like($salida, qr/100 c = 212 f/, 'REPL por stdin convierte');
  like($salida, qr/error: no se puede convertir/, 'REPL por stdin informa errores');
  
-@@ -36762,7 +39207,8 @@
+@@ -36762,7 +39224,8 @@
          for nombre in _RUTAS_GLOBALES:
              self._previas[nombre] = g[nombre]
              g[nombre] = nuevas[nombre]
@@ -4430,7 +4482,7 @@
              self._env_previo[variable] = os.environ.get(variable)
              os.environ[variable] = valor
          (self.base / "tmp").mkdir(parents=True, exist_ok=True)
-@@ -36856,6 +39302,26 @@
+@@ -36856,6 +39319,26 @@
          self.assertEqual(ancho_visible(ajustar("abcdef", 4)), 4)
          self.assertEqual(ajustar("ab", 4), "ab  ")
  
@@ -4457,7 +4509,7 @@
      def test_caja_y_tabla(self):
          dibujo = sin_ansi(caja(["uno", "dos"], titulo="T"))
          lineas = dibujo.splitlines()
-@@ -37928,6 +40394,45 @@
+@@ -37928,6 +40411,45 @@
          self.assertIn("operativos", c.disyuntor.resumen())
  
  
@@ -4503,7 +4555,7 @@
  # ======================================================================
  # MÓDULO: autotest_registro
  # ======================================================================
-@@ -39189,6 +41694,12 @@
+@@ -39189,6 +41711,12 @@
          texto = self.salida(app)
          self.assertIn("proyecto", texto)
          self.assertIn(__version__, texto)
@@ -4516,7 +4568,7 @@
  
      def test_sesion_persistente(self):
          ws = self.proyecto()
-@@ -39271,6 +41782,64 @@
+@@ -39271,6 +41799,64 @@
          diagnostico_sistema(ui, self.ajustes(proveedor="ollama"))
          self.assertIn("DOCTOR REAPER", ui.texto_registrado())
  
@@ -4581,7 +4633,7 @@
      def test_instalar_lanzador(self):
          casa = self.dir / "casa"
          casa.mkdir()
-@@ -39357,7 +41926,7 @@
+@@ -39357,7 +41943,7 @@
                  if not plantilla.comando_tests:
                      continue
                  if not plantilla.disponible():
@@ -4590,7 +4642,7 @@
                  if set(plantilla.requiere) & {"go", "cargo", "javac", "make"} and not os.getenv("REAPER_AUTOTEST_COMPLETO"):
                      continue  # compilar Go/Rust/Java/C tarda: solo con REAPER_AUTOTEST_COMPLETO=1
                  destino = self.dir / "plantillas_generadas" / nombre.replace("-", "_")
-@@ -39527,6 +42096,8 @@
+@@ -39527,6 +42113,8 @@
              "antes_de_comando": ["echo {comando} | grep -qv prohibido"],
          }})})
          ctx = self.contexto(ws)
@@ -4599,7 +4651,7 @@
          salida = self.herramienta(ctx, "write_to_file", path="a.py", content="x = 1")
          self.assertIn("un hook del proyecto modificó a.py", salida)
          self.assertIn("# formateado", ws.leer("a.py"))
-@@ -39535,6 +42106,14 @@
+@@ -39535,6 +42123,14 @@
              self.herramienta(ctx, "execute_command", command="echo prohibido")
          self.assertIn("hook", str(cm.exception))
  
@@ -4614,7 +4666,7 @@
      def test_eventos_y_desactivados(self):
          ws = self.proyecto({".reaper/config.json": '{"hooks": {"despues_de_build": "echo {estado}"}}'})
          resultados = ejecutar_hooks(ws, "despues_de_build", {"estado": "verificada"})
-@@ -39547,8 +42126,9 @@
+@@ -39547,8 +42143,9 @@
  
  class TestRenombrar(BaseTest):
      def test_python_no_toca_strings_ni_comentarios(self):
@@ -4625,7 +4677,7 @@
          self.assertEqual(n, 3)
          self.assertIn("def suma(x):", nuevo)
          self.assertIn("# total sin cambiar", nuevo)
-@@ -39556,9 +42136,23 @@
+@@ -39556,9 +42153,23 @@
          self.assertIn("obj.suma = 1", nuevo)
          self.assertNotIn("subtotal", renombrar_en_texto("b.py", "subtotal = total\n", "total", "suma")[0].replace("subtotal", "ok"))
  
@@ -4650,7 +4702,7 @@
          self.assertEqual(n, 2)
          self.assertIn("const suma = 1; // total", nuevo)
          self.assertIn("subtotal, suma)", nuevo)
-@@ -39586,6 +42180,32 @@
+@@ -39586,6 +42197,32 @@
          self.assertIn("def nueva", ws.leer("m.py"))
          self.assertIn("No encontré", self.herramienta(ctx, "rename_symbol", old="inexistente", new="x"))
  
@@ -4683,7 +4735,7 @@
  
  class TestIngles(BaseTest):
      def test_prompt_en(self):
-@@ -40176,6 +42796,24 @@
+@@ -40176,6 +42813,24 @@
          self.assertIn("SIN PROGRESO", verif.diagnostico)
          self.assertTrue(orq._verificar_tarea(tcid, ConteoTests(), set()).ok)
  
@@ -4708,7 +4760,7 @@
      def test_revisor_no_aprueba_una_tarea_que_rompe_tests(self):
          ws = self.proyecto({
              "calc.py": "def suma(a, b):\n    return a + b\n",
-@@ -40517,8 +43155,9 @@
+@@ -40517,8 +43172,9 @@
          self.assertIsNone(self._detectar({"README.md": "hola"}))
  
      def test_plantilla_ruby_se_detecta_sin_config(self):
@@ -4720,7 +4772,7 @@
          destino = self.dir / "bib"
          crear_desde_plantilla("ruby-biblioteca", destino)
          (destino / ".reaper" / "config.json").unlink(missing_ok=True)
-@@ -43233,11 +45872,20 @@
+@@ -43233,11 +45889,20 @@
          self.assertEqual(destino.read_text(encoding="utf-8"), "previo")   # no lo pisó
  
      def test_ruta_destino_cae_a_interna_sin_sdcard(self):
@@ -4743,7 +4795,7 @@
  
  class TestDeshacerEntrega(BaseTest):
      def test_deshace_si_no_cambio(self):
-@@ -44268,6 +46916,45 @@
+@@ -44268,6 +46933,45 @@
          self.assertTrue(any("descartado" in n for n in informe.notas))
  
  
@@ -4789,7 +4841,7 @@
  class TestReaper810(BaseTest):
      """Regresiones de permisos, identificación e informes del propio REAPER."""
  
-@@ -44300,8 +46987,11 @@
+@@ -44300,8 +47004,11 @@
  # ======================================================================
  class TestReaper810Mejoras(BaseTest):
      def test_alias_heredados_resuelven_sin_id_invalido(self):
@@ -4802,7 +4854,7 @@
          self.assertEqual(resolver_modelo("groq:openai/gpt-oss-120b"), "groq:openai/gpt-oss-120b")
          self.assertEqual(resolver_modelo("openrouter:cohere/north-mini-code:free"),
                           "openrouter:cohere/north-mini-code:free")
-@@ -44501,6 +47191,3438 @@
+@@ -44501,6 +47208,3519 @@
  
  
  # ======================================================================
@@ -7765,6 +7817,87 @@
 +                    os.environ[k] = v
 +
 +
++class TestCarpetaDeProyectoNuevo(BaseTest):
++    """Prueba real en Termux: `reaper --proyecto ~/almacen --grande "..."` terminaba en "No existe" sin hacer nada."""
++
++    def _con_libre(self, valor):
++        previo = os.environ.get("REAPER_LIBRE")
++        if valor:
++            os.environ["REAPER_LIBRE"] = "1"
++        else:
++            os.environ.pop("REAPER_LIBRE", None)
++        return previo
++
++    def _restaurar(self, previo):
++        if previo is None:
++            os.environ.pop("REAPER_LIBRE", None)
++        else:
++            os.environ["REAPER_LIBRE"] = previo
++
++    def test_crea_solo_si_se_pide_y_nunca_fuera_del_home(self):
++        nueva = Path(self.dir) / "nuevo" / "almacen"
++        previo = self._con_libre(True)
++        try:
++            with self.assertRaises(ErrorRuta):
++                resolver_workspace(str(nueva))
++            self.assertFalse(nueva.exists())
++            self.assertEqual(resolver_workspace(str(nueva), crear=True), nueva.resolve())
++            self.assertTrue(nueva.is_dir())
++        finally:
++            self._restaurar(previo)
++        fuera = Path(self.dir) / "fuera_del_home"
++        previo = self._con_libre(False)
++        try:
++            if Path.home().resolve() in fuera.resolve().parents:
++                self.skipTest("la carpeta temporal está dentro del home")
++            with self.assertRaises(ErrorRuta) as ctx:
++                resolver_workspace(str(fuera), crear=True)
++            self.assertIn("Por seguridad", str(ctx.exception))
++            self.assertFalse(fuera.exists())                                        # ni siquiera la crea
++        finally:
++            self._restaurar(previo)
++
++    def test_cli_crea_la_carpeta_para_un_proyecto_nuevo_y_no_para_estado(self):
++        nueva = Path(self.dir) / "almacen_cli"
++        previo = self._con_libre(True)
++        clave = os.environ.get("OPENROUTER_API_KEY")
++        os.environ["OPENROUTER_API_KEY"] = "clave-de-prueba-0123456789"
++        original = App.construir
++        App.construir = lambda self, pedido, confirmar=True, reanudar=False: False
++        try:
++            salida = io.StringIO()
++            with contextlib.redirect_stdout(salida):
++                self.assertEqual(main(["--proyecto", str(nueva), "--sin-animacion", "--grande", "estado"]), 1)
++                self.assertFalse(nueva.exists())                                    # ver el estado no crea nada
++                self.assertEqual(main(["--proyecto", str(nueva), "--sin-animacion", "--construir", "algo"]), 2)
++            self.assertTrue(nueva.is_dir())
++            self.assertIn("Creé la carpeta del proyecto", salida.getvalue())
++        finally:
++            App.construir = original
++            self._restaurar(previo)
++            if clave is None:
++                os.environ.pop("OPENROUTER_API_KEY", None)
++            else:
++                os.environ["OPENROUTER_API_KEY"] = clave
++
++    def test_proyecto_en_el_repl_pregunta_antes_de_crear(self):
++        nueva = Path(self.dir) / "repl_nuevo"
++        previo = self._con_libre(True)
++        try:
++            app = App(self.ajustes(), MockLLM([]), self.ui(respuestas=["s"], interactivo=True), self.proyecto({}),
++                      persistir=False)
++            app.cmd_proyecto(str(nueva))
++            self.assertTrue(nueva.is_dir())
++            self.assertEqual(app.ws.raiz, nueva.resolve())
++            otra = Path(self.dir) / "repl_no"
++            app2 = App(self.ajustes(), MockLLM([]), self.ui(respuestas=["n"], interactivo=True), self.proyecto({}),
++                       persistir=False)
++            app2.cmd_proyecto(str(otra))
++            self.assertFalse(otra.exists())
++        finally:
++            self._restaurar(previo)
++
++
 +# ======================================================================
 +# MÓDULO: autotest_cupo
 +# ======================================================================
@@ -8241,7 +8374,7 @@
  # MÓDULO: autotest_runner
  # ======================================================================
  """Ejecutor del autotest interno."""
-@@ -44514,6 +50636,44 @@
+@@ -44514,6 +50734,44 @@
      )
  
  
@@ -8286,7 +8419,7 @@
  def correr_autotest(filtro: Optional[str] = None, verbosidad: Optional[int] = None) -> int:
      filtro = (filtro if filtro is not None else os.getenv("REAPER_AUTOTEST", "")).lower()
      verbosidad = verbosidad if verbosidad is not None else (2 if os.getenv("REAPER_AUTOTEST_V") else 1)
-@@ -44525,13 +50685,39 @@
+@@ -44525,13 +50783,39 @@
          suite.addTests(cargador.loadTestsFromTestCase(clase))
      total = suite.countTestCases()
      if total == 0:
@@ -8328,7 +8461,7 @@
      if resultado.wasSuccessful():
          print(f"{Tema.ok}✓ {resultado.testsRun} tests OK en {duracion}"
                f"{f' ({len(resultado.skipped)} salteados)' if resultado.skipped else ''}{C.RESET}")
-@@ -45345,6 +51531,33 @@
+@@ -45345,6 +51629,33 @@
      return [c for c in comandos if isinstance(c, str) and c.strip()]
  
  
@@ -8362,7 +8495,7 @@
  def ejecutar_hooks(ws: Workspace, evento: str, variables: Optional[dict] = None, timeout: int = 60) -> list[ResultadoHook]:
      if evento not in EVENTOS_HOOK:
          raise ValueError(f"evento de hook desconocido: {evento}")
-@@ -45360,7 +51573,7 @@
+@@ -45360,7 +51671,7 @@
  
  def _hook_post_escritura(ctx: Contexto, rel: str) -> str:
      """Corre los hooks despues_de_escribir; devuelve texto para el agente si alguno falló o cambió algo."""
@@ -8371,7 +8504,7 @@
          return ""
      antes = ctx.ws.hash(rel)
      resultados = ejecutar_hooks(ctx.ws, "despues_de_escribir", {"archivo": rel})
-@@ -45377,7 +51590,7 @@
+@@ -45377,7 +51688,7 @@
  
  def _hook_antes_de_comando(ctx: Contexto, comando: str) -> Optional[str]:
      """Devuelve el motivo si un hook bloquea el comando."""
@@ -8380,7 +8513,7 @@
          return None
      for r in ejecutar_hooks(ctx.ws, "antes_de_comando", {"comando": comando}):
          if not r.ok:
-@@ -45404,27 +51617,84 @@
+@@ -45404,27 +51715,84 @@
  import tokenize as _tokenize
  
  _RE_IDENT_VALIDO = re.compile(r"^[A-Za-z_$][\w$]*$")
@@ -8402,9 +8535,8 @@
 +            for alias in nodo.names:
 +                nombres.add((alias.asname or alias.name).split(".")[0])
 +    return nombres
++
  
- 
--def _renombrar_python(texto: str, viejo: str, nuevo: str) -> tuple[str, int]:
 +def _es_metodo_de_clase(texto: str, viejo: str) -> bool:
 +    """¿`viejo` está definido como método (def directo en el cuerpo de una clase)? Entonces los accesos por
 +    atributo (`obj.viejo`) son sus llamadas y SÍ deben renombrarse; si no, son miembros ajenos del mismo nombre."""
@@ -8418,7 +8550,8 @@
 +                if isinstance(hijo, (ast.FunctionDef, ast.AsyncFunctionDef)) and hijo.name == viejo:
 +                    return True
 +    return False
-+
+ 
+-def _renombrar_python(texto: str, viejo: str, nuevo: str) -> tuple[str, int]:
 +
 +def _renombrar_python(texto: str, viejo: str, nuevo: str, incluir_atributos: bool = True) -> tuple[str, int, int]:
 +    """
@@ -8472,7 +8605,7 @@
      largo = len(viejo)
      while i < n:
          ch = texto[i]
-@@ -45455,27 +51725,33 @@
+@@ -45455,27 +51823,33 @@
              antes = texto[i - 1] if i > 0 else ""
              despues = texto[i + largo] if i + largo < n else ""
              if not (antes.isalnum() or antes in "_$") and not (despues.isalnum() or despues in "_$"):
@@ -8514,7 +8647,7 @@
  
  
  @dataclass
-@@ -45484,6 +51760,7 @@
+@@ -45484,6 +51858,7 @@
      nuevo: str
      cambios: dict = field(default_factory=dict)  # rel → (antes, despues, cantidad)
      conflictos: list = field(default_factory=list)
@@ -8522,7 +8655,7 @@
  
      @property
      def total(self) -> int:
-@@ -45507,6 +51784,10 @@
+@@ -45507,6 +51882,10 @@
          raise ValueError(f"'{nuevo}' es una palabra reservada de Python")
      plan = PlanRenombrado(viejo, nuevo)
      candidatos = list(archivos) if archivos else ws.archivos_codigo(limite=3000)
@@ -8533,7 +8666,7 @@
      for rel in candidatos:
          try:
              texto = ws.leer(rel)
-@@ -45514,7 +51795,13 @@
+@@ -45514,7 +51893,13 @@
              continue
          if viejo not in texto:
              continue
@@ -8548,7 +8681,7 @@
          if cantidad > 0:
              if re.search(r"(?<![\w$])" + re.escape(nuevo) + r"(?![\w$])", texto):
                  plan.conflictos.append(f"{rel}: ya existe el nombre '{nuevo}'")
-@@ -45570,6 +51857,10 @@
+@@ -45570,6 +51955,10 @@
      texto = plan.resumen()
      if plan.conflictos:
          texto += "\nOjo, el nombre nuevo ya existía en: " + "; ".join(plan.conflictos)
@@ -8559,7 +8692,7 @@
      return texto + "\nValidación: " + resumen_validacion(resultados)
  
  
-@@ -45675,6 +51966,11 @@
+@@ -45675,6 +52064,11 @@
  Define the public INTERFACE (files, functions/classes and exact signatures): tests are written from it BEFORE
  implementing, so it must be precise and importable.
  If a new file will be long (more than ~250 lines), split it into several modules or tasks.
@@ -8571,7 +8704,7 @@
  Your attempt_completion MUST contain the plan EXACTLY in this format:
  <plan>
  <objetivo>one sentence</objetivo>
-@@ -45788,6 +52084,23 @@
+@@ -45788,6 +52182,23 @@
  A criterion is MET only if you cite evidence that proves it; without evidence it is UNKNOWN.
  Reply ONLY a JSON object: {"criteria": [{"criterion": "...", "status": "MET|NOT_MET|UNKNOWN",
  "evidence_ids": ["EV-..."]}]}""",
@@ -8595,7 +8728,7 @@
  }
  
  DOCS_EN = {
-@@ -46847,17 +53160,17 @@
+@@ -46847,17 +53258,17 @@
  
  
  _PROCESOS: dict[str, ProcesoFondo] = {}
@@ -8616,7 +8749,7 @@
          procesos = list(_PROCESOS.values())
          _PROCESOS.clear()
      detenidos = 0
-@@ -46873,7 +53186,7 @@
+@@ -46873,7 +53284,7 @@
  
  def _proceso(ctx: Contexto, p: dict) -> ProcesoFondo:
      id_ = (p.get("id") or "").strip()
@@ -8625,7 +8758,7 @@
          if not id_ and len(_PROCESOS) == 1:
              return next(iter(_PROCESOS.values()))
          proceso = _PROCESOS.get(id_)
-@@ -46921,7 +53234,7 @@
+@@ -46921,7 +53332,7 @@
          proceso = ProcesoFondo(id_, comando, ctx.ws.raiz, _entrada_estandar(p))
      except OSError as e:
          raise ErrorHerramienta(f"No pude iniciar el proceso: {e}")
@@ -8634,7 +8767,7 @@
          _PROCESOS[id_] = proceso
      listo = proceso.esperar_texto(patron, timeout if patron else min(timeout, 0.8))
      salida = proceso.nuevas(80)
-@@ -46974,7 +53287,7 @@
+@@ -46974,7 +53385,7 @@
      proceso = _proceso(ctx, p)
      estaba_vivo = proceso.vivo
      codigo = proceso.detener()
@@ -8643,7 +8776,7 @@
          _PROCESOS.pop(proceso.id, None)
      finales = proceso.nuevas(60) or proceso.ultimas(20)
      estado = "detenido" if estaba_vivo else f"ya había terminado (código {codigo})"
-@@ -47018,7 +53331,7 @@
+@@ -47018,7 +53429,7 @@
          if objetivo == "todos":
              self.ui.ok(f"Detenidos {detener_todos_los_procesos()} proceso(s).")
              return
@@ -8652,7 +8785,7 @@
              proceso = _PROCESOS.pop(objetivo, None)
          if proceso is None:
              self.ui.error(f"No existe el proceso {objetivo}.")
-@@ -47140,6 +53453,49 @@
+@@ -47140,6 +53551,49 @@
      modo: no es censura, protegen el celular de un error del modelo.
  """)
  
@@ -8702,7 +8835,7 @@
  capitulo("construir", "/construir: el pipeline completo", """
      # /construir
  
-@@ -49171,6 +55527,314 @@
+@@ -49171,6 +55625,314 @@
      return salida
  
  
@@ -9017,7 +9150,7 @@
  def modelos_potentes_free() -> list:
      """Alias curados de modelos free POTENTES (del catálogo estático), como (alias, info)."""
      return [(alias, info) for alias, info in INFO_MODELOS.items() if info.free]
-@@ -49209,9 +55873,11 @@
+@@ -49209,9 +55971,11 @@
      """Petición mínima REAL a un modelo concreto (sin fallback): dice si responde de verdad."""
      t0 = time.monotonic()
      try:
@@ -9030,7 +9163,7 @@
          ms = round((time.monotonic() - t0) * 1000)
          visible = str(getattr(resp, "texto", "") or "").strip()
          if "REAPER_OK" not in visible.upper():
-@@ -49227,6 +55893,48 @@
+@@ -49227,6 +55991,48 @@
          return {"estado": "FALLA", "detalle": f"{type(e).__name__}: {e}"[:120]}
  
  
@@ -9079,7 +9212,7 @@
  def probar_equipo(llm, settings) -> list:
      """
      Prueba de verdad cada uno de los seis roles con una petición mínima. Dedup por modelo (no gasta de más).
-@@ -49254,7 +55962,8 @@
+@@ -49254,7 +56060,8 @@
      ind = independencia_equipo(estado)
      con_clave = sum(1 for e in estado if e["tiene_clave"])
      aviso = "" if con_clave == len(estado) else f" · {len(estado) - con_clave} sin clave"
@@ -9089,7 +9222,7 @@
              f" · conectividad NO VERIFICADA (/equipo probar)")
  
  
-@@ -49593,7 +56302,8 @@
+@@ -49593,7 +56400,8 @@
      return h.hexdigest(), tam
  
  
@@ -9099,7 +9232,7 @@
      """
      Elige una ruta de salida REAL y legible. Prefiere la autorizada; si no hay acceso a almacenamiento
      compartido, cae a una carpeta interna de REAPER (sin fingir que llegó a /sdcard). Devuelve (ruta, externo).
-@@ -49601,7 +56311,8 @@
+@@ -49601,7 +56409,8 @@
      candidatas = []
      if preferida:
          candidatas.append(Path(preferida).expanduser())
@@ -9109,7 +9242,7 @@
      for base in candidatas:
          try:
              if base.is_dir() and os.access(base, os.W_OK):
-@@ -49938,7 +56649,8 @@
+@@ -49938,7 +56747,8 @@
      """Prueba cada proveedor pedido (o todos los que tengan credencial). Dedup implícito por proveedor."""
      if not proveedores:
          proveedores = [p for p, d in PROVEEDORES.items()
@@ -9119,7 +9252,7 @@
      return [probar_proveedor(llm, p, settings) for p in proveedores]
  
  
-@@ -50198,6 +56910,65 @@
+@@ -50198,6 +57008,65 @@
      return salida
  
  
@@ -9185,7 +9318,7 @@
  def conteo_equipo_x(settings, probados: Optional[dict] = None) -> dict:
      """
      Conteos honestos y separados: roles, modelos distintos configurados, modelos distintos VERIFICADOS (solo los
-@@ -50216,6 +56987,1043 @@
+@@ -50216,6 +57085,1043 @@
  
  
  # ======================================================================
@@ -10229,7 +10362,7 @@
  # MÓDULO: main
  # ======================================================================
  """Punto de entrada."""
-@@ -50227,7 +58035,13 @@
+@@ -50227,7 +58133,13 @@
          description=f"REAPER {__version__} · agente de programación autónomo para Termux",
      )
      parser.add_argument("-p", "--pedido", help="ejecuta un pedido con el agente principal y sale")
@@ -10244,7 +10377,7 @@
      parser.add_argument("--plan", help="solo exploración + plan y sale")
      parser.add_argument("--torneo", help="corre un torneo de implementadores para una tarea y sale")
      parser.add_argument("--escribir", nargs=2, metavar=("RUTA", "DESCRIPCION"), help="genera un archivo largo y sale")
-@@ -50263,7 +58077,9 @@
+@@ -50263,7 +58175,9 @@
  def aplicar_flags_cli(settings: Settings, args) -> Settings:
      """Flags de línea de comandos ("solo esta ejecución"): tienen la máxima precedencia."""
      if args.perfil:
@@ -10255,7 +10388,7 @@
      if args.modelo:
          settings.modelo = resolver_modelo(args.modelo)
      if args.modelo_fuerte:
-@@ -50308,7 +58124,7 @@
+@@ -50308,7 +58222,7 @@
      aplicar_tema(settings.tema)
      aplicar_flags_cli(settings, args)
  
@@ -10264,7 +10397,23 @@
                            or args.evaluar is not None or args.comportamiento is not None or args.aceptacion)
      log = LOGS_DIR / f"{datetime.now():%Y%m%d}.log" if settings.log else None
      ui = UI(interactivo=not no_interactivo or sys.stdin.isatty(), log=log,
-@@ -50387,12 +58203,26 @@
+@@ -50375,7 +58289,14 @@
+         cargar_plugins(ui=ui)
+     try:
+         if args.proyecto:
+-            raiz = resolver_workspace(args.proyecto)
++            # Un /construir o /grande NUEVO crea su carpeta (lo normal es que todavía no exista); retomar, ver el
++            # estado o deshacer necesitan una carpeta que ya exista.
++            nuevo = bool((args.construir and args.construir.strip().lower() not in ("continuar", "estado"))
++                         or (args.grande and args.grande.strip().lower() not in ("continuar", "estado", "deshacer")))
++            existia = Path(os.path.expandvars(args.proyecto.strip())).expanduser().exists()
++            raiz = resolver_workspace(args.proyecto, crear=nuevo)
++            if nuevo and not existia:
++                ui.ok(f"Creé la carpeta del proyecto: {_ruta_corta(raiz)}")
+         else:
+             guardado = cargar_estado().get("proyecto")
+             raiz = Path(guardado) if guardado and Path(guardado).is_dir() else PROJECTS_DIR
+@@ -50387,12 +58308,26 @@
      # R-011: aplicar los overrides de .reaper/config.json del proyecto ANTES de construir el cliente, para que
      # candidatos/torneo/rpm/modelo/temperatura del proyecto manden de verdad (antes se definían y se ignoraban).
      if ws.config_local().get("settings"):
@@ -10292,7 +10441,7 @@
      app = App(settings, llm, ui, ws)
      if args.proyecto:
          guardar_estado(proyecto=str(ws.raiz))
-@@ -50403,11 +58233,34 @@
+@@ -50403,11 +58338,34 @@
              return 0 if correr_evaluacion(llm, settings, ui, cantidad=args.evaluar or None) else 2
          if args.comportamiento is not None:
              return 0 if correr_comportamiento(llm, settings, ui, ids=args.comportamiento) else 2
@@ -10327,7 +10476,7 @@
          if args.torneo:
              app.cmd_torneo(args.torneo)
              return 0
-@@ -50423,9 +58276,15 @@
+@@ -50423,9 +58381,15 @@
      except (KeyboardInterrupt, Cancelado):
          CANCELAR.set()
          ui.aviso("\n⏹ Interrumpido.")

@@ -5634,7 +5634,7 @@ index 390095e..919a836 100644
  """
  
 diff --git a/partes/35_cli.py b/partes/35_cli.py
-index 9e5d20f..fd2814b 100644
+index 9e5d20f..03f2a7a 100644
 --- a/partes/35_cli.py
 +++ b/partes/35_cli.py
 @@ -20,6 +20,10 @@ COMANDOS_AYUDA = [
@@ -5684,7 +5684,38 @@ index 9e5d20f..fd2814b 100644
          for comando, descripcion in comandos:
              if ancho < 70:
                  lineas.append(f"  {Tema.ok}{comando}{C.RESET}")
-@@ -110,6 +119,29 @@ def resolver_workspace(texto: str) -> Path:
+@@ -92,24 +101,55 @@ def texto_ayuda() -> str:
+     return "\n".join(lineas)
+ 
+ 
+-def resolver_workspace(texto: str) -> Path:
++def resolver_workspace(texto: str, crear: bool = False) -> Path:
++    """Carpeta del proyecto (siempre dentro de tu home, salvo REAPER_LIBRE=1). Con crear=True, si no existe la crea:
++    para un proyecto NUEVO lo normal es que todavía no exista (prueba real en Termux: `reaper --proyecto ~/almacen
++    --grande "..."` terminaba en "No existe" sin hacer nada)."""
+     ruta = Path(os.path.expandvars(texto.strip())).expanduser().resolve()
+-    if not ruta.exists():
+-        raise ErrorRuta(f"No existe: {ruta}")
+-    if not ruta.is_dir():
+-        raise ErrorRuta(f"No es una carpeta: {ruta}")
+     if not os.getenv("REAPER_LIBRE"):
+         home = Path.home().resolve()
+         if ruta != home and home not in ruta.parents:
+             raise ErrorRuta(
+                 f"Por seguridad el proyecto debe estar dentro de {home} (o exportá REAPER_LIBRE=1)."
+             )
++    if not ruta.exists():
++        if not crear:
++            raise ErrorRuta(f"No existe: {ruta}")
++        try:
++            ruta.mkdir(parents=True)
++        except OSError as e:
++            raise ErrorRuta(f"No pude crear la carpeta {ruta}: {e}") from e
++    if not ruta.is_dir():
++        raise ErrorRuta(f"No es una carpeta: {ruta}")
+     return ruta
+ 
+ 
  _RE_MENCION = re.compile(r"(?<![\w/])@([\w./-]+\.[\w]+|[\w./-]+/)")
  
  
@@ -5714,7 +5745,7 @@ index 9e5d20f..fd2814b 100644
  class App:
      def __init__(self, settings: Settings, llm, ui: UI, ws: Workspace, persistir: bool = True):
          self.settings = settings
-@@ -117,10 +149,15 @@ class App:
+@@ -117,10 +157,15 @@ class App:
          self.ui = ui
          self.ws = ws
          self.persistir = persistir
@@ -5730,7 +5761,7 @@ index 9e5d20f..fd2814b 100644
          self.modo_plan = False
          self.escalador = Escalador(llm, settings, ui)
          self.memoria = self._nueva_memoria()
-@@ -131,6 +168,10 @@ class App:
+@@ -131,6 +176,10 @@ class App:
              self._cargar_sesion()
  
      # ------------------------------------------------------------ sesión
@@ -5741,7 +5772,7 @@ index 9e5d20f..fd2814b 100644
      def _nueva_memoria(self) -> Optional[MemoriaLecciones]:
          if not self.settings.lecciones:
              return None
-@@ -157,9 +198,15 @@ class App:
+@@ -157,9 +206,15 @@ class App:
              mensajes = self.principal.mensajes[1:][-60:]
              while mensajes and mensajes[0]["role"] != "user":
                  mensajes = mensajes[1:]
@@ -5759,7 +5790,7 @@ index 9e5d20f..fd2814b 100644
          except OSError as e:
              self.ui.aviso(f"No pude guardar la sesión: {e}")
  
-@@ -168,18 +215,41 @@ class App:
+@@ -168,18 +223,41 @@ class App:
              datos = json.loads(self._ruta_sesion().read_text(encoding="utf-8"))
          except (OSError, ValueError):
              return
@@ -5804,7 +5835,7 @@ index 9e5d20f..fd2814b 100644
          self.memoria = self._nueva_memoria()
          self.principal = self._nuevo_principal()
          self.historial = []
-@@ -203,12 +273,21 @@ class App:
+@@ -203,12 +281,21 @@ class App:
              if ruta.is_dir():
                  listado = [self.ws.rel(p) for p in self.ws.iterar(rel, limite=60)]
                  adjuntos.append(f"### Carpeta {self.ws.rel(ruta)}\n" + "\n".join(listado))
@@ -5828,7 +5859,7 @@ index 9e5d20f..fd2814b 100644
                  extra = f"\n(... {len(lineas) - 300} líneas más: usá read_file)" if len(lineas) > 300 else ""
                  adjuntos.append(f"### {self.ws.rel(ruta)} ({len(lineas)} líneas)\n{cuerpo}{extra}")
          if not adjuntos:
-@@ -250,19 +329,52 @@ class App:
+@@ -250,19 +337,52 @@ class App:
              f"adaptalo y decilo en el informe):\n{res.resumen}"
          )
  
@@ -5883,7 +5914,7 @@ index 9e5d20f..fd2814b 100644
          self.ui.linea("")
          self.ui.linea(f"{Tema.agente}{C.BOLD}reaper »{C.RESET}")
          mostrar_markdown(self.ui, res.resumen)
-@@ -280,26 +392,55 @@ class App:
+@@ -280,26 +400,55 @@ class App:
              detalle.append("con escalada")
          self.ui.tenue("  " + " · ".join(detalle))
          claim = getattr(self.principal, "_ultimo_claim", None)
@@ -5944,7 +5975,7 @@ index 9e5d20f..fd2814b 100644
  
      # ------------------------------------------------------------ comandos
      def comando(self, entrada: str) -> Optional[str]:
-@@ -316,6 +457,7 @@ class App:
+@@ -316,6 +465,7 @@ class App:
              "/history": "historial", "/status": "estado", "/context": "contexto", "/compact": "compactar",
              "/run": "correr", "/test": "tests", "/project": "proyecto", "/model": "modelo", "/mode": "modo",
              "/strong": "modelo_fuerte", "/privacy": "privacidad", "/providers": "proveedores", "/team": "equipo",
@@ -5952,7 +5983,7 @@ index 9e5d20f..fd2814b 100644
          }
          nombre = alias.get(cmd, cmd[1:]).replace("-", "_")
          metodo = getattr(self, "cmd_" + nombre, None)
-@@ -347,6 +489,71 @@ class App:
+@@ -347,6 +497,71 @@ class App:
      def cmd_ayuda(self, arg: str) -> None:
          self.ui.linea(texto_ayuda())
  
@@ -6024,7 +6055,7 @@ index 9e5d20f..fd2814b 100644
      def cmd_salir(self, arg: str) -> str:
          self._guardar_sesion()
          u = self.llm.uso
-@@ -357,8 +564,35 @@ class App:
+@@ -357,8 +572,35 @@ class App:
  
      # ---------------------------------------------------------------- equipo
      def cmd_construir(self, arg: str) -> None:
@@ -6061,7 +6092,27 @@ index 9e5d20f..fd2814b 100644
              return
          self.construir(arg)
  
-@@ -543,15 +777,39 @@ class App:
+@@ -454,8 +696,17 @@ class App:
+         try:
+             ruta = resolver_workspace(arg)
+         except ErrorRuta as e:
+-            self.ui.error(str(e))
+-            return
++            nueva = Path(os.path.expandvars(arg.strip())).expanduser()
++            if str(e).startswith("No existe") and self.ui.confirmar(f"No existe {nueva}. ¿La creo como proyecto "
++                                                                     "nuevo?", defecto=True):
++                try:
++                    ruta = resolver_workspace(arg, crear=True)
++                except ErrorRuta as e2:
++                    self.ui.error(str(e2))
++                    return
++            else:
++                self.ui.error(str(e))
++                return
+         self.cambiar_workspace(ruta)
+         detectado = detectar_comando_tests(self.ws)
+         self.ui.ok(f"Proyecto: {self.ws.raiz}")
+@@ -543,15 +794,39 @@ class App:
              f"tests {'OK' if r.ok else 'FALLARON'} (exit {r.codigo}) · {conteo.texto()} · {formatear_duracion(r.duracion)}")
  
      def cmd_validar(self, arg: str) -> None:
@@ -6103,7 +6154,7 @@ index 9e5d20f..fd2814b 100644
      def cmd_correr(self, arg: str) -> None:
          try:
              tokens = shlex.split(arg)
-@@ -600,6 +858,10 @@ class App:
+@@ -600,6 +875,10 @@ class App:
              self.ui.info("Reintentando ejecución...")
  
      def cmd_vigilar(self, arg: str) -> None:
@@ -6114,7 +6165,7 @@ index 9e5d20f..fd2814b 100644
          vigilar(self.ws, self.ui, comando=arg or None, timeout=self.settings.tests_timeout)
  
      def cmd_diff(self, arg: str) -> None:
-@@ -797,7 +1059,25 @@ class App:
+@@ -797,7 +1076,25 @@ class App:
              self.ui.linea(f"  {Tema.tenue}{hora}{C.RESET} {Tema.ok + '✓' if ok else Tema.error + '✗'}{C.RESET} {texto}")
  
      def cmd_exportar(self, arg: str) -> None:
@@ -6141,7 +6192,7 @@ index 9e5d20f..fd2814b 100644
          partes = [f"# Conversación REAPER · {self.ws.raiz.name}\n", f"Fecha: {datetime.now():%Y-%m-%d %H:%M}\n"]
          for m in self.principal.mensajes[1:]:
              quien = "Vos" if m["role"] == "user" else "REAPER"
-@@ -828,7 +1108,7 @@ class App:
+@@ -828,7 +1125,7 @@ class App:
              return
          self.modo_plan = False
          self.settings.modo = arg
@@ -6150,7 +6201,7 @@ index 9e5d20f..fd2814b 100644
          self.ui.ok(f"Modo: {arg}")
  
      def cmd_perfil(self, arg: str) -> None:
-@@ -839,13 +1119,31 @@ class App:
+@@ -839,13 +1136,31 @@ class App:
                            f"tests_primero={self.settings.tests_primero}, escalar={self.settings.escalar}")
              return
          try:
@@ -6184,7 +6235,7 @@ index 9e5d20f..fd2814b 100644
  
      def cmd_tema(self, arg: str) -> None:
          if not arg:
-@@ -853,22 +1151,83 @@ class App:
+@@ -853,22 +1168,83 @@ class App:
              return
          nombre = aplicar_tema(arg)
          self.settings.tema = nombre
@@ -6270,7 +6321,7 @@ index 9e5d20f..fd2814b 100644
              return
          if len(partes) == 2 and partes[0].lower() in ROLES:
              rol = partes[0].lower()
-@@ -877,12 +1236,13 @@ class App:
+@@ -877,12 +1253,13 @@ class App:
              else:
                  self.settings.modelos_rol[rol] = resolver_modelo(partes[1])
              self.ui.ok(f"{rol} → {self.settings.modelo_para(rol)}")
@@ -6286,7 +6337,7 @@ index 9e5d20f..fd2814b 100644
          else:
              self.ui.error("Uso: /modelo [<alias>] | /modelo <rol> <alias>. Demasiados argumentos; no guardé nada.")
  
-@@ -900,7 +1260,7 @@ class App:
+@@ -900,7 +1277,7 @@ class App:
              self.settings.modelo_fuerte = arg
              self.settings.escalar = True
              self.ui.ok(f"Modelo de escalada: {resolver_modelo(arg)}")
@@ -6295,7 +6346,7 @@ index 9e5d20f..fd2814b 100644
  
      def cmd_modelos(self, arg: str) -> None:
          partes = (arg or "").split(maxsplit=1)
-@@ -955,12 +1315,12 @@ class App:
+@@ -955,12 +1332,12 @@ class App:
          arg = arg.strip()
          if arg.lower() in ("off", "no", "0", "stop", "salir", "apagar"):
              self.settings.modo_seguridad = False
@@ -6310,7 +6361,7 @@ index 9e5d20f..fd2814b 100644
                  self.ui.info(f"  Alcance autorizado: {self.settings.alcance_autorizado}")
              else:
                  self.ui.info("Modo seguridad apagado.")
-@@ -970,7 +1330,7 @@ class App:
+@@ -970,7 +1347,7 @@ class App:
              return
          self.settings.alcance_autorizado = arg
          self.settings.modo_seguridad = True
@@ -6319,7 +6370,7 @@ index 9e5d20f..fd2814b 100644
          self.ui.ok("Modo seguridad ACTIVADO (pentest / CTF / lab / estudio).")
          self.ui.info(f"  Alcance autorizado: {arg}")
          self.ui.aviso("  REAPER hará trabajo ofensivo SOLO dentro de ese alcance. Fuera de ahí, frena y avisa.")
-@@ -983,7 +1343,7 @@ class App:
+@@ -983,7 +1360,7 @@ class App:
          if sub in ("estricto", "estricta", "strict"):
              valor = len(partes) > 1 and partes[1].lower() in ("on", "si", "sí", "1", "true")
              self.settings.privacidad_estricta = valor
@@ -6328,7 +6379,7 @@ index 9e5d20f..fd2814b 100644
              self.ui.ok(f"Privacidad estricta: {'ON' if valor else 'OFF'}.")
              if valor:
                  self.ui.tenue("  Los modelos externos quedan BLOQUEADOS: solo saldrá tráfico a un proveedor local (ollama).")
-@@ -991,8 +1351,55 @@ class App:
+@@ -991,8 +1368,55 @@ class App:
          self.ui.linea(texto_reporte_privacidad(reporte_privacidad(self.llm, self.settings)))
  
      def cmd_equipo(self, arg: str) -> None:
@@ -6385,7 +6436,7 @@ index 9e5d20f..fd2814b 100644
          estado = estado_equipo(self.settings)
          ind = independencia_equipo(estado)
          if sub in ("independencia", "independence"):
-@@ -1008,33 +1415,43 @@ class App:
+@@ -1008,33 +1432,43 @@ class App:
                  self.ui.tenue("  Configurá un proveedor free: export GROQ_API_KEY=... (o NVIDIA/GEMINI/OpenRouter).")
              else:
                  self.settings.modelos_rol.update(asignacion)
@@ -6435,7 +6486,7 @@ index 9e5d20f..fd2814b 100644
  
      def cmd_proveedores(self, arg: str) -> None:
          """Estado de proveedores SIN exponer secretos. Las claves salen de env o .clave_<proveedor>."""
-@@ -1077,12 +1494,28 @@ class App:
+@@ -1077,12 +1511,28 @@ class App:
                            f"{c['providers_chat_operational']} · free confirmado: {c['providers_free_confirmed']}")
              self.ui.tenue("  Un gateway (OpenRouter) es 1 proveedor, no cientos. Credencial presente ≠ autenticado.")
              return
@@ -6469,7 +6520,7 @@ index 9e5d20f..fd2814b 100644
              return
          self.ui.error("Uso: /proveedores [estado|configurar|estadisticas|probar|sincronizar|diagnostico]")
  
-@@ -1170,7 +1603,11 @@ class App:
+@@ -1170,7 +1620,11 @@ class App:
              self.ui.error("Uso: /muestra <archivo>  (análisis estático; la muestra NUNCA se ejecuta)")
              return
          try:
@@ -6482,7 +6533,7 @@ index 9e5d20f..fd2814b 100644
          except (OSError, ValueError, ErrorRuta) as e:
              self.ui.error(f"No pude leer {ruta}: {e}")
              return
-@@ -1333,7 +1770,7 @@ class App:
+@@ -1333,7 +1787,7 @@ class App:
              aplicar_tema(self.settings.tema)
          if clave in ("rpm", "modelo") and hasattr(self.llm, "limitador"):
              self.llm.limitador = LimitadorTasa(self.settings.rpm_efectivo())
@@ -6491,7 +6542,7 @@ index 9e5d20f..fd2814b 100644
          self.ui.ok(f"{clave} = {getattr(self.settings, clave)!r}")
  
      def cmd_uso(self, arg: str) -> None:
-@@ -1374,6 +1811,7 @@ class App:
+@@ -1374,6 +1828,7 @@ class App:
  
      def cmd_reset(self, arg: str) -> None:
          self.principal = self._nuevo_principal()
@@ -6499,7 +6550,7 @@ index 9e5d20f..fd2814b 100644
          try:
              self._ruta_sesion().unlink()
          except OSError:
-@@ -1399,6 +1837,32 @@ class App:
+@@ -1399,6 +1854,32 @@ class App:
  
      def cmd_doctor(self, arg: str) -> None:
          diagnostico_sistema(self.ui, self.settings, self.llm)
@@ -6532,7 +6583,7 @@ index 9e5d20f..fd2814b 100644
  
      def cmd_instalar(self, arg: str) -> None:
          instalar_lanzador(self.ui)
-@@ -1471,15 +1935,24 @@ class App:
+@@ -1471,15 +1952,24 @@ class App:
  
      def _leer_entrada(self) -> str:
          marca = f"{Tema.aviso}[plan] {C.RESET}" if self.modo_plan else ""
@@ -6564,7 +6615,7 @@ index 9e5d20f..fd2814b 100644
  
      def mostrar_inicio(self, animar: bool = True) -> None:
          if not (animar and self.settings.animacion and animar_intro()):
-@@ -1494,24 +1967,44 @@ class App:
+@@ -1494,24 +1984,44 @@ class App:
              funciones.append(f"escalada→{self.settings.modelo_fuerte}")
          if self.settings.lecciones:
              funciones.append("lecciones")
@@ -10752,10 +10803,10 @@ index 0000000..9a0ba17
 +        self.assertIn(nombre, ("pytest", "unittest"))
 diff --git a/partes/48zi_autotest_grande.py b/partes/48zi_autotest_grande.py
 new file mode 100644
-index 0000000..af2338e
+index 0000000..96eaec2
 --- /dev/null
 +++ b/partes/48zi_autotest_grande.py
-@@ -0,0 +1,573 @@
+@@ -0,0 +1,654 @@
 +"""
 +Autotests de /grande (proyecto grande por etapas) con un modelo SIMULADO que escribe código de verdad: un gestor de
 +biblioteca en 3 etapas (almacenamiento SQLite → préstamos → CLI). Los tests del proyecto se ejecutan de verdad en
@@ -11329,6 +11380,87 @@ index 0000000..af2338e
 +                    os.environ.pop(k, None)
 +                else:
 +                    os.environ[k] = v
++
++
++class TestCarpetaDeProyectoNuevo(BaseTest):
++    """Prueba real en Termux: `reaper --proyecto ~/almacen --grande "..."` terminaba en "No existe" sin hacer nada."""
++
++    def _con_libre(self, valor):
++        previo = os.environ.get("REAPER_LIBRE")
++        if valor:
++            os.environ["REAPER_LIBRE"] = "1"
++        else:
++            os.environ.pop("REAPER_LIBRE", None)
++        return previo
++
++    def _restaurar(self, previo):
++        if previo is None:
++            os.environ.pop("REAPER_LIBRE", None)
++        else:
++            os.environ["REAPER_LIBRE"] = previo
++
++    def test_crea_solo_si_se_pide_y_nunca_fuera_del_home(self):
++        nueva = Path(self.dir) / "nuevo" / "almacen"
++        previo = self._con_libre(True)
++        try:
++            with self.assertRaises(ErrorRuta):
++                resolver_workspace(str(nueva))
++            self.assertFalse(nueva.exists())
++            self.assertEqual(resolver_workspace(str(nueva), crear=True), nueva.resolve())
++            self.assertTrue(nueva.is_dir())
++        finally:
++            self._restaurar(previo)
++        fuera = Path(self.dir) / "fuera_del_home"
++        previo = self._con_libre(False)
++        try:
++            if Path.home().resolve() in fuera.resolve().parents:
++                self.skipTest("la carpeta temporal está dentro del home")
++            with self.assertRaises(ErrorRuta) as ctx:
++                resolver_workspace(str(fuera), crear=True)
++            self.assertIn("Por seguridad", str(ctx.exception))
++            self.assertFalse(fuera.exists())                                        # ni siquiera la crea
++        finally:
++            self._restaurar(previo)
++
++    def test_cli_crea_la_carpeta_para_un_proyecto_nuevo_y_no_para_estado(self):
++        nueva = Path(self.dir) / "almacen_cli"
++        previo = self._con_libre(True)
++        clave = os.environ.get("OPENROUTER_API_KEY")
++        os.environ["OPENROUTER_API_KEY"] = "clave-de-prueba-0123456789"
++        original = App.construir
++        App.construir = lambda self, pedido, confirmar=True, reanudar=False: False
++        try:
++            salida = io.StringIO()
++            with contextlib.redirect_stdout(salida):
++                self.assertEqual(main(["--proyecto", str(nueva), "--sin-animacion", "--grande", "estado"]), 1)
++                self.assertFalse(nueva.exists())                                    # ver el estado no crea nada
++                self.assertEqual(main(["--proyecto", str(nueva), "--sin-animacion", "--construir", "algo"]), 2)
++            self.assertTrue(nueva.is_dir())
++            self.assertIn("Creé la carpeta del proyecto", salida.getvalue())
++        finally:
++            App.construir = original
++            self._restaurar(previo)
++            if clave is None:
++                os.environ.pop("OPENROUTER_API_KEY", None)
++            else:
++                os.environ["OPENROUTER_API_KEY"] = clave
++
++    def test_proyecto_en_el_repl_pregunta_antes_de_crear(self):
++        nueva = Path(self.dir) / "repl_nuevo"
++        previo = self._con_libre(True)
++        try:
++            app = App(self.ajustes(), MockLLM([]), self.ui(respuestas=["s"], interactivo=True), self.proyecto({}),
++                      persistir=False)
++            app.cmd_proyecto(str(nueva))
++            self.assertTrue(nueva.is_dir())
++            self.assertEqual(app.ws.raiz, nueva.resolve())
++            otra = Path(self.dir) / "repl_no"
++            app2 = App(self.ajustes(), MockLLM([]), self.ui(respuestas=["n"], interactivo=True), self.proyecto({}),
++                       persistir=False)
++            app2.cmd_proyecto(str(otra))
++            self.assertFalse(otra.exists())
++        finally:
++            self._restaurar(previo)
 diff --git a/partes/48zj_autotest_cupo.py b/partes/48zj_autotest_cupo.py
 new file mode 100644
 index 0000000..c67261c
@@ -14502,7 +14634,7 @@ index 0000000..f6f1cfa
 +
 +App.cmd_reporte = _cmd_reporte
 diff --git a/partes/99_main.py b/partes/99_main.py
-index 8196bf8..cf8dad7 100644
+index 8196bf8..8356061 100644
 --- a/partes/99_main.py
 +++ b/partes/99_main.py
 @@ -4,15 +4,24 @@
@@ -14662,7 +14794,7 @@ index 8196bf8..cf8dad7 100644
      api_key = obtener_clave_api(settings)
      if args.doctor:
          llm = LLMClient(api_key, settings) if api_key else None
-@@ -81,19 +155,13 @@ def main(argv: Optional[list] = None) -> int:
+@@ -81,21 +155,22 @@ def main(argv: Optional[list] = None) -> int:
          variable = settings.variable_clave() or "OPENROUTER_API_KEY"
          ui.error(f"Falta {variable}.")
          ui.tenue(f'  export {variable}="tu_key"      (agregalo a ~/.bashrc para no repetirlo)')
@@ -14681,9 +14813,19 @@ index 8196bf8..cf8dad7 100644
 -            ui.ok(f"Proyecto creado en {destino} ({len(creados)} archivos)")
 -            args.proyecto = str(destino)
          if args.proyecto:
-             raiz = resolver_workspace(args.proyecto)
+-            raiz = resolver_workspace(args.proyecto)
++            # Un /construir o /grande NUEVO crea su carpeta (lo normal es que todavía no exista); retomar, ver el
++            # estado o deshacer necesitan una carpeta que ya exista.
++            nuevo = bool((args.construir and args.construir.strip().lower() not in ("continuar", "estado"))
++                         or (args.grande and args.grande.strip().lower() not in ("continuar", "estado", "deshacer")))
++            existia = Path(os.path.expandvars(args.proyecto.strip())).expanduser().exists()
++            raiz = resolver_workspace(args.proyecto, crear=nuevo)
++            if nuevo and not existia:
++                ui.ok(f"Creé la carpeta del proyecto: {_ruta_corta(raiz)}")
          else:
-@@ -104,8 +172,29 @@ def main(argv: Optional[list] = None) -> int:
+             guardado = cargar_estado().get("proyecto")
+             raiz = Path(guardado) if guardado and Path(guardado).is_dir() else PROJECTS_DIR
+@@ -104,8 +179,29 @@ def main(argv: Optional[list] = None) -> int:
          ui.error(str(e) if not isinstance(e, KeyError) else f"No existe la plantilla {e}")
          return 1
  
@@ -14713,7 +14855,7 @@ index 8196bf8..cf8dad7 100644
      app = App(settings, llm, ui, ws)
      if args.proyecto:
          guardar_estado(proyecto=str(ws.raiz))
-@@ -116,11 +205,34 @@ def main(argv: Optional[list] = None) -> int:
+@@ -116,11 +212,34 @@ def main(argv: Optional[list] = None) -> int:
              return 0 if correr_evaluacion(llm, settings, ui, cantidad=args.evaluar or None) else 2
          if args.comportamiento is not None:
              return 0 if correr_comportamiento(llm, settings, ui, ids=args.comportamiento) else 2
@@ -14748,7 +14890,7 @@ index 8196bf8..cf8dad7 100644
          if args.torneo:
              app.cmd_torneo(args.torneo)
              return 0
-@@ -136,11 +248,842 @@ def main(argv: Optional[list] = None) -> int:
+@@ -136,11 +255,842 @@ def main(argv: Optional[list] = None) -> int:
      except (KeyboardInterrupt, Cancelado):
          CANCELAR.set()
          ui.aviso("\n⏹ Interrumpido.")
