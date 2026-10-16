@@ -17,7 +17,7 @@
 
 ![versión](https://img.shields.io/badge/versión-8.10-8b5cf6?style=flat-square)
 ![python](https://img.shields.io/badge/python-3.11_→_3.14-3776ab?style=flat-square&logo=python&logoColor=white)
-![autotests](https://img.shields.io/badge/autotests-1099_OK-2ea44f?style=flat-square)
+![autotests](https://img.shields.io/badge/autotests-1128_OK-2ea44f?style=flat-square)
 ![juez](https://img.shields.io/badge/juez-motor_central-a855f7?style=flat-square)
 ![plataforma](https://img.shields.io/badge/Termux_·_Android-sin_root-10b981?style=flat-square&logo=android&logoColor=white)
 ![distribución](https://img.shields.io/badge/distribución-1_archivo-f59e0b?style=flat-square)
@@ -44,7 +44,7 @@ Su obsesión es la **honestidad**: no declara una build "verificada" sin tests r
 lo entregado **sea lo que pediste, funcione de verdad y no rompa lo que ya tenías**.
 
 > [!NOTE]
-> Proyecto **experimental**. El andamiaje está cubierto por **1099 autotests**; la calidad del código que
+> Proyecto **experimental**. El andamiaje está cubierto por **1128 autotests**; la calidad del código que
 > produzca depende del modelo que le conectes. Lee **[Estado honesto](#estado)** antes de esperar magia.
 
 ---
@@ -193,8 +193,9 @@ maestro por etapas y construye una por vez, verificando cada una.
 
 > [!TIP]
 > **¿Se cortó?** (Termux cerrado, pantalla bloqueada, límite del modelo gratis) Repetí **el mismo comando**: REAPER
-> retoma donde quedó, sin empezar de cero. También: `reaper --proyecto ~/mi_app --grande continuar` (o
-> `--construir continuar`) y `--grande estado`. Para que Android no lo corte: `termux-wake-lock` antes de empezar.
+> retoma donde quedó, sin empezar de cero, aunque se haya cortado a mitad de una etapa. También: `reaper --proyecto
+> ~/mi_app --grande continuar` (o `--construir continuar`; si empezaste con `--perfil gratis`, agregalo: REAPER te
+> muestra el comando exacto) y `--grande estado`. Para que Android no lo corte: `termux-wake-lock` antes de empezar.
 
 **Paso 5 · Construí**
 
@@ -377,10 +378,15 @@ verificación**, no la opinión de un modelo: un "terminé" sin pruebas no alcan
 > [!IMPORTANT]
 > Lo que **sí** está verificado y lo que **no**, sin maquillaje.
 
-- ✅ **1099 autotests OK** en Python **3.10, 3.11, 3.12 y 3.13** (y en un Termux real con 3.14 en una versión
+- ✅ **1128 autotests OK** en Python **3.10, 3.11, 3.12 y 3.13** (y en un Termux real con 3.14 en una versión
   anterior). Prueban la **orquestación** de forma determinista: ediciones y procesos reales, parseo de tests,
   gates de honestidad, Ctrl+C, plazos de pared y el juez (contrato, cierre, desvío, preservación, arranque,
   examen de realidad, armado del equipo). La red de modelos se simula con un **MockLLM**.
+- ✅ **Corridas de punta a punta** de la CLI real contra un **OpenRouter simulado por HTTP** (`pruebas_fusion/e2e/`):
+  el script del teléfono entero, `/grande` de 5 etapas con el pipeline completo, cupo diario agotado a mitad de
+  etapa y retomado "al otro día", Ctrl+C en 8 momentos distintos, modelos que solo razonan, 429 por minuto y un
+  implementador flojo. Encontraron 8 bugs de lógica (p. ej. una etapa cortada por el cupo no se podía retomar
+  nunca más) y 10 fallas de mensajes, todos corregidos con su test.
 - ✅ **Probado con un modelo real** (OpenRouter, `nemotron-3-super` gratis): la primera build completa terminó
   **✓ VERIFICADA** (15 tests reales; el juez dijo CUMPLE gastando el 0,5 % de la build) y el código funciona
   (verificado aparte). Un proyecto más grande (gestor de gastos: SQLite, CSV, CLI con 6 subcomandos, 622 líneas)
@@ -398,7 +404,9 @@ verificación**, no la opinión de un modelo: un "terminé" sin pruebas no alcan
   pero una build puede tardar o no completarse. La **calidad del código** depende del modelo que conectes; el
   andamiaje sube el piso, no inventa capacidad que el modelo no tenga.
 - ⚠️ **Proyectos grandes**: `/grande` los parte en etapas verificadas, retoma donde quedó y no construye sobre
-  una etapa rota. Está probado con un modelo **simulado** que escribe código real, **no todavía con un modelo
+  una etapa rota. Está probado con un modelo **simulado** que escribe código real (también por HTTP, de punta a
+  punta); la **primera prueba con modelos reales** en un teléfono se cortó en la etapa 1 y mostró 6 bugs, ya
+  corregidos (`entrega_fusion/REAPER_FUSION_PRUEBAS.md` §21). **Todavía no terminó un `/grande` con un modelo
   real**: la calidad de cada etapa sigue dependiendo del modelo. Con modelos gratis, contá con muchas
   llamadas (cada etapa es una build entera) y con que los límites de uso pueden cortar a mitad: por eso
   existe `/grande continuar`.

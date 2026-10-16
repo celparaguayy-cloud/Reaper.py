@@ -209,7 +209,10 @@ def diagnostico_texto(settings, incluir_equipo: bool = True) -> str:
 
 # Catálogo REAL de OpenRouter (público: sin clave y sin costo). La lista fija de modelos gratis se pudre: en la
 # prueba real (2026-10) el perfil "gratis" apuntaba a dolphin…:free, que ya no existía, y llama-3.3-70b:free tampoco.
-URL_CATALOGO_OPENROUTER = "https://openrouter.ai/api/v1/models"
+# REAPER_OPENROUTER_BASE apunta catálogo y cuenta a otro servidor (el OpenRouter simulado de las pruebas de punta a
+# punta, junto con REAPER_API_URL para el chat); sin la variable, el OpenRouter de verdad.
+_BASE_OPENROUTER = (os.getenv("REAPER_OPENROUTER_BASE") or "https://openrouter.ai/api/v1").rstrip("/")
+URL_CATALOGO_OPENROUTER = f"{_BASE_OPENROUTER}/models"
 _RE_NO_SIRVE_PARA_CODIGO = re.compile(r"safety|guard|lyria|embed|tts|whisper|moderation|^openrouter/", re.I)
 _RE_MODELO_DIMINUTO = re.compile(r"[-_/](?:0?\.\d+|[0-6](?:\.\d+)?)b\b", re.I)   # ≤ 6B: no sirven para programar
 
@@ -241,7 +244,7 @@ def elegir_free_de_catalogo(datos: list) -> list:
     return [mid for _p, _c, mid in sorted(elegidos)]
 
 
-URL_CUENTA_OPENROUTER = "https://openrouter.ai/api/v1/key"
+URL_CUENTA_OPENROUTER = f"{_BASE_OPENROUTER}/key"
 
 
 @dataclass
@@ -259,6 +262,14 @@ class CuentaOpenRouter:
         cupo = f"{self.cupo_dia} pedidos gratis por día" if self.cupo_dia is not None else ""
         hoy = f" (hoy: usados {self.usados_hoy}, quedan {self.quedan_hoy})" if self.quedan_hoy is not None else ""
         return ", ".join(x for x in (tipo, cupo) if x) + hoy
+
+    def resumen_corto(self) -> str:
+        """Para la tabla del doctor (en el teléfono la columna es angosta y se cortaba antes de "quedan")."""
+        if self.quedan_hoy is not None and self.cupo_dia is not None:
+            return f"quedan {self.quedan_hoy} de {self.cupo_dia} hoy"
+        if self.cupo_dia is not None:
+            return f"{self.cupo_dia} pedidos por día"
+        return self.resumen()
 
 
 def _entero_o_nada(valor) -> Optional[int]:
@@ -411,6 +422,9 @@ def free_que_responden(llm, candidatos: list, cuantos: int = 4, max_probar: int 
             vivos.append(modelo)
             if len(vivos) >= cuantos:
                 break
+        agotado = getattr(llm, "cupo_free_agotado", None)
+        if callable(agotado) and agotado():
+            break                   # comparten el cupo diario: los demás :free tampoco van a responder hoy
     return vivos
 
 

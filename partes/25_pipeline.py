@@ -773,6 +773,19 @@ def verificacion_peor(despues: "Verificacion", antes: "Verificacion") -> bool:
     return es_peor(despues.conteo, antes.conteo)
 
 
+REVISION_SIN_DICTAMEN = "VEREDICTO: CAMBIOS\nLa revisión no entregó un dictamen verificable (APROBADO o CAMBIOS)."
+_RE_ITEM_REVISION = re.compile(r"(?m)^\s*(?:\d+[.)]|[-*•])\s+\S")
+_RE_PROBLEMA_REVISION = re.compile(r"\b(?:falta|faltan|error|errores|bug|falla|fallan|corregi|correg|deber[íi]a|"
+                                   r"no (?:valida|maneja|cubre|funciona|controla|verifica)|problema|incorrect|"
+                                   r"missing|should|fix|wrong|broken)", re.I)
+
+
+def observaciones_concretas(informe: str) -> bool:
+    """Una revisión sin la línea VEREDICTO puede igual traer puntos accionables (lista + un problema nombrado)."""
+    texto = informe or ""
+    return bool(_RE_ITEM_REVISION.search(texto) and _RE_PROBLEMA_REVISION.search(texto))
+
+
 def veredicto(informe: str) -> tuple[bool, bool]:
     """(aprobado, claro). Un dictamen malformado NO equivale a una aprobación."""
     m = _RE_VEREDICTO.search(informe or "")
@@ -1075,6 +1088,34 @@ def _es_test(rel: str) -> bool:
     return any(fnmatch.fnmatch(rel, p) for p in PATRONES_TESTS)
 
 
+FASE_BUILD = "fase:"
+
+
+def _marcar_fase(registro_build: "RegistroBuild", previo: dict, nombre: str, cid: int) -> None:
+    """Una FASE que escribe archivos (tests primero, verificación final y reparación) queda anotada en el diario como
+    la tarea activa: si se corta ahí (cupo diario, Ctrl+C, Termux cerrado), sus cambios tienen dueño y la build se
+    puede retomar. Antes solo las tareas lo tenían: la corrida E2E de /grande cortada por el cupo mientras el
+    especificador escribía tests/test_api.py quedaba en "Cambios externos…" y la etapa no se podía seguir nunca."""
+    previo["tarea_activa"] = FASE_BUILD + nombre
+    previo["tcid"] = cid
+    previo["huellas_inicio"] = registro_build.huellas()
+    registro_build.guardar(previo)
+
+
+def _cerrar_fase(previo: dict) -> None:
+    for clave in ("tarea_activa", "tcid", "huellas_inicio"):
+        previo.pop(clave, None)
+
+
+def mismo_pedido(guardado, actual: str) -> bool:
+    """¿El pedido guardado en un diario/estado es este? Los diarios se escriben REDACTADOS (un pedido con
+    "password: admin123" queda "password: [REDACTADO]"), así que se compara también contra la forma redactada:
+    si no, la build a medio hacer de ese pedido no se reconocía nunca más y /grande quedaba trabado."""
+    def norma(texto) -> str:
+        return " ".join(str(texto or "").split())
+    return norma(guardado) in (norma(actual), norma(redactar_secretos(actual or "")))
+
+
 def fallos_tolerables_al_reintentar(fallan_ahora: set, fallaban_al_inicio: Sequence[str], tarea, tareas) -> set:
     """Al RE-EJECUTAR una tarea que falló o se cortó, ¿qué tests en rojo no son culpa suya? Los que ya fallaban al
     empezar la build y los de archivos de test que declaran OTRAS tareas (en una corrida normal también se
@@ -1214,6 +1255,10 @@ class RegistroBuild:
         registrados = set(self.ws.checkpoints.archivos_desde(tcid))
         if not cambiados or not cambiados.issubset(registrados):
             return False
+        if activo == FASE_BUILD + "cierre":
+            # Cortada en la verificación final o la reparación: el reparador SÍ toca archivos de tareas verificadas,
+            # y al retomar la verificación final se repite entera (no se omite nada con evidencia vieja).
+            return True
         # Una tarea a medio hacer no debe invalidar en silencio otra ya validada.
         verificados = previo.get("archivos_verificados", {})
         if any(antes.get(p) != ahora.get(p) for p in verificados):
@@ -1452,7 +1497,10 @@ class Orquestador:
             "falta de implementación (ImportError/AttributeError/assert) y pasar cuando el plan esté hecho."
         )
         res = self._sub("especificador", texto, cid, titulo="escribe los tests ANTES de implementar")
-        tests = [r for r in res.cambios if _es_test(r) and (self.ws.raiz / r).is_file()]
+        # También cuentan los tests que esta MISMA build ya había escrito antes de un corte (cupo diario, Ctrl+C): al
+        # retomar, el especificador los encuentra hechos y no los reescribe; sin esto se descartaba la especificación.
+        escritos = sorted(set(res.cambios) | set(self.ws.checkpoints.archivos_desde(cid)))
+        tests = [r for r in escritos if _es_test(r) and (self.ws.raiz / r).is_file()]
         if not tests:
             self.ui.aviso("  El especificador no dejó archivos de test: sigo sin especificación ejecutable.")
             return {}
@@ -1469,14 +1517,21 @@ class Orquestador:
         conteo = conteo_de_resultado(r)
         codigo_plan = [a for a in plan.archivos() if not _es_test(a)]
         proyecto_nuevo = bool(codigo_plan) and not any(self.ws.existe(a) for a in codigo_plan)
-        if r is not None and conteo.reconocido and conteo.pasados and not conteo.ok and proyecto_nuevo:
+        # Los tests que YA pasaban antes de la build (etapas anteriores de /grande, el proyecto existente) no son de
+        # esta especificación: la corrida E2E de /grande acusaba al especificador en cada etapa desde la 2 ("3 tests
+        # YA pasan sin el código" = los de la etapa 1) y le hacía reescribir tests buenos.
+        base = getattr(self, "_base_tests", None)
+        conteo_base = conteo_de_resultado(base) if base is not None else None
+        ya_pasaban = conteo_base.pasados if conteo_base is not None and conteo_base.reconocido else 0
+        pasan_sin_codigo = max(0, conteo.pasados - ya_pasaban)
+        if r is not None and conteo.reconocido and pasan_sin_codigo and not conteo.ok and proyecto_nuevo:
             # Prueba real con OpenRouter: 3 tests "de error" pasaban SIN que existiera el código (solo miraban
             # returncode != 0 y stderr no vacío; "No module named conversor" también cumple). Después darían verde
             # aunque el CLI se rompiera por cualquier otra cosa. En un proyecto nuevo, un test que ya pasa no prueba nada.
-            self.ui.aviso(f"  {conteo.pasados} test(s) de la especificación YA pasan sin que exista el código: no "
+            self.ui.aviso(f"  {pasan_sin_codigo} test(s) de la especificación YA pasan sin que exista el código: no "
                           "prueban la función. Le pido al especificador que los ajuste.")
             self._sub("especificador",
-                      f"{conteo.pasados} de tus tests YA PASAN y la implementación todavía no existe "
+                      f"{pasan_sin_codigo} de tus tests YA PASAN y la implementación todavía no existe "
                       f"({conteo.texto()}): esos tests no prueban nada. Un test de aceptación tiene que FALLAR ahora. "
                       "Típico: un test de error que solo mira returncode != 0 o stderr no vacío también pasa si el "
                       "módulo ni existe. Comprobá el error CONCRETO (el tipo, p. ej. 'ValueError' en stderr, o el "
@@ -1490,7 +1545,9 @@ class Orquestador:
             if conteo.ok and conteo.pasados:
                 self.ui.aviso(f"  Ojo: la especificación ya pasa entera ({conteo.texto()}); quizá la función ya existía.")
             else:
-                self.ui.ok(f"especificación lista: {len(tests)} archivo(s) de test, {conteo.texto()} (esperado: fallan)")
+                previos = f"; {ya_pasaban} ya pasaban de antes" if ya_pasaban else ""
+                self.ui.ok(f"especificación lista: {len(tests)} archivo(s) de test, {conteo.texto()}{previos} "
+                           "(esperado: fallan los nuevos)")
         else:
             self.ui.ok(f"especificación lista: {len(tests)} archivo(s) de test")
         return copiar_contenidos(self.ws, tests)
@@ -1552,8 +1609,12 @@ class Orquestador:
             return True, "(revisión omitida: el revisor no respondió; la validación real pasa)"
         aprobado, claro = veredicto(res.resumen)
         if not claro:
+            if observaciones_concretas(res.resumen):
+                # Sin la línea VEREDICTO pero con puntos concretos ("1. falta validar…"): se pasan tal cual.
+                self.ui.aviso("  Revisión sin la línea VEREDICTO, pero con observaciones concretas: las paso como CAMBIOS.")
+                return False, "VEREDICTO: CAMBIOS\n" + res.resumen
             self.ui.aviso("  Revisión SIN VEREDICTO: no se considera aprobada; la verificación real decidirá el resultado.")
-            return False, "VEREDICTO: CAMBIOS\nLa revisión no entregó un dictamen verificable (APROBADO o CAMBIOS)."
+            return False, REVISION_SIN_DICTAMEN
         if aprobado and validacion and not validacion.startswith(("OK", "sin validadores")):
             self.ui.aviso("  El revisor aprobó, pero la validación real falla: lo tomo como CAMBIOS.")
             return False, ("VEREDICTO: CAMBIOS\n1. La validación automática falla (corregilo antes que nada):\n"
@@ -2060,11 +2121,13 @@ class Orquestador:
                          exigir_progreso: bool = False, verificar_entrega: bool = False,
                          archivos_esperados: Sequence[str] = (),
                          archivos_planeados: Sequence[str] = (),
-                         cid_build: Optional[int] = None) -> Verificacion:
+                         cid_build: Optional[int] = None,
+                         spec_ajena: Optional[Iterable[str]] = None) -> Verificacion:
         """
         Una tarea intermedia no necesita que pasen TODOS los tests (los de tareas
         siguientes todavía fallan): alcanza con validadores OK y que no se rompa
-        nada que antes pasaba.
+        nada que antes pasaba. `spec_ajena`: los archivos de la especificación que son de OTRAS tareas (los únicos
+        cuyo rojo se tolera); None = toda la especificación (comportamiento anterior).
         """
         archivos = [r for r in self.ws.checkpoints.archivos_desde(tcid) if (self.ws.raiz / r).is_file()]
         validaciones = validar_archivos(self.ws, archivos)
@@ -2118,8 +2181,9 @@ class Orquestador:
             problemas.extend(mensaje for _rel, mensaje in self._violaciones_preservar(tcid, cid_build, declarados))
         if tests is not None and not tests.ok and conteo.reconocido:
             # Los tests de la especificación de tareas siguientes fallan a propósito: no son regresión.
+            tolerables = self._protegidos if spec_ajena is None else {rel: None for rel in spec_ajena}
             nuevos_fallos = [n for n in conteo.nombres_fallados
-                             if n not in nombres_antes and not _es_de_especificacion(n, self._protegidos)]
+                             if n not in nombres_antes and not _es_de_especificacion(n, tolerables)]
             retroceso = conteo.pasados < antes.pasados
             mas_errores = conteo.errores > antes.errores
             if retroceso or mas_errores or nuevos_fallos:
@@ -2159,7 +2223,7 @@ class Orquestador:
             except ValueError:
                 previo = None                          # _construir informa el diario dañado con su mensaje
             if (previo and previo.get("estado") not in ("verificada", "validada")
-                    and " ".join(str(previo.get("pedido", "")).split()) == " ".join(pedido.split())):
+                    and mismo_pedido(previo.get("pedido"), pedido)):
                 self.ui.info("Esta misma build había quedado a medias: la retomo donde quedó (no empiezo de cero).")
                 reanudar = True
         restaurar_equipo = self._equipo_del_juez()
@@ -2210,6 +2274,7 @@ class Orquestador:
             self.ui.error(str(e) + ". Usá /construir estado y revisá el registro antes de descartarlo.")
             return InformeBuild("cancelada")
         base = ejecutar_tests(self.ws, timeout=self.settings.tests_timeout, completo=True)
+        self._base_tests = base
         base_fallaba = base is not None and not base.ok
         if base_fallaba and not reanudar:
             self.ui.aviso("Atención: la suite de tests YA falla antes de empezar; se tendrá en cuenta.")
@@ -2303,7 +2368,7 @@ class Orquestador:
         else:
             if previo and previo.get("estado") not in ("verificada", "validada"):
                 self.ui.error("Ya hay OTRA build incompleta en esta carpeta. Seguila con /construir continuar "
-                              f"(o `{comando_para_seguir(self.ws, 'construir')}`) o descartala con "
+                              f"(o `{comando_para_seguir(self.ws, 'construir', self.settings)}`) o descartala con "
                               "/construir descartar para comenzar otra (sin borrar archivos).")
                 return InformeBuild("cancelada")
             plan, exploracion = self.obtener_plan(pedido, confirmar)
@@ -2387,12 +2452,14 @@ class Orquestador:
         if tests_primero_build and testeable and not spec_completa:
             self.ui.fase(numero_fase, "Tests primero (especificación ejecutable)")
             numero_fase += 1
+            _marcar_fase(registro_build, previo, "especificacion", grupo)
             espec = self.especificar(pedido, plan, grupo)
             self._protegidos.update(espec)
             informe.spec_tests = list(espec)
             previo["spec_tests"] = list(espec)
             previo["tests_protegidos"] = {p: self.ws.hash(p) for p in self._protegidos}
             previo["especificacion_completa"] = True
+            _cerrar_fase(previo)
             registro_build.guardar(previo)
         elif reanudar:
             informe.spec_tests = list(previo.get("spec_tests", self._protegidos))
@@ -2464,10 +2531,17 @@ class Orquestador:
                               "lo confirma la verificación real.")
 
             exigir = not resultado.ok and not termino_sin_cambios
+            # Solo se tolera el rojo de la especificación de las tareas SIGUIENTES. Antes se toleraba toda: con una
+            # venta que no controlaba el stock, el test de la propia tarea fallaba y la tarea quedaba "verificada"
+            # (pasaba al revisor y lo atajaba recién la verificación final; corrida E2E de /grande, modelo flojo).
+            # Los tests que existían antes de la build (etapas anteriores) tampoco: romperlos es regresión.
+            spec_ajena = set() if i == len(plan.tareas) - 1 else (
+                set(informe.spec_tests or []) - {a for a in tarea.archivos if _es_test(a)})
             verif_tarea = self._verificar_tarea(tcid, conteo_antes, nombres_antes,
                                                  exigir_progreso=exigir, verificar_entrega=True,
                                                  archivos_esperados=tarea.archivos,
-                                                 archivos_planeados=planeados_despues, cid_build=grupo)
+                                                 archivos_planeados=planeados_despues, cid_build=grupo,
+                                                 spec_ajena=spec_ajena)
             if not verif_tarea.ok:
                 self.ui.aviso(f"  La tarea {tarea.id} no pasó su verificación: la reparo con el error real.")
                 self.ui.tenue(f"    motivo: {_primera_linea_util(verif_tarea.diagnostico)}")
@@ -2477,7 +2551,8 @@ class Orquestador:
                     lambda: self._verificar_tarea(tcid, conteo_antes, nombres_antes,
                                                  exigir_progreso=exigir, verificar_entrega=True,
                                                  archivos_esperados=tarea.archivos,
-                                                 archivos_planeados=planeados_despues, cid_build=grupo),
+                                                 archivos_planeados=planeados_despues, cid_build=grupo,
+                                                 spec_ajena=spec_ajena),
                     contexto=f"TAREA EN CURSO (#{tarea.id}): {tarea.descripcion}",
                 )
                 if not verif_tarea.ok:
@@ -2517,6 +2592,11 @@ class Orquestador:
                 if aprobado:
                     self.ui.ok(f"Revisor aprobó la tarea {tarea.id}")
                     break
+                if revision == REVISION_SIN_DICTAMEN:
+                    # Nada que aplicar: una ronda de "corrección" sin observaciones gastaba 1 implementador + 1
+                    # revisor por tarea (corrida E2E de /grande: 28 pedidos de 112 en revisiones vacías).
+                    informe.notas.append(f"Tarea {tarea.id}: el revisor no dio un dictamen; decide la verificación real.")
+                    break
                 self.ui.aviso(f"  Revisor pidió cambios en la tarea {tarea.id} (ronda {ronda + 1})")
                 if ronda + 1 >= self.settings.max_revisiones:
                     informe.notas.append(f"Tarea {tarea.id}: quedaron observaciones del revisor sin resolver.")
@@ -2528,7 +2608,8 @@ class Orquestador:
             verif_post = self._verificar_tarea(tcid, conteo_antes, nombres_antes,
                                               exigir_progreso=exigir, verificar_entrega=True,
                                               archivos_esperados=tarea.archivos,
-                                              archivos_planeados=planeados_despues, cid_build=grupo)
+                                              archivos_planeados=planeados_despues, cid_build=grupo,
+                                              spec_ajena=spec_ajena)
             if verif_post.ok:
                 previo["estados"][tarea.id] = "verificada"
                 # Archivo verificado por primera vez: no permitir que una tarea
@@ -2548,6 +2629,7 @@ class Orquestador:
             previo.pop("huellas_inicio", None)
             registro_build.guardar(previo)
         PLAZO.cerrar(token_tarea)
+        _marcar_fase(registro_build, previo, "cierre", grupo)
 
         archivos = [r for r in self.ws.checkpoints.archivos_desde(grupo) if (self.ws.raiz / r).is_file()]
         hay_tests_build = any(_es_test(a) for a in archivos)
@@ -2593,6 +2675,7 @@ class Orquestador:
         informe.tokens_juez = getattr(self, "_tokens_juez", 0)
         informe.tokens_build = max(0, _tokens_usados(self.llm) - getattr(self, "_tokens_inicio", 0))
         previo["estado"] = informe.estado
+        _cerrar_fase(previo)
         registro_build.guardar(previo)
         if informe.ok:
             registro_build.borrar()

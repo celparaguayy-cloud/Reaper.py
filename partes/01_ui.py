@@ -457,6 +457,24 @@ _BORDES = {
 }
 
 
+def _partir_para_caja(lineas: list, ancho: int, maximo: int = 6) -> list:
+    """Las líneas de texto largas se PARTEN en renglones en vez de recortarse: en el teléfono (Termux angosto) la caja
+    de /grande cortaba justo "Se renueva mañana a las …" o el comando para seguir. Las que traen colores ANSI (tablas,
+    barras) se dejan para ajustar() como antes."""
+    salida = []
+    for linea in lineas:
+        if ancho_visible(linea) <= ancho or "\x1b" in linea:
+            salida.append(linea)
+            continue
+        sangria = " " * (len(linea) - len(linea.lstrip(" ")))
+        partes = textwrap.wrap(linea.strip(), width=max(10, ancho - len(sangria)), break_long_words=True,
+                               break_on_hyphens=False) or [""]
+        if len(partes) > maximo:
+            partes = partes[:maximo - 1] + [partes[maximo - 1] + " …"]
+        salida.extend(sangria + parte for parte in partes)
+    return salida
+
+
 def caja(lineas: Sequence[str], titulo: str = "", color: str = "", estilo: str = "redondo",
          ancho: Optional[int] = None, relleno: int = 1) -> str:
     """Devuelve una caja dibujada con bordes alrededor de las líneas."""
@@ -468,6 +486,7 @@ def caja(lineas: Sequence[str], titulo: str = "", color: str = "", estilo: str =
         interior = max(10, min(ancho - 2 - 2 * relleno, maximo))
     else:
         interior = min(interior, maximo)
+    lineas = _partir_para_caja(lineas, interior)
     reset = C.RESET if color else ""
     pad = " " * relleno
     if titulo:

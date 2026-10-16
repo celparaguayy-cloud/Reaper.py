@@ -222,3 +222,19 @@ deshacer`, `/reporte`, simulación del almacén en 5 etapas (API + web).
 a más de 10 min; (c) la estimación de pedidos es gruesa (25–60 por etapa) y solo sirve para avisar.
 Regresión 1099 tests OK en Python 3.10/3.11/3.12/3.13.
 
+## 15. Prueba real en el teléfono y corridas de punta a punta (NO VERIFICADO con un modelo real)
+
+Detalle en `REAPER_FUSION_PRUEBAS.md` §21. Banco nuevo `pruebas_fusion/e2e/` (OpenRouter falso por HTTP + la CLI real;
+`REAPER_OPENROUTER_BASE` apunta catálogo y cuenta). Cambios: `mismo_pedido`, `_marcar_fase`/`_cerrar_fase` y la fase
+`cierre` en `RegistroBuild.recuperable`, `REVISION_SIN_DICTAMEN`/`observaciones_concretas`, `faltantes_planeados`,
+`spec_ajena` en `_verificar_tarea`, `_base_tests` en `especificar`, `ajustes_corrida` en el estado de `/grande`,
+`_partir_para_caja`.
+
+**A auditar:** (a) `recuperable` con la fase `cierre` acepta que cambien archivos de tareas verificadas si están en
+los checkpoints de la build (lo hace el reparador) porque la verificación final se repite entera: ¿hay algún camino
+que retome sin pasar por ella?; (b) `spec_ajena` atribuye tests a tareas por el nombre del archivo declarado: un test
+de la especificación que ninguna tarea declara se tolera salvo en la última tarea; (c) `faltantes_planeados` confía en
+que una ruta nombrada en el plan se va a crear: si ninguna tarea la crea, el cierre del agente y la verificación final
+la siguen exigiendo.
+Regresión 1128 tests OK en Python 3.10/3.11/3.12/3.13.
+

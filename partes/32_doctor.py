@@ -135,8 +135,9 @@ def _chequeo_cuenta_openrouter(settings: Settings) -> Optional[Chequeo]:
     if cuenta is None or cuenta.cupo_dia is None:
         return None
     poco = cuenta.quedan_hoy is not None and cuenta.quedan_hoy < 40
-    return Chequeo("cupo gratis OpenRouter", not poco, cuenta.resumen(),
-                   "esperá a mañana o cargá crédito" if poco else "",
+    return Chequeo("cupo gratis", not poco, cuenta.resumen_corto(),
+                   "esperá a mañana o cargá crédito" if poco else
+                   ("sin crédito: 50/día" if cuenta.sin_credito else ""),
                    ayuda=("Con 50 pedidos por día un /grande no termina en un día: REAPER se detiene limpio cuando "
                           "se agota y sigue con --grande continuar. Con al menos 10 de crédito comprado el cupo de "
                           "modelos :free sube a 1000 por día." if cuenta.sin_credito else ""))

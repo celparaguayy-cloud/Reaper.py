@@ -226,7 +226,12 @@ class Torneo:
         resultado = ResultadoTorneo(ganador, candidatos)
         if ganador is None:
             resultado.notas.append("Ningún candidato cambió archivos sin errores.")
-            self.ui.error("Ningún candidato produjo cambios utilizables.")
+            if resultado.termino_sin_cambios:
+                # Terminaron bien sin tocar nada (p. ej. al retomar tras un corte, el trabajo ya estaba en disco): no es
+                # un error, lo decide la verificación real. Antes salía "✗ Ningún candidato…" en una corrida sana.
+                self.ui.tenue("  Ningún candidato necesitó cambiar archivos.")
+            else:
+                self.ui.error("Ningún candidato produjo cambios utilizables.")
             return resultado
         if cid is not None:
             self.ws.checkpoints.actual = cid

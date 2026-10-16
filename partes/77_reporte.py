@@ -46,14 +46,22 @@ def _resumen_estado_reporte(ws: Workspace) -> list:
         for e in etapas:
             lineas.append(f"  - etapa {e.get('id')} · {e.get('titulo')}: {e.get('estado')} · intentos "
                           f"{e.get('intentos')} · {e.get('pedidos', '?')} pedidos")
-        if grande.get("motivo"):
-            lineas.append(f"  motivo de parada: {grande.get('motivo')}")
+        if grande.get("motivo") and grande.get("estado") != "terminado":
+            lineas.append(f"  motivo de parada: {' '.join(str(grande.get('motivo')).split())}")
+        corrida = grande.get("ajustes_corrida")
+        if isinstance(corrida, dict):
+            lineas.append(f"  última corrida ({corrida.get('fecha', '?')}): modelo {corrida.get('modelo')} · respaldos "
+                          f"{', '.join(corrida.get('respaldos') or []) or '—'} · roles "
+                          f"{json.dumps(corrida.get('roles') or {}, ensure_ascii=False)} · torneo={corrida.get('torneo')} "
+                          f"candidatos={corrida.get('candidatos')} tests_primero={corrida.get('tests_primero')} "
+                          f"rpm={corrida.get('rpm')} juez={corrida.get('juez')}")
     try:
         build = RegistroBuild(ws).leer()
     except (ValueError, OSError):
         build = {"estado": "ilegible"}
     if build:
-        lineas.append(f"/construir pendiente: {build.get('estado')} · {recortar(str(build.get('pedido', '')), 160)}")
+        pedido = " ".join(str(build.get("pedido", "")).split())          # en una línea (el de una etapa trae varias)
+        lineas.append(f"/construir pendiente: {build.get('estado')} · {pedido[:160]}{'…' if len(pedido) > 160 else ''}")
         for tid, est in (build.get("estados") or {}).items():
             lineas.append(f"  - tarea {tid}: {est}")
     return lineas or ["sin /grande ni /construir pendientes"]

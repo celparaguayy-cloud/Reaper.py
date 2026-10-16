@@ -2047,7 +2047,8 @@ class App:
             except (KeyboardInterrupt, Cancelado):
                 CANCELAR.set()
                 self.ui.fin_progreso()
-                self.ui.aviso("\n⏹ Interrumpido. Lo ya escrito queda en disco; /diff para ver, /deshacer para revertir.")
+                self.ui.linea("")
+                self.ui.aviso("⏹ Interrumpido. Lo ya escrito queda en disco; /diff para ver, /deshacer para revertir.")
                 self._guardar_sesion()
             except LLMError as e:
                 self.ui.error(f"Modelo: {e}")

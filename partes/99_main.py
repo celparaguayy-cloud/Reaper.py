@@ -254,14 +254,15 @@ def main(argv: Optional[list] = None) -> int:
         return app.repl(animar=settings.animacion)
     except (KeyboardInterrupt, Cancelado):
         CANCELAR.set()
-        ui.aviso("\n⏹ Interrumpido.")
-        pista = pista_para_seguir(ws)
+        ui.linea("")
+        ui.aviso("⏹ Interrumpido.")
+        pista = pista_para_seguir(ws, settings)
         if pista:
             ui.info(pista)
         return 130
     except LLMError as e:
         ui.error(f"Modelo: {e}")
-        pista = pista_para_seguir(ws)
+        pista = pista_para_seguir(ws, settings)
         if pista:
             ui.info(pista)
         return 1

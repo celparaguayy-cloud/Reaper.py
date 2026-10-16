@@ -493,8 +493,12 @@ class LLMClient:
                         self.on_evento(f"{candidato} retirado (no disponible/404): no lo vuelvo a intentar hasta que responda")
                 elif self.disyuntor.fallo(candidato) and self.on_evento:
                     self.on_evento(f"disyuntor ABIERTO para {candidato}: lo salteo un rato ({self.disyuntor.enfriamiento:.0f}s)")
-                if self.on_evento and n + 1 < len(orden):
-                    self.on_evento(f"{candidato} falló ({e}); pruebo con {orden[n + 1]}")
+                # El que de verdad se va a intentar: con el cupo diario agotado, los :free siguientes se saltean (antes
+                # decía "pruebo con nemotron…:free" y no lo probaba).
+                siguiente = next((c for c in orden[n + 1:]
+                                  if not (self.cupo_free_agotado() and self._es_free_openrouter(c))), None)
+                if self.on_evento and siguiente:
+                    self.on_evento(f"{candidato} falló ({e}); pruebo con {siguiente}")
         assert ultimo is not None
         raise ultimo
 
@@ -691,6 +695,12 @@ class LLMClient:
                     pass
                 if _RE_CONTEXTO.search(mensaje or ""):
                     raise LLMError(f"Contexto excedido: {mensaje}", contexto_excedido=True)
+                if codigo in (429, None) and _RE_CUPO_DIARIO.search(mensaje or ""):
+                    # El cupo diario también puede llegar como evento de error DENTRO del stream (HTTP 200): como
+                    # pasajero se reintentaba hasta agotar los intentos en vez de frenar con la hora de reinicio.
+                    meta = err.get("metadata") if isinstance(err, dict) else None
+                    cab = (meta or {}).get("headers") if isinstance(meta, dict) else None
+                    _lanzar_http(429, mensaje, None, cab if isinstance(cab, dict) else None)
                 if codigo is None or codigo in TRANSITORIOS:
                     raise _Transitorio(f"Error del proveedor durante el streaming: {mensaje}")
                 raise LLMError(f"Error del proveedor: {mensaje}", probar_otro_modelo=True)

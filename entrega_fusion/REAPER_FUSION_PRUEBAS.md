@@ -612,3 +612,66 @@ retomar una corrida cortada y un ZIP por proyecto.
 
 Tests: +19. Regresión: **1099 tests OK** en Python 3.10/3.11/3.12/3.13. Lint (pyflakes/ruff): sin hallazgos.
 
+## 21. Primera prueba REAL de `/grande` (teléfono) y corridas de punta a punta contra un OpenRouter simulado
+
+### 21.a Lo que mostró el teléfono (Termux, Python 3.14.6, modelos `:free`, versión `9c9f2a06`)
+
+La corrida se cortó en la etapa 1 de un plan de 10. Lo que se vio, ya corregido en rondas anteriores (1099 → 1113
+tests): el proyecto nuevo terminaba en "No existe ~/almacen" (ahora `--construir`/`--grande` crean la carpeta); el plan
+maestro no tenía etapa para la web, partía el proyecto en 10 etapas de un archivo y acusaba "datos de ejemplo" por un
+reporte (observaciones suaves en vez de rechazo); `cohere/north-mini-code:free` pensaba ~25 000 caracteres sin
+responder en cada pedido (razonamiento por modelo: `low` → `none` → se deja); el juez apuntaba a un ID de nanogpt que
+ya no existe (se retira al primer 400 "not a valid model"); el especificador entraba en bucle porque "No module named
+'almacen'" le parecía un error (es lo esperado en tests primero; ahora se lo dicen la herramienta y `run_tests`).
+
+### 21.b Corridas de punta a punta (`pruebas_fusion/e2e/`)
+
+Un OpenRouter FALSO por HTTP (`openrouter_falso.py`: chat con SSE, `/models`, `/key`, cupo diario con
+`X-RateLimit-*`, 429 por minuto, modelos que solo razonan, implementador flojo) y la **CLI real** apuntada a él con
+`REAPER_API_URL` + `REAPER_OPENROUTER_BASE` (nuevo). El cerebro es el almacén de 5 etapas del autotest, extendido al
+pipeline real del perfil gratis: tests primero, torneo de 2, revisor, juez. `correr_script.sh` corre el script del
+teléfono (`probar_grande.sh`) entero sin red: descarga con SHA-256 desde un servidor local, instala, doctor, `/grande`,
+`--reporte`.
+
+| Escenario | Antes | Ahora |
+|---|---|---|
+| Normal | verificado, 112 pedidos, 6m19s | verificado, 78 pedidos (−30 %), 4m19s |
+| Cupo diario agotado a los 40 pedidos (etapa 4, en "tests primero") | `continuar` → "Cambios externos o tareas ya verificadas alteradas": **la etapa no se podía retomar nunca más** | se detiene con la hora de renovación; `continuar` con el cupo agotado gasta 1 pedido y frena; "al otro día" termina verificado sin rehacer nada |
+| Ctrl+C a los 20, 37, 53, 71, 89 s… y `continuar` cada vez | — | retoma en todos los puntos y termina verificado |
+| Modelo que solo razona + 429 por minuto cada 7 pedidos | — | baja el razonamiento, reintenta con `Retry-After` y termina verificado |
+| Implementador flojo (vende sin stock) | la tarea quedaba "verificada" con su propio test en rojo; lo atajaba recién la reparación final | la verificación de la tarea lo detecta y el reparador lo corrige antes de revisar |
+
+**Bugs de lógica (8), todos con test que falla con el código anterior:**
+1. Desde la etapa 2 de `/grande`, los tests de etapas anteriores (que ya pasan) se contaban como "tests de la
+   especificación que YA pasan sin el código": el especificador tenía que reescribir tests buenos. Se resta la base.
+2. Una revisión sin la línea VEREDICTO mandaba al implementador "corregí" sin nada que corregir (28 de 112 pedidos).
+   Sin dictamen ni puntos concretos, no hay ronda; con puntos concretos ("1. falta validar…"), se pasan.
+3. Un test de JS que importa `../web/logica.js` antes de que exista se rechazaba (el "ImportError" de JS no era rojo
+   esperado; `es_archivo_de_test` ni reconocía `tests/*.test.mjs`); `run_tests` no lo explicaba.
+4. `web/index.html` escrito antes que `app.js`/`style.css` salía "VALIDACIÓN FALLÓ (corregilo antes de seguir)": un
+   modelo real podía "arreglarlo" sacando el `<script>`. Si lo que falta está en el plan, es trabajo pendiente.
+5. **Cortada en una FASE** (tests primero, QA, verificación final o reparación), la build no se podía retomar: el
+   diario solo aceptaba cambios de una *tarea* activa. Las fases quedan anotadas igual que una tarea.
+6. Los diarios se guardan redactados: un pedido con "password: admin123" no se reconocía al retomar (y `/grande`
+   quedaba trabado). `mismo_pedido` compara también la forma redactada.
+7. Al retomar la fase de tests, el especificador encontraba su test hecho, no lo reescribía, y se descartaba la
+   especificación. Cuentan los tests que la misma build ya había escrito.
+8. La verificación de una tarea toleraba TODO el rojo de la especificación (incluido el de la propia tarea y el de
+   la última): solo se tolera el de las tareas siguientes; romper tests de etapas anteriores es regresión.
+
+Por revisión del código: el cupo diario también puede llegar como evento de error **dentro** del stream (HTTP 200);
+antes se reintentaba como pasajero.
+
+**Mensajes (10):** la caja recortaba justo "Se renueva mañana a las…" (ahora parte las líneas); "pruebo con
+nemotron…:free" cuando el cupo gratis ya estaba agotado; el comando para seguir no llevaba `--perfil gratis` (podía
+caer en un modelo pago); "✗ Ningún candidato produjo cambios" con el trabajo ya hecho; un "⚠" vacío antes de
+"Interrumpido"; en el script, el doctor sin `--perfil gratis` no mostraba el cupo, el cierre decía "cupo del día, un
+límite o una etapa" sin decir cuál (ahora el motivo real, y Ctrl+C aparte), el reporte mostraba el modelo de la
+config y no el de la corrida (ahora guarda `ajustes_corrida`) y un motivo viejo en un proyecto terminado; la fila del
+cupo del doctor se cortaba antes de "quedan".
+
+Tests: +15 (`48zl_autotest_e2e.py`). Regresión: **1128 tests OK** en Python 3.10/3.11/3.12/3.13.
+
+**NO VERIFICADO con un modelo real:** el OpenRouter falso responde lo que el guion dice; los modelos reales fallan de
+formas que el guion no imita. La próxima prueba en el teléfono es la que cuenta.
+

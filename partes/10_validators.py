@@ -1351,6 +1351,15 @@ def separar_imports_tdd(resultados: list[Resultado], texto_plan: str = "",
     quedan, esperados, clasificaciones = [], [], []
     for r in resultados:
         tipo = r.comando.split(" ")[0]
+        es_test_js = bool(_RE_TEST_JS.match((r.archivo or "").rsplit("/", 1)[-1])) or (
+            r.archivo or "").startswith(("tests/", "test/", "__tests__/"))
+        if tipo == "imports-js" and not r.ok and ws is not None and es_test_js:
+            # tests/logica.test.mjs importa ../web/logica.js antes de que exista: el ImportError de JS.
+            _sigue, pendientes = faltantes_planeados(ws, [r], texto_plan)
+            if pendientes:
+                clasificaciones.extend(ClasificacionImport(r.archivo, x, "MODULO_PROPIO_AUSENTE") for x in pendientes)
+                esperados.append(r)
+                continue
         if r.ok or tipo not in ("imports", "imports-locales") or not es_archivo_de_test(r.archivo or ""):
             quedan.append(r)
             continue
@@ -1381,6 +1390,60 @@ def separar_imports_tdd(resultados: list[Resultado], texto_plan: str = "",
                 f"{c.modulo} → {c.causa}: {explicacion.get(c.causa, '')}" for c in reales)
         quedan.append(r)
     return quedan, esperados, clasificaciones
+
+
+_RE_FALTANTE_REF = re.compile(r"(?:no existe el archivo importado|referencia a) '([^']+)'")
+_RE_RUTA_PLAN = re.compile(r"(?<![\w/.-])((?:[\w.-]+/)*[\w-][\w.-]*\.[A-Za-z0-9]{1,5})(?![\w/-])")
+
+
+def _rutas_del_plan(texto_plan: str) -> set:
+    return {os.path.normpath(r).replace("\\", "/") for r in _RE_RUTA_PLAN.findall(texto_plan or "")}
+
+
+def _referencia_planeada(ws: Workspace, archivo_rel: str, destino: str, planeadas: set) -> Optional[str]:
+    """La ruta del plan a la que apunta un import/src/href que todavía no existe; None si el plan no la nombra."""
+    base = (ws.raiz / archivo_rel).parent
+    limpio = destino.lstrip("/")
+    absolutas = [ws.raiz / limpio, base / limpio] + [ws.raiz / d / limpio for d in _RAICES_WEB]
+    for c in (absolutas if destino.startswith("/") else [base / destino]):
+        try:
+            rel = os.path.relpath(os.path.normpath(c), ws.raiz).replace("\\", "/")
+        except ValueError:
+            continue
+        variantes = [rel] if Path(rel).suffix else [rel] + [rel + ext for ext in _EXTENSIONES_JS]
+        for v in variantes:
+            if v in planeadas:
+                return v
+    return None
+
+
+def faltantes_planeados(ws: Workspace, resultados: list[Resultado], texto_plan: str) -> tuple:
+    """
+    Un HTML que referencia app.js/style.css, o un módulo JS que importa otro, escritos ANTES que esos archivos: si
+    todos los que faltan están en el plan, no es un error sino trabajo pendiente (corrida E2E de /grande: el
+    implementador escribía web/index.html primero, veía "VALIDACIÓN FALLÓ (corregilo antes de seguir)" y un modelo
+    real podía "arreglarlo" sacando el <script>). → (resultados que siguen, rutas del plan pendientes de crear).
+    """
+    planeadas = _rutas_del_plan(texto_plan)
+    quedan, pendientes = [], []
+    for r in resultados:
+        tipo = r.comando.split(" ")[0]
+        if r.ok or tipo not in ("imports-js", "recursos-html") or not planeadas:
+            quedan.append(r)
+            continue
+        propias = []
+        for linea in (l for l in (r.stderr or "").splitlines() if l.strip()):
+            m = _RE_FALTANTE_REF.search(linea)
+            destino = _referencia_planeada(ws, r.archivo or "", m.group(1), planeadas) if m and r.archivo else None
+            if destino is None:
+                propias = []
+                break
+            propias.append(destino)
+        if propias:
+            pendientes.extend(x for x in propias if x not in pendientes)
+            continue
+        quedan.append(r)
+    return quedan, pendientes
 
 
 def fallos(resultados: list[Resultado]) -> list[Resultado]:

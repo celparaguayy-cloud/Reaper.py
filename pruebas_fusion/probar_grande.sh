@@ -51,7 +51,8 @@ y volvé a correr este script."
 fi
 
 paso "3/5 · Diagnóstico y cupo de pedidos gratis de hoy"
-$REAPER --doctor || true
+# Con --perfil gratis: así el diagnóstico mira los MISMOS modelos que va a usar la prueba y muestra el cupo de hoy.
+$REAPER --perfil gratis --doctor || true
 echo "  (sin crédito comprado: 50 pedidos gratis por día; con 10 o más de crédito: 1000)"
 
 if command -v termux-wake-lock >/dev/null 2>&1; then
@@ -72,7 +73,7 @@ fi
 RESULTADO=$?
 
 paso "5/5 · Armando el reporte para mandar (sin claves)"
-$REAPER --proyecto "$PROYECTO" --sin-animacion --reporte || true
+$REAPER --proyecto "$PROYECTO" --perfil gratis --sin-animacion --reporte || true
 ZIP=$(ls -t "$HOME"/reaper_reporte_*.zip 2>/dev/null | head -n 1)
 if [ -n "$ZIP" ]; then
   if [ -d "$HOME/storage/downloads" ]; then
@@ -88,8 +89,14 @@ command -v termux-wake-unlock >/dev/null 2>&1 && termux-wake-unlock
 if [ "$RESULTADO" -eq 0 ]; then
   printf '\n\033[1;32m✓ Proyecto grande TERMINADO Y VERIFICADO.\033[0m Probalo:\n'
   echo "  cd $PROYECTO && python3 -m unittest discover -s tests && python3 -m almacen --puerto 8000"
+elif [ "$RESULTADO" -eq 130 ]; then
+  printf '\n\033[1;33m◐ Lo cortaste (Ctrl+C). Lo hecho quedó guardado.\033[0m\n'
+  echo "  Para seguir, corré EXACTAMENTE el mismo comando otra vez (retoma donde quedó)."
 else
-  printf '\n\033[1;33m◐ Se detuvo (cupo del día, un límite del modelo o una etapa que no quedó verificada).\033[0m\n'
+  # El motivo REAL de la parada (cupo del día con la hora en que se renueva, una etapa sin verificar…).
+  MOTIVO=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("motivo", ""))' \
+    "$PROYECTO/.reaper/proyecto_grande.json" 2>/dev/null)
+  printf '\n\033[1;33m◐ Se detuvo: %s\033[0m\n' "${MOTIVO:-mirá el informe en el ZIP}"
   echo "  Mandame el ZIP de Descargas. Para seguir más tarde, corré EXACTAMENTE el mismo comando otra vez."
 fi
 exit "$RESULTADO"

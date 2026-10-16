@@ -313,8 +313,10 @@ def pedido_de_etapa(pedido: str, maestro: PlanMaestro, etapa: Etapa) -> str:
     return "\n\n".join(partes)
 
 
-def comando_para_seguir(ws, modo: str) -> str:
-    """El comando exacto para retomar desde la terminal (lo que hay que tipear después de un corte)."""
+def comando_para_seguir(ws, modo: str, settings: Optional[Settings] = None) -> str:
+    """El comando exacto para retomar desde la terminal (lo que hay que tipear después de un corte). Si la corrida usa
+    modelos :free de OpenRouter, lleva --perfil gratis: sin eso, retomar con la config de siempre podía caer en un
+    modelo PAGO (o en uno gratis viejo que ya no existe)."""
     ruta = str(getattr(ws, "raiz", ws))
     casa = str(Path.home())
     if ruta == casa or ruta.startswith(casa + os.sep):
@@ -322,18 +324,19 @@ def comando_para_seguir(ws, modo: str) -> str:
         visible = ruta if not re.search(r"[^\w./~-]", ruta) else '~/' + shlex.quote(ruta[2:])
     else:
         visible = shlex.quote(ruta)
-    return f"reaper --proyecto {visible} --{modo} continuar"
+    perfil = " --perfil gratis" if settings is not None and usa_free_openrouter(settings) else ""
+    return f"reaper --proyecto {visible}{perfil} --{modo} continuar"
 
 
-def pista_para_seguir(ws: Workspace) -> str:
+def pista_para_seguir(ws: Workspace, settings: Optional[Settings] = None) -> str:
     """Si en la carpeta quedó un /grande o un /construir sin terminar, cómo seguirlo ('' si no hay nada)."""
     try:
         grande = ConstructorGrande(None, ws, Settings(), None).leer()
         if grande and grande.get("estado") != "terminado":
-            return f"El proyecto grande quedó guardado. Para seguir: {comando_para_seguir(ws, 'grande')}"
+            return f"El proyecto grande quedó guardado. Para seguir: {comando_para_seguir(ws, 'grande', settings)}"
         build = RegistroBuild(ws).leer()
         if build and build.get("estado") not in ESTADOS_OK_ETAPA:
-            return f"La build quedó guardada. Para seguir: {comando_para_seguir(ws, 'construir')}"
+            return f"La build quedó guardada. Para seguir: {comando_para_seguir(ws, 'construir', settings)}"
     except (ValueError, OSError, KeyError, TypeError):
         return ""
     return ""
@@ -396,7 +399,7 @@ class ConstructorGrande:
         if cuenta.quedan_hoy is not None and cuenta.quedan_hoy < minimo:
             self.ui.aviso("  Con lo que queda hoy no alcanza para todo: avanzo lo que se pueda y, cuando se agote el "
                           "cupo, me detengo limpio (nada queda a medias sin guardar). Seguí después con: "
-                          + comando_para_seguir(self.ws, "grande"))
+                          + comando_para_seguir(self.ws, "grande", self.settings))
 
     def _ahorro_de_pedidos(self) -> Callable[[], None]:
         """Cuenta con 50 pedidos gratis por día: sin torneo ni revisor en ESTA corrida (cada candidato del torneo es
@@ -551,14 +554,15 @@ class ConstructorGrande:
             self.ui.error(str(e))
             return False
         if previo and previo.get("estado") != "terminado":
-            if " ".join(str(previo.get("pedido", "")).split()) == " ".join(pedido.split()):
+            if mismo_pedido(previo.get("pedido"), pedido):
                 # Repetir el MISMO comando después de un corte (Termux cerrado, teléfono bloqueado, límite del
                 # modelo) es la forma natural de "seguir": antes daba error y había que saber /grande continuar.
                 self.ui.info("Este mismo proyecto grande había quedado a medias: lo retomo donde quedó.")
                 return self.continuar()
             self.ui.error("Ya hay OTRO proyecto grande sin terminar en esta carpeta. Seguilo con "
-                          f"`{comando_para_seguir(self.ws, 'grande')}`, miralo con /grande estado o descartalo con "
-                          "/grande descartar (no borra archivos). Para uno nuevo usá otra carpeta (--proyecto).")
+                          f"`{comando_para_seguir(self.ws, 'grande', self.settings)}`, miralo con /grande estado o "
+                          "descartalo con /grande descartar (no borra archivos). Para uno nuevo usá otra carpeta "
+                          "(--proyecto).")
             return False
         try:
             pendiente = RegistroBuild(self.ws).leer()
@@ -603,6 +607,13 @@ class ConstructorGrande:
         return self._ejecutar(estado, maestro)
 
     def _ejecutar(self, estado: dict, maestro: PlanMaestro) -> bool:
+        # Con qué modelos y ajustes corrió de verdad (con --perfil gratis no coincide con la config guardada): lo usa
+        # /reporte, que si no mostraba el modelo de la config y no el que construyó.
+        s = self.settings
+        estado["ajustes_corrida"] = {"modelo": s.modelo, "respaldos": list(s.fallbacks or []),
+                                     "roles": dict(s.modelos_rol or {}), "torneo": s.torneo,
+                                     "candidatos": s.candidatos, "tests_primero": s.tests_primero, "rpm": s.rpm,
+                                     "juez": getattr(s, "juez", None), "fecha": datetime.now().isoformat(timespec="seconds")}
         restaurar = self._ahorro_de_pedidos()
         try:
             return self._ejecutar_etapas(estado, maestro)
@@ -635,14 +646,15 @@ class ConstructorGrande:
                         # Límite pasajero (o cupo que se renueva pronto): esperar y seguir SOLO, sin perder lo hecho.
                         self.ui.aviso(f"  {recortar(_primera_linea_util(str(e)), 140)}")
                         self.ui.aviso(f"  Espero {formatear_duracion(espera)} y sigo solo (Ctrl+C corta; después: "
-                                      f"{comando_para_seguir(self.ws, 'grande')}).")
+                                      f"{comando_para_seguir(self.ws, 'grande', self.settings)}).")
                         self.dormir(espera)
                         esperado, esperas = esperado + espera, esperas + 1
                         continue
                     etapa.estado, etapa.motivo = "pendiente", recortar(str(e), 400)
                     if e.cupo_diario:
-                        return self._detener(estado, maestro, "se agotó el cupo diario de pedidos gratis. "
-                                             + recortar(str(e), 220))
+                        # Corto y con la HORA: el error entero en la caja se recortaba justo antes de "Se renueva…".
+                        return self._detener(estado, maestro, "se agotó el cupo diario de pedidos gratis.\n"
+                                             + (_texto_reinicio(e.reinicio) or " Se renueva en unas horas.").strip())
                     return self._detener(estado, maestro, f"el modelo no responde ({recortar(str(e), 160)})")
                 terminadas += 1
                 if etapa.ok or informe.estado == "cancelada" or terminadas >= 2:
@@ -665,7 +677,7 @@ class ConstructorGrande:
         except ValueError as e:
             raise LLMError(f"diario de build ilegible: {e}", probar_otro_modelo=False)
         reanudar = bool(pendiente and pendiente.get("estado") not in ESTADOS_OK_ETAPA)
-        if reanudar and pendiente.get("pedido") != pedido_etapa:
+        if reanudar and not mismo_pedido(pendiente.get("pedido"), pedido_etapa):
             etapa.estado, etapa.motivo = "pendiente", "hay otro /construir sin terminar en la carpeta"
             self.guardar(estado, maestro)
             self.ui.error("Hay un /construir sin terminar que no es de esta etapa: terminalo o descartalo "
@@ -730,7 +742,7 @@ class ConstructorGrande:
         etapa = next((e for e in maestro.etapas if not e.ok and e.estado != "pendiente"), None) or next(
             (e for e in maestro.etapas if not e.ok), None)
         if not build or build.get("estado") in ESTADOS_OK_ETAPA or etapa is None \
-                or build.get("pedido") != pedido_de_etapa(estado["pedido"], maestro, etapa):
+                or not mismo_pedido(build.get("pedido"), pedido_de_etapa(estado["pedido"], maestro, etapa)):
             self.ui.aviso("No hay una etapa a medias para deshacer (todo lo que está en disco ya quedó verificado o "
                           "la build pendiente no es de este proyecto grande).")
             return False
@@ -743,7 +755,7 @@ class ConstructorGrande:
         self.guardar(estado, maestro)
         indice_de(self.ws).invalidar()
         self.ui.ok(f"Etapa {etapa.id} deshecha: {len(tocados)} archivo(s) vuelven al último estado verificado.")
-        self.ui.tenue(f"  Para rehacerla: /grande continuar  ·  {comando_para_seguir(self.ws, 'grande')}")
+        self.ui.tenue(f"  Para rehacerla: /grande continuar  ·  {comando_para_seguir(self.ws, 'grande', self.settings)}")
         return True
 
     def _detener(self, estado: dict, maestro: PlanMaestro, motivo: str) -> bool:
@@ -760,9 +772,13 @@ class ConstructorGrande:
         self.guardar(estado, maestro)
         hechas = sum(1 for e in maestro.etapas if e.ok)
         self.ui.linea("")
+        cupo = motivo.startswith("se agotó el cupo diario")
+        primera, *resto = recortar(motivo, 300).splitlines() or [""]
         self.ui.caja([f"Etapas verificadas: {hechas}/{len(maestro.etapas)}",
-                      f"Me detengo: {recortar(motivo, 300)}",
+                      f"Me detengo: {primera}", *resto,
+                      "Lo hecho queda guardado: nada se pierde." if cupo else
                       "No construyo encima de algo que no está verificado.",
+                      "Cuando se renueve el cupo, seguí con: /grande continuar" if cupo else
                       "Revisá el informe de la etapa y seguí con: /grande continuar"],
                      titulo="Proyecto grande · DETENIDO", color=Tema.aviso)
         if rotas:
@@ -770,7 +786,7 @@ class ConstructorGrande:
             self.ui.aviso(f"  Los cambios de esta etapa ROMPIERON lo que ya estaba verificado ({detalle}).")
             self.ui.aviso("  Para volver al último estado verificado: /grande deshacer  (y después /grande continuar)")
         # Fuera de la caja: adentro se recorta al ancho de la terminal y el comando no se podía copiar entero.
-        self.ui.info(f"  Desde la terminal: {comando_para_seguir(self.ws, 'grande')}")
+        self.ui.info(f"  Desde la terminal: {comando_para_seguir(self.ws, 'grande', self.settings)}")
         return False
 
     # ------------------------------------------------------------ integración
@@ -802,7 +818,9 @@ class ConstructorGrande:
             resultado = self._verificar_integracion(estado, maestro)
         estado["integracion"].update({k: resultado[k] for k in ("ok", "estado", "faltantes", "juicio")})
         estado["estado"] = "terminado" if resultado["ok"] else "integracion_pendiente"
-        if not resultado["ok"]:
+        if resultado["ok"]:
+            estado.pop("motivo", None)              # el motivo de una parada anterior ya no vale (salía en /reporte)
+        else:
             estado["motivo"] = "la integración final no quedó verificada: " + (
                 "; ".join(resultado["faltantes"][:3]) or _primera_linea_util(resultado["diagnostico"]))
         self.guardar(estado, maestro)
@@ -847,7 +865,7 @@ class ConstructorGrande:
         self.ui.caja(lineas, titulo="Proyecto grande · " + ("✓ TERMINADO Y VERIFICADO" if ok else "INCOMPLETO"),
                      color=Tema.ok if ok else Tema.aviso)
         if not ok:
-            self.ui.info(f"  Desde la terminal: {comando_para_seguir(self.ws, 'grande')}")
+            self.ui.info(f"  Desde la terminal: {comando_para_seguir(self.ws, 'grande', self.settings)}")
         ruta = self._guardar_informe(estado, maestro)
         if ruta:
             self.ui.tenue(f"  Informe: {ruta}")

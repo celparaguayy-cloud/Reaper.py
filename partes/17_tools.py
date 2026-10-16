@@ -178,6 +178,10 @@ def _post_escritura(ctx: Contexto, rel: str, antes: Optional[str], despues: str,
         if tdd:
             notas = list(notas) + ["importa módulos que todavía no existen (esperado en tests primero: "
                                    "los crea la implementación)"]
+    resultados, pendientes = faltantes_planeados(ctx.ws, resultados, ctx.pedido)
+    if pendientes:
+        notas = list(notas) + [f"referencia archivos del plan que todavía no existen ({', '.join(pendientes)}): "
+                               "crealos a continuación"]
     malos = fallos(resultados)
     accion = accion or ("Creé" if antes is None else "Modifiqué")
     texto = f"{accion} {rel} ({lineas} líneas)."
@@ -713,6 +717,15 @@ def run_tests(ctx: Contexto, p: dict) -> str:
         faltan = sorted({m.split(".")[0] for m in re.findall(r"No module named '([\w.]+)'", combinado)
                          if not (ctx.ws.raiz / m.split(".")[0]).exists()
                          and not (ctx.ws.raiz / (m.split(".")[0] + ".py")).exists()})
+        # El ImportError de node (tests/*.test.mjs que importan ../web/logica.js antes de que exista).
+        for ruta in re.findall(r"Cannot find module '([^']+)'", combinado):
+            destino = Path(ruta)
+            try:
+                rel = destino.resolve().relative_to(ctx.ws.raiz.resolve()).as_posix() if destino.is_absolute() else ""
+            except (ValueError, OSError):
+                rel = ""
+            if rel and not destino.exists() and rel not in faltan:
+                faltan.append(rel)
         if faltan:
             texto = ("ESPERADO (tests primero): fallan porque " + ", ".join(f"'{m}'" for m in faltan)
                      + " todavía no existe; lo crea el IMPLEMENTADOR después de vos. No intentes crearlo: si tus "
