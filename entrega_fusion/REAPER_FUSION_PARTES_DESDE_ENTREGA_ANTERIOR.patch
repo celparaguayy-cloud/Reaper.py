@@ -2167,7 +2167,7 @@ index 460ab85..1e0db07 100644
          return nodo
  
 diff --git a/partes/17_tools.py b/partes/17_tools.py
-index 5dd7c2d..8bc1a44 100644
+index 5dd7c2d..95425d2 100644
 --- a/partes/17_tools.py
 +++ b/partes/17_tools.py
 @@ -30,6 +30,7 @@ class Contexto:
@@ -2178,7 +2178,22 @@ index 5dd7c2d..8bc1a44 100644
  
      def tropiezo(self, tipo: str) -> None:
          if self.memoria is not None:
-@@ -164,6 +165,11 @@ def _post_escritura(ctx: Contexto, rel: str, antes: Optional[str], despues: str,
+@@ -127,6 +128,14 @@ def _escribir(ctx: Contexto, rel: str, contenido: str) -> None:
+             "en esta tarea. Cambiá el código para que esos tests pasen."
+         )
+     if ctx.permitidos and not any(fnmatch.fnmatch(rel, patron) for patron in ctx.permitidos):
++        if getattr(ctx, "rol", "") == "especificador":
++            # Prueba real /grande: el especificador intentó 6 veces crear almacen/storage.py "para que el test no
++            # falle por ImportError" y terminó en bucle. Que falle AHORA es justamente lo esperado.
++            raise ErrorHerramienta(
++                f"{rel} es código de la aplicación: lo escribe el IMPLEMENTADOR después de vos. Que tus tests fallen "
++                "AHORA con ImportError / ModuleNotFoundError es lo ESPERADO en tests primero. No crees ese archivo "
++                "ni un conftest.py para esquivarlo: si tus tests ya cubren la interfaz y los criterios, terminá con "
++                "attempt_completion.")
+         raise ErrorHerramienta(
+             f"En este rol solo podés escribir archivos que coincidan con: {', '.join(ctx.permitidos)}. "
+             f"{rel} no está permitido."
+@@ -164,6 +173,11 @@ def _post_escritura(ctx: Contexto, rel: str, antes: Optional[str], despues: str,
              lineas = despues.count("\n") + (0 if despues.endswith("\n") or not despues else 1)
  
      resultados = validar_archivo(ctx.ws, rel)
@@ -2190,7 +2205,7 @@ index 5dd7c2d..8bc1a44 100644
      malos = fallos(resultados)
      accion = accion or ("Creé" if antes is None else "Modifiqué")
      texto = f"{accion} {rel} ({lineas} líneas)."
-@@ -311,7 +317,14 @@ def search_files(ctx: Contexto, p: dict) -> str:
+@@ -311,7 +325,14 @@ def search_files(ctx: Contexto, p: dict) -> str:
          for ruta in ctx.ws.iterar(p.get("path") or ".", limite=3000):
              if filtro and not Path(ruta.name).match(filtro):
                  continue
@@ -2206,7 +2221,7 @@ index 5dd7c2d..8bc1a44 100644
                  continue
              try:
                  texto = ruta.read_text(encoding="utf-8", errors="replace")
-@@ -319,7 +332,8 @@ def search_files(ctx: Contexto, p: dict) -> str:
+@@ -319,7 +340,8 @@ def search_files(ctx: Contexto, p: dict) -> str:
                  continue
              for n, linea in enumerate(texto.splitlines(), start=1):
                  if rx.search(linea):
@@ -2216,7 +2231,7 @@ index 5dd7c2d..8bc1a44 100644
                      if len(hallazgos) >= 80:
                          return hallazgos
          return hallazgos
-@@ -535,12 +549,12 @@ _BLOQUEADOS = [
+@@ -535,12 +557,12 @@ _BLOQUEADOS = [
  ]
  
  _SEGUROS = (
@@ -2235,7 +2250,7 @@ index 5dd7c2d..8bc1a44 100644
  )
  
  
-@@ -552,10 +566,35 @@ def comando_bloqueado(comando: str) -> Optional[str]:
+@@ -552,10 +574,35 @@ def comando_bloqueado(comando: str) -> Optional[str]:
  
  
  def comando_seguro(comando: str) -> bool:
@@ -2273,7 +2288,7 @@ index 5dd7c2d..8bc1a44 100644
  
  
  PISTA_INTERACTIVO = (
-@@ -599,6 +638,8 @@ def execute_command(ctx: Contexto, p: dict) -> str:
+@@ -599,6 +646,8 @@ def execute_command(ctx: Contexto, p: dict) -> str:
      comando = p["command"].strip()
      if not comando:
          raise ErrorHerramienta("Comando vacío.")
@@ -2282,7 +2297,7 @@ index 5dd7c2d..8bc1a44 100644
      patron = comando_bloqueado(comando)
      if patron:
          raise ErrorHerramienta(f"Comando bloqueado por seguridad (coincide con {patron}).")
-@@ -608,12 +649,17 @@ def execute_command(ctx: Contexto, p: dict) -> str:
+@@ -608,12 +657,17 @@ def execute_command(ctx: Contexto, p: dict) -> str:
      if ctx.settings.modo != "auto" and not comando_seguro(comando):
          if not pedir_permiso_comando(ctx, comando):
              raise ErrorHerramienta(
@@ -2302,7 +2317,22 @@ index 5dd7c2d..8bc1a44 100644
      texto = r.resumen(limite=MAX_SALIDA // 2)
      if entrada is not None:
          texto = texto.replace("\n", f"\n(stdin: {len(entrada.splitlines())} línea(s))\n", 1)
-@@ -718,6 +764,22 @@ def update_todo(ctx: Contexto, p: dict) -> str:
+@@ -655,6 +709,14 @@ def run_tests(ctx: Contexto, p: dict) -> str:
+     if conteo.nombres_fallados:
+         texto += "Fallaron: " + ", ".join(conteo.nombres_fallados[:10]) + "\n"
+     texto += "DETALLE DE LOS PRIMEROS FALLOS:\n" + detalle
++    if getattr(ctx, "rol", "") == "especificador":
++        faltan = sorted({m.split(".")[0] for m in re.findall(r"No module named '([\w.]+)'", combinado)
++                         if not (ctx.ws.raiz / m.split(".")[0]).exists()
++                         and not (ctx.ws.raiz / (m.split(".")[0] + ".py")).exists()})
++        if faltan:
++            texto = ("ESPERADO (tests primero): fallan porque " + ", ".join(f"'{m}'" for m in faltan)
++                     + " todavía no existe; lo crea el IMPLEMENTADOR después de vos. No intentes crearlo: si tus "
++                       "tests cubren la interfaz y los criterios, terminá con attempt_completion.\n\n" + texto)
+     if ctx.settings.pistas_errores:
+         texto = anexar_pistas(texto, 2)
+     return texto
+@@ -718,6 +780,22 @@ def update_todo(ctx: Contexto, p: dict) -> str:
          marca = {"x": "✓", ">": "▸"}.get(estado, "○")
          ctx.ui.tenue(f"      {marca} {texto}")
      hechos = sum(1 for e, _ in items if e == "x")
@@ -11579,10 +11609,10 @@ index 0000000..316099b
 +        self.assertIn("lo vuelve a revisar la integración final", ui.texto_registrado())
 diff --git a/partes/48zj_autotest_cupo.py b/partes/48zj_autotest_cupo.py
 new file mode 100644
-index 0000000..3bf50f7
+index 0000000..6cf10fb
 --- /dev/null
 +++ b/partes/48zj_autotest_cupo.py
-@@ -0,0 +1,325 @@
+@@ -0,0 +1,355 @@
 +"""
 +Autotests de preparación para una prueba GRANDE con modelos gratis de OpenRouter (límites publicados: 20 pedidos por
 +minuto; 50 por día sin crédito comprado, 1000 con al menos 10 de crédito; 429 con X-RateLimit-* al pasarse).
@@ -11908,6 +11938,36 @@ index 0000000..3bf50f7
 +        sin = cobertura_criterios(["Todo el código utiliza únicamente la biblioteca estándar de Python",
 +                                   "No se incluyen todavía módulos de CRUD", "Existe un endpoint /api/ventas"], plan)
 +        self.assertEqual(sin, ["Existe un endpoint /api/ventas"])
++
++
++class TestEspecificadorNoSeTrabaConImportError(BaseTest):
++    """Prueba real /grande: el test del especificador fallaba con "No module named 'almacen'" (lo ESPERADO en tests
++    primero), el modelo creía que estaba mal, intentaba 6 veces crear almacen/storage.py (bloqueado), creaba un
++    conftest.py y terminaba en "bucle improductivo"."""
++
++    def _ctx(self, ws):
++        ctx = self.contexto(ws)
++        ctx.rol = "especificador"
++        ctx.permitidos = tuple(ROLES["especificador"].rutas_permitidas)
++        return ctx
++
++    def test_escribir_codigo_explica_que_la_falla_es_esperada(self):
++        ws = self.proyecto({})
++        with self.assertRaises(ErrorHerramienta) as error:
++            _escribir(self._ctx(ws), "almacen/storage.py", "x = 1\n")
++        self.assertIn("lo ESPERADO en tests primero", str(error.exception))
++        self.assertIn("attempt_completion", str(error.exception))
++        self.assertFalse(ws.existe("almacen/storage.py"))
++
++    def test_run_tests_le_dice_que_el_import_que_falta_es_esperado(self):
++        ws = self.proyecto({"tests/test_storage.py": "import unittest\nfrom almacen.storage import init_db\n\n\n"
++                                                     "class T(unittest.TestCase):\n    def test_x(self):\n"
++                                                     "        self.assertTrue(init_db)\n"})
++        salida = run_tests(self._ctx(ws), {})
++        self.assertTrue(salida.startswith("ESPERADO (tests primero)"), salida[:300])
++        self.assertIn("'almacen'", salida)
++        otro = self.contexto(ws)                                                    # otros roles: sin la nota
++        self.assertNotIn("ESPERADO (tests primero)", run_tests(otro, {}))
 diff --git a/partes/48zk_autotest_almacen.py b/partes/48zk_autotest_almacen.py
 new file mode 100644
 index 0000000..a17f353
