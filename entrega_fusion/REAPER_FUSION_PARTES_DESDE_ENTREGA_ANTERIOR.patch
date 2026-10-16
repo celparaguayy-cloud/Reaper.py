@@ -2929,10 +2929,10 @@ index 4eba772..e986b98 100644
                  (self.ws.raiz / rel).unlink()
                  self.restaurados.append(f"{rel} (creado por los tests, borrado)")
 diff --git a/partes/25_pipeline.py b/partes/25_pipeline.py
-index ad78b6b..b754c2b 100644
+index ad78b6b..b07c3fd 100644
 --- a/partes/25_pipeline.py
 +++ b/partes/25_pipeline.py
-@@ -40,6 +40,587 @@ _RE_VEREDICTO = re.compile(r"VEREDICTO\s*:?\s*\**\s*(APROBADO|CAMBIOS|RECHAZADO)
+@@ -40,6 +40,592 @@ _RE_VEREDICTO = re.compile(r"VEREDICTO\s*:?\s*\**\s*(APROBADO|CAMBIOS|RECHAZADO)
  EXTENSIONES_TESTEABLES = (".py", ".js", ".mjs", ".cjs", ".ts")
  
  
@@ -3033,6 +3033,9 @@ index ad78b6b..b754c2b 100644
 +    r"(?:(?:las?|los|the)\s+)?(?:pruebas|tests?|suite|unit\s*tests?)\b", re.IGNORECASE)
 +
 +
++_RE_CONTEXTO_TEST = re.compile(r"\btests?\b|\btestead|prueba|unittest|pytest|fixture|node:test", re.I)
++
++
 +def problemas_del_plan(plan, pedido: str = "") -> list:
 +    """Determinista (0 tokens): tareas que planean simular o que no entregan nada. → mensajes para replanificar.
 +    "Datos de ejemplo" no cuenta si el PEDIDO los pide ("la base arranca con 3 recetas de ejemplo")."""
@@ -3041,7 +3044,9 @@ index ad78b6b..b754c2b 100644
 +    for tarea in getattr(plan, "tareas", []) or []:
 +        texto = tarea.descripcion or ""
 +        m = _RE_TAREA_SIMULADA.search(texto) or _RE_TODO.search(texto)
-+        if m and pide_ejemplos and re.search(r"ejemplo", m.group(0), re.I):
++        if m and re.search(r"ejemplo|fictici", m.group(0), re.I) and (
++                pide_ejemplos or _RE_CONTEXTO_TEST.search(texto[max(0, m.start() - 80):m.end() + 80])):
++            # "testeadas con datos de ejemplo" es lo normal en un test (prueba real: hizo replanificar sin motivo).
 +            m = _RE_TODO.search(texto)
 +        if m:
 +            salida.append(f"la tarea {tarea.id} planea una simulación («{m.group(0)}»): tiene que implementar "
@@ -3520,7 +3525,7 @@ index ad78b6b..b754c2b 100644
  @dataclass
  class Tarea:
      id: str
-@@ -108,10 +689,13 @@ def parsear_plan(texto: str, pedido: str, max_tareas: int = 8) -> Plan:
+@@ -108,10 +694,13 @@ def parsear_plan(texto: str, pedido: str, max_tareas: int = 8) -> Plan:
  
      if len(tareas) > max_tareas:
          sobrantes = tareas[max_tareas - 1:]
@@ -3534,7 +3539,7 @@ index ad78b6b..b754c2b 100644
          )]
  
      criterios = []
-@@ -178,13 +762,218 @@ def verificacion_peor(despues: "Verificacion", antes: "Verificacion") -> bool:
+@@ -178,13 +767,218 @@ def verificacion_peor(despues: "Verificacion", antes: "Verificacion") -> bool:
  
  
  def veredicto(informe: str) -> tuple[bool, bool]:
@@ -3755,7 +3760,7 @@ index ad78b6b..b754c2b 100644
  @dataclass
  class Verificacion:
      ok: bool
-@@ -193,6 +982,7 @@ class Verificacion:
+@@ -193,6 +987,7 @@ class Verificacion:
      diagnostico: str
      archivos: list
      conteo: ConteoTests = field(default_factory=ConteoTests)
@@ -3763,7 +3768,7 @@ index ad78b6b..b754c2b 100644
  
  
  @dataclass
-@@ -201,6 +991,7 @@ class InformeBuild:
+@@ -201,6 +996,7 @@ class InformeBuild:
      plan: Optional[Plan] = None
      archivos: list = field(default_factory=list)
      tests: Optional[Resultado] = None
@@ -3771,7 +3776,7 @@ index ad78b6b..b754c2b 100644
      diagnostico: str = ""
      cid: Optional[int] = None
      ruta_informe: Optional[Path] = None
-@@ -211,12 +1002,32 @@ class InformeBuild:
+@@ -211,12 +1007,32 @@ class InformeBuild:
      commit: Optional[str] = None
      spec_tests: list = field(default_factory=list)
      segundos: float = 0.0
@@ -3804,7 +3809,7 @@ index ad78b6b..b754c2b 100644
  def _diffstat(diff: str) -> str:
      stats: dict[str, list[int]] = {}
      actual = None
-@@ -231,10 +1042,36 @@ def _diffstat(diff: str) -> str:
+@@ -231,10 +1047,36 @@ def _diffstat(diff: str) -> str:
      return "\n".join(f"  {a}  +{m} -{n}" for a, (m, n) in stats.items())
  
  
@@ -3841,7 +3846,7 @@ index ad78b6b..b754c2b 100644
  def _es_de_especificacion(nombre_test: str, protegidos: dict) -> bool:
      """¿El test que falla pertenece a un archivo de la especificación? (pytest usa ruta::test, unittest modulo.Clase.test)"""
      for rel in protegidos:
-@@ -246,6 +1083,214 @@ def _es_de_especificacion(nombre_test: str, protegidos: dict) -> bool:
+@@ -246,6 +1088,214 @@ def _es_de_especificacion(nombre_test: str, protegidos: dict) -> bool:
      return False
  
  
@@ -4056,7 +4061,7 @@ index ad78b6b..b754c2b 100644
  class Orquestador:
      def __init__(self, llm, ws: Workspace, settings: Settings, ui: UI):
          self.llm = llm
-@@ -255,6 +1300,10 @@ class Orquestador:
+@@ -255,6 +1305,10 @@ class Orquestador:
          self.memoria = MemoriaLecciones(ws) if settings.lecciones else None
          self.escalador = Escalador(llm, settings, ui)
          self._protegidos: dict[str, Optional[str]] = {}
@@ -4067,7 +4072,7 @@ index ad78b6b..b754c2b 100644
  
      def _sub(self, rol: str, tarea: str, cid: Optional[int], archivos: str = "", titulo: str = "",
               **opciones) -> ResultadoAgente:
-@@ -264,6 +1313,20 @@ class Orquestador:
+@@ -264,6 +1318,20 @@ class Orquestador:
              profundidad=1, cid_inicio=cid,
          )[0]
  
@@ -4088,7 +4093,7 @@ index ad78b6b..b754c2b 100644
      # ------------------------------------------------------------ fases
      def explorar(self, pedido: str) -> str:
          archivos = self.ws.archivos_codigo(limite=500)
-@@ -296,7 +1359,13 @@ class Orquestador:
+@@ -296,7 +1364,13 @@ class Orquestador:
                  "cómo se ejecuta y se prueba el proyecto",
                  {"memoria": self.memoria},
              ))
@@ -4103,7 +4108,7 @@ index ad78b6b..b754c2b 100644
          informe = "\n\n".join(
              f"### Informe explorador {i}\n{r.resumen}" for i, r in enumerate(resultados, start=1)
          )
-@@ -308,7 +1377,10 @@ class Orquestador:
+@@ -308,7 +1382,10 @@ class Orquestador:
              f"PEDIDO DEL USUARIO:\n{pedido}\n\n"
              f"INFORME DE EXPLORACIÓN (código real):\n{recortar(exploracion, 7000)}\n\n"
              f"Comando de tests detectado: {detectado[0] if detectado else 'ninguno (habrá que crear tests)'}\n"
@@ -4115,7 +4120,7 @@ index ad78b6b..b754c2b 100644
          )
          if self.settings.tests_primero:
              tarea += ("\nLos tests se escriben ANTES de implementar a partir de tu <interfaz> y tus <criterios>: "
-@@ -323,6 +1395,11 @@ class Orquestador:
+@@ -323,6 +1400,11 @@ class Orquestador:
          if not _RE_TAREA.search(texto) and _RE_TAREA.search(res.contexto):
              texto = res.contexto + "\n" + texto
          plan = parsear_plan(texto, pedido, self.settings.max_tareas)
@@ -4127,7 +4132,7 @@ index ad78b6b..b754c2b 100644
          if not res.ok:
              self.ui.aviso("El arquitecto no terminó limpio; uso lo que produjo.")
          motivo = plan_degenerado(plan, pedido, texto)
-@@ -378,6 +1455,25 @@ class Orquestador:
+@@ -378,6 +1460,25 @@ class Orquestador:
                  return {}
          r = ejecutar_tests(self.ws, timeout=self.settings.tests_timeout, completo=True)
          conteo = conteo_de_resultado(r)
@@ -4153,7 +4158,7 @@ index ad78b6b..b754c2b 100644
          if r is not None and conteo.reconocido:
              if conteo.ok and conteo.pasados:
                  self.ui.aviso(f"  Ojo: la especificación ya pasa entera ({conteo.texto()}); quizá la función ya existía.")
-@@ -421,27 +1517,38 @@ class Orquestador:
+@@ -421,27 +1522,38 @@ class Orquestador:
          return torneo.correr(texto, archivos=", ".join(tarea.archivos), titulo=titulo,
                               n=self.settings.candidatos if usar_torneo else 1, protegidos=protegidos, cid=cid)
  
@@ -4196,7 +4201,7 @@ index ad78b6b..b754c2b 100644
          detectado = detectar_comando_tests(self.ws)
          criterios = "\n".join(f"- {c}" for c in plan.criterios) or "- (derivalos del pedido)"
          texto = (
-@@ -452,7 +1559,7 @@ class Orquestador:
+@@ -452,7 +1564,7 @@ class Orquestador:
              "Escribí (o completá) tests automáticos que verifiquen los criterios y corrélos con run_tests. "
              "Reportá el resultado REAL."
          )
@@ -4205,7 +4210,7 @@ index ad78b6b..b754c2b 100644
  
      def verificar(self, cid: int) -> Verificacion:
          archivos = [r for r in self.ws.checkpoints.archivos_desde(cid) if (self.ws.raiz / r).is_file()]
-@@ -462,13 +1569,35 @@ class Orquestador:
+@@ -462,13 +1574,35 @@ class Orquestador:
          malos = fallos(validaciones)
          tests_ok = tests is None or tests.ok
          partes = [r.resumen(2500) for r in malos]
@@ -4243,7 +4248,7 @@ index ad78b6b..b754c2b 100644
  
      def reparar(self, pedido: str, verif: Verificacion, cid: int, base_fallaba: bool,
                  diagnostico_experto: str = "", contexto: str = "") -> ResultadoAgente:
-@@ -485,7 +1614,8 @@ class Orquestador:
+@@ -485,7 +1619,8 @@ class Orquestador:
          if diagnostico_experto:
              texto = tarea_con_diagnostico(texto, diagnostico_experto)
          protegidos = set(self._protegidos)
@@ -4253,7 +4258,7 @@ index ad78b6b..b754c2b 100644
                                                                                      if diagnostico_experto else ""),
                           protegidos=protegidos)
  
-@@ -513,7 +1643,17 @@ class Orquestador:
+@@ -513,7 +1648,17 @@ class Orquestador:
          intentos_txt: list[str] = []
          forense_hecho = False
          informe_forense = ""
@@ -4271,7 +4276,7 @@ index ad78b6b..b754c2b 100644
              firma = _firma_error(verif.diagnostico)
              if diagnosticos_vistos.count(firma) >= 3:
                  informe.notas.append(f"{etiqueta}: la reparación no logró avances (mismo diagnóstico repetido).")
-@@ -549,6 +1689,7 @@ class Orquestador:
+@@ -549,6 +1694,7 @@ class Orquestador:
                                       + "\n---\n".join(intentos_txt[-2:]))
              res = self.reparar(pedido, verif, rcid, base_fallaba, experto, contexto_intento.strip())
              intentos_txt.append(recortar(res.resumen, 1200))
@@ -4279,7 +4284,7 @@ index ad78b6b..b754c2b 100644
              verif = verificador()
              self._mostrar_verificacion(verif)
              if verif.ok:
-@@ -566,6 +1707,221 @@ class Orquestador:
+@@ -566,6 +1712,221 @@ class Orquestador:
                  verif = antes
          return verif
  
@@ -4501,7 +4506,7 @@ index ad78b6b..b754c2b 100644
      # ------------------------------------------------------------ flujos
      def _mostrar_plan(self, plan: Plan) -> None:
          self.ui.titulo("PLAN")
-@@ -575,10 +1931,47 @@ class Orquestador:
+@@ -575,10 +1936,47 @@ class Orquestador:
          self.ui.fase(1, "Exploración")
          exploracion = self.explorar(pedido)
          self.ui.fase(2, "Arquitectura")
@@ -4551,7 +4556,7 @@ index ad78b6b..b754c2b 100644
                  return plan, exploracion
              feedback = self.ui.preguntar("¿Qué cambiarías del plan? (Enter vacío = cancelar)")
              if not feedback:
-@@ -598,8 +1991,64 @@ class Orquestador:
+@@ -598,8 +1996,64 @@ class Orquestador:
          ))
          return ruta
  
@@ -4617,7 +4622,7 @@ index ad78b6b..b754c2b 100644
          """
          Una tarea intermedia no necesita que pasen TODOS los tests (los de tareas
          siguientes todavía fallan): alcanza con validadores OK y que no se rompa
-@@ -609,7 +2058,52 @@ class Orquestador:
+@@ -609,7 +2063,52 @@ class Orquestador:
          validaciones = validar_archivos(self.ws, archivos)
          tests = ejecutar_tests(self.ws, timeout=self.settings.tests_timeout, completo=True)
          conteo = conteo_de_resultado(tests)
@@ -4671,7 +4676,7 @@ index ad78b6b..b754c2b 100644
          if tests is not None and not tests.ok and conteo.reconocido:
              # Los tests de la especificación de tareas siguientes fallan a propósito: no son regresión.
              nuevos_fallos = [n for n in conteo.nombres_fallados
-@@ -629,7 +2123,9 @@ class Orquestador:
+@@ -629,7 +2128,9 @@ class Orquestador:
          if exigir_progreso and not problemas:
              # El implementador NO terminó (límite de pasos, error...). "No romper nada" no alcanza:
              # tiene que haber cambios reales y, si hay tests fallando, alguno más tiene que pasar.
@@ -4682,7 +4687,7 @@ index ad78b6b..b754c2b 100644
                  problemas.append("SIN PROGRESO: el implementador no terminó y no cambió ningún archivo.")
              elif tests is not None and not tests.ok and conteo.reconocido and conteo.pasados <= antes.pasados:
                  problemas.append(
-@@ -642,30 +2138,252 @@ class Orquestador:
+@@ -642,30 +2143,252 @@ class Orquestador:
              diagnostico = anexar_pistas(diagnostico, 2)
          return Verificacion(not problemas, validaciones, tests, diagnostico, archivos, conteo)
  
@@ -4950,7 +4955,7 @@ index ad78b6b..b754c2b 100644
  
          self.ui.fase(numero_fase, "Implementación" + (" · torneo" if self.settings.torneo and self.settings.candidatos > 1 else ""))
          numero_fase += 1
-@@ -676,35 +2394,103 @@ class Orquestador:
+@@ -676,35 +2399,103 @@ class Orquestador:
          if [t.id for t in orden] != [t.id for t in plan.tareas]:
              self.ui.tenue("  Orden por dependencias: " + " → ".join(t.id for t in orden))
              plan.tareas = orden
@@ -5060,7 +5065,7 @@ index ad78b6b..b754c2b 100644
                  continue
  
              for ronda in range(self.settings.max_revisiones):
-@@ -712,7 +2498,10 @@ class Orquestador:
+@@ -712,7 +2503,10 @@ class Orquestador:
                  if not diff.strip():
                      informe.notas.append(f"Tarea {tarea.id}: sin cambios en archivos.")
                      break
@@ -5072,7 +5077,7 @@ index ad78b6b..b754c2b 100644
                  if aprobado:
                      self.ui.ok(f"Revisor aprobó la tarea {tarea.id}")
                      break
-@@ -722,6 +2511,31 @@ class Orquestador:
+@@ -722,6 +2516,31 @@ class Orquestador:
                      break
                  self.implementar(pedido, plan, i, exploracion, tcid, correcciones=revision,
                                   protegidos=self._protegidos)
@@ -5104,7 +5109,7 @@ index ad78b6b..b754c2b 100644
  
          archivos = [r for r in self.ws.checkpoints.archivos_desde(grupo) if (self.ws.raiz / r).is_file()]
          hay_tests_build = any(_es_test(a) for a in archivos)
-@@ -734,21 +2548,42 @@ class Orquestador:
+@@ -734,21 +2553,42 @@ class Orquestador:
          self.ui.fase(numero_fase, "Verificación real")
          verif = self.verificar(grupo)
          self._mostrar_verificacion(verif)
@@ -5151,7 +5156,7 @@ index ad78b6b..b754c2b 100644
          informe.ruta_informe = self._guardar_informe(pedido, informe)
          self._mostrar_cierre(informe)
          return informe
-@@ -769,19 +2604,51 @@ class Orquestador:
+@@ -769,19 +2609,51 @@ class Orquestador:
          else:
              self.ui.error(f"tests: fallaron ({verif.conteo.texto() if verif.conteo.reconocido else verif.tests.comando})")
              self.ui.tenue(recortar(fallos_relevantes(verif.tests.stdout + "\n" + verif.tests.stderr, 2, 1500), 1500))
@@ -5205,7 +5210,7 @@ index ad78b6b..b754c2b 100644
                     if informe.spec_tests else "")
                  + (f"## Escaladas al modelo fuerte\n{informe.escaladas}\n\n" if informe.escaladas else "")
                  + ("## Lecciones aprendidas\n" + "\n".join(f"- {l}" for l in informe.lecciones) + "\n\n" if informe.lecciones else "")
-@@ -790,40 +2657,80 @@ class Orquestador:
+@@ -790,40 +2662,80 @@ class Orquestador:
                  + ("## Notas\n" + "\n".join(f"- {n}" for n in informe.notas) + "\n" if informe.notas else "")
              )
              ruta = self.ws.raiz / ".reaper" / "informes" / f"build_{datetime.now():%Y%m%d_%H%M%S}.md"
@@ -10803,10 +10808,10 @@ index 0000000..9a0ba17
 +        self.assertIn(nombre, ("pytest", "unittest"))
 diff --git a/partes/48zi_autotest_grande.py b/partes/48zi_autotest_grande.py
 new file mode 100644
-index 0000000..96eaec2
+index 0000000..316099b
 --- /dev/null
 +++ b/partes/48zi_autotest_grande.py
-@@ -0,0 +1,654 @@
+@@ -0,0 +1,702 @@
 +"""
 +Autotests de /grande (proyecto grande por etapas) con un modelo SIMULADO que escribe código de verdad: un gestor de
 +biblioteca en 3 etapas (almacenamiento SQLite → préstamos → CLI). Los tests del proyecto se ejecutan de verdad en
@@ -11461,6 +11466,54 @@ index 0000000..96eaec2
 +            self.assertFalse(otra.exists())
 +        finally:
 +            self._restaurar(previo)
++
++
++class TestPlanMaestroDeLaPruebaReal(BaseTest):
++    """Primera prueba REAL de /grande (Termux, modelos :free, octubre 2026): el plan maestro tenía 10 etapas (un CRUD
++    por tabla), una etapa solo de tests, ninguna etapa creaba la web que el pedido nombraba, y el juez tomó "testeadas
++    con datos de ejemplo" por una simulación (replanificación de más)."""
++
++    PEDIDO = "Almacén con API JSON y una página web en web/ (index.html, app.js, style.css). Tests con unittest."
++
++    def test_cobertura_de_archivos_nombrados_y_etapas_de_solo_tests(self):
++        m = parsear_maestro('<etapa id="1"><objetivo>datos</objetivo><archivos>almacen/db.py, tests/test_db.py'
++                            '</archivos></etapa><etapa id="2" deps="1"><objetivo>e2e</objetivo>'
++                            '<archivos>tests/test_integracion.py</archivos></etapa>')
++        obs = observaciones_maestro(m, self.PEDIDO)
++        self.assertTrue(any("index.html, app.js, style.css" in o for o in obs), obs)
++        self.assertTrue(any("etapa 2 solo tiene tests" in o for o in obs), obs)
++        bien = parsear_maestro('<etapa id="1"><objetivo>x</objetivo><archivos>almacen/api.py, web/index.html, '
++                               'web/app.js, web/style.css, tests/test_api.py</archivos></etapa>')
++        self.assertEqual(observaciones_maestro(bien, self.PEDIDO), [])
++
++    def test_plan_fragmentado(self):
++        texto = "".join(f'<etapa id="{i}"><objetivo>crud {i}</objetivo><archivos>a/m{i}.py, tests/test_m{i}.py'
++                        f'</archivos></etapa>' for i in range(1, 9))
++        self.assertTrue(any("fragmentado" in o for o in observaciones_maestro(parsear_maestro(texto), "")))
++
++    def test_datos_de_ejemplo_en_tests_no_es_simulacion(self):
++        en_tests = Plan("x", [Tarea("1", "Reportes por día, testeadas con datos de ejemplo en una base temporal",
++                                    ["r.py"])], [])
++        self.assertEqual(problemas_del_plan(en_tests), [])
++        simulado = Plan("x", [Tarea("1", "Devolver datos de ejemplo hasta tener la API real", ["r.py"])], [])
++        self.assertTrue(problemas_del_plan(simulado))
++
++    def test_observacion_replanifica_una_vez_y_no_frena_si_el_modelo_insiste(self):
++        plan_sin_web = ('<maestro><vision>v</vision><etapa id="1"><objetivo>api</objetivo><archivos>almacen/api.py, '
++                        'tests/test_api.py</archivos></etapa></maestro>')
++        respuestas = []
++
++        def responder(mensajes, kw):
++            respuestas.append(MockLLM.ultimo_usuario(mensajes))
++            return plan_sin_web
++        ui = self.ui()
++        grande = ConstructorGrande(MockLLM(responder), self.proyecto({}), self.ajustes(), ui)
++        grande.consultar_cuenta = lambda: None
++        maestro = grande.planificar(self.PEDIDO, confirmar=False)
++        self.assertIsNotNone(maestro)                                               # no se frena por esto
++        self.assertEqual(len(respuestas), 2)                                        # UNA replanificación
++        self.assertIn("NINGUNA etapa los crea", respuestas[1])                      # con la razón concreta
++        self.assertIn("lo vuelve a revisar la integración final", ui.texto_registrado())
 diff --git a/partes/48zj_autotest_cupo.py b/partes/48zj_autotest_cupo.py
 new file mode 100644
 index 0000000..c67261c
@@ -13596,10 +13649,10 @@ index 0000000..15f8d02
 +            "proveedores": len(proveedores), "independencia_reducida": len(proveedores) <= 1}
 diff --git a/partes/76_grande.py b/partes/76_grande.py
 new file mode 100644
-index 0000000..0986d47
+index 0000000..f661d82
 --- /dev/null
 +++ b/partes/76_grande.py
-@@ -0,0 +1,886 @@
+@@ -0,0 +1,928 @@
 +"""
 +Proyectos GRANDES por etapas (/grande).
 +
@@ -13649,7 +13702,11 @@ index 0000000..0986d47
 +  para completar después": lo que una etapa crea, lo termina.
 +- Orden por dependencias: primero la base (modelo de datos, núcleo, configuración), después lo que la usa. Preferí
 +  porciones verticales que funcionen de punta a punta antes que capas sueltas.
-+- Cada etapa entra en un plan de ~4 a 10 tareas: si es más grande, partila.
++- Cada etapa entra en un plan de ~4 a 10 tareas: si es más grande, partila. Si es más chica, AGRUPALA con otra:
++  apuntá a 3–6 etapas en un proyecto mediano (varios CRUD o varias tablas en UNA etapa, no una etapa por archivo).
++- Cada etapa trae SUS tests. NO hagas etapas de solo tests ("pruebas de integración"): REAPER ya verifica el
++  proyecto entero al final.
++- Si el pedido NOMBRA archivos (p. ej. web/index.html, app.js, style.css), alguna etapa tiene que crearlos.
 +- Definí la ARQUITECTURA una sola vez (stack, carpetas, cómo se corren los tests y la app, convenciones) y que
 +  todas las etapas la respeten.
 +- La INTERFAZ de cada etapa (archivos, funciones/clases/endpoints con firmas exactas) es un contrato: las etapas
@@ -13839,6 +13896,40 @@ index 0000000..0986d47
 +    como_plan = Plan(maestro.vision, [Tarea(e.id, f"{e.objetivo}\n{e.interfaz}", e.archivos, e.deps)
 +                                      for e in maestro.etapas], [])
 +    salida.extend(p.replace("la tarea", "la etapa") for p in problemas_del_plan(como_plan, pedido))
++    return salida
++
++
++_RE_ARCHIVO_PEDIDO = re.compile(r"(?<![\w/.-])((?:[\w-]+/)*[\w-]+\.(?:py|js|mjs|cjs|jsx|ts|tsx|html|htm|css))\b", re.I)
++
++
++def archivos_nombrados(pedido: str) -> list:
++    """Archivos de código/web que el PEDIDO nombra explícitamente (sin los de tests: sus nombres son libres)."""
++    salida = []
++    for m in _RE_ARCHIVO_PEDIDO.finditer(pedido or ""):
++        rel = m.group(1)
++        if not _es_test(rel) and rel not in salida:
++            salida.append(rel)
++    return salida
++
++
++def observaciones_maestro(maestro: PlanMaestro, pedido: str = "") -> list:
++    """Determinista (0 tokens): defectos que valen UNA replanificación pero no frenan el proyecto si el modelo insiste
++    (la integración final contra el pedido igual los atrapa). Vistos en la primera prueba REAL de /grande: el pedido
++    nombraba web/index.html, app.js y style.css y ninguna de las 10 etapas los creaba; una etapa era solo de tests;
++    y había una etapa por cada CRUD."""
++    salida = []
++    planeados = {Path(rel).name.lower() for e in maestro.etapas for rel in e.archivos}
++    faltan = [rel for rel in archivos_nombrados(pedido) if Path(rel).name.lower() not in planeados]
++    if faltan:
++        salida.append("el pedido nombra " + ", ".join(faltan[:8]) + " y NINGUNA etapa los crea: agregalos a la etapa "
++                      "que corresponda")
++    for e in maestro.etapas:
++        if e.archivos and all(_es_test(rel) for rel in e.archivos):
++            salida.append(f"la etapa {e.id} solo tiene tests: los tests van con el código de cada etapa; fusionala")
++    codigo = sorted(sum(1 for rel in e.archivos if not _es_test(rel)) for e in maestro.etapas)
++    if len(maestro.etapas) > 6 and codigo and codigo[len(codigo) // 2] <= 1:
++        salida.append(f"el plan está muy fragmentado ({len(maestro.etapas)} etapas, la mayoría de un solo archivo): "
++                      "agrupá piezas relacionadas y apuntá a 3–6 etapas")
 +    return salida
 +
 +
@@ -14053,13 +14144,17 @@ index 0000000..0986d47
 +        self.ui.fase("G", "Plan maestro (proyecto grande por etapas)")
 +        maestro = self._pedir_maestro(pedido)
 +        problemas = problemas_maestro(maestro, self.settings.max_etapas, pedido)
-+        if problemas:
++        observaciones = observaciones_maestro(maestro, pedido) if maestro.etapas else []
++        if problemas or observaciones:
 +            # Juez (0 tokens): una sola replanificación con las razones; si sigue mal, no se arranca a ciegas.
 +            self.ui.aviso("  Juez · el plan maestro tiene problemas: lo hago rehacer una vez.")
-+            for p in problemas[:5]:
++            for p in (problemas + observaciones)[:6]:
 +                self.ui.tenue(f"    • {p}")
-+            maestro = self._pedir_maestro(pedido, "\n".join(f"- {p}" for p in problemas), maestro)
++            maestro = self._pedir_maestro(pedido, "\n".join(f"- {p}" for p in problemas + observaciones), maestro)
 +            problemas = problemas_maestro(maestro, self.settings.max_etapas, pedido)
++            for o in observaciones_maestro(maestro, pedido) if not problemas else []:
++                # Lo que no frena: queda avisado y la integración final contra el pedido lo vuelve a mirar.
++                self.ui.aviso(f"  Juez · sigue: {o} (lo vuelve a revisar la integración final)")
 +            if problemas:
 +                self.ui.error("El plan maestro sigue sin servir: " + "; ".join(problemas[:4]))
 +                if any("tope es" in p for p in problemas):
