@@ -128,6 +128,14 @@ def _escribir(ctx: Contexto, rel: str, contenido: str) -> None:
             "en esta tarea. Cambiá el código para que esos tests pasen."
         )
     if ctx.permitidos and not any(fnmatch.fnmatch(rel, patron) for patron in ctx.permitidos):
+        if getattr(ctx, "rol", "") == "especificador":
+            # Prueba real /grande: el especificador intentó 6 veces crear almacen/storage.py "para que el test no
+            # falle por ImportError" y terminó en bucle. Que falle AHORA es justamente lo esperado.
+            raise ErrorHerramienta(
+                f"{rel} es código de la aplicación: lo escribe el IMPLEMENTADOR después de vos. Que tus tests fallen "
+                "AHORA con ImportError / ModuleNotFoundError es lo ESPERADO en tests primero. No crees ese archivo "
+                "ni un conftest.py para esquivarlo: si tus tests ya cubren la interfaz y los criterios, terminá con "
+                "attempt_completion.")
         raise ErrorHerramienta(
             f"En este rol solo podés escribir archivos que coincidan con: {', '.join(ctx.permitidos)}. "
             f"{rel} no está permitido."
@@ -701,6 +709,14 @@ def run_tests(ctx: Contexto, p: dict) -> str:
     if conteo.nombres_fallados:
         texto += "Fallaron: " + ", ".join(conteo.nombres_fallados[:10]) + "\n"
     texto += "DETALLE DE LOS PRIMEROS FALLOS:\n" + detalle
+    if getattr(ctx, "rol", "") == "especificador":
+        faltan = sorted({m.split(".")[0] for m in re.findall(r"No module named '([\w.]+)'", combinado)
+                         if not (ctx.ws.raiz / m.split(".")[0]).exists()
+                         and not (ctx.ws.raiz / (m.split(".")[0] + ".py")).exists()})
+        if faltan:
+            texto = ("ESPERADO (tests primero): fallan porque " + ", ".join(f"'{m}'" for m in faltan)
+                     + " todavía no existe; lo crea el IMPLEMENTADOR después de vos. No intentes crearlo: si tus "
+                       "tests cubren la interfaz y los criterios, terminá con attempt_completion.\n\n" + texto)
     if ctx.settings.pistas_errores:
         texto = anexar_pistas(texto, 2)
     return texto

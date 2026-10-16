@@ -323,3 +323,33 @@ class TestModelosDeLaPruebaRealGrande(BaseTest):
         sin = cobertura_criterios(["Todo el código utiliza únicamente la biblioteca estándar de Python",
                                    "No se incluyen todavía módulos de CRUD", "Existe un endpoint /api/ventas"], plan)
         self.assertEqual(sin, ["Existe un endpoint /api/ventas"])
+
+
+class TestEspecificadorNoSeTrabaConImportError(BaseTest):
+    """Prueba real /grande: el test del especificador fallaba con "No module named 'almacen'" (lo ESPERADO en tests
+    primero), el modelo creía que estaba mal, intentaba 6 veces crear almacen/storage.py (bloqueado), creaba un
+    conftest.py y terminaba en "bucle improductivo"."""
+
+    def _ctx(self, ws):
+        ctx = self.contexto(ws)
+        ctx.rol = "especificador"
+        ctx.permitidos = tuple(ROLES["especificador"].rutas_permitidas)
+        return ctx
+
+    def test_escribir_codigo_explica_que_la_falla_es_esperada(self):
+        ws = self.proyecto({})
+        with self.assertRaises(ErrorHerramienta) as error:
+            _escribir(self._ctx(ws), "almacen/storage.py", "x = 1\n")
+        self.assertIn("lo ESPERADO en tests primero", str(error.exception))
+        self.assertIn("attempt_completion", str(error.exception))
+        self.assertFalse(ws.existe("almacen/storage.py"))
+
+    def test_run_tests_le_dice_que_el_import_que_falta_es_esperado(self):
+        ws = self.proyecto({"tests/test_storage.py": "import unittest\nfrom almacen.storage import init_db\n\n\n"
+                                                     "class T(unittest.TestCase):\n    def test_x(self):\n"
+                                                     "        self.assertTrue(init_db)\n"})
+        salida = run_tests(self._ctx(ws), {})
+        self.assertTrue(salida.startswith("ESPERADO (tests primero)"), salida[:300])
+        self.assertIn("'almacen'", salida)
+        otro = self.contexto(ws)                                                    # otros roles: sin la nota
+        self.assertNotIn("ESPERADO (tests primero)", run_tests(otro, {}))
