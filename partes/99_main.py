@@ -163,7 +163,14 @@ def main(argv: Optional[list] = None) -> int:
         cargar_plugins(ui=ui)
     try:
         if args.proyecto:
-            raiz = resolver_workspace(args.proyecto)
+            # Un /construir o /grande NUEVO crea su carpeta (lo normal es que todavía no exista); retomar, ver el
+            # estado o deshacer necesitan una carpeta que ya exista.
+            nuevo = bool((args.construir and args.construir.strip().lower() not in ("continuar", "estado"))
+                         or (args.grande and args.grande.strip().lower() not in ("continuar", "estado", "deshacer")))
+            existia = Path(os.path.expandvars(args.proyecto.strip())).expanduser().exists()
+            raiz = resolver_workspace(args.proyecto, crear=nuevo)
+            if nuevo and not existia:
+                ui.ok(f"Creé la carpeta del proyecto: {_ruta_corta(raiz)}")
         else:
             guardado = cargar_estado().get("proyecto")
             raiz = Path(guardado) if guardado and Path(guardado).is_dir() else PROJECTS_DIR

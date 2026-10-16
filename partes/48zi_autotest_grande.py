@@ -571,3 +571,84 @@ class TestSeguirDespuesDeUnCorte(BaseTest):
                     os.environ.pop(k, None)
                 else:
                     os.environ[k] = v
+
+
+class TestCarpetaDeProyectoNuevo(BaseTest):
+    """Prueba real en Termux: `reaper --proyecto ~/almacen --grande "..."` terminaba en "No existe" sin hacer nada."""
+
+    def _con_libre(self, valor):
+        previo = os.environ.get("REAPER_LIBRE")
+        if valor:
+            os.environ["REAPER_LIBRE"] = "1"
+        else:
+            os.environ.pop("REAPER_LIBRE", None)
+        return previo
+
+    def _restaurar(self, previo):
+        if previo is None:
+            os.environ.pop("REAPER_LIBRE", None)
+        else:
+            os.environ["REAPER_LIBRE"] = previo
+
+    def test_crea_solo_si_se_pide_y_nunca_fuera_del_home(self):
+        nueva = Path(self.dir) / "nuevo" / "almacen"
+        previo = self._con_libre(True)
+        try:
+            with self.assertRaises(ErrorRuta):
+                resolver_workspace(str(nueva))
+            self.assertFalse(nueva.exists())
+            self.assertEqual(resolver_workspace(str(nueva), crear=True), nueva.resolve())
+            self.assertTrue(nueva.is_dir())
+        finally:
+            self._restaurar(previo)
+        fuera = Path(self.dir) / "fuera_del_home"
+        previo = self._con_libre(False)
+        try:
+            if Path.home().resolve() in fuera.resolve().parents:
+                self.skipTest("la carpeta temporal está dentro del home")
+            with self.assertRaises(ErrorRuta) as ctx:
+                resolver_workspace(str(fuera), crear=True)
+            self.assertIn("Por seguridad", str(ctx.exception))
+            self.assertFalse(fuera.exists())                                        # ni siquiera la crea
+        finally:
+            self._restaurar(previo)
+
+    def test_cli_crea_la_carpeta_para_un_proyecto_nuevo_y_no_para_estado(self):
+        nueva = Path(self.dir) / "almacen_cli"
+        previo = self._con_libre(True)
+        clave = os.environ.get("OPENROUTER_API_KEY")
+        os.environ["OPENROUTER_API_KEY"] = "clave-de-prueba-0123456789"
+        original = App.construir
+        App.construir = lambda self, pedido, confirmar=True, reanudar=False: False
+        try:
+            salida = io.StringIO()
+            with contextlib.redirect_stdout(salida):
+                self.assertEqual(main(["--proyecto", str(nueva), "--sin-animacion", "--grande", "estado"]), 1)
+                self.assertFalse(nueva.exists())                                    # ver el estado no crea nada
+                self.assertEqual(main(["--proyecto", str(nueva), "--sin-animacion", "--construir", "algo"]), 2)
+            self.assertTrue(nueva.is_dir())
+            self.assertIn("Creé la carpeta del proyecto", salida.getvalue())
+        finally:
+            App.construir = original
+            self._restaurar(previo)
+            if clave is None:
+                os.environ.pop("OPENROUTER_API_KEY", None)
+            else:
+                os.environ["OPENROUTER_API_KEY"] = clave
+
+    def test_proyecto_en_el_repl_pregunta_antes_de_crear(self):
+        nueva = Path(self.dir) / "repl_nuevo"
+        previo = self._con_libre(True)
+        try:
+            app = App(self.ajustes(), MockLLM([]), self.ui(respuestas=["s"], interactivo=True), self.proyecto({}),
+                      persistir=False)
+            app.cmd_proyecto(str(nueva))
+            self.assertTrue(nueva.is_dir())
+            self.assertEqual(app.ws.raiz, nueva.resolve())
+            otra = Path(self.dir) / "repl_no"
+            app2 = App(self.ajustes(), MockLLM([]), self.ui(respuestas=["n"], interactivo=True), self.proyecto({}),
+                       persistir=False)
+            app2.cmd_proyecto(str(otra))
+            self.assertFalse(otra.exists())
+        finally:
+            self._restaurar(previo)

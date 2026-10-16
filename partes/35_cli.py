@@ -101,18 +101,26 @@ def texto_ayuda() -> str:
     return "\n".join(lineas)
 
 
-def resolver_workspace(texto: str) -> Path:
+def resolver_workspace(texto: str, crear: bool = False) -> Path:
+    """Carpeta del proyecto (siempre dentro de tu home, salvo REAPER_LIBRE=1). Con crear=True, si no existe la crea:
+    para un proyecto NUEVO lo normal es que todavía no exista (prueba real en Termux: `reaper --proyecto ~/almacen
+    --grande "..."` terminaba en "No existe" sin hacer nada)."""
     ruta = Path(os.path.expandvars(texto.strip())).expanduser().resolve()
-    if not ruta.exists():
-        raise ErrorRuta(f"No existe: {ruta}")
-    if not ruta.is_dir():
-        raise ErrorRuta(f"No es una carpeta: {ruta}")
     if not os.getenv("REAPER_LIBRE"):
         home = Path.home().resolve()
         if ruta != home and home not in ruta.parents:
             raise ErrorRuta(
                 f"Por seguridad el proyecto debe estar dentro de {home} (o exportá REAPER_LIBRE=1)."
             )
+    if not ruta.exists():
+        if not crear:
+            raise ErrorRuta(f"No existe: {ruta}")
+        try:
+            ruta.mkdir(parents=True)
+        except OSError as e:
+            raise ErrorRuta(f"No pude crear la carpeta {ruta}: {e}") from e
+    if not ruta.is_dir():
+        raise ErrorRuta(f"No es una carpeta: {ruta}")
     return ruta
 
 
@@ -688,8 +696,17 @@ class App:
         try:
             ruta = resolver_workspace(arg)
         except ErrorRuta as e:
-            self.ui.error(str(e))
-            return
+            nueva = Path(os.path.expandvars(arg.strip())).expanduser()
+            if str(e).startswith("No existe") and self.ui.confirmar(f"No existe {nueva}. ¿La creo como proyecto "
+                                                                     "nuevo?", defecto=True):
+                try:
+                    ruta = resolver_workspace(arg, crear=True)
+                except ErrorRuta as e2:
+                    self.ui.error(str(e2))
+                    return
+            else:
+                self.ui.error(str(e))
+                return
         self.cambiar_workspace(ruta)
         detectado = detectar_comando_tests(self.ws)
         self.ui.ok(f"Proyecto: {self.ws.raiz}")
