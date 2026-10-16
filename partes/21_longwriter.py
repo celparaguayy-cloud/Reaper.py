@@ -364,7 +364,7 @@ class EscritorLargo:
                 return grupo, self._pedir_relleno(rel, lenguaje, especificacion, texto_base, grupo,
                                                   "\n".join(errores.get(s.nombre_completo, "") for s in grupo).strip())
             except LLMError as e:
-                if e.presupuesto:
+                if e.detiene_todo:
                     raise
                 return grupo, {}
 

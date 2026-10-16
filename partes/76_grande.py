@@ -19,10 +19,23 @@ Lo que el modelo escribe en el plan maestro NUNCA autoriza nada: reescribir arch
 ejemplo" se decide con el pedido del usuario (Orquestador.pedido_usuario).
 """
 
-_RE_ETAPA = re.compile(r"<etapa\b([^>]*)>(.*?)</etapa\s*>", re.S | re.I)
+# Los modelos reales no siempre respetan el castellano del formato: <stage>, <fase>, <phase> también valen.
+_ETIQUETA_ETAPA = r"(?:etapa|stage|fase|phase)"
+_RE_ETAPA = re.compile(rf"<{_ETIQUETA_ETAPA}\b([^>]*)>(.*?)</{_ETIQUETA_ETAPA}\s*>", re.S | re.I)
+_RE_ETAPA_ABIERTA = re.compile(rf"<{_ETIQUETA_ETAPA}\b[^>]*>", re.I)
+_RE_ETAPA_CERRADA = re.compile(rf"</{_ETIQUETA_ETAPA}\s*>", re.I)
+_SINONIMOS = {"objetivo": ("objetivo", "objective", "goal"), "archivos": ("archivos", "files"),
+              "interfaz": ("interfaz", "interface"), "criterios": ("criterios", "criteria", "acceptance"),
+              "vision": ("vision", "visión", "overview"), "arquitectura": ("arquitectura", "architecture")}
+_SIN_DEPENDENCIAS = {"ninguna", "ninguno", "none", "no", "-", "—", "0", "n/a", "na", "nada", "[]"}
 _RE_ATTR_ETAPA = re.compile(r"""(\w+)\s*=\s*["']([^"']*)["']""")
 # Intentos TOTALES por etapa (entre todas las invocaciones) antes de pedir intervención: no quemar tokens en bucle.
+# Solo cuentan las builds que TERMINARON: un corte por límite del modelo, Ctrl+C o el teléfono no es culpa de la etapa.
 MAX_INTENTOS_ETAPA = 4
+# Esperas ante límites PASAJEROS (todos los modelos en enfriamiento, 429 por minuto, proveedor caído un rato).
+ESPERAS_LIMITE = (120, 300, 600)
+_RE_LIMITE_PASAJERO = re.compile(r"enfriamiento|429|rate|satura|50[0-4]|timeout|no respondi|red |network|"
+                                 r"vac[ií]a|overloaded|temporar|unavailable|cort[oó] el streaming", re.I)
 ESTADOS_OK_ETAPA = ("verificada", "validada")
 
 MISION_MAESTRO = """Sos el ARQUITECTO DE UN PROYECTO GRANDE. No escribís código: dividís el pedido en ETAPAS que otro
@@ -80,6 +93,7 @@ class Etapa:
     motivo: str = ""                    # por qué no quedó verificada (el error REAL, recortado)
     segundos: float = 0.0
     consumo: int = 0                    # tokens (entrada + salida) de sus builds
+    pedidos: int = 0                    # pedidos al modelo de sus builds (lo que cuenta para el cupo diario gratis)
 
     @property
     def ok(self) -> bool:
@@ -92,6 +106,7 @@ class PlanMaestro:
     arquitectura: str
     etapas: list
     texto: str = ""
+    cortado: bool = False               # la respuesta del modelo terminó a mitad de una etapa
 
     def por_id(self, eid: str) -> Optional[Etapa]:
         return next((e for e in self.etapas if e.id == eid), None)
@@ -108,8 +123,48 @@ class PlanMaestro:
 
 
 def _tag(cuerpo: str, nombre: str) -> str:
-    m = re.search(rf"<{nombre}>(.*?)</{nombre}\s*>", cuerpo or "", re.S | re.I)
-    return m.group(1).strip() if m else ""
+    for variante in _SINONIMOS.get(nombre, (nombre,)):
+        m = re.search(rf"<{variante}>(.*?)</{variante}\s*>", cuerpo or "", re.S | re.I)
+        if m:
+            return m.group(1).strip()
+    return ""
+
+
+_RE_PREFIJO_ETAPA = re.compile(r"^(?:etapa|stage|fase|phase|e)\s*#?\s*", re.I)
+
+
+def _id_corto(eid: str) -> str:
+    return _RE_PREFIJO_ETAPA.sub("", str(eid).strip()).lower()
+
+
+def _separar_deps(texto: str) -> list:
+    """'1, 2' · '1 2' · 'etapa 2, E1' → ['1', '2'] · ['1', '2'] · ['etapa 2', 'E1'] (sin partir 'etapa 2')."""
+    salida = []
+    for parte in re.split(r"[,;]+", texto or ""):
+        parte = parte.strip()
+        if not parte:
+            continue
+        if re.match(r"^(?:etapa|stage|fase|phase)\s+#?\S+$", parte, re.I):
+            salida.append(parte)
+        else:
+            salida.extend(parte.split())
+    return salida
+
+
+def _normalizar_deps(deps: list, ids: list) -> list:
+    """'ninguna' → sin deps; 'E1' / 'etapa 1' / '1' → el id real de esa etapa (comparando sin prefijo). Lo que no
+    coincide con ninguna queda tal cual y la validación lo marca (no se inventa a qué etapa se refería)."""
+    por_corto = {_id_corto(i): i for i in ids}
+    salida = []
+    for d in deps:
+        limpio = d.strip().strip("\"'[](){}.")
+        if not limpio or limpio.lower() in _SIN_DEPENDENCIAS:
+            continue
+        if limpio not in ids:
+            limpio = por_corto.get(_id_corto(limpio), limpio)
+        if limpio not in salida:
+            salida.append(limpio)
+    return salida
 
 
 def _lista_criterios(texto: str) -> list:
@@ -144,18 +199,27 @@ def parsear_maestro(texto: str) -> PlanMaestro:
         if not objetivo:
             continue
         eid = (attrs.get("id") or str(len(etapas) + 1)).strip()
-        deps = [d.strip() for d in re.split(r"[,;\s]+", attrs.get("deps", "")) if d.strip()]
+        dep_txt = attrs.get("deps") or attrs.get("depends") or attrs.get("depende") or attrs.get("after") or ""
+        deps = _separar_deps(dep_txt)
         etapas.append(Etapa(eid, (attrs.get("titulo") or attrs.get("title") or f"Etapa {eid}").strip()[:80],
                             objetivo, _rutas_etapa(_tag(cuerpo, "archivos")), _tag(cuerpo, "interfaz"),
                             _lista_criterios(_tag(cuerpo, "criterios"))[:10], deps))
-    return PlanMaestro(_tag(texto, "vision"), _tag(texto, "arquitectura"), etapas, texto)
+    ids = [e.id for e in etapas]
+    for e in etapas:
+        e.deps = _normalizar_deps(e.deps, ids)
+    # Una etapa que abre y no cierra = la respuesta se cortó (tope de tokens): antes esa etapa se perdía en silencio.
+    cortado = len(_RE_ETAPA_ABIERTA.findall(texto)) > len(_RE_ETAPA_CERRADA.findall(texto))
+    return PlanMaestro(_tag(texto, "vision"), _tag(texto, "arquitectura"), etapas, texto, cortado)
 
 
 def problemas_maestro(maestro: PlanMaestro, max_etapas: int, pedido: str = "") -> list:
     """Determinista (0 tokens): lo que hace que un plan maestro no sirva. → razones para replanificar."""
     salida = []
+    if getattr(maestro, "cortado", False):
+        salida.append("tu respuesta se CORTÓ a mitad de una etapa (se pierden las que faltan): respondé más "
+                      "corto — objetivos y criterios en una línea, interfaz solo con las firmas")
     if not maestro.etapas:
-        return ["no vino ninguna <etapa> con el formato pedido"]
+        return salida + ["no vino ninguna <etapa> con el formato pedido"]
     if len(maestro.etapas) > max_etapas:
         salida.append(f"trae {len(maestro.etapas)} etapas y el tope es {max_etapas}: agrupá etapas chicas "
                       "(cada etapa puede tener hasta ~10 tareas)")
@@ -259,6 +323,79 @@ class ConstructorGrande:
         self.llm, self.ws, self.settings, self.ui = llm, ws, settings, ui
         self.ruta = ws.carpeta_reaper() / "proyecto_grande.json"
         self._construir_build = construir_build or self._build_directo
+        self.consultar_cuenta: Callable[[], Optional["CuentaOpenRouter"]] = self._consultar_cuenta_real
+        self.dormir: Callable[[float], None] = self._dormir_cancelable
+        self._cuenta_cache: Optional[tuple] = None
+        self._integracion_reparada = False      # UNA build de integración por corrida (no por proyecto)
+
+    # ------------------------------------------------------------ cupo y esperas
+    def _consultar_cuenta_real(self) -> Optional["CuentaOpenRouter"]:
+        if self.settings is None or not usa_free_openrouter(self.settings):
+            return None
+        return cuenta_openrouter(clave_de_proveedor("openrouter", self.settings))
+
+    def _cuenta(self) -> Optional["CuentaOpenRouter"]:
+        if self._cuenta_cache is None:
+            try:
+                self._cuenta_cache = (self.consultar_cuenta(),)
+            except (OSError, ValueError, TypeError, AttributeError):
+                self._cuenta_cache = (None,)
+        return self._cuenta_cache[0]
+
+    def _cupo_chico(self) -> bool:
+        cuenta = self._cuenta()
+        return bool(cuenta is not None and cuenta.cupo_dia is not None and cuenta.cupo_dia <= 50)
+
+    def _aviso_cupo(self, maestro: PlanMaestro) -> None:
+        """Antes de arrancar: cuántos pedidos puede llevar y cuántos quedan hoy. Un proyecto grande con 50 pedidos
+        gratis por día NO termina en un día: mejor saberlo antes que a mitad de camino."""
+        cuenta = self._cuenta()
+        if cuenta is None:
+            return
+        torneo = self.settings.torneo and not self._cupo_chico()
+        minimo, maximo = estimar_pedidos_grande(len(maestro.etapas), replace(self.settings, torneo=torneo))
+        self.ui.info(f"  Pedidos estimados al modelo: ~{minimo}–{maximo} · tu cuenta: {cuenta.resumen()}")
+        if cuenta.quedan_hoy is not None and cuenta.quedan_hoy < minimo:
+            self.ui.aviso("  Con lo que queda hoy no alcanza para todo: avanzo lo que se pueda y, cuando se agote el "
+                          "cupo, me detengo limpio (nada queda a medias sin guardar). Seguí después con: "
+                          + comando_para_seguir(self.ws, "grande"))
+
+    def _ahorro_de_pedidos(self) -> Callable[[], None]:
+        """Cuenta con 50 pedidos gratis por día: sin torneo ni revisor en ESTA corrida (cada candidato del torneo es
+        una implementación entera). Tu configuración vuelve a como estaba al terminar."""
+        if not self._cupo_chico() or not (self.settings.torneo or self.settings.max_revisiones):
+            return lambda: None
+        antes = (self.settings.torneo, self.settings.max_revisiones)
+        self.settings.torneo, self.settings.max_revisiones = False, 0
+        self.ui.tenue("  Ahorro de pedidos (cupo de 50 por día): sin torneo ni revisor en esta corrida.")
+
+        def restaurar() -> None:
+            self.settings.torneo, self.settings.max_revisiones = antes
+        return restaurar
+
+    def _espera_para(self, error: LLMError, esperado: float, esperas: int) -> float:
+        """Segundos a esperar antes de reintentar la etapa (0 = no esperar, detenerse). Acotado por
+        settings.espera_limites_min en TOTAL por etapa: no se queda colgado horas."""
+        tope = max(0, int(getattr(self.settings, "espera_limites_min", 30))) * 60
+        if not tope or error.presupuesto:
+            return 0.0
+        if error.cupo_diario:
+            if not error.reinicio:
+                return 0.0
+            falta = error.reinicio - time.time() + 30
+            return falta if 0 < falta <= tope - esperado else 0.0
+        if not _RE_LIMITE_PASAJERO.search(str(error)) or esperas >= len(ESPERAS_LIMITE):
+            return 0.0
+        espera = float(ESPERAS_LIMITE[esperas])
+        return espera if esperado + espera <= tope else 0.0
+
+    @staticmethod
+    def _dormir_cancelable(segundos: float) -> None:
+        fin = time.monotonic() + segundos
+        while time.monotonic() < fin:
+            if "CANCELAR" in globals() and CANCELAR.is_set():
+                raise Cancelado()
+            time.sleep(min(1.0, max(0.0, fin - time.monotonic())))
 
     # ------------------------------------------------------------ estado en disco
     def leer(self) -> Optional[dict]:
@@ -301,10 +438,14 @@ class ConstructorGrande:
             prompt += (f"\n\nTU PLAN MAESTRO ANTERIOR:\n{anterior.como_texto()}\n\n"
                        f"CORREGÍ ESTO:\n{feedback}")
         modelo = self.settings.modelo_para("arquitecto")
-        resp = self.llm.chat([{"role": "system", "content": "# TU ROL: MAESTRO\n" + MISION_MAESTRO}, {"role": "user", "content": prompt}],
-                             modelo=modelo, temperatura=0.3, max_tokens=max(3000, self.settings.max_tokens // 2),
+        resp = self.llm.chat([{"role": "system", "content": "# TU ROL: MAESTRO\n" + MISION_MAESTRO},
+                              {"role": "user", "content": prompt}],
+                             modelo=modelo, temperatura=0.3, max_tokens=max(4000, self.settings.max_tokens),
                              rol="arquitecto")
-        return parsear_maestro(str(getattr(resp, "texto", "") or ""))
+        maestro = parsear_maestro(str(getattr(resp, "texto", "") or ""))
+        if getattr(resp, "finish_reason", None) == "length":
+            maestro.cortado = True              # cortado por el tope aunque la última etiqueta haya cerrado
+        return maestro
 
     def planificar(self, pedido: str, confirmar: bool) -> Optional[PlanMaestro]:
         self.ui.fase("G", "Plan maestro (proyecto grande por etapas)")
@@ -324,8 +465,12 @@ class ConstructorGrande:
                                   f"{min(30, len(maestro.etapas))}")
                 return None
         maestro.etapas = GrafoTareas(maestro.etapas).orden()
+        aviso_cupo = True
         for _ in range(3):
             self._mostrar_maestro(maestro)
+            if aviso_cupo:
+                self._aviso_cupo(maestro)
+                aviso_cupo = False
             if not confirmar:
                 return maestro
             if self.ui.confirmar("¿Aprobás el plan maestro y arrancamos por la etapa 1?", defecto=True):
@@ -416,6 +561,13 @@ class ConstructorGrande:
         return self._ejecutar(estado, maestro)
 
     def _ejecutar(self, estado: dict, maestro: PlanMaestro) -> bool:
+        restaurar = self._ahorro_de_pedidos()
+        try:
+            return self._ejecutar_etapas(estado, maestro)
+        finally:
+            restaurar()
+
+    def _ejecutar_etapas(self, estado: dict, maestro: PlanMaestro) -> bool:
         inicio = time.monotonic()
         grafo = GrafoTareas(maestro.etapas)
         for n, etapa in enumerate(grafo.orden(), start=1):
@@ -431,13 +583,27 @@ class ConstructorGrande:
                                                       "quedar verificada: revisá su informe y partila o corregila a mano")
             self.ui.linea("")
             self.ui.titulo(f"Etapa {etapa.id} ({n}/{len(maestro.etapas)}) · {etapa.titulo}")
-            for intento in range(2):                     # el intento original + UNA reanudación de su misma build
+            terminadas, esperado, esperas = 0, 0.0, 0
+            while True:                                  # el intento original + UNA reanudación de su misma build
                 try:
                     informe = self._correr_etapa(estado, maestro, etapa)
                 except LLMError as e:
+                    espera = self._espera_para(e, esperado, esperas)
+                    if espera:
+                        # Límite pasajero (o cupo que se renueva pronto): esperar y seguir SOLO, sin perder lo hecho.
+                        self.ui.aviso(f"  {recortar(_primera_linea_util(str(e)), 140)}")
+                        self.ui.aviso(f"  Espero {formatear_duracion(espera)} y sigo solo (Ctrl+C corta; después: "
+                                      f"{comando_para_seguir(self.ws, 'grande')}).")
+                        self.dormir(espera)
+                        esperado, esperas = esperado + espera, esperas + 1
+                        continue
                     etapa.estado, etapa.motivo = "pendiente", recortar(str(e), 400)
+                    if e.cupo_diario:
+                        return self._detener(estado, maestro, "se agotó el cupo diario de pedidos gratis. "
+                                             + recortar(str(e), 220))
                     return self._detener(estado, maestro, f"el modelo no responde ({recortar(str(e), 160)})")
-                if etapa.ok or informe.estado == "cancelada" or intento == 1:
+                terminadas += 1
+                if etapa.ok or informe.estado == "cancelada" or terminadas >= 2:
                     break
                 if etapa.intentos >= MAX_INTENTOS_ETAPA:
                     break
@@ -464,11 +630,18 @@ class ConstructorGrande:
                           "(/construir estado) y después /grande continuar.")
             return InformeBuild("cancelada")
         etapa.estado = "en_curso"
-        etapa.intentos += 1
         self.guardar(estado, maestro)
         if reanudar:
             self.ui.tenue("  Hay una build de esta etapa a medio terminar: la retomo sin replanificar.")
-        informe = self._construir_build(pedido_etapa, reanudar, estado["pedido"])
+        uso = getattr(self.llm, "uso", None)
+        pedidos_antes = int(getattr(uso, "llamadas", 0) or 0)
+        try:
+            informe = self._construir_build(pedido_etapa, reanudar, estado["pedido"])
+        finally:
+            etapa.pedidos += max(0, int(getattr(uso, "llamadas", 0) or 0) - pedidos_antes)
+            self.guardar(estado, maestro)
+        if informe.estado != "cancelada":
+            etapa.intentos += 1                  # solo cuenta lo que terminó (un corte no es culpa de la etapa)
         etapa.estado = informe.estado if informe.estado != "cancelada" else "pendiente"
         etapa.segundos += float(getattr(informe, "segundos", 0.0) or 0.0)
         etapa.consumo += int(getattr(informe, "tokens_build", 0) or 0)
@@ -507,10 +680,11 @@ class ConstructorGrande:
         self.ui.fase("G", "Integración final (todo el proyecto contra tu pedido original)")
         pedido = estado["pedido"]
         resultado = self._verificar_integracion(estado, maestro)
-        if not resultado["ok"] and not estado["integracion"].get("reparada"):
+        if not resultado["ok"] and not self._integracion_reparada:
             faltas = resultado["faltantes"] or [_primera_linea_util(resultado["diagnostico"])]
             self.ui.aviso("  Falta para cumplir el pedido completo: " + "; ".join(recortar(f, 80) for f in faltas[:4]))
             estado["integracion"]["reparada"] = True
+            self._integracion_reparada = True
             self.guardar(estado, maestro)
             pedido_integracion = (
                 "PROYECTO GRANDE — INTEGRACIÓN FINAL. Todas las etapas están construidas y verificadas; NO rehagas "
@@ -561,8 +735,8 @@ class ConstructorGrande:
     def _cierre(self, estado: dict, maestro: PlanMaestro, segundos: float) -> None:
         integ = estado.get("integracion", {})
         ok = estado.get("estado") == "terminado"
-        lineas = [f"{'✓' if e.ok else '✗'} Etapa {e.id} · {recortar(e.titulo, 40)}: {e.estado}"
-                  f" · {formatear_duracion(e.segundos)}" for e in maestro.etapas]
+        lineas = [f"{'✓' if e.ok else '✗'} Etapa {e.id} · {recortar(e.titulo, 36)}: {e.estado}"
+                  f" · {formatear_duracion(e.segundos)} · {e.pedidos} pedidos" for e in maestro.etapas]
         lineas.append(f"Integración final: {integ.get('estado', '?')} · {recortar(str(integ.get('juicio', '')), 90)}")
         if not ok:
             lineas.append("Pendiente: " + recortar(str(estado.get("motivo", "")), 200))
@@ -583,7 +757,7 @@ class ConstructorGrande:
                   "## Plan maestro", "```", maestro.como_texto(), "```", "", "## Etapas"]
         for e in maestro.etapas:
             lineas.append(f"- Etapa {e.id} · {e.titulo}: **{e.estado}** · intentos {e.intentos} · "
-                          f"{formatear_duracion(e.segundos)} · ~{e.consumo} tokens"
+                          f"{formatear_duracion(e.segundos)} · {e.pedidos} pedidos · ~{e.consumo} tokens"
                           + (f" · informe: {e.informe}" if e.informe else ""))
             if e.motivo and not e.ok:
                 lineas.append(f"  - motivo: {recortar(e.motivo, 400)}")

@@ -126,6 +126,22 @@ def _chequeo_symlinks() -> Chequeo:
                        "export REAPER_TMP=$HOME/.cache/reaper (almacenamiento interno)")
 
 
+def _chequeo_cuenta_openrouter(settings: Settings) -> Optional[Chequeo]:
+    """Cupo de pedidos gratis de TU cuenta (50/día sin crédito, 1000 con ≥10 de crédito). Un proyecto grande necesita
+    cientos de pedidos: mejor saberlo antes que a mitad de camino. Solo con OpenRouter y con clave."""
+    if not usa_free_openrouter(settings):
+        return None
+    cuenta = cuenta_openrouter(clave_de_proveedor("openrouter", settings))
+    if cuenta is None or cuenta.cupo_dia is None:
+        return None
+    poco = cuenta.quedan_hoy is not None and cuenta.quedan_hoy < 40
+    return Chequeo("cupo gratis OpenRouter", not poco, cuenta.resumen(),
+                   "esperá a mañana o cargá crédito" if poco else "",
+                   ayuda=("Con 50 pedidos por día un /grande no termina en un día: REAPER se detiene limpio cuando "
+                          "se agota y sigue con --grande continuar. Con al menos 10 de crédito comprado el cupo de "
+                          "modelos :free sube a 1000 por día." if cuenta.sin_credito else ""))
+
+
 def chequeos_sistema(settings: Settings) -> list[Chequeo]:
     chequeos = []
     version = sys.version_info
@@ -134,6 +150,9 @@ def chequeos_sistema(settings: Settings) -> list[Chequeo]:
     chequeos.append(Chequeo("sistema", True, "Termux en Android" if es_termux() else f"{platform.system()} {platform.machine()}"))
     chequeos.append(_chequeo_clave(settings))
     chequeos.append(_chequeo_red(settings.url_api()))
+    cuenta = _chequeo_cuenta_openrouter(settings)
+    if cuenta is not None:
+        chequeos.append(cuenta)
     chequeos.append(_chequeo_modulo("httpx", "streaming más robusto; sin él se usa urllib"))
     chequeos.append(_chequeo_modulo("pyflakes", "nombres indefinidos más precisos (REAPER tiene un detector propio)"))
     chequeos.append(_chequeo_modulo("readline", "historial y autocompletado en el REPL", "gnureadline"))

@@ -241,6 +241,80 @@ def elegir_free_de_catalogo(datos: list) -> list:
     return [mid for _p, _c, mid in sorted(elegidos)]
 
 
+URL_CUENTA_OPENROUTER = "https://openrouter.ai/api/v1/key"
+
+
+@dataclass
+class CuentaOpenRouter:
+    """Lo que dice /api/v1/key de TU clave (no es un pedido a un modelo: no gasta cupo)."""
+    sin_credito: Optional[bool] = None          # is_free_tier: nunca compró créditos → 50 pedidos :free por día
+    cupo_dia: Optional[int] = None              # free_model_daily_requests.limit
+    usados_hoy: Optional[int] = None
+    quedan_hoy: Optional[int] = None
+
+    def resumen(self) -> str:
+        if self.cupo_dia is None and self.sin_credito is None:
+            return "sin datos de la cuenta"
+        tipo = ("sin crédito comprado" if self.sin_credito else "con crédito") if self.sin_credito is not None else ""
+        cupo = f"{self.cupo_dia} pedidos gratis por día" if self.cupo_dia is not None else ""
+        hoy = f" (hoy: usados {self.usados_hoy}, quedan {self.quedan_hoy})" if self.quedan_hoy is not None else ""
+        return ", ".join(x for x in (tipo, cupo) if x) + hoy
+
+
+def _entero_o_nada(valor) -> Optional[int]:
+    try:
+        return int(valor) if valor is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def interpretar_cuenta_openrouter(datos) -> CuentaOpenRouter:
+    d = datos.get("data", datos) if isinstance(datos, dict) else {}
+    if not isinstance(d, dict):
+        return CuentaOpenRouter()
+    sin_credito = d.get("is_free_tier") if isinstance(d.get("is_free_tier"), bool) else None
+    diario = d.get("free_model_daily_requests") if isinstance(d.get("free_model_daily_requests"), dict) else {}
+    cupo = _entero_o_nada(diario.get("limit"))
+    if cupo is None and sin_credito is not None:
+        cupo = 50 if sin_credito else 1000              # los topes publicados por OpenRouter
+    usados, quedan = _entero_o_nada(diario.get("used")), _entero_o_nada(diario.get("remaining"))
+    if quedan is None and cupo is not None and usados is not None:
+        quedan = max(0, cupo - usados)
+    return CuentaOpenRouter(sin_credito, cupo, usados, quedan)
+
+
+def cuenta_openrouter(clave: Optional[str], timeout: float = 8.0, abrir=None) -> Optional[CuentaOpenRouter]:
+    """Consulta TU cuenta con TU clave. None sin clave, sin red o con REAPER_SIN_RED (autotests)."""
+    if not clave or clave == "sin-clave" or (abrir is None and os.getenv("REAPER_SIN_RED")):
+        return None
+    pedido = urllib.request.Request(URL_CUENTA_OPENROUTER, headers={"Authorization": f"Bearer {clave}",
+                                                                     "User-Agent": "REAPER"})
+    try:
+        with (abrir or urllib.request.urlopen)(pedido, timeout=timeout) as r:
+            return interpretar_cuenta_openrouter(json.loads(r.read().decode("utf-8")))
+    except (OSError, ValueError, AttributeError, urllib.error.URLError):
+        return None
+
+
+def usa_free_openrouter(settings) -> bool:
+    try:
+        return settings.modelo.endswith(":free") and destino_modelo(settings.modelo, settings).proveedor == "openrouter"
+    except (ValueError, KeyError, TypeError, AttributeError):
+        return False
+
+
+def estimar_pedidos_grande(etapas: int, settings) -> tuple:
+    """Rango GRUESO de pedidos al modelo para un /grande: cada etapa es una build entera (exploración, plan,
+    implementación con varios turnos, verificación, reparaciones, juez). Con torneo, la implementación se multiplica
+    por los candidatos. Sirve para avisar ANTES si el cupo del día no alcanza, no como promesa."""
+    factor = 1.0
+    if getattr(settings, "torneo", False) and int(getattr(settings, "candidatos", 1)) > 1:
+        factor = 0.4 + 0.6 * int(settings.candidatos)
+    minimo = int(etapas * 25 * factor) + 10
+    maximo = int(etapas * 60 * factor) + 25
+    return minimo, maximo
+
+
 def catalogo_free_openrouter(timeout: float = 8.0, horas_cache: float = 12.0) -> list:
     """Modelos gratis que OpenRouter ofrece HOY (con caché). [] sin red o con REAPER_SIN_RED (los autotests)."""
     if os.getenv("REAPER_SIN_RED"):

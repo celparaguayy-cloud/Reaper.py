@@ -160,6 +160,8 @@ class Torneo:
         except (Cancelado, KeyboardInterrupt):
             raise
         except LLMError as e:
+            if e.detiene_todo:
+                raise                                   # sin cupo/presupuesto ningún candidato puede seguir
             cand.error = f"modelo: {e}"
         except Exception as e:  # un candidato roto no tumba el torneo
             cand.error = f"{type(e).__name__}: {e}"

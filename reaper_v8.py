@@ -1760,6 +1760,8 @@ class Settings:
     max_tareas: int = 12
     # /grande: tope de ETAPAS del plan maestro (cada etapa es un /construir de hasta max_tareas tareas).
     max_etapas: int = 10
+    # /grande: minutos que puede esperar SOLO, por etapa, ante límites pasajeros del modelo (0 = no espera).
+    espera_limites_min: int = 30
     paralelo: int = 2
     qa: bool = True
 
@@ -1869,6 +1871,7 @@ class Settings:
         acotar("max_revisiones", 0, 5)
         acotar("max_tareas", 1, 60)
         acotar("max_etapas", 2, 30)
+        acotar("espera_limites_min", 0, 240)
         acotar("paralelo", 1, 8)
         acotar("candidatos", 1, 6)
         acotar("paralelo_torneo", 1, 6)
@@ -2283,13 +2286,23 @@ except ImportError:  # pragma: no cover - depende del entorno
 
 class LLMError(RuntimeError):
     def __init__(self, mensaje: str, *, probar_otro_modelo: bool = False, contexto_excedido: bool = False,
-                 presupuesto: bool = False, solo_razonamiento: bool = False):
+                 presupuesto: bool = False, solo_razonamiento: bool = False, cupo_diario: bool = False,
+                 reinicio: Optional[float] = None):
         super().__init__(mensaje)
         self.probar_otro_modelo = probar_otro_modelo
         self.contexto_excedido = contexto_excedido
         self.presupuesto = presupuesto
         # El modelo respondió, pero gastó toda la salida en razonamiento sin dar contenido (modelos "thinking").
         self.solo_razonamiento = solo_razonamiento
+        # Cupo DIARIO de modelos gratis agotado (OpenRouter: 50/día sin crédito, 1000 con ≥10 de crédito). Reintentar
+        # o cambiar a otro :free no sirve (comparten el cupo): hay que esperar a `reinicio` (epoch, si se conoce).
+        self.cupo_diario = cupo_diario
+        self.reinicio = reinicio
+
+    @property
+    def detiene_todo(self) -> bool:
+        """Errores que ninguna fase puede "saltear": sin presupuesto o sin cupo no hay modelo que responda."""
+        return bool(self.presupuesto or self.cupo_diario)
 
 
 class _Transitorio(Exception):
@@ -2392,9 +2405,57 @@ def _detalle_error(cuerpo: str, limite: int = 220) -> str:
     return texto if len(texto) <= limite else texto[:limite - 1] + "…"
 
 
-def _lanzar_http(status: int, cuerpo: str, retry_after: Optional[str]) -> None:
+_RE_CUPO_DIARIO = re.compile(r"per[-_ ]?day|daily|free-models-per-day|por\s+d[ií]a|diari[oa]", re.I)
+
+
+def _epoch_reinicio(valor) -> Optional[float]:
+    """X-RateLimit-Reset de OpenRouter viene en milisegundos desde epoch; se aceptan también segundos o un plazo
+    relativo en segundos. None si no se puede leer."""
+    try:
+        numero = float(str(valor).strip())
+    except (TypeError, ValueError):
+        return None
+    if numero > 1e12:
+        return numero / 1000.0
+    if numero > 1e9:
+        return numero
+    return time.time() + numero if numero >= 0 else None
+
+
+def es_cupo_diario(status: int, cuerpo: str, cabeceras=None) -> tuple:
+    """(¿es el cupo DIARIO de modelos gratis?, reinicio epoch|None). Un 429 por minuto (o del pool del proveedor) se
+    libera en segundos y se reintenta; el diario no: reintentar solo gasta tiempo (prueba de preparación /grande)."""
+    if status != 429:
+        return False, None
+    leer = (lambda k: cabeceras.get(k)) if cabeceras is not None else (lambda k: None)
+    reinicio = _epoch_reinicio(leer("X-RateLimit-Reset") or leer("x-ratelimit-reset"))
+    restante = str(leer("X-RateLimit-Remaining") or leer("x-ratelimit-remaining") or "").strip()
+    if _RE_CUPO_DIARIO.search(cuerpo or ""):
+        return True, reinicio
+    # Sin texto explícito: cupo en 0 y reinicio lejano (más de 10 min) = no es el límite por minuto.
+    if restante == "0" and reinicio is not None and reinicio - time.time() > 600:
+        return True, reinicio
+    return False, None
+
+
+def _texto_reinicio(reinicio: Optional[float]) -> str:
+    if not reinicio:
+        return ""
+    momento = datetime.fromtimestamp(reinicio)
+    dia = "hoy" if momento.date() == datetime.now().date() else "mañana" if (
+        momento.date() - datetime.now().date()).days == 1 else momento.strftime("%d/%m")
+    return f" Se renueva {dia} a las {momento:%H:%M}."
+
+
+def _lanzar_http(status: int, cuerpo: str, retry_after: Optional[str], cabeceras=None) -> None:
     detalle = _detalle_error(cuerpo)
     motivo = MENSAJES_HTTP.get(status, "Error HTTP del proveedor.")
+    diario, reinicio = es_cupo_diario(status, cuerpo, cabeceras)
+    if diario:
+        raise LLMError(
+            "Se agotó el cupo DIARIO de pedidos a modelos gratis (OpenRouter: 50 por día sin crédito, 1000 con al "
+            f"menos 10 de crédito).{_texto_reinicio(reinicio)} Reintentar ahora no sirve. ({detalle})",
+            probar_otro_modelo=True, cupo_diario=True, reinicio=reinicio)
     if status in TRANSITORIOS:
         espera = None
         try:
@@ -2423,7 +2484,7 @@ def _transporte_httpx(url: str, headers: dict, payload: dict, timeout: int) -> I
             if r.status_code >= 400:
                 # En streaming hay que leer el cuerpo antes de usarlo.
                 cuerpo = r.read().decode("utf-8", "replace")
-                _lanzar_http(r.status_code, cuerpo, r.headers.get("retry-after"))
+                _lanzar_http(r.status_code, cuerpo, r.headers.get("retry-after"), r.headers)
             for linea in r.iter_lines():
                 yield linea
     except httpx.TimeoutException as e:
@@ -2439,7 +2500,7 @@ def _transporte_urllib(url: str, headers: dict, payload: dict, timeout: int) -> 
         respuesta = urllib.request.urlopen(pedido, timeout=timeout)
     except urllib.error.HTTPError as e:
         cuerpo = e.read().decode("utf-8", "replace") if e.fp else ""
-        _lanzar_http(e.code, cuerpo, e.headers.get("Retry-After") if e.headers else None)
+        _lanzar_http(e.code, cuerpo, e.headers.get("Retry-After") if e.headers else None, e.headers)
         return
     except (urllib.error.URLError, socket.timeout, TimeoutError, ConnectionError) as e:
         raise _Transitorio(f"Error de red hablando con el proveedor: {e}") from e
@@ -2545,6 +2606,23 @@ class LLMClient:
                                           enfriamiento=getattr(settings, "disyuntor_enfriamiento", 45.0))
         self._claves_proveedor: dict = {}       # proveedor → clave (cache; Fase 6, ruteo multi-proveedor)
         self.on_evento: Optional[Callable[[str], None]] = None
+        # Cupo diario de modelos gratis de OpenRouter agotado: hasta cuándo (epoch; 0 = no se sabe, se asume que
+        # sigue agotado en esta sesión). Mientras dure, los :free de OpenRouter se saltean sin tocar la red.
+        self.cupo_free_hasta: Optional[float] = None
+
+    def _es_free_openrouter(self, modelo: str) -> bool:
+        try:
+            return str(modelo).endswith(":free") and self._destino(modelo).proveedor == "openrouter"
+        except (ValueError, KeyError, TypeError):
+            return False
+
+    def cupo_free_agotado(self) -> bool:
+        if self.cupo_free_hasta is None:
+            return False
+        if self.cupo_free_hasta and time.time() >= self.cupo_free_hasta:
+            self.cupo_free_hasta = None                 # ya se renovó
+            return False
+        return True
 
     def _destino(self, modelo: str) -> "DestinoModelo":
         return destino_modelo(modelo, self.settings)
@@ -2630,6 +2708,16 @@ class LLMClient:
                     probar_otro_modelo=False)
             candidatos = locales
 
+        # Cupo diario de :free agotado: comparten el cupo, así que solo sirven modelos de OTRO proveedor (o pagos).
+        if self.cupo_free_agotado():
+            otros = [c for c in candidatos if not self._es_free_openrouter(c)]
+            if not otros:
+                hasta = self.cupo_free_hasta or None
+                raise LLMError("El cupo DIARIO de modelos gratis de OpenRouter sigue agotado."
+                               + _texto_reinicio(hasta) + " Ningún otro modelo del equipo puede responder.",
+                               cupo_diario=True, reinicio=hasta)
+            candidatos = otros
+
         # Disyuntor (Ω §5.2): EXCLUIR los modelos abiertos/retirados; no "probar igual" contra algo caído.
         orden = self.disyuntor.elegibles(candidatos)
         if not orden:
@@ -2640,6 +2728,8 @@ class LLMClient:
 
         ultimo: Optional[LLMError] = None
         for n, candidato in enumerate(orden):
+            if self.cupo_free_agotado() and self._es_free_openrouter(candidato):
+                continue                                # mismo cupo diario agotado: ni lo intento
             try:
                 respuesta = self._con_reintentos(
                     candidato, mensajes, temperatura, max_tokens, stop, on_progress,
@@ -2655,6 +2745,10 @@ class LLMClient:
                 ultimo = e
                 with self._lock:
                     self.uso.errores += 1
+                if e.cupo_diario:
+                    self.cupo_free_hasta = e.reinicio or 0.0
+                    if self.on_evento:
+                        self.on_evento("cupo diario de modelos gratis agotado: solo sigo con modelos de otro proveedor")
                 if not e.probar_otro_modelo:
                     raise
                 if _RE_MODELO_RETIRADO.search(str(e)):      # 404 model_not_found → cuarentena de esa ruta
@@ -13360,7 +13454,7 @@ class EscritorLargo:
                 return grupo, self._pedir_relleno(rel, lenguaje, especificacion, texto_base, grupo,
                                                   "\n".join(errores.get(s.nombre_completo, "") for s in grupo).strip())
             except LLMError as e:
-                if e.presupuesto:
+                if e.detiene_todo:
                     raise
                 return grupo, {}
 
@@ -13706,6 +13800,8 @@ class Torneo:
         except (Cancelado, KeyboardInterrupt):
             raise
         except LLMError as e:
+            if e.detiene_todo:
+                raise                                   # sin cupo/presupuesto ningún candidato puede seguir
             cand.error = f"modelo: {e}"
         except Exception as e:  # un candidato roto no tumba el torneo
             cand.error = f"{type(e).__name__}: {e}"
@@ -16162,7 +16258,7 @@ class Orquestador:
         try:
             return self._sub(rol, tarea, cid, **kw)
         except LLMError as e:
-            if e.presupuesto:
+            if e.detiene_todo:
                 raise
             self.ui.aviso(f"  {rol}: el modelo no respondió ({recortar(str(e), 180)}). Sigo sin esa fase.")
             return None
@@ -16202,7 +16298,7 @@ class Orquestador:
         try:
             resultados = ejecutar_subagentes(specs, self.llm, self.ws, self.settings, self.ui, profundidad=1)
         except LLMError as e:
-            if e.presupuesto:
+            if e.detiene_todo:
                 raise
             self.ui.aviso(f"  explorador: el modelo no respondió ({recortar(str(e), 180)}). Sigo con el mapa local.")
             return mapa or "(exploración no disponible: el modelo no respondió)"
@@ -16560,7 +16656,7 @@ class Orquestador:
             resp = self.llm.chat(mensajes, modelo=pedido_modelo, temperatura=ROLES[rol].temperatura,
                                  max_tokens=max_tokens, rol=rol)
         except LLMError as e:
-            if e.presupuesto:
+            if e.detiene_todo:
                 raise
             self.ui.aviso(f"  {rol}: el modelo no respondió ({recortar(str(e), 160)}); sigo sin su dictamen.")
             return None, pedido_modelo, "unknown"
@@ -27640,6 +27736,22 @@ def _chequeo_symlinks() -> Chequeo:
                        "export REAPER_TMP=$HOME/.cache/reaper (almacenamiento interno)")
 
 
+def _chequeo_cuenta_openrouter(settings: Settings) -> Optional[Chequeo]:
+    """Cupo de pedidos gratis de TU cuenta (50/día sin crédito, 1000 con ≥10 de crédito). Un proyecto grande necesita
+    cientos de pedidos: mejor saberlo antes que a mitad de camino. Solo con OpenRouter y con clave."""
+    if not usa_free_openrouter(settings):
+        return None
+    cuenta = cuenta_openrouter(clave_de_proveedor("openrouter", settings))
+    if cuenta is None or cuenta.cupo_dia is None:
+        return None
+    poco = cuenta.quedan_hoy is not None and cuenta.quedan_hoy < 40
+    return Chequeo("cupo gratis OpenRouter", not poco, cuenta.resumen(),
+                   "esperá a mañana o cargá crédito" if poco else "",
+                   ayuda=("Con 50 pedidos por día un /grande no termina en un día: REAPER se detiene limpio cuando "
+                          "se agota y sigue con --grande continuar. Con al menos 10 de crédito comprado el cupo de "
+                          "modelos :free sube a 1000 por día." if cuenta.sin_credito else ""))
+
+
 def chequeos_sistema(settings: Settings) -> list[Chequeo]:
     chequeos = []
     version = sys.version_info
@@ -27648,6 +27760,9 @@ def chequeos_sistema(settings: Settings) -> list[Chequeo]:
     chequeos.append(Chequeo("sistema", True, "Termux en Android" if es_termux() else f"{platform.system()} {platform.machine()}"))
     chequeos.append(_chequeo_clave(settings))
     chequeos.append(_chequeo_red(settings.url_api()))
+    cuenta = _chequeo_cuenta_openrouter(settings)
+    if cuenta is not None:
+        chequeos.append(cuenta)
     chequeos.append(_chequeo_modulo("httpx", "streaming más robusto; sin él se usa urllib"))
     chequeos.append(_chequeo_modulo("pyflakes", "nombres indefinidos más precisos (REAPER tiene un detector propio)"))
     chequeos.append(_chequeo_modulo("readline", "historial y autocompletado en el REPL", "gnureadline"))
@@ -50030,6 +50145,214 @@ class TestSeguirDespuesDeUnCorte(BaseTest):
 
 
 # ======================================================================
+# MÓDULO: autotest_cupo
+# ======================================================================
+"""
+Autotests de preparación para una prueba GRANDE con modelos gratis de OpenRouter (límites publicados: 20 pedidos por
+minuto; 50 por día sin crédito comprado, 1000 con al menos 10 de crédito; 429 con X-RateLimit-* al pasarse).
+
+- Un 429 de cupo DIARIO se reintentaba como si fuera pasajero y se probaban los otros :free (que comparten el cupo).
+- /grande no sabía cuántos pedidos le quedaban ni avisaba antes; un corte por límite contaba como intento fallido.
+"""
+
+
+def _cupo_agotado(reinicio_segundos: float = 6 * 3600) -> LLMError:
+    try:
+        _lanzar_http(429, json.dumps({"error": {"code": 429, "message": "Rate limit exceeded: free-models-per-day. "
+                                                                        "Add 10 credits to unlock 1000"}}),
+                     None, {"X-RateLimit-Remaining": "0",
+                            "X-RateLimit-Reset": str(int((time.time() + reinicio_segundos) * 1000))})
+    except LLMError as e:
+        return e
+    raise AssertionError("no lanzó")
+
+
+class TestCupoDiarioOpenRouter(BaseTest):
+    def _cliente(self, eventos, **ajustes):
+        pedidos = []
+        base = transporte_falso(eventos)
+
+        def transporte(url, headers, payload, timeout):
+            pedidos.append(payload.get("model"))
+            return base(url, headers, payload, timeout)
+        c = LLMClient("clave", self.ajustes(**ajustes), url="http://falso", transporte=transporte)
+        c.dormir = lambda s: self.fail(f"no debía esperar {s}s")
+        return c, pedidos
+
+    def test_detecta_cupo_diario_y_no_el_limite_por_minuto(self):
+        e = _cupo_agotado()
+        self.assertTrue(e.cupo_diario and e.detiene_todo)
+        self.assertIn("Se renueva", str(e))
+        self.assertIn("50 por día", str(e))
+        minuto = {"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": str(int((time.time() + 40) * 1000))}
+        self.assertEqual(es_cupo_diario(429, '{"error": {"message": "Rate limit exceeded"}}', minuto), (False, None))
+        self.assertFalse(es_cupo_diario(503, "free-models-per-day", None)[0])            # solo un 429 es cupo
+        with self.assertRaises(_Transitorio):                                           # el de minuto se reintenta
+            _lanzar_http(429, '{"error": {"message": "Rate limit exceeded"}}', "3", minuto)
+
+    def test_saltea_los_free_y_usa_otro_modelo_sin_reintentar(self):
+        c, pedidos = self._cliente([_cupo_agotado(), "ok"], modelo="a/uno:free", reintentos=4, rpm=0,
+                                   fallbacks=["b/dos:free", "c/pago"], respaldo_equipo=False)
+        self.assertEqual(c.chat([{"role": "user", "content": "x"}]).texto, "ok")
+        self.assertEqual(pedidos, ["a/uno:free", "c/pago"])                             # b/dos:free ni se intenta
+        self.assertTrue(c.cupo_free_agotado())
+
+    def test_sin_alternativa_falla_al_instante_y_sin_red(self):
+        c, pedidos = self._cliente([_cupo_agotado()], modelo="a/uno:free", reintentos=4, rpm=0,
+                                   fallbacks=["b/dos:free"], respaldo_equipo=False)
+        with self.assertRaises(LLMError) as ctx:
+            c.chat([{"role": "user", "content": "x"}])
+        self.assertTrue(ctx.exception.cupo_diario)
+        self.assertEqual(pedidos, ["a/uno:free"])
+        with self.assertRaises(LLMError) as ctx2:                                       # ahora sin tocar la red
+            c.chat([{"role": "user", "content": "y"}])
+        self.assertTrue(ctx2.exception.cupo_diario)
+        self.assertEqual(pedidos, ["a/uno:free"])
+
+    def test_el_cupo_vuelve_cuando_se_renueva(self):
+        c, _ = self._cliente([], modelo="a/uno:free")
+        c.cupo_free_hasta = time.time() - 1
+        self.assertFalse(c.cupo_free_agotado())
+
+    def test_las_fases_opcionales_no_se_tragan_el_cupo(self):
+        llm = MockLLM(lambda m, k: (_ for _ in ()).throw(_cupo_agotado()))
+        orq = Orquestador(llm, self.proyecto({}), self.ajustes(), self.ui())
+        with self.assertRaises(LLMError):
+            orq._consultar_rol_x("juez", "x")                                           # antes: "sigo sin su dictamen"
+
+    def test_cuenta_y_estimacion(self):
+        cuenta = interpretar_cuenta_openrouter({"data": {"is_free_tier": True, "free_model_daily_requests":
+                                                         {"used": 12, "limit": 50, "remaining": 38}}})
+        self.assertEqual((cuenta.sin_credito, cuenta.cupo_dia, cuenta.quedan_hoy), (True, 50, 38))
+        self.assertIn("quedan 38", cuenta.resumen())
+        self.assertEqual(interpretar_cuenta_openrouter({"data": {"is_free_tier": False}}).cupo_dia, 1000)
+        self.assertIsNone(cuenta_openrouter(None))
+        sin_torneo = estimar_pedidos_grande(5, self.ajustes(torneo=False))
+        con_torneo = estimar_pedidos_grande(5, self.ajustes(torneo=True, candidatos=3))
+        self.assertLess(sin_torneo[1], con_torneo[1])
+        self.assertGreater(sin_torneo[0], 50)                                           # 5 etapas no entran en 50
+
+    def test_doctor_muestra_el_cupo(self):
+        g = globals()
+        original = g["cuenta_openrouter"]
+        g["cuenta_openrouter"] = lambda clave, **k: CuentaOpenRouter(True, 50, 45, 5)
+        os.environ["OPENROUTER_API_KEY"] = "sk-or-v1-0123456789abcdef0123"
+        try:
+            chequeo = _chequeo_cuenta_openrouter(self.ajustes(proveedor="openrouter", modelo="a/uno:free"))
+        finally:
+            g["cuenta_openrouter"] = original
+            os.environ.pop("OPENROUTER_API_KEY", None)
+        self.assertFalse(chequeo.ok)
+        self.assertIn("quedan 5", chequeo.detalle)
+        self.assertIn("1000 por día", chequeo.ayuda)
+        self.assertIsNone(_chequeo_cuenta_openrouter(self.ajustes(modelo="a/pago")))     # no es :free: no consulta
+
+
+class TestGrandeConLimites(BaseTest):
+    def _ajustes(self, **extra):
+        valores = dict(tests_primero=False, torneo=False, escalar=False, max_revisiones=0, qa=False,
+                       max_reparaciones=1, juez=False, git_snapshots=False)
+        valores.update(extra)
+        return self.ajustes(**valores)
+
+    def _grande(self, error, veces=1, **ajustes):
+        """Proyecto biblioteca cuyo modelo tira `error` en la PRIMERA llamada del implementador de la etapa 2."""
+        ws = self.proyecto({})
+        guion = _GuionBiblioteca(ws)
+        restantes = [veces]
+
+        def responder(mensajes, kw):
+            primero = next((m["content"] for m in mensajes if m["role"] == "user"), "")
+            if (MockLLM.rol_de(mensajes) == "implementador" and "(E2)" in primero and restantes[0] > 0
+                    and _turno(mensajes) == 0):
+                restantes[0] -= 1
+                raise error
+            return guion(mensajes, kw)
+        ui = self.ui()
+        grande = ConstructorGrande(MockLLM(responder), ws, self._ajustes(**ajustes), ui)
+        esperas = []
+        grande.dormir = esperas.append
+        grande.consultar_cuenta = lambda: None
+        return ws, grande, ui, esperas
+
+    def test_limite_pasajero_espera_y_sigue_solo(self):
+        _ws, grande, ui, esperas = self._grande(
+            LLMError("Todos los modelos están en enfriamiento o retirados (a:abierto)."))
+        self.assertTrue(grande.iniciar("Un gestor de biblioteca con préstamos y CLI", confirmar=False),
+                        ui.texto_registrado()[-2000:])
+        self.assertEqual(esperas, [ESPERAS_LIMITE[0]])
+        etapas = {e["id"]: e for e in grande.leer()["maestro"]["etapas"]}
+        self.assertEqual(etapas["2"]["intentos"], 1)                                # el corte no contó
+        self.assertIn("Espero 2m", ui.texto_registrado())
+
+    def test_cupo_diario_lejano_se_detiene_limpio_y_despues_sigue(self):
+        ws, grande, ui, esperas = self._grande(_cupo_agotado(6 * 3600))
+        self.assertFalse(grande.iniciar("Un gestor de biblioteca con préstamos y CLI", confirmar=False))
+        self.assertEqual(esperas, [])                                               # 6 h: no se queda esperando
+        estado = grande.leer()
+        etapas = {e["id"]: e for e in estado["maestro"]["etapas"]}
+        self.assertEqual(estado["estado"], "detenido")
+        self.assertIn("cupo diario", estado["motivo"])
+        self.assertEqual(etapas["2"]["intentos"], 0)
+        self.assertIsNotNone(RegistroBuild(ws).leer())                             # la build quedó para retomar
+        self.assertIn("--grande continuar", ui.texto_registrado())
+        self.assertTrue(grande.continuar())                                         # "al otro día"
+
+    def test_cupo_que_se_renueva_pronto_espera_hasta_la_renovacion(self):
+        _ws, grande, _ui, esperas = self._grande(_cupo_agotado(5 * 60))
+        self.assertTrue(grande.iniciar("Un gestor de biblioteca con préstamos y CLI", confirmar=False))
+        self.assertEqual(len(esperas), 1)
+        self.assertTrue(300 <= esperas[0] <= 340)
+
+    def test_sin_esperas_si_el_usuario_las_apaga(self):
+        _ws, grande, _ui, esperas = self._grande(LLMError("HTTP 503 overloaded"), espera_limites_min=0)
+        self.assertFalse(grande.iniciar("Un gestor de biblioteca con préstamos y CLI", confirmar=False))
+        self.assertEqual(esperas, [])
+
+    def test_cuenta_chica_avisa_y_ahorra_pedidos_solo_en_esta_corrida(self):
+        ws = self.proyecto({})
+        ui = self.ui()
+        ajustes = self._ajustes(torneo=True, candidatos=2, max_revisiones=1)
+        grande = ConstructorGrande(MockLLM(_GuionBiblioteca(ws)), ws, ajustes, ui)
+        grande.consultar_cuenta = lambda: CuentaOpenRouter(True, 50, 40, 10)
+        visto = {}
+        real = grande._construir_build
+
+        def espiar(pedido, reanudar, usuario):
+            visto.setdefault("torneo", ajustes.torneo)
+            visto.setdefault("revisiones", ajustes.max_revisiones)
+            return real(pedido, reanudar, usuario)
+        grande._construir_build = espiar
+        self.assertTrue(grande.iniciar("Un gestor de biblioteca con préstamos y CLI", confirmar=False))
+        texto = ui.texto_registrado()
+        self.assertIn("Pedidos estimados al modelo", texto)
+        self.assertIn("no alcanza", texto)
+        self.assertIn("Ahorro de pedidos", texto)
+        self.assertEqual(visto, {"torneo": False, "revisiones": 0})                 # durante la corrida
+        self.assertEqual((ajustes.torneo, ajustes.max_revisiones), (True, 1))      # tu config, intacta después
+        self.assertTrue(all(e["pedidos"] > 0 for e in grande.leer()["maestro"]["etapas"]))
+
+    def test_plan_maestro_con_formatos_de_modelos_reales(self):
+        texto = ('```xml\n<maestro><vision>v</vision><architecture>arq</architecture>\n'
+                 '<stage id="E1" title="Base" depends="none"><objective>datos</objective>'
+                 '<files>a.py, tests/test_a.py</files></stage>\n'
+                 '<stage id="E2" title="Ventas" depends="E1"><objective>ventas</objective></stage>\n'
+                 '<etapa id="3" titulo="CLI" deps="etapa 2, 1"><objetivo>cli</objetivo></etapa>\n'
+                 '<etapa id="4" titulo="Web" deps="1 3"><objetivo>web</objetivo></etapa></maestro>\n```')
+        m = parsear_maestro(texto)
+        self.assertEqual([(e.id, e.deps) for e in m.etapas],
+                         [("E1", []), ("E2", ["E1"]), ("3", ["E2", "E1"]), ("4", ["E1", "3"])])
+        self.assertEqual(m.arquitectura, "arq")
+        self.assertEqual(problemas_maestro(m, 10), [])
+
+    def test_plan_maestro_cortado_se_detecta(self):
+        m = parsear_maestro('<etapa id="1"><objetivo>a</objetivo></etapa><etapa id="2"><objetivo>b, y se cor')
+        self.assertTrue(m.cortado)
+        self.assertEqual(len(m.etapas), 1)                                          # la 2 se perdía en silencio
+        self.assertTrue(any("CORTÓ" in p for p in problemas_maestro(m, 10)))
+
+
+# ======================================================================
 # MÓDULO: autotest_runner
 # ======================================================================
 """Ejecutor del autotest interno."""
@@ -55130,6 +55453,80 @@ def elegir_free_de_catalogo(datos: list) -> list:
     return [mid for _p, _c, mid in sorted(elegidos)]
 
 
+URL_CUENTA_OPENROUTER = "https://openrouter.ai/api/v1/key"
+
+
+@dataclass
+class CuentaOpenRouter:
+    """Lo que dice /api/v1/key de TU clave (no es un pedido a un modelo: no gasta cupo)."""
+    sin_credito: Optional[bool] = None          # is_free_tier: nunca compró créditos → 50 pedidos :free por día
+    cupo_dia: Optional[int] = None              # free_model_daily_requests.limit
+    usados_hoy: Optional[int] = None
+    quedan_hoy: Optional[int] = None
+
+    def resumen(self) -> str:
+        if self.cupo_dia is None and self.sin_credito is None:
+            return "sin datos de la cuenta"
+        tipo = ("sin crédito comprado" if self.sin_credito else "con crédito") if self.sin_credito is not None else ""
+        cupo = f"{self.cupo_dia} pedidos gratis por día" if self.cupo_dia is not None else ""
+        hoy = f" (hoy: usados {self.usados_hoy}, quedan {self.quedan_hoy})" if self.quedan_hoy is not None else ""
+        return ", ".join(x for x in (tipo, cupo) if x) + hoy
+
+
+def _entero_o_nada(valor) -> Optional[int]:
+    try:
+        return int(valor) if valor is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def interpretar_cuenta_openrouter(datos) -> CuentaOpenRouter:
+    d = datos.get("data", datos) if isinstance(datos, dict) else {}
+    if not isinstance(d, dict):
+        return CuentaOpenRouter()
+    sin_credito = d.get("is_free_tier") if isinstance(d.get("is_free_tier"), bool) else None
+    diario = d.get("free_model_daily_requests") if isinstance(d.get("free_model_daily_requests"), dict) else {}
+    cupo = _entero_o_nada(diario.get("limit"))
+    if cupo is None and sin_credito is not None:
+        cupo = 50 if sin_credito else 1000              # los topes publicados por OpenRouter
+    usados, quedan = _entero_o_nada(diario.get("used")), _entero_o_nada(diario.get("remaining"))
+    if quedan is None and cupo is not None and usados is not None:
+        quedan = max(0, cupo - usados)
+    return CuentaOpenRouter(sin_credito, cupo, usados, quedan)
+
+
+def cuenta_openrouter(clave: Optional[str], timeout: float = 8.0, abrir=None) -> Optional[CuentaOpenRouter]:
+    """Consulta TU cuenta con TU clave. None sin clave, sin red o con REAPER_SIN_RED (autotests)."""
+    if not clave or clave == "sin-clave" or (abrir is None and os.getenv("REAPER_SIN_RED")):
+        return None
+    pedido = urllib.request.Request(URL_CUENTA_OPENROUTER, headers={"Authorization": f"Bearer {clave}",
+                                                                     "User-Agent": "REAPER"})
+    try:
+        with (abrir or urllib.request.urlopen)(pedido, timeout=timeout) as r:
+            return interpretar_cuenta_openrouter(json.loads(r.read().decode("utf-8")))
+    except (OSError, ValueError, AttributeError, urllib.error.URLError):
+        return None
+
+
+def usa_free_openrouter(settings) -> bool:
+    try:
+        return settings.modelo.endswith(":free") and destino_modelo(settings.modelo, settings).proveedor == "openrouter"
+    except (ValueError, KeyError, TypeError, AttributeError):
+        return False
+
+
+def estimar_pedidos_grande(etapas: int, settings) -> tuple:
+    """Rango GRUESO de pedidos al modelo para un /grande: cada etapa es una build entera (exploración, plan,
+    implementación con varios turnos, verificación, reparaciones, juez). Con torneo, la implementación se multiplica
+    por los candidatos. Sirve para avisar ANTES si el cupo del día no alcanza, no como promesa."""
+    factor = 1.0
+    if getattr(settings, "torneo", False) and int(getattr(settings, "candidatos", 1)) > 1:
+        factor = 0.4 + 0.6 * int(settings.candidatos)
+    minimo = int(etapas * 25 * factor) + 10
+    maximo = int(etapas * 60 * factor) + 25
+    return minimo, maximo
+
+
 def catalogo_free_openrouter(timeout: float = 8.0, horas_cache: float = 12.0) -> list:
     """Modelos gratis que OpenRouter ofrece HOY (con caché). [] sin red o con REAPER_SIN_RED (los autotests)."""
     if os.getenv("REAPER_SIN_RED"):
@@ -56304,10 +56701,23 @@ Lo que el modelo escribe en el plan maestro NUNCA autoriza nada: reescribir arch
 ejemplo" se decide con el pedido del usuario (Orquestador.pedido_usuario).
 """
 
-_RE_ETAPA = re.compile(r"<etapa\b([^>]*)>(.*?)</etapa\s*>", re.S | re.I)
+# Los modelos reales no siempre respetan el castellano del formato: <stage>, <fase>, <phase> también valen.
+_ETIQUETA_ETAPA = r"(?:etapa|stage|fase|phase)"
+_RE_ETAPA = re.compile(rf"<{_ETIQUETA_ETAPA}\b([^>]*)>(.*?)</{_ETIQUETA_ETAPA}\s*>", re.S | re.I)
+_RE_ETAPA_ABIERTA = re.compile(rf"<{_ETIQUETA_ETAPA}\b[^>]*>", re.I)
+_RE_ETAPA_CERRADA = re.compile(rf"</{_ETIQUETA_ETAPA}\s*>", re.I)
+_SINONIMOS = {"objetivo": ("objetivo", "objective", "goal"), "archivos": ("archivos", "files"),
+              "interfaz": ("interfaz", "interface"), "criterios": ("criterios", "criteria", "acceptance"),
+              "vision": ("vision", "visión", "overview"), "arquitectura": ("arquitectura", "architecture")}
+_SIN_DEPENDENCIAS = {"ninguna", "ninguno", "none", "no", "-", "—", "0", "n/a", "na", "nada", "[]"}
 _RE_ATTR_ETAPA = re.compile(r"""(\w+)\s*=\s*["']([^"']*)["']""")
 # Intentos TOTALES por etapa (entre todas las invocaciones) antes de pedir intervención: no quemar tokens en bucle.
+# Solo cuentan las builds que TERMINARON: un corte por límite del modelo, Ctrl+C o el teléfono no es culpa de la etapa.
 MAX_INTENTOS_ETAPA = 4
+# Esperas ante límites PASAJEROS (todos los modelos en enfriamiento, 429 por minuto, proveedor caído un rato).
+ESPERAS_LIMITE = (120, 300, 600)
+_RE_LIMITE_PASAJERO = re.compile(r"enfriamiento|429|rate|satura|50[0-4]|timeout|no respondi|red |network|"
+                                 r"vac[ií]a|overloaded|temporar|unavailable|cort[oó] el streaming", re.I)
 ESTADOS_OK_ETAPA = ("verificada", "validada")
 
 MISION_MAESTRO = """Sos el ARQUITECTO DE UN PROYECTO GRANDE. No escribís código: dividís el pedido en ETAPAS que otro
@@ -56365,6 +56775,7 @@ class Etapa:
     motivo: str = ""                    # por qué no quedó verificada (el error REAL, recortado)
     segundos: float = 0.0
     consumo: int = 0                    # tokens (entrada + salida) de sus builds
+    pedidos: int = 0                    # pedidos al modelo de sus builds (lo que cuenta para el cupo diario gratis)
 
     @property
     def ok(self) -> bool:
@@ -56377,6 +56788,7 @@ class PlanMaestro:
     arquitectura: str
     etapas: list
     texto: str = ""
+    cortado: bool = False               # la respuesta del modelo terminó a mitad de una etapa
 
     def por_id(self, eid: str) -> Optional[Etapa]:
         return next((e for e in self.etapas if e.id == eid), None)
@@ -56393,8 +56805,48 @@ class PlanMaestro:
 
 
 def _tag(cuerpo: str, nombre: str) -> str:
-    m = re.search(rf"<{nombre}>(.*?)</{nombre}\s*>", cuerpo or "", re.S | re.I)
-    return m.group(1).strip() if m else ""
+    for variante in _SINONIMOS.get(nombre, (nombre,)):
+        m = re.search(rf"<{variante}>(.*?)</{variante}\s*>", cuerpo or "", re.S | re.I)
+        if m:
+            return m.group(1).strip()
+    return ""
+
+
+_RE_PREFIJO_ETAPA = re.compile(r"^(?:etapa|stage|fase|phase|e)\s*#?\s*", re.I)
+
+
+def _id_corto(eid: str) -> str:
+    return _RE_PREFIJO_ETAPA.sub("", str(eid).strip()).lower()
+
+
+def _separar_deps(texto: str) -> list:
+    """'1, 2' · '1 2' · 'etapa 2, E1' → ['1', '2'] · ['1', '2'] · ['etapa 2', 'E1'] (sin partir 'etapa 2')."""
+    salida = []
+    for parte in re.split(r"[,;]+", texto or ""):
+        parte = parte.strip()
+        if not parte:
+            continue
+        if re.match(r"^(?:etapa|stage|fase|phase)\s+#?\S+$", parte, re.I):
+            salida.append(parte)
+        else:
+            salida.extend(parte.split())
+    return salida
+
+
+def _normalizar_deps(deps: list, ids: list) -> list:
+    """'ninguna' → sin deps; 'E1' / 'etapa 1' / '1' → el id real de esa etapa (comparando sin prefijo). Lo que no
+    coincide con ninguna queda tal cual y la validación lo marca (no se inventa a qué etapa se refería)."""
+    por_corto = {_id_corto(i): i for i in ids}
+    salida = []
+    for d in deps:
+        limpio = d.strip().strip("\"'[](){}.")
+        if not limpio or limpio.lower() in _SIN_DEPENDENCIAS:
+            continue
+        if limpio not in ids:
+            limpio = por_corto.get(_id_corto(limpio), limpio)
+        if limpio not in salida:
+            salida.append(limpio)
+    return salida
 
 
 def _lista_criterios(texto: str) -> list:
@@ -56429,18 +56881,27 @@ def parsear_maestro(texto: str) -> PlanMaestro:
         if not objetivo:
             continue
         eid = (attrs.get("id") or str(len(etapas) + 1)).strip()
-        deps = [d.strip() for d in re.split(r"[,;\s]+", attrs.get("deps", "")) if d.strip()]
+        dep_txt = attrs.get("deps") or attrs.get("depends") or attrs.get("depende") or attrs.get("after") or ""
+        deps = _separar_deps(dep_txt)
         etapas.append(Etapa(eid, (attrs.get("titulo") or attrs.get("title") or f"Etapa {eid}").strip()[:80],
                             objetivo, _rutas_etapa(_tag(cuerpo, "archivos")), _tag(cuerpo, "interfaz"),
                             _lista_criterios(_tag(cuerpo, "criterios"))[:10], deps))
-    return PlanMaestro(_tag(texto, "vision"), _tag(texto, "arquitectura"), etapas, texto)
+    ids = [e.id for e in etapas]
+    for e in etapas:
+        e.deps = _normalizar_deps(e.deps, ids)
+    # Una etapa que abre y no cierra = la respuesta se cortó (tope de tokens): antes esa etapa se perdía en silencio.
+    cortado = len(_RE_ETAPA_ABIERTA.findall(texto)) > len(_RE_ETAPA_CERRADA.findall(texto))
+    return PlanMaestro(_tag(texto, "vision"), _tag(texto, "arquitectura"), etapas, texto, cortado)
 
 
 def problemas_maestro(maestro: PlanMaestro, max_etapas: int, pedido: str = "") -> list:
     """Determinista (0 tokens): lo que hace que un plan maestro no sirva. → razones para replanificar."""
     salida = []
+    if getattr(maestro, "cortado", False):
+        salida.append("tu respuesta se CORTÓ a mitad de una etapa (se pierden las que faltan): respondé más "
+                      "corto — objetivos y criterios en una línea, interfaz solo con las firmas")
     if not maestro.etapas:
-        return ["no vino ninguna <etapa> con el formato pedido"]
+        return salida + ["no vino ninguna <etapa> con el formato pedido"]
     if len(maestro.etapas) > max_etapas:
         salida.append(f"trae {len(maestro.etapas)} etapas y el tope es {max_etapas}: agrupá etapas chicas "
                       "(cada etapa puede tener hasta ~10 tareas)")
@@ -56544,6 +57005,79 @@ class ConstructorGrande:
         self.llm, self.ws, self.settings, self.ui = llm, ws, settings, ui
         self.ruta = ws.carpeta_reaper() / "proyecto_grande.json"
         self._construir_build = construir_build or self._build_directo
+        self.consultar_cuenta: Callable[[], Optional["CuentaOpenRouter"]] = self._consultar_cuenta_real
+        self.dormir: Callable[[float], None] = self._dormir_cancelable
+        self._cuenta_cache: Optional[tuple] = None
+        self._integracion_reparada = False      # UNA build de integración por corrida (no por proyecto)
+
+    # ------------------------------------------------------------ cupo y esperas
+    def _consultar_cuenta_real(self) -> Optional["CuentaOpenRouter"]:
+        if self.settings is None or not usa_free_openrouter(self.settings):
+            return None
+        return cuenta_openrouter(clave_de_proveedor("openrouter", self.settings))
+
+    def _cuenta(self) -> Optional["CuentaOpenRouter"]:
+        if self._cuenta_cache is None:
+            try:
+                self._cuenta_cache = (self.consultar_cuenta(),)
+            except (OSError, ValueError, TypeError, AttributeError):
+                self._cuenta_cache = (None,)
+        return self._cuenta_cache[0]
+
+    def _cupo_chico(self) -> bool:
+        cuenta = self._cuenta()
+        return bool(cuenta is not None and cuenta.cupo_dia is not None and cuenta.cupo_dia <= 50)
+
+    def _aviso_cupo(self, maestro: PlanMaestro) -> None:
+        """Antes de arrancar: cuántos pedidos puede llevar y cuántos quedan hoy. Un proyecto grande con 50 pedidos
+        gratis por día NO termina en un día: mejor saberlo antes que a mitad de camino."""
+        cuenta = self._cuenta()
+        if cuenta is None:
+            return
+        torneo = self.settings.torneo and not self._cupo_chico()
+        minimo, maximo = estimar_pedidos_grande(len(maestro.etapas), replace(self.settings, torneo=torneo))
+        self.ui.info(f"  Pedidos estimados al modelo: ~{minimo}–{maximo} · tu cuenta: {cuenta.resumen()}")
+        if cuenta.quedan_hoy is not None and cuenta.quedan_hoy < minimo:
+            self.ui.aviso("  Con lo que queda hoy no alcanza para todo: avanzo lo que se pueda y, cuando se agote el "
+                          "cupo, me detengo limpio (nada queda a medias sin guardar). Seguí después con: "
+                          + comando_para_seguir(self.ws, "grande"))
+
+    def _ahorro_de_pedidos(self) -> Callable[[], None]:
+        """Cuenta con 50 pedidos gratis por día: sin torneo ni revisor en ESTA corrida (cada candidato del torneo es
+        una implementación entera). Tu configuración vuelve a como estaba al terminar."""
+        if not self._cupo_chico() or not (self.settings.torneo or self.settings.max_revisiones):
+            return lambda: None
+        antes = (self.settings.torneo, self.settings.max_revisiones)
+        self.settings.torneo, self.settings.max_revisiones = False, 0
+        self.ui.tenue("  Ahorro de pedidos (cupo de 50 por día): sin torneo ni revisor en esta corrida.")
+
+        def restaurar() -> None:
+            self.settings.torneo, self.settings.max_revisiones = antes
+        return restaurar
+
+    def _espera_para(self, error: LLMError, esperado: float, esperas: int) -> float:
+        """Segundos a esperar antes de reintentar la etapa (0 = no esperar, detenerse). Acotado por
+        settings.espera_limites_min en TOTAL por etapa: no se queda colgado horas."""
+        tope = max(0, int(getattr(self.settings, "espera_limites_min", 30))) * 60
+        if not tope or error.presupuesto:
+            return 0.0
+        if error.cupo_diario:
+            if not error.reinicio:
+                return 0.0
+            falta = error.reinicio - time.time() + 30
+            return falta if 0 < falta <= tope - esperado else 0.0
+        if not _RE_LIMITE_PASAJERO.search(str(error)) or esperas >= len(ESPERAS_LIMITE):
+            return 0.0
+        espera = float(ESPERAS_LIMITE[esperas])
+        return espera if esperado + espera <= tope else 0.0
+
+    @staticmethod
+    def _dormir_cancelable(segundos: float) -> None:
+        fin = time.monotonic() + segundos
+        while time.monotonic() < fin:
+            if "CANCELAR" in globals() and CANCELAR.is_set():
+                raise Cancelado()
+            time.sleep(min(1.0, max(0.0, fin - time.monotonic())))
 
     # ------------------------------------------------------------ estado en disco
     def leer(self) -> Optional[dict]:
@@ -56586,10 +57120,14 @@ class ConstructorGrande:
             prompt += (f"\n\nTU PLAN MAESTRO ANTERIOR:\n{anterior.como_texto()}\n\n"
                        f"CORREGÍ ESTO:\n{feedback}")
         modelo = self.settings.modelo_para("arquitecto")
-        resp = self.llm.chat([{"role": "system", "content": "# TU ROL: MAESTRO\n" + MISION_MAESTRO}, {"role": "user", "content": prompt}],
-                             modelo=modelo, temperatura=0.3, max_tokens=max(3000, self.settings.max_tokens // 2),
+        resp = self.llm.chat([{"role": "system", "content": "# TU ROL: MAESTRO\n" + MISION_MAESTRO},
+                              {"role": "user", "content": prompt}],
+                             modelo=modelo, temperatura=0.3, max_tokens=max(4000, self.settings.max_tokens),
                              rol="arquitecto")
-        return parsear_maestro(str(getattr(resp, "texto", "") or ""))
+        maestro = parsear_maestro(str(getattr(resp, "texto", "") or ""))
+        if getattr(resp, "finish_reason", None) == "length":
+            maestro.cortado = True              # cortado por el tope aunque la última etiqueta haya cerrado
+        return maestro
 
     def planificar(self, pedido: str, confirmar: bool) -> Optional[PlanMaestro]:
         self.ui.fase("G", "Plan maestro (proyecto grande por etapas)")
@@ -56609,8 +57147,12 @@ class ConstructorGrande:
                                   f"{min(30, len(maestro.etapas))}")
                 return None
         maestro.etapas = GrafoTareas(maestro.etapas).orden()
+        aviso_cupo = True
         for _ in range(3):
             self._mostrar_maestro(maestro)
+            if aviso_cupo:
+                self._aviso_cupo(maestro)
+                aviso_cupo = False
             if not confirmar:
                 return maestro
             if self.ui.confirmar("¿Aprobás el plan maestro y arrancamos por la etapa 1?", defecto=True):
@@ -56701,6 +57243,13 @@ class ConstructorGrande:
         return self._ejecutar(estado, maestro)
 
     def _ejecutar(self, estado: dict, maestro: PlanMaestro) -> bool:
+        restaurar = self._ahorro_de_pedidos()
+        try:
+            return self._ejecutar_etapas(estado, maestro)
+        finally:
+            restaurar()
+
+    def _ejecutar_etapas(self, estado: dict, maestro: PlanMaestro) -> bool:
         inicio = time.monotonic()
         grafo = GrafoTareas(maestro.etapas)
         for n, etapa in enumerate(grafo.orden(), start=1):
@@ -56716,13 +57265,27 @@ class ConstructorGrande:
                                                       "quedar verificada: revisá su informe y partila o corregila a mano")
             self.ui.linea("")
             self.ui.titulo(f"Etapa {etapa.id} ({n}/{len(maestro.etapas)}) · {etapa.titulo}")
-            for intento in range(2):                     # el intento original + UNA reanudación de su misma build
+            terminadas, esperado, esperas = 0, 0.0, 0
+            while True:                                  # el intento original + UNA reanudación de su misma build
                 try:
                     informe = self._correr_etapa(estado, maestro, etapa)
                 except LLMError as e:
+                    espera = self._espera_para(e, esperado, esperas)
+                    if espera:
+                        # Límite pasajero (o cupo que se renueva pronto): esperar y seguir SOLO, sin perder lo hecho.
+                        self.ui.aviso(f"  {recortar(_primera_linea_util(str(e)), 140)}")
+                        self.ui.aviso(f"  Espero {formatear_duracion(espera)} y sigo solo (Ctrl+C corta; después: "
+                                      f"{comando_para_seguir(self.ws, 'grande')}).")
+                        self.dormir(espera)
+                        esperado, esperas = esperado + espera, esperas + 1
+                        continue
                     etapa.estado, etapa.motivo = "pendiente", recortar(str(e), 400)
+                    if e.cupo_diario:
+                        return self._detener(estado, maestro, "se agotó el cupo diario de pedidos gratis. "
+                                             + recortar(str(e), 220))
                     return self._detener(estado, maestro, f"el modelo no responde ({recortar(str(e), 160)})")
-                if etapa.ok or informe.estado == "cancelada" or intento == 1:
+                terminadas += 1
+                if etapa.ok or informe.estado == "cancelada" or terminadas >= 2:
                     break
                 if etapa.intentos >= MAX_INTENTOS_ETAPA:
                     break
@@ -56749,11 +57312,18 @@ class ConstructorGrande:
                           "(/construir estado) y después /grande continuar.")
             return InformeBuild("cancelada")
         etapa.estado = "en_curso"
-        etapa.intentos += 1
         self.guardar(estado, maestro)
         if reanudar:
             self.ui.tenue("  Hay una build de esta etapa a medio terminar: la retomo sin replanificar.")
-        informe = self._construir_build(pedido_etapa, reanudar, estado["pedido"])
+        uso = getattr(self.llm, "uso", None)
+        pedidos_antes = int(getattr(uso, "llamadas", 0) or 0)
+        try:
+            informe = self._construir_build(pedido_etapa, reanudar, estado["pedido"])
+        finally:
+            etapa.pedidos += max(0, int(getattr(uso, "llamadas", 0) or 0) - pedidos_antes)
+            self.guardar(estado, maestro)
+        if informe.estado != "cancelada":
+            etapa.intentos += 1                  # solo cuenta lo que terminó (un corte no es culpa de la etapa)
         etapa.estado = informe.estado if informe.estado != "cancelada" else "pendiente"
         etapa.segundos += float(getattr(informe, "segundos", 0.0) or 0.0)
         etapa.consumo += int(getattr(informe, "tokens_build", 0) or 0)
@@ -56792,10 +57362,11 @@ class ConstructorGrande:
         self.ui.fase("G", "Integración final (todo el proyecto contra tu pedido original)")
         pedido = estado["pedido"]
         resultado = self._verificar_integracion(estado, maestro)
-        if not resultado["ok"] and not estado["integracion"].get("reparada"):
+        if not resultado["ok"] and not self._integracion_reparada:
             faltas = resultado["faltantes"] or [_primera_linea_util(resultado["diagnostico"])]
             self.ui.aviso("  Falta para cumplir el pedido completo: " + "; ".join(recortar(f, 80) for f in faltas[:4]))
             estado["integracion"]["reparada"] = True
+            self._integracion_reparada = True
             self.guardar(estado, maestro)
             pedido_integracion = (
                 "PROYECTO GRANDE — INTEGRACIÓN FINAL. Todas las etapas están construidas y verificadas; NO rehagas "
@@ -56846,8 +57417,8 @@ class ConstructorGrande:
     def _cierre(self, estado: dict, maestro: PlanMaestro, segundos: float) -> None:
         integ = estado.get("integracion", {})
         ok = estado.get("estado") == "terminado"
-        lineas = [f"{'✓' if e.ok else '✗'} Etapa {e.id} · {recortar(e.titulo, 40)}: {e.estado}"
-                  f" · {formatear_duracion(e.segundos)}" for e in maestro.etapas]
+        lineas = [f"{'✓' if e.ok else '✗'} Etapa {e.id} · {recortar(e.titulo, 36)}: {e.estado}"
+                  f" · {formatear_duracion(e.segundos)} · {e.pedidos} pedidos" for e in maestro.etapas]
         lineas.append(f"Integración final: {integ.get('estado', '?')} · {recortar(str(integ.get('juicio', '')), 90)}")
         if not ok:
             lineas.append("Pendiente: " + recortar(str(estado.get("motivo", "")), 200))
@@ -56868,7 +57439,7 @@ class ConstructorGrande:
                   "## Plan maestro", "```", maestro.como_texto(), "```", "", "## Etapas"]
         for e in maestro.etapas:
             lineas.append(f"- Etapa {e.id} · {e.titulo}: **{e.estado}** · intentos {e.intentos} · "
-                          f"{formatear_duracion(e.segundos)} · ~{e.consumo} tokens"
+                          f"{formatear_duracion(e.segundos)} · {e.pedidos} pedidos · ~{e.consumo} tokens"
                           + (f" · informe: {e.informe}" if e.informe else ""))
             if e.motivo and not e.ok:
                 lineas.append(f"  - motivo: {recortar(e.motivo, 400)}")

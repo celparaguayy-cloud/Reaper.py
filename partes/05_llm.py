@@ -12,13 +12,23 @@ except ImportError:  # pragma: no cover - depende del entorno
 
 class LLMError(RuntimeError):
     def __init__(self, mensaje: str, *, probar_otro_modelo: bool = False, contexto_excedido: bool = False,
-                 presupuesto: bool = False, solo_razonamiento: bool = False):
+                 presupuesto: bool = False, solo_razonamiento: bool = False, cupo_diario: bool = False,
+                 reinicio: Optional[float] = None):
         super().__init__(mensaje)
         self.probar_otro_modelo = probar_otro_modelo
         self.contexto_excedido = contexto_excedido
         self.presupuesto = presupuesto
         # El modelo respondió, pero gastó toda la salida en razonamiento sin dar contenido (modelos "thinking").
         self.solo_razonamiento = solo_razonamiento
+        # Cupo DIARIO de modelos gratis agotado (OpenRouter: 50/día sin crédito, 1000 con ≥10 de crédito). Reintentar
+        # o cambiar a otro :free no sirve (comparten el cupo): hay que esperar a `reinicio` (epoch, si se conoce).
+        self.cupo_diario = cupo_diario
+        self.reinicio = reinicio
+
+    @property
+    def detiene_todo(self) -> bool:
+        """Errores que ninguna fase puede "saltear": sin presupuesto o sin cupo no hay modelo que responda."""
+        return bool(self.presupuesto or self.cupo_diario)
 
 
 class _Transitorio(Exception):
@@ -121,9 +131,57 @@ def _detalle_error(cuerpo: str, limite: int = 220) -> str:
     return texto if len(texto) <= limite else texto[:limite - 1] + "…"
 
 
-def _lanzar_http(status: int, cuerpo: str, retry_after: Optional[str]) -> None:
+_RE_CUPO_DIARIO = re.compile(r"per[-_ ]?day|daily|free-models-per-day|por\s+d[ií]a|diari[oa]", re.I)
+
+
+def _epoch_reinicio(valor) -> Optional[float]:
+    """X-RateLimit-Reset de OpenRouter viene en milisegundos desde epoch; se aceptan también segundos o un plazo
+    relativo en segundos. None si no se puede leer."""
+    try:
+        numero = float(str(valor).strip())
+    except (TypeError, ValueError):
+        return None
+    if numero > 1e12:
+        return numero / 1000.0
+    if numero > 1e9:
+        return numero
+    return time.time() + numero if numero >= 0 else None
+
+
+def es_cupo_diario(status: int, cuerpo: str, cabeceras=None) -> tuple:
+    """(¿es el cupo DIARIO de modelos gratis?, reinicio epoch|None). Un 429 por minuto (o del pool del proveedor) se
+    libera en segundos y se reintenta; el diario no: reintentar solo gasta tiempo (prueba de preparación /grande)."""
+    if status != 429:
+        return False, None
+    leer = (lambda k: cabeceras.get(k)) if cabeceras is not None else (lambda k: None)
+    reinicio = _epoch_reinicio(leer("X-RateLimit-Reset") or leer("x-ratelimit-reset"))
+    restante = str(leer("X-RateLimit-Remaining") or leer("x-ratelimit-remaining") or "").strip()
+    if _RE_CUPO_DIARIO.search(cuerpo or ""):
+        return True, reinicio
+    # Sin texto explícito: cupo en 0 y reinicio lejano (más de 10 min) = no es el límite por minuto.
+    if restante == "0" and reinicio is not None and reinicio - time.time() > 600:
+        return True, reinicio
+    return False, None
+
+
+def _texto_reinicio(reinicio: Optional[float]) -> str:
+    if not reinicio:
+        return ""
+    momento = datetime.fromtimestamp(reinicio)
+    dia = "hoy" if momento.date() == datetime.now().date() else "mañana" if (
+        momento.date() - datetime.now().date()).days == 1 else momento.strftime("%d/%m")
+    return f" Se renueva {dia} a las {momento:%H:%M}."
+
+
+def _lanzar_http(status: int, cuerpo: str, retry_after: Optional[str], cabeceras=None) -> None:
     detalle = _detalle_error(cuerpo)
     motivo = MENSAJES_HTTP.get(status, "Error HTTP del proveedor.")
+    diario, reinicio = es_cupo_diario(status, cuerpo, cabeceras)
+    if diario:
+        raise LLMError(
+            "Se agotó el cupo DIARIO de pedidos a modelos gratis (OpenRouter: 50 por día sin crédito, 1000 con al "
+            f"menos 10 de crédito).{_texto_reinicio(reinicio)} Reintentar ahora no sirve. ({detalle})",
+            probar_otro_modelo=True, cupo_diario=True, reinicio=reinicio)
     if status in TRANSITORIOS:
         espera = None
         try:
@@ -152,7 +210,7 @@ def _transporte_httpx(url: str, headers: dict, payload: dict, timeout: int) -> I
             if r.status_code >= 400:
                 # En streaming hay que leer el cuerpo antes de usarlo.
                 cuerpo = r.read().decode("utf-8", "replace")
-                _lanzar_http(r.status_code, cuerpo, r.headers.get("retry-after"))
+                _lanzar_http(r.status_code, cuerpo, r.headers.get("retry-after"), r.headers)
             for linea in r.iter_lines():
                 yield linea
     except httpx.TimeoutException as e:
@@ -168,7 +226,7 @@ def _transporte_urllib(url: str, headers: dict, payload: dict, timeout: int) -> 
         respuesta = urllib.request.urlopen(pedido, timeout=timeout)
     except urllib.error.HTTPError as e:
         cuerpo = e.read().decode("utf-8", "replace") if e.fp else ""
-        _lanzar_http(e.code, cuerpo, e.headers.get("Retry-After") if e.headers else None)
+        _lanzar_http(e.code, cuerpo, e.headers.get("Retry-After") if e.headers else None, e.headers)
         return
     except (urllib.error.URLError, socket.timeout, TimeoutError, ConnectionError) as e:
         raise _Transitorio(f"Error de red hablando con el proveedor: {e}") from e
@@ -274,6 +332,23 @@ class LLMClient:
                                           enfriamiento=getattr(settings, "disyuntor_enfriamiento", 45.0))
         self._claves_proveedor: dict = {}       # proveedor → clave (cache; Fase 6, ruteo multi-proveedor)
         self.on_evento: Optional[Callable[[str], None]] = None
+        # Cupo diario de modelos gratis de OpenRouter agotado: hasta cuándo (epoch; 0 = no se sabe, se asume que
+        # sigue agotado en esta sesión). Mientras dure, los :free de OpenRouter se saltean sin tocar la red.
+        self.cupo_free_hasta: Optional[float] = None
+
+    def _es_free_openrouter(self, modelo: str) -> bool:
+        try:
+            return str(modelo).endswith(":free") and self._destino(modelo).proveedor == "openrouter"
+        except (ValueError, KeyError, TypeError):
+            return False
+
+    def cupo_free_agotado(self) -> bool:
+        if self.cupo_free_hasta is None:
+            return False
+        if self.cupo_free_hasta and time.time() >= self.cupo_free_hasta:
+            self.cupo_free_hasta = None                 # ya se renovó
+            return False
+        return True
 
     def _destino(self, modelo: str) -> "DestinoModelo":
         return destino_modelo(modelo, self.settings)
@@ -359,6 +434,16 @@ class LLMClient:
                     probar_otro_modelo=False)
             candidatos = locales
 
+        # Cupo diario de :free agotado: comparten el cupo, así que solo sirven modelos de OTRO proveedor (o pagos).
+        if self.cupo_free_agotado():
+            otros = [c for c in candidatos if not self._es_free_openrouter(c)]
+            if not otros:
+                hasta = self.cupo_free_hasta or None
+                raise LLMError("El cupo DIARIO de modelos gratis de OpenRouter sigue agotado."
+                               + _texto_reinicio(hasta) + " Ningún otro modelo del equipo puede responder.",
+                               cupo_diario=True, reinicio=hasta)
+            candidatos = otros
+
         # Disyuntor (Ω §5.2): EXCLUIR los modelos abiertos/retirados; no "probar igual" contra algo caído.
         orden = self.disyuntor.elegibles(candidatos)
         if not orden:
@@ -369,6 +454,8 @@ class LLMClient:
 
         ultimo: Optional[LLMError] = None
         for n, candidato in enumerate(orden):
+            if self.cupo_free_agotado() and self._es_free_openrouter(candidato):
+                continue                                # mismo cupo diario agotado: ni lo intento
             try:
                 respuesta = self._con_reintentos(
                     candidato, mensajes, temperatura, max_tokens, stop, on_progress,
@@ -384,6 +471,10 @@ class LLMClient:
                 ultimo = e
                 with self._lock:
                     self.uso.errores += 1
+                if e.cupo_diario:
+                    self.cupo_free_hasta = e.reinicio or 0.0
+                    if self.on_evento:
+                        self.on_evento("cupo diario de modelos gratis agotado: solo sigo con modelos de otro proveedor")
                 if not e.probar_otro_modelo:
                     raise
                 if _RE_MODELO_RETIRADO.search(str(e)):      # 404 model_not_found → cuarentena de esa ruta

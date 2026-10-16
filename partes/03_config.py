@@ -255,6 +255,8 @@ class Settings:
     max_tareas: int = 12
     # /grande: tope de ETAPAS del plan maestro (cada etapa es un /construir de hasta max_tareas tareas).
     max_etapas: int = 10
+    # /grande: minutos que puede esperar SOLO, por etapa, ante límites pasajeros del modelo (0 = no espera).
+    espera_limites_min: int = 30
     paralelo: int = 2
     qa: bool = True
 
@@ -364,6 +366,7 @@ class Settings:
         acotar("max_revisiones", 0, 5)
         acotar("max_tareas", 1, 60)
         acotar("max_etapas", 2, 30)
+        acotar("espera_limites_min", 0, 240)
         acotar("paralelo", 1, 8)
         acotar("candidatos", 1, 6)
         acotar("paralelo_torneo", 1, 6)

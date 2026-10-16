@@ -1322,7 +1322,7 @@ class Orquestador:
         try:
             return self._sub(rol, tarea, cid, **kw)
         except LLMError as e:
-            if e.presupuesto:
+            if e.detiene_todo:
                 raise
             self.ui.aviso(f"  {rol}: el modelo no respondió ({recortar(str(e), 180)}). Sigo sin esa fase.")
             return None
@@ -1362,7 +1362,7 @@ class Orquestador:
         try:
             resultados = ejecutar_subagentes(specs, self.llm, self.ws, self.settings, self.ui, profundidad=1)
         except LLMError as e:
-            if e.presupuesto:
+            if e.detiene_todo:
                 raise
             self.ui.aviso(f"  explorador: el modelo no respondió ({recortar(str(e), 180)}). Sigo con el mapa local.")
             return mapa or "(exploración no disponible: el modelo no respondió)"
@@ -1720,7 +1720,7 @@ class Orquestador:
             resp = self.llm.chat(mensajes, modelo=pedido_modelo, temperatura=ROLES[rol].temperatura,
                                  max_tokens=max_tokens, rol=rol)
         except LLMError as e:
-            if e.presupuesto:
+            if e.detiene_todo:
                 raise
             self.ui.aviso(f"  {rol}: el modelo no respondió ({recortar(str(e), 160)}); sigo sin su dictamen.")
             return None, pedido_modelo, "unknown"
