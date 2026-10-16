@@ -560,3 +560,19 @@ Tests: +15 (de `/grande` y de la reanudación; el de reanudación falla con el c
 retoma, pero cada etapa gasta lo de una build entera; (b) la integración usa el juez con un diffstat de TODO el
 proyecto: en proyectos muy grandes conviene revisar que el contrato no quede genérico; (c) `MAX_INTENTOS_ETAPA = 4`.
 
+### 19.b Seguir después de un corte
+
+El usuario reportó que la corrida "se cortó" (en el teléfono: Termux cerrado, pantalla bloqueada o límite del
+modelo gratis). Lo natural es repetir el mismo comando, y REAPER respondía "ya hay una build incompleta" (o, con
+`/grande`, "ya hay un proyecto grande sin terminar"): había que saber el subcomando. Ahora:
+
+- repetir el MISMO `--construir "..."` o `--grande "..."` (mismo pedido, ignorando espacios) **retoma** donde quedó,
+  sin replanificar; un pedido distinto no pisa lo que quedó a medias y dice el comando exacto para seguirlo;
+- `--construir continuar|estado` y `--grande continuar|estado` desde la terminal (antes `--construir estado`
+  intentaba construir un proyecto llamado "estado");
+- al cortarse con Ctrl+C o por un error del modelo se imprime el comando exacto para seguir;
+- el comando para seguir se imprime FUERA del cuadro de cierre: adentro se recortaba al ancho de la terminal y no
+  se podía copiar entero (lo encontró el autotest).
+
+Tests: +5 (los 5 fallan con el código anterior). Regresión: **1080 tests OK** en Python 3.10/3.11/3.12/3.13.
+

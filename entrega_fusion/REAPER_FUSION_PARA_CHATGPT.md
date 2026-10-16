@@ -206,3 +206,7 @@ dependencias.
 autoriza algo; `fallos_tolerables_al_reintentar` con suites que no nombran el archivo del test en el nombre.
 Regresión 1075 tests OK en Python 3.10/3.11/3.12/3.13.
 
+**Después (§19.b de PRUEBAS):** repetir el mismo `--construir`/`--grande` retoma lo que quedó a medias; existen
+`--construir continuar|estado` y `--grande continuar|estado`; al cortarse se imprime el comando exacto para seguir.
+Regresión 1080 tests OK en Python 3.10/3.11/3.12/3.13.
+
