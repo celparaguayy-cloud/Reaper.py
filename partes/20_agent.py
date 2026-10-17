@@ -478,6 +478,7 @@ class Agente:
         self._escrituras = 0                     # se incrementa con cada escritura exitosa
         self._evidencias: list[tuple[str, str, int]] = []  # (herramienta, ok|fallo|bloqueado|sin_tests, escrituras)
         self._reusos_seguidos = 0
+        self._repetidas_seguidas = 0
         self._ultima_salida_ok = ""
         self._bucles = RompedorDeBucles()        # v9 Fase 4: oscilación / machaque / error estancado
         self._prohibido: set = set()
@@ -546,6 +547,7 @@ class Agente:
         self._escrituras = 0
         self._evidencias = []
         self._reusos_seguidos = 0
+        self._repetidas_seguidas = 0
         self._ultima_salida_ok = ""
         self._bucles = RompedorDeBucles()
         self._guardia = None
@@ -651,6 +653,12 @@ class Agente:
             if final is not None:
                 return self._cerrar(final[0], paso, "completado", ok=final[1])
 
+            if self._repetidas_seguidas >= 8:
+                # Prueba real: un implementador mandó read_file del MISMO archivo 60 veces seguidas (todas bloqueadas):
+                # cada ráfaga llenaba el contexto de errores y quemaba pasos sin hacer nada.
+                self.ui.aviso(f"  [{self.etiqueta}] repite la misma lectura una y otra vez sin avanzar: lo corto")
+                return self._cerrar("El modelo repetía la misma llamada sin cambiar nada (" + str(self._repetidas_seguidas)
+                                    + " veces seguidas). " + self._respuesta_por_bucle(), paso, "bucle", ok=False)
             if self._reusos_seguidos >= 2 and (self.rol.nombre == "principal" or self._reusos_seguidos >= 4):
                 # El modelo pide una y otra vez lo mismo que ya tiene: se corta el bucle. Si había obtenido
                 # un resultado (ej. 2+2 → 4) se responde con eso; Claude Code tampoco ejecuta tres veces "2+2".
@@ -900,6 +908,7 @@ class Agente:
                                        "usá lo que ya sabés y avanzá con el próximo paso.)\n")
             elif veces >= 3:
                 self.ui.resultado_herramienta(False, f"{nombre}: llamada repetida")
+                self._repetidas_seguidas += 1
                 self._registrar_evidencia(nombre, "bloqueado")
                 return obs(
                     f"ERROR: ya hiciste exactamente esta llamada {veces} veces sin cambiar nada en el proyecto y el "
@@ -957,6 +966,7 @@ class Agente:
         if h.escribe and not error:
             self._escrituras += 1
         self._reusos_seguidos = 0
+        self._repetidas_seguidas = 0
         if nombre in ("run_tests", "validate", "execute_command", "run_python"):
             self._registrar_evidencia(nombre, self._estado_evidencia(nombre, llamada.params, salida, error),
                                       llamada.params.get("command", ""))

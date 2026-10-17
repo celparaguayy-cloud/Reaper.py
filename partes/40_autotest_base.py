@@ -285,7 +285,7 @@ class TestConfig(BaseTest):
     def test_perfiles(self):
         s = Settings()
         cambios = aplicar_perfil(s, "gratis")
-        self.assertIn("rpm=16", cambios)
+        self.assertIn("rpm=14", cambios)
         self.assertFalse(s.escalar)
         self.assertGreater(s.costo_maximo, 0)          # R-010: gratis impone techo de costo (≠ ilimitado)
         self.assertLessEqual(s.costo_maximo, 0.01)

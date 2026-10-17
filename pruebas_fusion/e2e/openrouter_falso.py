@@ -7,6 +7,7 @@ primero, torneo, revisor, qa, juez). Fallas configurables por variables de entor
   MOCK_RAZONA=modelo     → ese modelo responde SOLO razonamiento (finish=length) a pedidos cortos (max_tokens<=2048)
   MOCK_ESTADO=archivo    → contador persistente de pedidos (para simular el día siguiente: se borra)
   MOCK_FLOJO=1           → el implementador escribe una venta que NO controla el stock; el reparador la arregla
+  MOCK_TEST_ROTO=1       → el especificador escribe tests/test_db.py usando db SIN importarlo y no lo corrige
 Log de cada pedido (modelo, rol, status) en MOCK_LOG.
 """
 import json
@@ -66,7 +67,10 @@ def cerebro(mensajes):
     if rol == "especificador":
         tests = [a for t in _tareas_de(etapa) for a in G.TAREAS[t] if a.startswith("tests/")]
         if turno < len(tests):
-            return rol, R.herramienta_xml("write_to_file", path=tests[turno], content=G.ARCHIVOS[tests[turno]])
+            contenido = G.ARCHIVOS[tests[turno]]
+            if os.environ.get("MOCK_TEST_ROTO") and tests[turno] == "tests/test_db.py":
+                contenido = _TEST_DB_ROTO                 # usa db sin importarlo (como el teléfono) y no lo corrige
+            return rol, R.herramienta_xml("write_to_file", path=tests[turno], content=contenido)
         return rol, R.terminar_xml("tests escritos: fallan por ImportError hasta que exista el código (esperado)")
     if rol == "implementador":
         tarea = re.search(r"TU TAREA AHORA \(#[^)]*\):\n(.*?)\n\n", primero, re.S)
@@ -87,6 +91,9 @@ def cerebro(mensajes):
         if "TAREA: CONTRATO" in texto:
             return rol, '{"criterios": ["lo pedido funciona y tiene tests"]}'
         return rol, '{"cumple": true, "confianza": "high", "evidence_ids": ["EV-TESTS"]}'
+    if rol in ("reparador", "integrador") and ("AGREGARLE las líneas import" in primero or "nombres indefinidos" in primero) \
+            and turno == 0 and "tests/test_db.py" in primero:
+        return rol, R.herramienta_xml("write_to_file", path="tests/test_db.py", content=G.ARCHIVOS["tests/test_db.py"])
     if rol in ("reparador", "integrador") and "ventas" in primero and turno == 0 and os.environ.get("MOCK_FLOJO"):
         # El reparador ve el test que falla (SinStock no se lanzó) y escribe la versión correcta.
         return rol, R.herramienta_xml("write_to_file", path="almacen/ventas.py", content=G.ARCHIVOS["almacen/ventas.py"])
@@ -98,6 +105,10 @@ def cerebro(mensajes):
 _VENTAS_FLOJA = G.ARCHIVOS["almacen/ventas.py"].replace(
     '            if fila["stock"] < cantidad:\n', '            if False:\n')
 assert _VENTAS_FLOJA != G.ARCHIVOS["almacen/ventas.py"]
+
+
+_TEST_DB_ROTO = G.ARCHIVOS["tests/test_db.py"].replace("from almacen import db\n", "")
+assert _TEST_DB_ROTO != G.ARCHIVOS["tests/test_db.py"]
 
 
 def _tareas_de(etapa):

@@ -58,7 +58,7 @@ ALIAS_HERRAMIENTAS = {
 ALIAS_PARAMS = {
     "path": ("file", "filepath", "file_path", "filename", "ruta", "archivo"),
     "command": ("cmd", "comando"),
-    "content": ("contenido", "code", "codigo", "text"),
+    "content": ("contenido", "code", "codigo", "código", "text"),
     "regex": ("pattern", "query", "patron"),
     "desde": ("start_line", "start", "linea_inicio"),
     "hasta": ("end_line", "end", "linea_fin"),
@@ -259,6 +259,36 @@ def _params_json(args) -> dict:
 _RE_FUNCION_LLAMA = re.compile(r"<\s*function\s*=\s*([A-Za-z_][\w-]*)\s*>(.*?)(?:<\s*/\s*function\s*>|\Z)", re.S | re.I)
 
 
+_TAGS_BUSCAR = ("search", "buscar", "find", "old", "old_str", "old_string", "original", "antes")
+_TAGS_REEMPLAZO = ("replace", "reemplazar", "new", "new_str", "new_string", "replacement", "nuevo", "despues")
+_RE_CODIGO_EN_HERRAMIENTA = re.compile(r"```[\w+#.-]*[ \t]*\r?\n(.*?)\r?\n?```", re.S)
+
+
+def _bloques_de_tag(cuerpo: str, tags: tuple) -> list:
+    alternativa = "|".join(re.escape(t) for t in tags)
+    return [m.group(2) for m in re.finditer(rf"<\s*({alternativa})\s*>(.*?)<\s*/\s*\1\s*>", cuerpo, re.S | re.I)]
+
+
+def _diff_alternativo(cuerpo: str) -> str:
+    """replace_in_file escrito de otra forma por modelos reales: pares <search>/<replace> (u <old>/<new>…), o los
+    bloques SEARCH/REPLACE sin la etiqueta <diff>. → diff en el formato de REAPER ('' si no hay nada usable)."""
+    if "<<<<<<<" in cuerpo and ">>>>>>>" in cuerpo:
+        inicio, fin = cuerpo.index("<<<<<<<"), cuerpo.rindex(">>>>>>>")
+        fin = cuerpo.find("\n", fin)
+        return cuerpo[inicio:fin if fin >= 0 else len(cuerpo)].strip("\n")
+    buscados, reemplazos = _bloques_de_tag(cuerpo, _TAGS_BUSCAR), _bloques_de_tag(cuerpo, _TAGS_REEMPLAZO)
+    if not buscados or len(buscados) != len(reemplazos):
+        return ""
+    return "\n".join(f"<<<<<<< SEARCH\n{limpiar_largo(b)}\n=======\n{limpiar_largo(r)}\n>>>>>>> REPLACE"
+                     for b, r in zip(buscados, reemplazos))
+
+
+def _contenido_en_bloque(cuerpo: str) -> Optional[str]:
+    """write_to_file con el código en un bloque ``` y sin <content> (prueba real: 4 veces "faltan content")."""
+    bloques = _RE_CODIGO_EN_HERRAMIENTA.findall(cuerpo)
+    return max(bloques, key=len) if bloques else None
+
+
 def analizar(texto: str, esquemas: Esquemas) -> Analisis:
     limpio = texto or ""
     corte = _CORTE_RESULTADO.search(limpio)
@@ -308,6 +338,11 @@ def analizar(texto: str, esquemas: Esquemas) -> Analisis:
                 pos = c.end()
             else:
                 siguiente = apertura.search(limpio, m.end())
+                # Un <search> dentro de un replace_in_file sin cerrar es SU bloque a buscar, no la herramienta
+                # search_files (prueba real: salía un search_files fantasma con ">>>>>> REPLACE </diff>" de regex).
+                while real == "replace_in_file" and siguiente is not None and \
+                        (siguiente.group(2) or "").lower() in _TAGS_BUSCAR:
+                    siguiente = apertura.search(limpio, siguiente.end())
                 fin = siguiente.start() if siguiente else len(limpio)
                 cuerpo = limpio[m.end():fin]
                 pos = fin
@@ -322,6 +357,14 @@ def analizar(texto: str, esquemas: Esquemas) -> Analisis:
         for clave, valor in atributos.items():
             canon = _canonico_param(clave)
             params.setdefault(canon, valor)
+        if real == "replace_in_file" and not params.get("diff"):
+            diff = _diff_alternativo(cuerpo)
+            if diff:
+                params["diff"] = diff
+        if real == "write_to_file" and "content" not in params:
+            suelto = _contenido_en_bloque(cuerpo)
+            if suelto is not None:
+                params["content"] = suelto
         if not params and cuerpo.strip() and definicion:
             completa = completa and True
         llamadas.append(Llamada(real, params, completa, limpio[m.start():pos], frozenset(abiertos)))

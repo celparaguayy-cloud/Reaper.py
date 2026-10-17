@@ -315,8 +315,11 @@ class TestModelosDeLaPruebaRealGrande(BaseTest):
         s = self.ajustes(proveedor="openrouter", modelos_rol={"juez": "nanogpt:qwen/qwen3.8-27b-uncensored",
                                                               "reparador": "nvidia/nemotron-3-super-120b-a12b:free"})
         cambios = aplicar_perfil(s, "gratis", ["a/uno:free", "b/dos:free"])
-        self.assertEqual(s.modelos_rol, {"reparador": "nvidia/nemotron-3-super-120b-a12b:free"})
+        # El :free que no está entre los de hoy también sale (segunda prueba real: el juez le dio el reparador a
+        # nemotron-3-super:free, que no había respondido el sondeo, y se quedó pensando sin contestar).
+        self.assertEqual(s.modelos_rol, {})
         self.assertTrue(any("juez: nanogpt:qwen" in c for c in cambios))
+        self.assertTrue(any("reparador: nvidia/nemotron-3-super-120b-a12b:free no está" in c for c in cambios))
 
     def test_restricciones_no_son_criterios_sin_cubrir(self):
         plan = Plan("x", [Tarea("1", "Crear storage.py con init_db y sus tests", ["almacen/storage.py"])], [])

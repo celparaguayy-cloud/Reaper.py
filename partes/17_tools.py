@@ -121,11 +121,42 @@ def _permiso_edicion(ctx: Contexto, rel: str, diff: str, nuevo: bool) -> None:
         )
 
 
+_RE_LINEA_IMPORT = re.compile(r"^\s*(?:import\s+[\w.]+(?:\s+as\s+\w+)?(?:\s*,\s*[\w.]+(?:\s+as\s+\w+)?)*"
+                              r"|from\s+\.*[\w.]*\s+import\s+(?:\(?[\w\s,]+\)?|\*))\s*(?:#.*)?$")
+
+
+def solo_agrega_imports(original: Optional[str], nuevo: Optional[str]) -> bool:
+    """¿`nuevo` es `original` + líneas import/from (y en blanco), sin tocar ni una línea de lo que el test prueba?
+    Es lo único que se le permite a un test protegido: un test de la especificación que llama `main(...)` sin
+    importarlo (prueba real) se arregla agregando el import, sin poder debilitar ningún assert."""
+    if original is None or nuevo is None or original == nuevo:
+        return False
+    viejas, nuevas = original.splitlines(), nuevo.splitlines()
+    agregadas = 0
+    for op, i1, i2, j1, j2 in difflib.SequenceMatcher(a=viejas, b=nuevas, autojunk=False).get_opcodes():
+        if op == "equal":
+            continue
+        if op != "insert":
+            return False
+        for linea in nuevas[j1:j2]:
+            if linea.strip() and not _RE_LINEA_IMPORT.match(linea):
+                return False
+            agregadas += bool(linea.strip())
+    return agregadas > 0
+
+
 def _escribir(ctx: Contexto, rel: str, contenido: str) -> None:
+    actual_protegido = None
     if rel in ctx.protegidos:
+        try:
+            actual_protegido = ctx.ws.leer(rel)
+        except (OSError, ValueError, ErrorRuta):
+            actual_protegido = None
+    if rel in ctx.protegidos and not solo_agrega_imports(actual_protegido, contenido):
         raise ErrorHerramienta(
             f"{rel} es parte de la especificación (tests escritos antes de implementar) y no se puede modificar "
-            "en esta tarea. Cambiá el código para que esos tests pasen."
+            "en esta tarea. Cambiá el código para que esos tests pasen. (Lo único permitido: AGREGARLE imports que "
+            "le falten, sin tocar ninguna otra línea.)"
         )
     if ctx.permitidos and not any(fnmatch.fnmatch(rel, patron) for patron in ctx.permitidos):
         if getattr(ctx, "rol", "") == "especificador":

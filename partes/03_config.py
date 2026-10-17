@@ -413,12 +413,12 @@ class Settings:
 
 PERFILES = {
     "gratis": {
-        "descripcion": "modelos :free, 2 candidatos, sin escalada paga, 16 solicitudes/min y tope de costo ~0",
+        "descripcion": "modelos :free, 2 candidatos, sin escalada paga, 14 solicitudes/min y tope de costo ~0",
         # R-010: el perfil gratis impone un techo de costo casi cero. Los modelos :free reportan costo 0, así
         # que no estorba; pero si por error se usa uno pago, el presupuesto de la sesión corta enseguida.
         # Sin red, este modelo fijo (existe y respondió en la prueba real 2026-10; dolphin…:free fue retirado).
         "valores": {"modelo": "nvidia/nemotron-3-super-120b-a12b:free", "paralelo": 1, "paralelo_torneo": 1,
-                    "candidatos": 2, "rpm": 16, "escalar": False, "costo_maximo": 0.01},
+                    "candidatos": 2, "rpm": 14, "escalar": False, "costo_maximo": 0.01},
     },
     "rapido": {
         "descripcion": "sin torneo ni tests previos: un intento por tarea (barato y veloz)",
@@ -454,10 +454,19 @@ def aplicar_perfil(settings: Settings, nombre: str, catalogo: Optional[list] = N
         cambios.append(f"modelo={catalogo[0]} (catálogo real de OpenRouter)")
         # "Gratis" es TODO el equipo: un rol que apunta a un modelo pago o de otro proveedor (prueba real /grande: el
         # juez en "nanogpt:qwen/…-uncensored", un ID que ya no existe) usa el modelo gratis principal.
+        # Y un rol en un :free que HOY no está (no respondió el sondeo o salió del catálogo) también: prueba real, el
+        # juez le dio el reparador a nemotron-3-super:free ("más capaz"), que no estaba entre los que respondieron, y
+        # se quedó pensando 25 000 caracteres sin contestar.
+        disponibles = {str(c) for c in catalogo} | {resolver_modelo(str(c)) for c in catalogo}
         for rol, asignado in sorted((settings.modelos_rol or {}).items()):
-            if not str(asignado).endswith(":free"):
+            texto = str(asignado)
+            sin_prefijo = texto.split(":", 1)[1] if texto.startswith("openrouter:") else texto
+            if not texto.endswith(":free"):
                 del settings.modelos_rol[rol]
                 cambios.append(f"{rol}: {asignado} → modelo gratis principal")
+            elif not ({texto, sin_prefijo, resolver_modelo(texto)} & disponibles):
+                del settings.modelos_rol[rol]
+                cambios.append(f"{rol}: {asignado} no está entre los gratis de hoy → modelo gratis principal")
         if settings.fallbacks:
             cambios.append(f"respaldos={', '.join(settings.fallbacks)}")
     settings.validar()

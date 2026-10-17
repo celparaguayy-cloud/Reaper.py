@@ -17,7 +17,7 @@
 
 ![versión](https://img.shields.io/badge/versión-8.10-8b5cf6?style=flat-square)
 ![python](https://img.shields.io/badge/python-3.11_→_3.14-3776ab?style=flat-square&logo=python&logoColor=white)
-![autotests](https://img.shields.io/badge/autotests-1128_OK-2ea44f?style=flat-square)
+![autotests](https://img.shields.io/badge/autotests-1144_OK-2ea44f?style=flat-square)
 ![juez](https://img.shields.io/badge/juez-motor_central-a855f7?style=flat-square)
 ![plataforma](https://img.shields.io/badge/Termux_·_Android-sin_root-10b981?style=flat-square&logo=android&logoColor=white)
 ![distribución](https://img.shields.io/badge/distribución-1_archivo-f59e0b?style=flat-square)
@@ -44,7 +44,7 @@ Su obsesión es la **honestidad**: no declara una build "verificada" sin tests r
 lo entregado **sea lo que pediste, funcione de verdad y no rompa lo que ya tenías**.
 
 > [!NOTE]
-> Proyecto **experimental**. El andamiaje está cubierto por **1128 autotests**; la calidad del código que
+> Proyecto **experimental**. El andamiaje está cubierto por **1144 autotests**; la calidad del código que
 > produzca depende del modelo que le conectes. Lee **[Estado honesto](#estado)** antes de esperar magia.
 
 ---
@@ -378,7 +378,7 @@ verificación**, no la opinión de un modelo: un "terminé" sin pruebas no alcan
 > [!IMPORTANT]
 > Lo que **sí** está verificado y lo que **no**, sin maquillaje.
 
-- ✅ **1128 autotests OK** en Python **3.10, 3.11, 3.12 y 3.13** (y en un Termux real con 3.14 en una versión
+- ✅ **1144 autotests OK** en Python **3.10, 3.11, 3.12 y 3.13** (y en un Termux real con 3.14 en una versión
   anterior). Prueban la **orquestación** de forma determinista: ediciones y procesos reales, parseo de tests,
   gates de honestidad, Ctrl+C, plazos de pared y el juez (contrato, cierre, desvío, preservación, arranque,
   examen de realidad, armado del equipo). La red de modelos se simula con un **MockLLM**.
@@ -405,8 +405,9 @@ verificación**, no la opinión de un modelo: un "terminé" sin pruebas no alcan
   andamiaje sube el piso, no inventa capacidad que el modelo no tenga.
 - ⚠️ **Proyectos grandes**: `/grande` los parte en etapas verificadas, retoma donde quedó y no construye sobre
   una etapa rota. Está probado con un modelo **simulado** que escribe código real (también por HTTP, de punta a
-  punta); la **primera prueba con modelos reales** en un teléfono se cortó en la etapa 1 y mostró 6 bugs, ya
-  corregidos (`entrega_fusion/REAPER_FUSION_PRUEBAS.md` §21). **Todavía no terminó un `/grande` con un modelo
+  punta); las **dos primeras pruebas con modelos reales** en un teléfono no pasaron de la etapa 1 y mostraron
+  bugs de REAPER, ya corregidos (`entrega_fusion/REAPER_FUSION_PRUEBAS.md` §21 y §22): la segunda, un test de la
+  especificación roto que REAPER protegió y que el reparador "arregló" con una trampa durante horas. **Todavía no terminó un `/grande` con un modelo
   real**: la calidad de cada etapa sigue dependiendo del modelo. Con modelos gratis, contá con muchas
   llamadas (cada etapa es una build entera) y con que los límites de uso pueden cortar a mitad: por eso
   existe `/grande continuar`.

@@ -238,3 +238,17 @@ que una ruta nombrada en el plan se va a crear: si ninguna tarea la crea, el cie
 la siguen exigiendo.
 Regresión 1128 tests OK en Python 3.10/3.11/3.12/3.13.
 
+## 16. Segunda prueba real: test roto protegido y trampa del reparador (NO VERIFICADO con un modelo real)
+
+Detalle en `REAPER_FUSION_PRUEBAS.md` §22. Cambios: `tests_de_especificacion_rotos`, `solo_agrega_imports`,
+`Orquestador._custodiar_protegidos`, `trampas_para_tests` (validador `trampas`), `spec_propia` en `_verificar_tarea`,
+`_spec_rotos`, salto de tareas ya cubiertas por la especificación, `_diff_alternativo`/`_contenido_en_bloque` en el
+parser, `cargar_/guardar_razonamiento_aprendido`, `_repetidas_seguidas`, perfil gratis (roles y rpm 14).
+
+**A auditar:** (a) `solo_agrega_imports` permite cualquier línea `import`/`from`: ¿un import con efectos (un módulo que
+parchea el código bajo prueba) puede debilitar un test protegido?; (b) `trampas_para_tests` es por patrones: hay
+otras formas de inyectar nombres (`globals()` de otro módulo vía `importlib`, `sys.modules[...].__dict__[...]`); (c)
+`spec_propia` asume que el archivo de test declarado por una tarea es SUYO: si dos tareas lo comparten, solo la
+última lo exige.
+Regresión 1144 tests OK en Python 3.10/3.11/3.12/3.13.
+

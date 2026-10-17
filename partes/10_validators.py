@@ -785,7 +785,42 @@ def _validar_python(ws: Workspace, ruta: Path, rel: str) -> list[Resultado]:
     rotos = imports_locales_rotos(ws, ruta, arbol)
     if rotos:
         resultados.append(Resultado(False, f"imports-locales {rel}", 1, stderr="\n".join(rotos), archivo=rel))
+    if not es_archivo_de_test(rel):
+        trampas = trampas_para_tests(texto)
+        if trampas:
+            resultados.append(Resultado(False, f"trampas {rel}", 1, archivo=rel, stderr=(
+                "TRAMPA PARA LOS TESTS: el código mete nombres en OTRO módulo para que un test pase sin arreglar "
+                "nada:\n" + "\n".join(trampas[:6]) + "\nSi un test usa un nombre que no importó, el arreglo es "
+                "agregar el import EN EL TEST (permitido aunque sea un test protegido), no esto.")))
     return resultados
+
+
+# Prueba real (teléfono): el test llamaba main() sin importarlo y el reparador, en vez de agregar el import, escribió en
+# almacen/__main__.py `sys._getframe(1).f_globals['main'] = main` (y variantes con setattr sobre sys.modules). El test
+# "pasaba" y la verificación habría dado verde por una trampa.
+_RE_TRAMPAS = (
+    (re.compile(r"\.f_(?:globals|locals)\s*\[[^\]\n]+\]\s*=(?!=)"), "escribe en los globals de otro marco (f_globals[...] =)"),
+    (re.compile(r"\.f_(?:globals|locals)\.(?:setdefault|update)\s*\("), "escribe en los globals de otro marco (f_globals.setdefault/update)"),
+    (re.compile(r"\b(?:builtins|__builtins__)\.(?!_\b)\w+\s*=(?!=)|__builtins__\s*\[[^\]\n]+\]\s*=(?!=)|"
+                r"setattr\(\s*(?:builtins|__builtins__)\s*,"), "agrega nombres a builtins"),
+    (re.compile(r"setattr\(\s*sys\.modules\s*\["), "le agrega atributos a otro módulo (setattr(sys.modules[...]))"),
+)
+
+
+def trampas_para_tests(texto: str) -> list:
+    """Código de la aplicación que inyecta nombres en otros módulos (el del test, builtins). Con `sys._getframe` o
+    `inspect.currentframe`, también un setattr sobre un módulo sacado de sys.modules."""
+    hallazgos = []
+    for numero, linea in enumerate(texto.splitlines(), start=1):
+        codigo = linea.split("#", 1)[0]
+        for patron, motivo in _RE_TRAMPAS:
+            if patron.search(codigo):
+                hallazgos.append(f"línea {numero}: {motivo}: {linea.strip()[:120]}")
+                break
+    if not hallazgos and re.search(r"sys\._getframe\s*\(|inspect\.(?:currentframe|stack)\s*\(", texto) \
+            and re.search(r"sys\.modules", texto) and re.search(r"setattr\s*\(", texto):
+        hallazgos.append("toma el marco de quien lo importa (sys._getframe/inspect) y le agrega atributos a su módulo")
+    return hallazgos
 
 
 def pista_sintaxis_python(texto: str, error: SyntaxError) -> str:

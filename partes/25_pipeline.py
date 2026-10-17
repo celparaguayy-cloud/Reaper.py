@@ -1084,6 +1084,13 @@ def _resumen_diff(diff: str) -> str:
     return f"{archivos} archivo(s) · +{mas} −{menos}"
 
 
+def tests_de_especificacion_rotos(validaciones: list) -> list:
+    """Fallos que son errores DEL TEST (sintaxis o nombres que el test nunca importó ni definió), no el rojo
+    esperado de tests primero (importar un módulo que todavía no existe)."""
+    return [r for r in fallos(validaciones)
+            if r.comando.startswith(("py_compile", "node --check")) or "(nombres indefinidos)" in r.comando]
+
+
 def _es_test(rel: str) -> bool:
     return any(fnmatch.fnmatch(rel, p) for p in PATRONES_TESTS)
 
@@ -1505,14 +1512,28 @@ class Orquestador:
             self.ui.aviso("  El especificador no dejó archivos de test: sigo sin especificación ejecutable.")
             return {}
         validacion = validar_archivos(self.ws, tests)
-        rotos = [r for r in fallos(validacion) if r.comando.startswith(("py_compile", "node --check"))]
+        rotos = tests_de_especificacion_rotos(validacion)
         if rotos:
-            self.ui.aviso("  Los tests de la especificación tienen errores de sintaxis: le pido al especificador que los arregle.")
-            self._sub("especificador", "Los tests que escribiste no compilan:\n" + resumen_validacion(validacion, 2500)
-                      + "\nCorregí SOLO los errores de sintaxis de los tests.", cid, titulo="corrige los tests")
-            if fallos([r for r in validar_archivos(self.ws, tests) if r.comando.startswith(("py_compile", "node --check"))]):
-                self.ui.aviso("  Siguen sin compilar: descarto la especificación para no bloquear la build.")
-                return {}
+            # Prueba real en el teléfono: el test hacía `from almacen import __main__` y llamaba `main(...)` sin
+            # importarlo (NameError). Solo se rechazaba la sintaxis: el test roto quedó PROTEGIDO, nadie pudo
+            # corregirlo y el reparador pasó horas inyectando `main` en el módulo del test con sys._getframe.
+            self.ui.aviso("  Los tests de la especificación están rotos (sintaxis o nombres sin importar): le pido al "
+                          "especificador que los arregle.")
+            self._sub("especificador",
+                      "Tus tests tienen errores PROPIOS (no son el rojo esperado):\n" + resumen_validacion(rotos, 2500)
+                      + "\n\nUn nombre indefinido (p. ej. llamar `main(...)` sin `from paquete.modulo import main`) es "
+                      "un error del test. Que falle porque el MÓDULO todavía no existe está bien; usar un nombre que "
+                      "nunca importaste, no. Corregí SOLO eso en los tests (agregá los imports que faltan).",
+                      cid, titulo="corrige los tests")
+            siguen = {r.archivo for r in tests_de_especificacion_rotos(validar_archivos(self.ws, tests))}
+            if siguen:
+                # No se protegen: así el implementador o el reparador pueden corregirlos (protegidos, no podía nadie).
+                self.ui.aviso("  Siguen rotos " + ", ".join(sorted(siguen)) + ": no los protejo (los puede corregir "
+                              "el implementador).")
+                tests = [t for t in tests if t not in siguen]
+                self._spec_rotos = sorted(siguen)            # sin proteger, pero la tarea igual los tiene que pasar
+                if not tests:
+                    return {}
         r = ejecutar_tests(self.ws, timeout=self.settings.tests_timeout, completo=True)
         conteo = conteo_de_resultado(r)
         codigo_plan = [a for a in plan.archivos() if not _es_test(a)]
@@ -1634,7 +1655,37 @@ class Orquestador:
         )
         return self._sub_opcional("qa", texto, cid, titulo="escribe y corre tests de aceptación")
 
+    def _custodiar_protegidos(self) -> None:
+        """Los tests protegidos se custodian EN DISCO, no solo en las herramientas de escritura: el reparador de la
+        prueba real los pisaba con `cp tests/test_cli.py.backup tests/test_cli.py` (execute_command). Si solo se les
+        agregaron imports (lo único permitido), se acepta y se actualiza el diario; cualquier otro cambio se revierte."""
+        for rel, original in list(getattr(self, "_protegidos", {}).items()):
+            if original is None:
+                continue
+            try:
+                actual = self.ws.leer(rel)
+            except (OSError, ValueError, ErrorRuta):
+                actual = None
+            if actual == original:
+                continue
+            if solo_agrega_imports(original, actual):
+                self._protegidos[rel] = actual
+                diario = getattr(self, "_diario_build", None)
+                if diario is not None:
+                    registro, previo = diario
+                    previo.setdefault("tests_protegidos", {})[rel] = self.ws.hash(rel)
+                    registro.guardar(previo)
+                self.ui.tenue(f"  {rel}: se le agregaron imports al test protegido (permitido: no cambia lo que prueba).")
+                continue
+            try:
+                self.ws.escribir(rel, original)
+            except (OSError, ErrorRuta) as e:
+                self.ui.error(f"  {rel} es un test protegido, cambió y no lo pude restaurar: {e}")
+                continue
+            self.ui.aviso(f"  {rel} es un test protegido y se cambió por fuera de lo permitido: lo restauré.")
+
     def verificar(self, cid: int) -> Verificacion:
+        self._custodiar_protegidos()
         archivos = [r for r in self.ws.checkpoints.archivos_desde(cid) if (self.ws.raiz / r).is_file()]
         validaciones = validar_archivos(self.ws, archivos)
         tests = ejecutar_tests(self.ws, timeout=self.settings.tests_timeout, completo=True)
@@ -1684,6 +1735,14 @@ class Orquestador:
         if base_fallaba:
             texto += "Ojo: la suite de tests ya fallaba ANTES de esta build; priorizá los fallos causados por los cambios.\n"
         texto += "Encontrá la causa raíz y corregila. No debilites ni borres tests."
+        en_protegidos = sorted(rel for rel in self._protegidos if rel in (verif.diagnostico or ""))
+        if en_protegidos:
+            # Sin esto, el reparador de la prueba real "arreglaba" un test protegido que llamaba main() sin importarlo
+            # inyectando main en el módulo del test con sys._getframe (una trampa) durante horas.
+            texto += ("\n\nEl fallo está en un test PROTEGIDO de la especificación (" + ", ".join(en_protegidos) + "). "
+                      "No podés cambiar lo que prueba, pero SÍ podés AGREGARLE las líneas import/from que le falten "
+                      "(p. ej. `from paquete.modulo import main`): es lo único permitido en ese archivo. Nunca hagas "
+                      "trampas en el código (inyectar nombres en el módulo del test, sys._getframe, builtins).")
         if diagnostico_experto:
             texto = tarea_con_diagnostico(texto, diagnostico_experto)
         protegidos = set(self._protegidos)
@@ -2122,15 +2181,20 @@ class Orquestador:
                          archivos_esperados: Sequence[str] = (),
                          archivos_planeados: Sequence[str] = (),
                          cid_build: Optional[int] = None,
-                         spec_ajena: Optional[Iterable[str]] = None) -> Verificacion:
+                         spec_ajena: Optional[Iterable[str]] = None,
+                         spec_propia: Iterable[str] = ()) -> Verificacion:
         """
         Una tarea intermedia no necesita que pasen TODOS los tests (los de tareas
         siguientes todavía fallan): alcanza con validadores OK y que no se rompa
         nada que antes pasaba. `spec_ajena`: los archivos de la especificación que son de OTRAS tareas (los únicos
         cuyo rojo se tolera); None = toda la especificación (comportamiento anterior).
         """
+        self._custodiar_protegidos()
         archivos = [r for r in self.ws.checkpoints.archivos_desde(tcid) if (self.ws.raiz / r).is_file()]
-        validaciones = validar_archivos(self.ws, archivos)
+        # Sus tests de la especificación también se validan: el diagnóstico dice "nombres indefinidos en
+        # tests/test_db.py" en vez de solo un NameError en la salida de los tests.
+        validaciones = validar_archivos(self.ws, archivos + sorted(
+            r for r in spec_propia if r not in archivos and (self.ws.raiz / r).is_file()))
         tests = ejecutar_tests(self.ws, timeout=self.settings.tests_timeout, completo=True)
         conteo = conteo_de_resultado(tests)
         problemas = []
@@ -2196,6 +2260,16 @@ class Orquestador:
                 )
         elif tests is not None and not tests.ok and not conteo.reconocido and antes.ok:
             problemas.append("TESTS: la suite pasaba antes de la tarea y ahora falla.\n" + tests.resumen(4000))
+        propios = {rel: None for rel in spec_propia}
+        rojos_propios = [n for n in (conteo.nombres_fallados if tests is not None and conteo.reconocido else [])
+                         if propios and _es_de_especificacion(n, propios)]
+        if rojos_propios and not any(p.startswith("REGRESIÓN DE TESTS") for p in problemas):
+            # Sus tests de la especificación fallaban ANTES (es tests primero) y por eso no contaban como regresión: la
+            # tarea quedaba "verificada" con su propia especificación en rojo (con pytest los nombres no cambian; E2E
+            # con un test de la especificación roto).
+            problemas.append("LA ESPECIFICACIÓN DE ESTA TAREA SIGUE EN ROJO (" + ", ".join(sorted(propios)) + "): "
+                             + ", ".join(rojos_propios[:8]) + "\n"
+                             + fallos_relevantes(f"{tests.stdout}\n{tests.stderr}", maximo=3, limite=4000))
         if exigir_progreso and not problemas:
             # El implementador NO terminó (límite de pasos, error...). "No romper nada" no alcanza:
             # tiene que haber cambios reales y, si hay tests fallando, alguno más tiene que pasar.
@@ -2265,6 +2339,7 @@ class Orquestador:
     def _construir(self, pedido: str, confirmar: bool = True, reanudar: bool = False) -> InformeBuild:
         inicio = time.monotonic()
         self._protegidos: dict[str, Optional[str]] = {}
+        self._spec_rotos: list = []
         self._tokens_juez = 0
         self._tokens_inicio = _tokens_usados(self.llm)
         registro_build = RegistroBuild(self.ws)
@@ -2273,6 +2348,7 @@ class Orquestador:
         except ValueError as e:
             self.ui.error(str(e) + ". Usá /construir estado y revisá el registro antes de descartarlo.")
             return InformeBuild("cancelada")
+        self._diario_build = None                     # (registro, previo) para que el custodio actualice los hashes
         base = ejecutar_tests(self.ws, timeout=self.settings.tests_timeout, completo=True)
         self._base_tests = base
         base_fallaba = base is not None and not base.ok
@@ -2405,6 +2481,7 @@ class Orquestador:
                               "pediste ni aprobaste el plan: se protegen (no se pierde lo que ya tenías).")
             registro_build.guardar(previo)
         self._reemplazos_autorizados = set(previo.get("reemplazos_autorizados", []))
+        self._diario_build = (registro_build, previo)
 
         informe = InformeBuild("fallida", plan=plan, cid=grupo,
                                reemplazos_autorizados=sorted(self._reemplazos_autorizados))
@@ -2503,6 +2580,18 @@ class Orquestador:
                 previo["estados"][tarea.id] = "pendiente"
                 registro_build.guardar(previo)
                 continue
+            ya_escritos = [a for a in tarea.archivos if _es_test(a) and a in (informe.spec_tests or [])
+                           and self.ws.existe(a)]
+            if tarea.archivos and len(ya_escritos) == len(tarea.archivos):
+                # Prueba real: el arquitecto planeó "Escribir la prueba unitaria" como tarea y la especificación ya la
+                # había escrito (y protegido). Los implementadores no podían tocarla → SIN PROGRESO → 2 reparaciones y
+                # modo forense sin nada que hacer. No hay nada que implementar: lo verifican las tareas que siguen.
+                self.ui.ok(f"Tarea {tarea.id}: {', '.join(ya_escritos)} ya lo escribió la especificación (tests "
+                           "primero): no hay nada que implementar.")
+                informe.notas.append(f"Tarea {tarea.id}: cubierta por la especificación ({', '.join(ya_escritos)}).")
+                previo["estados"][tarea.id] = "verificada"
+                registro_build.guardar(previo)
+                continue
             token_tarea = PLAZO.abrir(self.settings.tiempo_max_tarea, f"la tarea {tarea.id}")
             previo["estados"][tarea.id] = "en_curso"
             previo["tarea_activa"] = tarea.id
@@ -2535,13 +2624,19 @@ class Orquestador:
             # venta que no controlaba el stock, el test de la propia tarea fallaba y la tarea quedaba "verificada"
             # (pasaba al revisor y lo atajaba recién la verificación final; corrida E2E de /grande, modelo flojo).
             # Los tests que existían antes de la build (etapas anteriores) tampoco: romperlos es regresión.
-            spec_ajena = set() if i == len(plan.tareas) - 1 else (
-                set(informe.spec_tests or []) - {a for a in tarea.archivos if _es_test(a)})
+            spec_build = set(informe.spec_tests or []) | set(getattr(self, "_spec_rotos", ()))
+            ultima = i == len(plan.tareas) - 1
+            spec_ajena = set() if ultima else (spec_build - {a for a in tarea.archivos if _es_test(a)})
+            # Los de la especificación que declara ESTA tarea (y ninguna posterior) tienen que quedar en verde con
+            # ella; en la última tarea, todos.
+            de_despues = {a for t_sig in plan.tareas[i + 1:] for a in t_sig.archivos}
+            spec_propia = spec_build if ultima else {a for a in tarea.archivos
+                                                     if a in spec_build and a not in de_despues}
             verif_tarea = self._verificar_tarea(tcid, conteo_antes, nombres_antes,
                                                  exigir_progreso=exigir, verificar_entrega=True,
                                                  archivos_esperados=tarea.archivos,
                                                  archivos_planeados=planeados_despues, cid_build=grupo,
-                                                 spec_ajena=spec_ajena)
+                                                 spec_ajena=spec_ajena, spec_propia=spec_propia)
             if not verif_tarea.ok:
                 self.ui.aviso(f"  La tarea {tarea.id} no pasó su verificación: la reparo con el error real.")
                 self.ui.tenue(f"    motivo: {_primera_linea_util(verif_tarea.diagnostico)}")
@@ -2552,7 +2647,7 @@ class Orquestador:
                                                  exigir_progreso=exigir, verificar_entrega=True,
                                                  archivos_esperados=tarea.archivos,
                                                  archivos_planeados=planeados_despues, cid_build=grupo,
-                                                 spec_ajena=spec_ajena),
+                                                 spec_ajena=spec_ajena, spec_propia=spec_propia),
                     contexto=f"TAREA EN CURSO (#{tarea.id}): {tarea.descripcion}",
                 )
                 if not verif_tarea.ok:
@@ -2609,7 +2704,7 @@ class Orquestador:
                                               exigir_progreso=exigir, verificar_entrega=True,
                                               archivos_esperados=tarea.archivos,
                                               archivos_planeados=planeados_despues, cid_build=grupo,
-                                              spec_ajena=spec_ajena)
+                                              spec_ajena=spec_ajena, spec_propia=spec_propia)
             if verif_post.ok:
                 previo["estados"][tarea.id] = "verificada"
                 # Archivo verificado por primera vez: no permitir que una tarea

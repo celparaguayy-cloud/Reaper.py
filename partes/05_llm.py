@@ -314,6 +314,43 @@ class LimitadorTasa:
             esperado += tramo
 
 
+HORAS_RAZONAMIENTO_APRENDIDO = 24.0
+
+
+def _ruta_razonamiento() -> Optional[Path]:
+    if os.getenv("REAPER_SIN_RED"):                 # autotests: nada se arrastra de una prueba a otra
+        return None
+    return CACHE_DIR / "razonamiento_modelos.json"
+
+
+def cargar_razonamiento_aprendido(ruta: Optional[Path] = None) -> dict:
+    """Lo que ya se aprendió de cada modelo en corridas anteriores ("low"/"none"/"minimal"). En la prueba real cada
+    corrida del script volvía a dejar pensar 25 000 caracteres a cada :free (2–3 pedidos perdidos por modelo, más el
+    tiempo) antes de bajarle el razonamiento."""
+    ruta = ruta or _ruta_razonamiento()
+    if ruta is None:
+        return {}
+    try:
+        datos = json.loads(ruta.read_text(encoding="utf-8"))
+        limite = time.time() - HORAS_RAZONAMIENTO_APRENDIDO * 3600
+        return {m: d["nivel"] for m, d in datos.items()
+                if isinstance(d, dict) and d.get("nivel") in ("low", "none", "minimal") and float(d.get("ts", 0)) > limite}
+    except (OSError, ValueError, TypeError, AttributeError, KeyError):
+        return {}
+
+
+def guardar_razonamiento_aprendido(niveles: dict, ruta: Optional[Path] = None) -> None:
+    ruta = ruta or _ruta_razonamiento()
+    if ruta is None:
+        return
+    try:
+        ahora = time.time()
+        escritura_atomica(ruta, json.dumps({m: {"nivel": n, "ts": ahora} for m, n in niveles.items() if n},
+                                           ensure_ascii=False))
+    except (OSError, TypeError, ValueError):
+        pass
+
+
 class LLMClient:
     def __init__(
         self,
@@ -343,7 +380,7 @@ class LLMClient:
         # Razonamiento POR MODELO (prueba real /grande: cohere/north-mini-code:free pensaba 25 000 caracteres sin
         # responder en cada pedido, ignorando effort "low", y se lo volvía a probar primero cada vez). Escalera:
         # sin parámetro → "low" → "none" (lo apaga) → se deja de usar en la sesión.
-        self._nivel_razonamiento: dict = {}
+        self._nivel_razonamiento: dict = cargar_razonamiento_aprendido()
         self._solo_razona: collections.Counter = collections.Counter()
 
     def _es_free_openrouter(self, modelo: str) -> bool:
@@ -560,6 +597,7 @@ class LLMClient:
         siguiente = {None: "low", "low": "none"}.get(actual)
         if siguiente and self._solo_razona[modelo] < 3:
             self._nivel_razonamiento[modelo] = siguiente
+            guardar_razonamiento_aprendido(self._nivel_razonamiento)
             if self.on_evento:
                 self.on_evento(f"{modelo} piensa sin responder: la próxima vez le pido razonamiento '{siguiente}'")
             return
@@ -587,6 +625,7 @@ class LLMClient:
                         and re.search(r"reason|effort|thinking|mandatory", str(e), re.I)):
                     # Razonamiento obligatorio: rechaza "none". Se lo deja en "minimal" y se reintenta una vez.
                     self._nivel_razonamiento[modelo] = "minimal"
+                    guardar_razonamiento_aprendido(self._nivel_razonamiento)
                     payload = self._payload(modelo, mensajes, temperatura, max_tokens, stop,
                                             self._destino(modelo).proveedor)
                     continue

@@ -675,3 +675,41 @@ Tests: +15 (`48zl_autotest_e2e.py`). Regresión: **1128 tests OK** en Python 3.1
 **NO VERIFICADO con un modelo real:** el OpenRouter falso responde lo que el guion dice; los modelos reales fallan de
 formas que el guion no imita. La próxima prueba en el teléfono es la que cuenta.
 
+## 22. Segunda prueba REAL de `/grande` (teléfono, versión `8ace580a`): un test roto protegido y una trampa
+
+La etapa 1 (esqueleto: `__main__.py`, `server.py`, `tests/test_cli.py`) estuvo ~2 horas en reparaciones. Lo que pasó,
+en orden (salida del teléfono, Termux, modelos `:free`):
+
+1. El especificador escribió `tests/test_cli.py` con `from almacen import __main__` y llamó `main([...])` **sin
+   importarlo** (NameError). Además perdió 4 escrituras por poner el código en ``` sin `<content>`.
+2. REAPER solo rechazaba errores de sintaxis en la especificación: **protegió el test roto**.
+3. El arquitecto había planeado "Escribir la prueba unitaria" como tarea 2; la especificación ya la había escrito y
+   protegido → los implementadores no podían tocarla → SIN PROGRESO → 2 reparaciones y modo forense sin nada que hacer.
+4. Como nadie podía corregir el test, el reparador **hizo trampa**: `sys._getframe(1).f_globals['main'] = main` en
+   `almacen/__main__.py` (y variantes con `setattr` sobre `sys.modules`). El test "pasó"; solo lo frenó el validador de
+   nombres indefinidos sobre el test. También pisó el test con `cp tests/test_cli.py.backup …` por la terminal.
+5. Implementadores que repetían la misma lectura hasta 60 veces; `<search>`/`<replace>` dentro de `replace_in_file` que
+   se leía como una herramienta `search_files` fantasma; cada modelo volvía a "pensar 25 000 caracteres sin responder"
+   en cada corrida; el juez le dio el reparador a un `:free` que no había respondido el sondeo; 429 de cohere
+   ("limitado a 15 por minuto") con el perfil gratis a 16.
+
+| Arreglo | Dónde |
+|---|---|
+| Un test de la especificación con **nombres sin importar** (o sintaxis) es un test roto: se le pide corregirlo al especificador; si sigue roto, **no se protege** (lo puede corregir el implementador) y su tarea igual tiene que dejarlo en verde | `tests_de_especificacion_rotos`, `especificar`, `_spec_rotos` |
+| A un test protegido se le pueden **agregar imports** (y nada más); el reparador lo sabe cuando el fallo está ahí | `solo_agrega_imports`, `_escribir`, `reparar` |
+| **Custodio** de los tests protegidos en disco: imports agregados → se aceptan y se actualiza el diario; cualquier otro cambio (incluso por la terminal) → se revierte | `_custodiar_protegidos` |
+| **Trampas para los tests**: escribir en `f_globals`/`f_locals`, agregar a `builtins`, `setattr(sys.modules[…])` o tomar el marco de quien importa y agregarle atributos → falla de validación con la explicación | `trampas_para_tests`, validador `trampas` |
+| La **especificación propia** de una tarea tiene que quedar en verde (antes, al fallar ya antes de la tarea, no contaba; con pytest los nombres no cambian) y se valida en la tarea | `spec_propia` en `_verificar_tarea` |
+| Tarea cuyos archivos son solo tests que ya escribió la especificación: no corre implementadores | bucle de tareas |
+| Parser: código en ``` sin `<content>`, `<código>`, `<search>/<replace>` (y `<old>/<new>`…) y bloques SEARCH/REPLACE sin `<diff>`; un `<search>` dentro de un `replace_in_file` sin cerrar ya no es otra herramienta | `_contenido_en_bloque`, `_diff_alternativo` |
+| El nivel de razonamiento aprendido de cada modelo se **recuerda 24 h** entre corridas | `cargar_/guardar_razonamiento_aprendido` |
+| 8 llamadas repetidas bloqueadas seguidas cortan al agente (antes hasta 60) | `_repetidas_seguidas` |
+| El perfil gratis saca de los roles los `:free` que hoy no respondieron, y baja a 14 pedidos por minuto | `aplicar_perfil` |
+
+**De punta a punta** (OpenRouter simulado, `MOCK_TEST_ROTO=1`: especificador que escribe `tests/test_db.py` usando `db`
+sin importarlo y no lo corrige): no se protege, la verificación de la tarea dice `F821 Undefined name 'db'`, el
+reparador agrega el import en la tarea y el proyecto termina verificado. El escenario normal sigue en 78 pedidos.
+
+Tests: +16 (`48zm_autotest_prueba_real2.py`), todos fallan con el código anterior. Regresión: **1144 tests OK** en
+Python 3.10/3.11/3.12/3.13. **NO VERIFICADO con un modelo real.**
+
