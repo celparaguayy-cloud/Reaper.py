@@ -1938,12 +1938,12 @@ class Settings:
 
 PERFILES = {
     "gratis": {
-        "descripcion": "modelos :free, 2 candidatos, sin escalada paga, 16 solicitudes/min y tope de costo ~0",
+        "descripcion": "modelos :free, 2 candidatos, sin escalada paga, 14 solicitudes/min y tope de costo ~0",
         # R-010: el perfil gratis impone un techo de costo casi cero. Los modelos :free reportan costo 0, así
         # que no estorba; pero si por error se usa uno pago, el presupuesto de la sesión corta enseguida.
         # Sin red, este modelo fijo (existe y respondió en la prueba real 2026-10; dolphin…:free fue retirado).
         "valores": {"modelo": "nvidia/nemotron-3-super-120b-a12b:free", "paralelo": 1, "paralelo_torneo": 1,
-                    "candidatos": 2, "rpm": 16, "escalar": False, "costo_maximo": 0.01},
+                    "candidatos": 2, "rpm": 14, "escalar": False, "costo_maximo": 0.01},
     },
     "rapido": {
         "descripcion": "sin torneo ni tests previos: un intento por tarea (barato y veloz)",
@@ -1979,10 +1979,19 @@ def aplicar_perfil(settings: Settings, nombre: str, catalogo: Optional[list] = N
         cambios.append(f"modelo={catalogo[0]} (catálogo real de OpenRouter)")
         # "Gratis" es TODO el equipo: un rol que apunta a un modelo pago o de otro proveedor (prueba real /grande: el
         # juez en "nanogpt:qwen/…-uncensored", un ID que ya no existe) usa el modelo gratis principal.
+        # Y un rol en un :free que HOY no está (no respondió el sondeo o salió del catálogo) también: prueba real, el
+        # juez le dio el reparador a nemotron-3-super:free ("más capaz"), que no estaba entre los que respondieron, y
+        # se quedó pensando 25 000 caracteres sin contestar.
+        disponibles = {str(c) for c in catalogo} | {resolver_modelo(str(c)) for c in catalogo}
         for rol, asignado in sorted((settings.modelos_rol or {}).items()):
-            if not str(asignado).endswith(":free"):
+            texto = str(asignado)
+            sin_prefijo = texto.split(":", 1)[1] if texto.startswith("openrouter:") else texto
+            if not texto.endswith(":free"):
                 del settings.modelos_rol[rol]
                 cambios.append(f"{rol}: {asignado} → modelo gratis principal")
+            elif not ({texto, sin_prefijo, resolver_modelo(texto)} & disponibles):
+                del settings.modelos_rol[rol]
+                cambios.append(f"{rol}: {asignado} no está entre los gratis de hoy → modelo gratis principal")
         if settings.fallbacks:
             cambios.append(f"respaldos={', '.join(settings.fallbacks)}")
     settings.validar()
@@ -2614,6 +2623,43 @@ class LimitadorTasa:
             esperado += tramo
 
 
+HORAS_RAZONAMIENTO_APRENDIDO = 24.0
+
+
+def _ruta_razonamiento() -> Optional[Path]:
+    if os.getenv("REAPER_SIN_RED"):                 # autotests: nada se arrastra de una prueba a otra
+        return None
+    return CACHE_DIR / "razonamiento_modelos.json"
+
+
+def cargar_razonamiento_aprendido(ruta: Optional[Path] = None) -> dict:
+    """Lo que ya se aprendió de cada modelo en corridas anteriores ("low"/"none"/"minimal"). En la prueba real cada
+    corrida del script volvía a dejar pensar 25 000 caracteres a cada :free (2–3 pedidos perdidos por modelo, más el
+    tiempo) antes de bajarle el razonamiento."""
+    ruta = ruta or _ruta_razonamiento()
+    if ruta is None:
+        return {}
+    try:
+        datos = json.loads(ruta.read_text(encoding="utf-8"))
+        limite = time.time() - HORAS_RAZONAMIENTO_APRENDIDO * 3600
+        return {m: d["nivel"] for m, d in datos.items()
+                if isinstance(d, dict) and d.get("nivel") in ("low", "none", "minimal") and float(d.get("ts", 0)) > limite}
+    except (OSError, ValueError, TypeError, AttributeError, KeyError):
+        return {}
+
+
+def guardar_razonamiento_aprendido(niveles: dict, ruta: Optional[Path] = None) -> None:
+    ruta = ruta or _ruta_razonamiento()
+    if ruta is None:
+        return
+    try:
+        ahora = time.time()
+        escritura_atomica(ruta, json.dumps({m: {"nivel": n, "ts": ahora} for m, n in niveles.items() if n},
+                                           ensure_ascii=False))
+    except (OSError, TypeError, ValueError):
+        pass
+
+
 class LLMClient:
     def __init__(
         self,
@@ -2643,7 +2689,7 @@ class LLMClient:
         # Razonamiento POR MODELO (prueba real /grande: cohere/north-mini-code:free pensaba 25 000 caracteres sin
         # responder en cada pedido, ignorando effort "low", y se lo volvía a probar primero cada vez). Escalera:
         # sin parámetro → "low" → "none" (lo apaga) → se deja de usar en la sesión.
-        self._nivel_razonamiento: dict = {}
+        self._nivel_razonamiento: dict = cargar_razonamiento_aprendido()
         self._solo_razona: collections.Counter = collections.Counter()
 
     def _es_free_openrouter(self, modelo: str) -> bool:
@@ -2860,6 +2906,7 @@ class LLMClient:
         siguiente = {None: "low", "low": "none"}.get(actual)
         if siguiente and self._solo_razona[modelo] < 3:
             self._nivel_razonamiento[modelo] = siguiente
+            guardar_razonamiento_aprendido(self._nivel_razonamiento)
             if self.on_evento:
                 self.on_evento(f"{modelo} piensa sin responder: la próxima vez le pido razonamiento '{siguiente}'")
             return
@@ -2887,6 +2934,7 @@ class LLMClient:
                         and re.search(r"reason|effort|thinking|mandatory", str(e), re.I)):
                     # Razonamiento obligatorio: rechaza "none". Se lo deja en "minimal" y se reintenta una vez.
                     self._nivel_razonamiento[modelo] = "minimal"
+                    guardar_razonamiento_aprendido(self._nivel_razonamiento)
                     payload = self._payload(modelo, mensajes, temperatura, max_tokens, stop,
                                             self._destino(modelo).proveedor)
                     continue
@@ -3231,7 +3279,7 @@ ALIAS_HERRAMIENTAS = {
 ALIAS_PARAMS = {
     "path": ("file", "filepath", "file_path", "filename", "ruta", "archivo"),
     "command": ("cmd", "comando"),
-    "content": ("contenido", "code", "codigo", "text"),
+    "content": ("contenido", "code", "codigo", "código", "text"),
     "regex": ("pattern", "query", "patron"),
     "desde": ("start_line", "start", "linea_inicio"),
     "hasta": ("end_line", "end", "linea_fin"),
@@ -3432,6 +3480,36 @@ def _params_json(args) -> dict:
 _RE_FUNCION_LLAMA = re.compile(r"<\s*function\s*=\s*([A-Za-z_][\w-]*)\s*>(.*?)(?:<\s*/\s*function\s*>|\Z)", re.S | re.I)
 
 
+_TAGS_BUSCAR = ("search", "buscar", "find", "old", "old_str", "old_string", "original", "antes")
+_TAGS_REEMPLAZO = ("replace", "reemplazar", "new", "new_str", "new_string", "replacement", "nuevo", "despues")
+_RE_CODIGO_EN_HERRAMIENTA = re.compile(r"```[\w+#.-]*[ \t]*\r?\n(.*?)\r?\n?```", re.S)
+
+
+def _bloques_de_tag(cuerpo: str, tags: tuple) -> list:
+    alternativa = "|".join(re.escape(t) for t in tags)
+    return [m.group(2) for m in re.finditer(rf"<\s*({alternativa})\s*>(.*?)<\s*/\s*\1\s*>", cuerpo, re.S | re.I)]
+
+
+def _diff_alternativo(cuerpo: str) -> str:
+    """replace_in_file escrito de otra forma por modelos reales: pares <search>/<replace> (u <old>/<new>…), o los
+    bloques SEARCH/REPLACE sin la etiqueta <diff>. → diff en el formato de REAPER ('' si no hay nada usable)."""
+    if "<<<<<<<" in cuerpo and ">>>>>>>" in cuerpo:
+        inicio, fin = cuerpo.index("<<<<<<<"), cuerpo.rindex(">>>>>>>")
+        fin = cuerpo.find("\n", fin)
+        return cuerpo[inicio:fin if fin >= 0 else len(cuerpo)].strip("\n")
+    buscados, reemplazos = _bloques_de_tag(cuerpo, _TAGS_BUSCAR), _bloques_de_tag(cuerpo, _TAGS_REEMPLAZO)
+    if not buscados or len(buscados) != len(reemplazos):
+        return ""
+    return "\n".join(f"<<<<<<< SEARCH\n{limpiar_largo(b)}\n=======\n{limpiar_largo(r)}\n>>>>>>> REPLACE"
+                     for b, r in zip(buscados, reemplazos))
+
+
+def _contenido_en_bloque(cuerpo: str) -> Optional[str]:
+    """write_to_file con el código en un bloque ``` y sin <content> (prueba real: 4 veces "faltan content")."""
+    bloques = _RE_CODIGO_EN_HERRAMIENTA.findall(cuerpo)
+    return max(bloques, key=len) if bloques else None
+
+
 def analizar(texto: str, esquemas: Esquemas) -> Analisis:
     limpio = texto or ""
     corte = _CORTE_RESULTADO.search(limpio)
@@ -3481,6 +3559,11 @@ def analizar(texto: str, esquemas: Esquemas) -> Analisis:
                 pos = c.end()
             else:
                 siguiente = apertura.search(limpio, m.end())
+                # Un <search> dentro de un replace_in_file sin cerrar es SU bloque a buscar, no la herramienta
+                # search_files (prueba real: salía un search_files fantasma con ">>>>>> REPLACE </diff>" de regex).
+                while real == "replace_in_file" and siguiente is not None and \
+                        (siguiente.group(2) or "").lower() in _TAGS_BUSCAR:
+                    siguiente = apertura.search(limpio, siguiente.end())
                 fin = siguiente.start() if siguiente else len(limpio)
                 cuerpo = limpio[m.end():fin]
                 pos = fin
@@ -3495,6 +3578,14 @@ def analizar(texto: str, esquemas: Esquemas) -> Analisis:
         for clave, valor in atributos.items():
             canon = _canonico_param(clave)
             params.setdefault(canon, valor)
+        if real == "replace_in_file" and not params.get("diff"):
+            diff = _diff_alternativo(cuerpo)
+            if diff:
+                params["diff"] = diff
+        if real == "write_to_file" and "content" not in params:
+            suelto = _contenido_en_bloque(cuerpo)
+            if suelto is not None:
+                params["content"] = suelto
         if not params and cuerpo.strip() and definicion:
             completa = completa and True
         llamadas.append(Llamada(real, params, completa, limpio[m.start():pos], frozenset(abiertos)))
@@ -5648,7 +5739,42 @@ def _validar_python(ws: Workspace, ruta: Path, rel: str) -> list[Resultado]:
     rotos = imports_locales_rotos(ws, ruta, arbol)
     if rotos:
         resultados.append(Resultado(False, f"imports-locales {rel}", 1, stderr="\n".join(rotos), archivo=rel))
+    if not es_archivo_de_test(rel):
+        trampas = trampas_para_tests(texto)
+        if trampas:
+            resultados.append(Resultado(False, f"trampas {rel}", 1, archivo=rel, stderr=(
+                "TRAMPA PARA LOS TESTS: el código mete nombres en OTRO módulo para que un test pase sin arreglar "
+                "nada:\n" + "\n".join(trampas[:6]) + "\nSi un test usa un nombre que no importó, el arreglo es "
+                "agregar el import EN EL TEST (permitido aunque sea un test protegido), no esto.")))
     return resultados
+
+
+# Prueba real (teléfono): el test llamaba main() sin importarlo y el reparador, en vez de agregar el import, escribió en
+# almacen/__main__.py `sys._getframe(1).f_globals['main'] = main` (y variantes con setattr sobre sys.modules). El test
+# "pasaba" y la verificación habría dado verde por una trampa.
+_RE_TRAMPAS = (
+    (re.compile(r"\.f_(?:globals|locals)\s*\[[^\]\n]+\]\s*=(?!=)"), "escribe en los globals de otro marco (f_globals[...] =)"),
+    (re.compile(r"\.f_(?:globals|locals)\.(?:setdefault|update)\s*\("), "escribe en los globals de otro marco (f_globals.setdefault/update)"),
+    (re.compile(r"\b(?:builtins|__builtins__)\.(?!_\b)\w+\s*=(?!=)|__builtins__\s*\[[^\]\n]+\]\s*=(?!=)|"
+                r"setattr\(\s*(?:builtins|__builtins__)\s*,"), "agrega nombres a builtins"),
+    (re.compile(r"setattr\(\s*sys\.modules\s*\["), "le agrega atributos a otro módulo (setattr(sys.modules[...]))"),
+)
+
+
+def trampas_para_tests(texto: str) -> list:
+    """Código de la aplicación que inyecta nombres en otros módulos (el del test, builtins). Con `sys._getframe` o
+    `inspect.currentframe`, también un setattr sobre un módulo sacado de sys.modules."""
+    hallazgos = []
+    for numero, linea in enumerate(texto.splitlines(), start=1):
+        codigo = linea.split("#", 1)[0]
+        for patron, motivo in _RE_TRAMPAS:
+            if patron.search(codigo):
+                hallazgos.append(f"línea {numero}: {motivo}: {linea.strip()[:120]}")
+                break
+    if not hallazgos and re.search(r"sys\._getframe\s*\(|inspect\.(?:currentframe|stack)\s*\(", texto) \
+            and re.search(r"sys\.modules", texto) and re.search(r"setattr\s*\(", texto):
+        hallazgos.append("toma el marco de quien lo importa (sys._getframe/inspect) y le agrega atributos a su módulo")
+    return hallazgos
 
 
 def pista_sintaxis_python(texto: str, error: SyntaxError) -> str:
@@ -9554,11 +9680,42 @@ def _permiso_edicion(ctx: Contexto, rel: str, diff: str, nuevo: bool) -> None:
         )
 
 
+_RE_LINEA_IMPORT = re.compile(r"^\s*(?:import\s+[\w.]+(?:\s+as\s+\w+)?(?:\s*,\s*[\w.]+(?:\s+as\s+\w+)?)*"
+                              r"|from\s+\.*[\w.]*\s+import\s+(?:\(?[\w\s,]+\)?|\*))\s*(?:#.*)?$")
+
+
+def solo_agrega_imports(original: Optional[str], nuevo: Optional[str]) -> bool:
+    """¿`nuevo` es `original` + líneas import/from (y en blanco), sin tocar ni una línea de lo que el test prueba?
+    Es lo único que se le permite a un test protegido: un test de la especificación que llama `main(...)` sin
+    importarlo (prueba real) se arregla agregando el import, sin poder debilitar ningún assert."""
+    if original is None or nuevo is None or original == nuevo:
+        return False
+    viejas, nuevas = original.splitlines(), nuevo.splitlines()
+    agregadas = 0
+    for op, i1, i2, j1, j2 in difflib.SequenceMatcher(a=viejas, b=nuevas, autojunk=False).get_opcodes():
+        if op == "equal":
+            continue
+        if op != "insert":
+            return False
+        for linea in nuevas[j1:j2]:
+            if linea.strip() and not _RE_LINEA_IMPORT.match(linea):
+                return False
+            agregadas += bool(linea.strip())
+    return agregadas > 0
+
+
 def _escribir(ctx: Contexto, rel: str, contenido: str) -> None:
+    actual_protegido = None
     if rel in ctx.protegidos:
+        try:
+            actual_protegido = ctx.ws.leer(rel)
+        except (OSError, ValueError, ErrorRuta):
+            actual_protegido = None
+    if rel in ctx.protegidos and not solo_agrega_imports(actual_protegido, contenido):
         raise ErrorHerramienta(
             f"{rel} es parte de la especificación (tests escritos antes de implementar) y no se puede modificar "
-            "en esta tarea. Cambiá el código para que esos tests pasen."
+            "en esta tarea. Cambiá el código para que esos tests pasen. (Lo único permitido: AGREGARLE imports que "
+            "le falten, sin tocar ninguna otra línea.)"
         )
     if ctx.permitidos and not any(fnmatch.fnmatch(rel, patron) for patron in ctx.permitidos):
         if getattr(ctx, "rol", "") == "especificador":
@@ -11930,6 +12087,7 @@ class Agente:
         self._escrituras = 0                     # se incrementa con cada escritura exitosa
         self._evidencias: list[tuple[str, str, int]] = []  # (herramienta, ok|fallo|bloqueado|sin_tests, escrituras)
         self._reusos_seguidos = 0
+        self._repetidas_seguidas = 0
         self._ultima_salida_ok = ""
         self._bucles = RompedorDeBucles()        # v9 Fase 4: oscilación / machaque / error estancado
         self._prohibido: set = set()
@@ -11998,6 +12156,7 @@ class Agente:
         self._escrituras = 0
         self._evidencias = []
         self._reusos_seguidos = 0
+        self._repetidas_seguidas = 0
         self._ultima_salida_ok = ""
         self._bucles = RompedorDeBucles()
         self._guardia = None
@@ -12103,6 +12262,12 @@ class Agente:
             if final is not None:
                 return self._cerrar(final[0], paso, "completado", ok=final[1])
 
+            if self._repetidas_seguidas >= 8:
+                # Prueba real: un implementador mandó read_file del MISMO archivo 60 veces seguidas (todas bloqueadas):
+                # cada ráfaga llenaba el contexto de errores y quemaba pasos sin hacer nada.
+                self.ui.aviso(f"  [{self.etiqueta}] repite la misma lectura una y otra vez sin avanzar: lo corto")
+                return self._cerrar("El modelo repetía la misma llamada sin cambiar nada (" + str(self._repetidas_seguidas)
+                                    + " veces seguidas). " + self._respuesta_por_bucle(), paso, "bucle", ok=False)
             if self._reusos_seguidos >= 2 and (self.rol.nombre == "principal" or self._reusos_seguidos >= 4):
                 # El modelo pide una y otra vez lo mismo que ya tiene: se corta el bucle. Si había obtenido
                 # un resultado (ej. 2+2 → 4) se responde con eso; Claude Code tampoco ejecuta tres veces "2+2".
@@ -12352,6 +12517,7 @@ class Agente:
                                        "usá lo que ya sabés y avanzá con el próximo paso.)\n")
             elif veces >= 3:
                 self.ui.resultado_herramienta(False, f"{nombre}: llamada repetida")
+                self._repetidas_seguidas += 1
                 self._registrar_evidencia(nombre, "bloqueado")
                 return obs(
                     f"ERROR: ya hiciste exactamente esta llamada {veces} veces sin cambiar nada en el proyecto y el "
@@ -12409,6 +12575,7 @@ class Agente:
         if h.escribe and not error:
             self._escrituras += 1
         self._reusos_seguidos = 0
+        self._repetidas_seguidas = 0
         if nombre in ("run_tests", "validate", "execute_command", "run_python"):
             self._registrar_evidencia(nombre, self._estado_evidencia(nombre, llamada.params, salida, error),
                                       llamada.params.get("command", ""))
@@ -16191,6 +16358,13 @@ def _resumen_diff(diff: str) -> str:
     return f"{archivos} archivo(s) · +{mas} −{menos}"
 
 
+def tests_de_especificacion_rotos(validaciones: list) -> list:
+    """Fallos que son errores DEL TEST (sintaxis o nombres que el test nunca importó ni definió), no el rojo
+    esperado de tests primero (importar un módulo que todavía no existe)."""
+    return [r for r in fallos(validaciones)
+            if r.comando.startswith(("py_compile", "node --check")) or "(nombres indefinidos)" in r.comando]
+
+
 def _es_test(rel: str) -> bool:
     return any(fnmatch.fnmatch(rel, p) for p in PATRONES_TESTS)
 
@@ -16612,14 +16786,28 @@ class Orquestador:
             self.ui.aviso("  El especificador no dejó archivos de test: sigo sin especificación ejecutable.")
             return {}
         validacion = validar_archivos(self.ws, tests)
-        rotos = [r for r in fallos(validacion) if r.comando.startswith(("py_compile", "node --check"))]
+        rotos = tests_de_especificacion_rotos(validacion)
         if rotos:
-            self.ui.aviso("  Los tests de la especificación tienen errores de sintaxis: le pido al especificador que los arregle.")
-            self._sub("especificador", "Los tests que escribiste no compilan:\n" + resumen_validacion(validacion, 2500)
-                      + "\nCorregí SOLO los errores de sintaxis de los tests.", cid, titulo="corrige los tests")
-            if fallos([r for r in validar_archivos(self.ws, tests) if r.comando.startswith(("py_compile", "node --check"))]):
-                self.ui.aviso("  Siguen sin compilar: descarto la especificación para no bloquear la build.")
-                return {}
+            # Prueba real en el teléfono: el test hacía `from almacen import __main__` y llamaba `main(...)` sin
+            # importarlo (NameError). Solo se rechazaba la sintaxis: el test roto quedó PROTEGIDO, nadie pudo
+            # corregirlo y el reparador pasó horas inyectando `main` en el módulo del test con sys._getframe.
+            self.ui.aviso("  Los tests de la especificación están rotos (sintaxis o nombres sin importar): le pido al "
+                          "especificador que los arregle.")
+            self._sub("especificador",
+                      "Tus tests tienen errores PROPIOS (no son el rojo esperado):\n" + resumen_validacion(rotos, 2500)
+                      + "\n\nUn nombre indefinido (p. ej. llamar `main(...)` sin `from paquete.modulo import main`) es "
+                      "un error del test. Que falle porque el MÓDULO todavía no existe está bien; usar un nombre que "
+                      "nunca importaste, no. Corregí SOLO eso en los tests (agregá los imports que faltan).",
+                      cid, titulo="corrige los tests")
+            siguen = {r.archivo for r in tests_de_especificacion_rotos(validar_archivos(self.ws, tests))}
+            if siguen:
+                # No se protegen: así el implementador o el reparador pueden corregirlos (protegidos, no podía nadie).
+                self.ui.aviso("  Siguen rotos " + ", ".join(sorted(siguen)) + ": no los protejo (los puede corregir "
+                              "el implementador).")
+                tests = [t for t in tests if t not in siguen]
+                self._spec_rotos = sorted(siguen)            # sin proteger, pero la tarea igual los tiene que pasar
+                if not tests:
+                    return {}
         r = ejecutar_tests(self.ws, timeout=self.settings.tests_timeout, completo=True)
         conteo = conteo_de_resultado(r)
         codigo_plan = [a for a in plan.archivos() if not _es_test(a)]
@@ -16741,7 +16929,37 @@ class Orquestador:
         )
         return self._sub_opcional("qa", texto, cid, titulo="escribe y corre tests de aceptación")
 
+    def _custodiar_protegidos(self) -> None:
+        """Los tests protegidos se custodian EN DISCO, no solo en las herramientas de escritura: el reparador de la
+        prueba real los pisaba con `cp tests/test_cli.py.backup tests/test_cli.py` (execute_command). Si solo se les
+        agregaron imports (lo único permitido), se acepta y se actualiza el diario; cualquier otro cambio se revierte."""
+        for rel, original in list(getattr(self, "_protegidos", {}).items()):
+            if original is None:
+                continue
+            try:
+                actual = self.ws.leer(rel)
+            except (OSError, ValueError, ErrorRuta):
+                actual = None
+            if actual == original:
+                continue
+            if solo_agrega_imports(original, actual):
+                self._protegidos[rel] = actual
+                diario = getattr(self, "_diario_build", None)
+                if diario is not None:
+                    registro, previo = diario
+                    previo.setdefault("tests_protegidos", {})[rel] = self.ws.hash(rel)
+                    registro.guardar(previo)
+                self.ui.tenue(f"  {rel}: se le agregaron imports al test protegido (permitido: no cambia lo que prueba).")
+                continue
+            try:
+                self.ws.escribir(rel, original)
+            except (OSError, ErrorRuta) as e:
+                self.ui.error(f"  {rel} es un test protegido, cambió y no lo pude restaurar: {e}")
+                continue
+            self.ui.aviso(f"  {rel} es un test protegido y se cambió por fuera de lo permitido: lo restauré.")
+
     def verificar(self, cid: int) -> Verificacion:
+        self._custodiar_protegidos()
         archivos = [r for r in self.ws.checkpoints.archivos_desde(cid) if (self.ws.raiz / r).is_file()]
         validaciones = validar_archivos(self.ws, archivos)
         tests = ejecutar_tests(self.ws, timeout=self.settings.tests_timeout, completo=True)
@@ -16791,6 +17009,14 @@ class Orquestador:
         if base_fallaba:
             texto += "Ojo: la suite de tests ya fallaba ANTES de esta build; priorizá los fallos causados por los cambios.\n"
         texto += "Encontrá la causa raíz y corregila. No debilites ni borres tests."
+        en_protegidos = sorted(rel for rel in self._protegidos if rel in (verif.diagnostico or ""))
+        if en_protegidos:
+            # Sin esto, el reparador de la prueba real "arreglaba" un test protegido que llamaba main() sin importarlo
+            # inyectando main en el módulo del test con sys._getframe (una trampa) durante horas.
+            texto += ("\n\nEl fallo está en un test PROTEGIDO de la especificación (" + ", ".join(en_protegidos) + "). "
+                      "No podés cambiar lo que prueba, pero SÍ podés AGREGARLE las líneas import/from que le falten "
+                      "(p. ej. `from paquete.modulo import main`): es lo único permitido en ese archivo. Nunca hagas "
+                      "trampas en el código (inyectar nombres en el módulo del test, sys._getframe, builtins).")
         if diagnostico_experto:
             texto = tarea_con_diagnostico(texto, diagnostico_experto)
         protegidos = set(self._protegidos)
@@ -17229,15 +17455,20 @@ class Orquestador:
                          archivos_esperados: Sequence[str] = (),
                          archivos_planeados: Sequence[str] = (),
                          cid_build: Optional[int] = None,
-                         spec_ajena: Optional[Iterable[str]] = None) -> Verificacion:
+                         spec_ajena: Optional[Iterable[str]] = None,
+                         spec_propia: Iterable[str] = ()) -> Verificacion:
         """
         Una tarea intermedia no necesita que pasen TODOS los tests (los de tareas
         siguientes todavía fallan): alcanza con validadores OK y que no se rompa
         nada que antes pasaba. `spec_ajena`: los archivos de la especificación que son de OTRAS tareas (los únicos
         cuyo rojo se tolera); None = toda la especificación (comportamiento anterior).
         """
+        self._custodiar_protegidos()
         archivos = [r for r in self.ws.checkpoints.archivos_desde(tcid) if (self.ws.raiz / r).is_file()]
-        validaciones = validar_archivos(self.ws, archivos)
+        # Sus tests de la especificación también se validan: el diagnóstico dice "nombres indefinidos en
+        # tests/test_db.py" en vez de solo un NameError en la salida de los tests.
+        validaciones = validar_archivos(self.ws, archivos + sorted(
+            r for r in spec_propia if r not in archivos and (self.ws.raiz / r).is_file()))
         tests = ejecutar_tests(self.ws, timeout=self.settings.tests_timeout, completo=True)
         conteo = conteo_de_resultado(tests)
         problemas = []
@@ -17303,6 +17534,16 @@ class Orquestador:
                 )
         elif tests is not None and not tests.ok and not conteo.reconocido and antes.ok:
             problemas.append("TESTS: la suite pasaba antes de la tarea y ahora falla.\n" + tests.resumen(4000))
+        propios = {rel: None for rel in spec_propia}
+        rojos_propios = [n for n in (conteo.nombres_fallados if tests is not None and conteo.reconocido else [])
+                         if propios and _es_de_especificacion(n, propios)]
+        if rojos_propios and not any(p.startswith("REGRESIÓN DE TESTS") for p in problemas):
+            # Sus tests de la especificación fallaban ANTES (es tests primero) y por eso no contaban como regresión: la
+            # tarea quedaba "verificada" con su propia especificación en rojo (con pytest los nombres no cambian; E2E
+            # con un test de la especificación roto).
+            problemas.append("LA ESPECIFICACIÓN DE ESTA TAREA SIGUE EN ROJO (" + ", ".join(sorted(propios)) + "): "
+                             + ", ".join(rojos_propios[:8]) + "\n"
+                             + fallos_relevantes(f"{tests.stdout}\n{tests.stderr}", maximo=3, limite=4000))
         if exigir_progreso and not problemas:
             # El implementador NO terminó (límite de pasos, error...). "No romper nada" no alcanza:
             # tiene que haber cambios reales y, si hay tests fallando, alguno más tiene que pasar.
@@ -17372,6 +17613,7 @@ class Orquestador:
     def _construir(self, pedido: str, confirmar: bool = True, reanudar: bool = False) -> InformeBuild:
         inicio = time.monotonic()
         self._protegidos: dict[str, Optional[str]] = {}
+        self._spec_rotos: list = []
         self._tokens_juez = 0
         self._tokens_inicio = _tokens_usados(self.llm)
         registro_build = RegistroBuild(self.ws)
@@ -17380,6 +17622,7 @@ class Orquestador:
         except ValueError as e:
             self.ui.error(str(e) + ". Usá /construir estado y revisá el registro antes de descartarlo.")
             return InformeBuild("cancelada")
+        self._diario_build = None                     # (registro, previo) para que el custodio actualice los hashes
         base = ejecutar_tests(self.ws, timeout=self.settings.tests_timeout, completo=True)
         self._base_tests = base
         base_fallaba = base is not None and not base.ok
@@ -17512,6 +17755,7 @@ class Orquestador:
                               "pediste ni aprobaste el plan: se protegen (no se pierde lo que ya tenías).")
             registro_build.guardar(previo)
         self._reemplazos_autorizados = set(previo.get("reemplazos_autorizados", []))
+        self._diario_build = (registro_build, previo)
 
         informe = InformeBuild("fallida", plan=plan, cid=grupo,
                                reemplazos_autorizados=sorted(self._reemplazos_autorizados))
@@ -17610,6 +17854,18 @@ class Orquestador:
                 previo["estados"][tarea.id] = "pendiente"
                 registro_build.guardar(previo)
                 continue
+            ya_escritos = [a for a in tarea.archivos if _es_test(a) and a in (informe.spec_tests or [])
+                           and self.ws.existe(a)]
+            if tarea.archivos and len(ya_escritos) == len(tarea.archivos):
+                # Prueba real: el arquitecto planeó "Escribir la prueba unitaria" como tarea y la especificación ya la
+                # había escrito (y protegido). Los implementadores no podían tocarla → SIN PROGRESO → 2 reparaciones y
+                # modo forense sin nada que hacer. No hay nada que implementar: lo verifican las tareas que siguen.
+                self.ui.ok(f"Tarea {tarea.id}: {', '.join(ya_escritos)} ya lo escribió la especificación (tests "
+                           "primero): no hay nada que implementar.")
+                informe.notas.append(f"Tarea {tarea.id}: cubierta por la especificación ({', '.join(ya_escritos)}).")
+                previo["estados"][tarea.id] = "verificada"
+                registro_build.guardar(previo)
+                continue
             token_tarea = PLAZO.abrir(self.settings.tiempo_max_tarea, f"la tarea {tarea.id}")
             previo["estados"][tarea.id] = "en_curso"
             previo["tarea_activa"] = tarea.id
@@ -17642,13 +17898,19 @@ class Orquestador:
             # venta que no controlaba el stock, el test de la propia tarea fallaba y la tarea quedaba "verificada"
             # (pasaba al revisor y lo atajaba recién la verificación final; corrida E2E de /grande, modelo flojo).
             # Los tests que existían antes de la build (etapas anteriores) tampoco: romperlos es regresión.
-            spec_ajena = set() if i == len(plan.tareas) - 1 else (
-                set(informe.spec_tests or []) - {a for a in tarea.archivos if _es_test(a)})
+            spec_build = set(informe.spec_tests or []) | set(getattr(self, "_spec_rotos", ()))
+            ultima = i == len(plan.tareas) - 1
+            spec_ajena = set() if ultima else (spec_build - {a for a in tarea.archivos if _es_test(a)})
+            # Los de la especificación que declara ESTA tarea (y ninguna posterior) tienen que quedar en verde con
+            # ella; en la última tarea, todos.
+            de_despues = {a for t_sig in plan.tareas[i + 1:] for a in t_sig.archivos}
+            spec_propia = spec_build if ultima else {a for a in tarea.archivos
+                                                     if a in spec_build and a not in de_despues}
             verif_tarea = self._verificar_tarea(tcid, conteo_antes, nombres_antes,
                                                  exigir_progreso=exigir, verificar_entrega=True,
                                                  archivos_esperados=tarea.archivos,
                                                  archivos_planeados=planeados_despues, cid_build=grupo,
-                                                 spec_ajena=spec_ajena)
+                                                 spec_ajena=spec_ajena, spec_propia=spec_propia)
             if not verif_tarea.ok:
                 self.ui.aviso(f"  La tarea {tarea.id} no pasó su verificación: la reparo con el error real.")
                 self.ui.tenue(f"    motivo: {_primera_linea_util(verif_tarea.diagnostico)}")
@@ -17659,7 +17921,7 @@ class Orquestador:
                                                  exigir_progreso=exigir, verificar_entrega=True,
                                                  archivos_esperados=tarea.archivos,
                                                  archivos_planeados=planeados_despues, cid_build=grupo,
-                                                 spec_ajena=spec_ajena),
+                                                 spec_ajena=spec_ajena, spec_propia=spec_propia),
                     contexto=f"TAREA EN CURSO (#{tarea.id}): {tarea.descripcion}",
                 )
                 if not verif_tarea.ok:
@@ -17716,7 +17978,7 @@ class Orquestador:
                                               exigir_progreso=exigir, verificar_entrega=True,
                                               archivos_esperados=tarea.archivos,
                                               archivos_planeados=planeados_despues, cid_build=grupo,
-                                              spec_ajena=spec_ajena)
+                                              spec_ajena=spec_ajena, spec_propia=spec_propia)
             if verif_post.ok:
                 previo["estados"][tarea.id] = "verificada"
                 # Archivo verificado por primera vez: no permitir que una tarea
@@ -39735,7 +39997,7 @@ class TestConfig(BaseTest):
     def test_perfiles(self):
         s = Settings()
         cambios = aplicar_perfil(s, "gratis")
-        self.assertIn("rpm=16", cambios)
+        self.assertIn("rpm=14", cambios)
         self.assertFalse(s.escalar)
         self.assertGreater(s.costo_maximo, 0)          # R-010: gratis impone techo de costo (≠ ilimitado)
         self.assertLessEqual(s.costo_maximo, 0.01)
@@ -50886,8 +51148,11 @@ class TestModelosDeLaPruebaRealGrande(BaseTest):
         s = self.ajustes(proveedor="openrouter", modelos_rol={"juez": "nanogpt:qwen/qwen3.8-27b-uncensored",
                                                               "reparador": "nvidia/nemotron-3-super-120b-a12b:free"})
         cambios = aplicar_perfil(s, "gratis", ["a/uno:free", "b/dos:free"])
-        self.assertEqual(s.modelos_rol, {"reparador": "nvidia/nemotron-3-super-120b-a12b:free"})
+        # El :free que no está entre los de hoy también sale (segunda prueba real: el juez le dio el reparador a
+        # nemotron-3-super:free, que no había respondido el sondeo, y se quedó pensando sin contestar).
+        self.assertEqual(s.modelos_rol, {})
         self.assertTrue(any("juez: nanogpt:qwen" in c for c in cambios))
+        self.assertTrue(any("reparador: nvidia/nemotron-3-super-120b-a12b:free no está" in c for c in cambios))
 
     def test_restricciones_no_son_criterios_sin_cubrir(self):
         plan = Plan("x", [Tarea("1", "Crear storage.py con init_db y sus tests", ["almacen/storage.py"])], [])
@@ -51422,6 +51687,282 @@ class TestVerificacionDeTareaConSuEspecificacion(BaseTest):
         self.assertIn("La tarea 1 no pasó su verificación", texto)
         self.assertLess(pasos.index("reparador"), pasos.index("revisor"))          # se repara ANTES de revisar
         self.assertNotIn("REPARACIÓN final", texto)
+
+
+# ======================================================================
+# MÓDULO: autotest_prueba_real2
+# ======================================================================
+"""
+Segunda prueba REAL de /grande en el teléfono (Termux, modelos :free): la etapa 1 quedó horas en reparaciones.
+
+- El especificador escribió tests/test_cli.py con `from almacen import __main__` y `main([...])` SIN importar main
+  (NameError). Solo se rechazaba la sintaxis: el test roto quedó PROTEGIDO y nadie lo podía corregir.
+- El reparador "lo arregló" inyectando main en el módulo del test (`sys._getframe(1).f_globals['main'] = main`) y
+  hasta pisó el test con `cp tests/test_cli.py.backup tests/test_cli.py` por la terminal.
+- El arquitecto planeó "Escribir la prueba unitaria" como TAREA aunque la especificación ya la había escrito: SIN
+  PROGRESO → 2 reparaciones y modo forense sin nada que hacer.
+- Los modelos escribieron <search>/<replace> dentro de replace_in_file y write_to_file con el código en ``` sin
+  <content>; cada modelo volvía a "pensar sin responder" en cada corrida; un implementador repitió 60 veces la misma
+  lectura.
+"""
+
+_PR2_TEST_ROTO = ("import unittest\nfrom unittest import mock\n\nfrom almacen import __main__\n\n\n"
+                  "class TestCLI(unittest.TestCase):\n    def test_main_llama_run_server(self):\n"
+                  "        with mock.patch('almacen.__main__.run_server') as run:\n"
+                  "            main(['--puerto', '9999'])\n        run.assert_called_once_with(9999)\n")
+_PR2_TEST_BIEN = _PR2_TEST_ROTO.replace("from almacen import __main__\n",
+                                        "from almacen import __main__\nfrom almacen.__main__ import main\n")
+_PR2_MAIN = ("import argparse\n\nfrom almacen.server import run_server\n\n\ndef main(args=None):\n"
+             "    parser = argparse.ArgumentParser(prog='almacen')\n"
+             "    parser.add_argument('--puerto', type=int, default=8000)\n"
+             "    run_server(parser.parse_args(args).puerto)\n\n\nif __name__ == '__main__':\n    main()\n")
+_PR2_SERVER = "def run_server(puerto):\n    raise SystemExit(f'servidor en {puerto}')\n"
+_PR2_TRAMPA = _PR2_MAIN + "\nimport sys\nsys._getframe(1).f_globals['main'] = main\n"
+_PR2_PLAN = ('<plan><objetivo>CLI</objetivo><criterios>- main(--puerto) llama a run_server</criterios>'
+             '<tarea id="1" archivos="almacen/__init__.py, almacen/__main__.py, almacen/server.py, tests/test_cli.py">'
+             'main y run_server con su test</tarea></plan>')
+
+
+class TestEspecificacionConNombresSinImportar(BaseTest):
+    def _especificar(self, arregla: bool):
+        ws = self.proyecto({})
+        pedidos = []
+
+        def guion(mensajes, kw):
+            if MockLLM.rol_de(mensajes) != "especificador":
+                return terminar_xml("listo")
+            primero = next((m["content"] for m in mensajes if m["role"] == "user"), "")
+            if MockLLM.turnos_asistente(mensajes) == 0:
+                pedidos.append(primero)
+                corregir = "errores PROPIOS" in primero
+                contenido = _PR2_TEST_BIEN if (corregir and arregla) else _PR2_TEST_ROTO
+                return herramienta_xml("write_to_file", path="tests/test_cli.py", content=contenido)
+            return terminar_xml("tests escritos")
+        ui = self.ui()
+        orq = Orquestador(MockLLM(guion), ws, self.ajustes(tests_primero=True), ui)
+        plan = Plan("CLI", [Tarea("1", "main", ["almacen/__main__.py", "tests/test_cli.py"])], [])
+        espec = orq.especificar("CLI del almacén", plan, ws.checkpoints.iniciar("espec"))
+        return ws, espec, pedidos, ui.texto_registrado()
+
+    def test_un_test_que_usa_main_sin_importarlo_se_manda_a_corregir(self):
+        ws, espec, pedidos, texto = self._especificar(arregla=True)
+        self.assertEqual(len(pedidos), 2)                                           # se le pidió corregir
+        self.assertIn("main", pedidos[1])
+        self.assertIn("tests/test_cli.py", espec)                                   # y queda protegido, ya bien
+        self.assertIn("from almacen.__main__ import main", espec["tests/test_cli.py"])
+        self.assertIn("están rotos", texto)
+
+    def test_si_sigue_roto_no_se_protege(self):
+        _ws, espec, pedidos, texto = self._especificar(arregla=False)
+        self.assertEqual(len(pedidos), 2)
+        self.assertNotIn("tests/test_cli.py", espec)                                # lo puede corregir otro
+        self.assertIn("no los protejo", texto)
+
+
+class TestTestProtegidoSoloAgregarImports(BaseTest):
+    def test_solo_agrega_imports(self):
+        self.assertTrue(solo_agrega_imports(_PR2_TEST_ROTO, _PR2_TEST_BIEN))
+        self.assertTrue(solo_agrega_imports("x = 1\n", "import os\nfrom a.b import (c, d)\n\nx = 1\n"))
+        self.assertFalse(solo_agrega_imports(_PR2_TEST_ROTO, _PR2_TEST_BIEN.replace("9999)", "1)")))   # toca un assert
+        self.assertFalse(solo_agrega_imports(_PR2_TEST_ROTO, _PR2_TEST_ROTO.replace(
+            "        run.assert_called_once_with(9999)\n", "")))                                    # borra una línea
+        self.assertFalse(solo_agrega_imports("x = 1\n", "x = 1\ny = 2\n"))
+        self.assertFalse(solo_agrega_imports("x = 1\n", "x = 1\n"))
+
+    def test_la_herramienta_deja_agregar_el_import_y_nada_mas(self):
+        ws = self.proyecto({"tests/test_cli.py": _PR2_TEST_ROTO})
+        ctx = self.contexto(ws)
+        ctx.protegidos = {"tests/test_cli.py"}
+        self.herramienta(ctx, "write_to_file", path="tests/test_cli.py", content=_PR2_TEST_BIEN)
+        self.assertEqual(ws.leer("tests/test_cli.py"), _PR2_TEST_BIEN)
+        with self.assertRaises(ErrorHerramienta) as error:
+            self.herramienta(ctx, "write_to_file", path="tests/test_cli.py", content=_PR2_TEST_BIEN.replace("9999)", "1)"))
+        self.assertIn("parte de la especificación", str(error.exception))
+        self.assertEqual(ws.leer("tests/test_cli.py"), _PR2_TEST_BIEN)
+
+    def test_el_custodio_acepta_imports_y_revierte_lo_demas(self):
+        ws = self.proyecto({"tests/test_cli.py": _PR2_TEST_ROTO})
+        ui = self.ui()
+        orq = Orquestador(MockLLM(lambda m, k: terminar_xml("x")), ws, self.ajustes(), ui)
+        orq._protegidos = {"tests/test_cli.py": _PR2_TEST_ROTO}
+        (ws.raiz / "tests/test_cli.py").write_text(_PR2_TEST_BIEN, encoding="utf-8")       # p. ej. por la terminal
+        orq._custodiar_protegidos()
+        self.assertEqual(orq._protegidos["tests/test_cli.py"], _PR2_TEST_BIEN)
+        self.assertIn("se le agregaron imports", ui.texto_registrado())
+        (ws.raiz / "tests/test_cli.py").write_text("import unittest\n", encoding="utf-8")   # cp de un backup
+        orq._custodiar_protegidos()
+        self.assertEqual(ws.leer("tests/test_cli.py"), _PR2_TEST_BIEN)
+        self.assertIn("lo restauré", ui.texto_registrado())
+
+
+class TestTrampasParaLosTests(BaseTest):
+    def test_inyectar_main_en_el_modulo_del_test_es_una_trampa(self):
+        ws = self.proyecto({"almacen/__init__.py": "", "almacen/server.py": _PR2_SERVER,
+                            "almacen/__main__.py": _PR2_TRAMPA, "tests/test_x.py": _PR2_TRAMPA})
+        malos = [r.comando.split()[0] for r in fallos(validar_archivos(ws, ["almacen/__main__.py"]))]
+        self.assertIn("trampas", malos)
+        self.assertNotIn("trampas", [r.comando.split()[0] for r in validar_archivos(ws, ["tests/test_x.py"])])
+        self.assertEqual(trampas_para_tests(_PR2_MAIN), [])
+        self.assertEqual(trampas_para_tests("import builtins\nbuiltins._ = str\n"), [])     # gettext: legítimo
+
+    def test_el_reparador_arregla_el_test_protegido_con_el_import(self):
+        # El caso del teléfono al retomar: el test roto YA está protegido (existía al empezar la build). Antes no había
+        # salida; ahora el reparador agrega el import (lo único permitido) y la build queda verificada.
+        ws = self.proyecto({"tests/__init__.py": "", "tests/test_cli.py": _PR2_TEST_ROTO})
+        vistos = []
+
+        def guion(mensajes, kw):
+            rol, turno = MockLLM.rol_de(mensajes), MockLLM.turnos_asistente(mensajes)
+            if rol == "arquitecto":
+                return terminar_xml(_PR2_PLAN.replace(", tests/test_cli.py", ""))
+            if rol == "implementador":
+                archivos = [("almacen/__init__.py", ""), ("almacen/server.py", _PR2_SERVER),
+                            ("almacen/__main__.py", _PR2_MAIN)]
+                if turno < len(archivos):
+                    return herramienta_xml("write_to_file", path=archivos[turno][0], content=archivos[turno][1])
+                return terminar_xml("listo")
+            if rol == "reparador":
+                vistos.append(MockLLM.ultimo_usuario(mensajes) if turno == 0 else "")
+                if turno == 0:
+                    return herramienta_xml("write_to_file", path="tests/test_cli.py", content=_PR2_TEST_BIEN)
+            return terminar_xml("listo")
+        ui = self.ui()
+        informe = Orquestador(MockLLM(guion), ws, self.ajustes(juez=False), ui).construir(
+            "CLI del almacén con --puerto", confirmar=False)
+        texto = ui.texto_registrado()
+        self.assertTrue(informe.ok, texto[-3000:])
+        self.assertIn("AGREGARLE las líneas import", vistos[0])                   # se le dijo qué puede hacer
+        self.assertEqual(ws.leer("tests/test_cli.py"), _PR2_TEST_BIEN)
+
+
+class TestTareaYaEscritaPorLaEspecificacion(BaseTest):
+    def test_tarea_de_solo_tests_ya_escritos_no_corre_implementadores(self):
+        ws = self.proyecto({})
+        tareas_impl = []
+        plan = ('<plan><objetivo>CLI</objetivo><criterios>- main llama a run_server</criterios>'
+                '<tarea id="1" archivos="tests/test_cli.py">Escribir la prueba unitaria de main</tarea>'
+                '<tarea id="2" archivos="almacen/__init__.py, almacen/__main__.py, almacen/server.py" deps="1">'
+                'main y run_server</tarea></plan>')
+
+        def guion(mensajes, kw):
+            rol, turno = MockLLM.rol_de(mensajes), MockLLM.turnos_asistente(mensajes)
+            if rol == "arquitecto":
+                return terminar_xml(plan)
+            if rol == "especificador" and turno == 0:
+                return herramienta_xml("write_to_file", path="tests/test_cli.py", content=_PR2_TEST_BIEN)
+            if rol == "implementador":
+                if turno == 0:
+                    tareas_impl.append(re.search(r"TU TAREA AHORA \(#(\d+)\)", MockLLM.ultimo_usuario(mensajes)).group(1))
+                archivos = [("almacen/__init__.py", ""), ("almacen/server.py", _PR2_SERVER),
+                            ("almacen/__main__.py", _PR2_MAIN)]
+                if turno < len(archivos):
+                    return herramienta_xml("write_to_file", path=archivos[turno][0], content=archivos[turno][1])
+            return terminar_xml("listo")
+        ui = self.ui()
+        informe = Orquestador(MockLLM(guion), ws, self.ajustes(tests_primero=True, juez=False), ui).construir(
+            "CLI del almacén", confirmar=False)
+        texto = ui.texto_registrado()
+        self.assertTrue(informe.ok, texto[-3000:])
+        self.assertEqual(tareas_impl, ["2"])                                         # la 1 no gasta implementadores
+        self.assertIn("ya lo escribió la especificación", texto)
+
+
+class TestFormatosDeHerramientasDeModelosReales(BaseTest):
+    def _una(self, texto):
+        llamadas = analizar(texto, esquemas()).llamadas
+        self.assertEqual(len(llamadas), 1, llamadas)
+        return llamadas[0]
+
+    def test_search_replace_como_etiquetas(self):
+        ll = self._una("<replace_in_file>\n<path>a.py</path>\n<search>\nx = 1\n</search>\n<replace>\nx = 2\n</replace>\n"
+                       "</replace_in_file>")
+        self.assertEqual(ll.params["diff"], "<<<<<<< SEARCH\nx = 1\n=======\nx = 2\n>>>>>>> REPLACE")
+        sin_cierre = self._una("<replace_in_file>\n<path>a.py</path>\n<old>\nx = 1\n</old>\n<new>\nx = 2\n</new>\n"
+                               "</file>\nListo.")
+        self.assertEqual(sin_cierre.nombre, "replace_in_file")                    # no un search_files fantasma
+        self.assertIn(">>>>>>> REPLACE", sin_cierre.params["diff"])
+
+    def test_bloques_search_replace_sin_etiqueta_diff(self):
+        ll = self._una("<replace_in_file>\n<path>a.py</path>\n<<<<<<< SEARCH\nx = 1\n=======\nx = 2\n>>>>>>> REPLACE\n"
+                       "</replace_in_file>")
+        self.assertTrue(ll.params["diff"].startswith("<<<<<<< SEARCH"))
+
+    def test_write_to_file_con_el_codigo_en_un_bloque(self):
+        ll = self._una("<write_to_file>\n<path>almacen/server.py</path>\n```python\nimport http.server\n```\n"
+                       "</write_to_file>")
+        self.assertEqual(ll.params["content"].strip(), "import http.server")
+        acento = self._una("<write_to_file>\n<archivo>a.py</archivo>\n<código>\nx = 1\n</código>\n</write_to_file>")
+        self.assertEqual(acento.params, {"path": "a.py", "content": "x = 1"})
+
+    def test_aplicado_de_punta_a_punta(self):
+        ws = self.proyecto({"a.py": "x = 1\n"})
+        ctx = self.contexto(ws)
+        ll = self._una("<replace_in_file>\n<path>a.py</path>\n<search>x = 1</search>\n<replace>x = 2</replace>\n"
+                       "</replace_in_file>")
+        self.herramienta(ctx, "replace_in_file", **ll.params)
+        self.assertEqual(ws.leer("a.py"), "x = 2\n")
+
+
+class TestModelosQueRepitenYQuePiensan(BaseTest):
+    def test_el_razonamiento_aprendido_se_recuerda_entre_corridas(self):
+        ruta = self.dir / "razonamiento.json"
+        guardar_razonamiento_aprendido({"cohere/north-mini-code:free": "none", "x": None}, ruta)
+        self.assertEqual(cargar_razonamiento_aprendido(ruta), {"cohere/north-mini-code:free": "none"})
+        viejo = {"m": {"nivel": "low", "ts": time.time() - (HORAS_RAZONAMIENTO_APRENDIDO + 1) * 3600}}
+        ruta.write_text(json.dumps(viejo), encoding="utf-8")
+        self.assertEqual(cargar_razonamiento_aprendido(ruta), {})                   # vence a las 24 h
+        self.assertEqual(cargar_razonamiento_aprendido(self.dir / "no_existe.json"), {})
+
+    def test_la_misma_lectura_repetida_sin_fin_se_corta(self):
+        ws = self.proyecto({"a.py": "x = 1\n"})
+        lectura = "\n".join([herramienta_xml("read_file", path="a.py")] * 4)
+        llm = MockLLM(lambda m, k: lectura)
+        res = Agente("implementador", llm, ws, self.ajustes(max_pasos=25, max_llamadas_turno=8, forense=False,
+                                                           escalar=False), self.ui()).ejecutar("Implementá algo en a.py")
+        self.assertFalse(res.ok)
+        self.assertLess(len(llm.llamadas), 10)                                       # antes: hasta max_pasos (25)
+
+    def test_perfil_gratis_saca_roles_en_gratis_que_hoy_no_responden(self):
+        ajustes = self.ajustes(proveedor="openrouter", modelos_rol={
+            "reparador": "openrouter:nvidia/nemotron-3-super-120b-a12b:free",
+            "juez": "nvidia/nemotron-3.5-lightning:free"})
+        cambios = aplicar_perfil(ajustes, "gratis", ["cohere/north-mini-code:free", "nvidia/nemotron-3.5-lightning:free"])
+        self.assertNotIn("reparador", ajustes.modelos_rol)
+        self.assertEqual(ajustes.modelos_rol.get("juez"), "nvidia/nemotron-3.5-lightning:free")
+        self.assertTrue(any("no está entre los gratis de hoy" in c for c in cambios))
+        self.assertEqual(ajustes.rpm, 14)                                            # cohere: 15 por minuto
+
+
+class TestEspecificacionPropiaEnRojo(BaseTest):
+    def test_la_tarea_no_queda_verificada_con_su_especificacion_en_rojo(self):
+        # El test de la especificación sigue roto (no se protege) y falla ANTES y DESPUÉS de la tarea con los mismos
+        # nombres: antes no contaba como regresión y la tarea quedaba "verificada"; lo atajaba la reparación final.
+        ws = self.proyecto({"tests/__init__.py": ""})
+
+        def guion(mensajes, kw):
+            rol, turno = MockLLM.rol_de(mensajes), MockLLM.turnos_asistente(mensajes)
+            primero = MockLLM.ultimo_usuario(mensajes) if turno == 0 else ""
+            if rol == "arquitecto":
+                return terminar_xml(_PR2_PLAN)
+            if rol == "especificador" and turno == 0:
+                return herramienta_xml("write_to_file", path="tests/test_cli.py", content=_PR2_TEST_ROTO)
+            if rol == "implementador":
+                archivos = [("almacen/__init__.py", ""), ("almacen/server.py", _PR2_SERVER),
+                            ("almacen/__main__.py", _PR2_MAIN)]
+                if turno < len(archivos):
+                    return herramienta_xml("write_to_file", path=archivos[turno][0], content=archivos[turno][1])
+            if rol == "reparador" and turno == 0 and "F821" in primero:
+                return herramienta_xml("write_to_file", path="tests/test_cli.py", content=_PR2_TEST_BIEN)
+            return terminar_xml("listo")
+        ui = self.ui()
+        informe = Orquestador(MockLLM(guion), ws, self.ajustes(tests_primero=True, juez=False), ui).construir(
+            "CLI del almacén con --puerto", confirmar=False)
+        texto = ui.texto_registrado()
+        if not shutil.which("ruff"):
+            self.skipTest("sin ruff el diagnóstico no trae el código F821")
+        self.assertTrue(informe.ok, texto[-3000:])
+        self.assertRegex(texto, r"La tarea \d+ no pasó su verificación")
+        self.assertNotIn("REPARACIÓN final", texto)                                # se arregla en la tarea
 
 
 # ======================================================================
