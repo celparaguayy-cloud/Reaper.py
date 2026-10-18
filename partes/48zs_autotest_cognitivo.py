@@ -192,3 +192,28 @@ class TestCognitivoProsa(BaseTest):
             return "Estoy pensando cómo seguir con la tarea; enseguida continúo con lo que falta."
         _ws, agente = self._agente(guion)
         self.assertEqual(agente.ejecutar("Escribí calc.py").motivo, "sin_herramientas")
+
+
+class TestCognitivoIntegracionConJuezTerco(BaseTest):
+    def test_el_proyecto_termina_si_la_integracion_no_encuentra_nada_que_cambiar(self):
+        base = _PRB_GuionPartible(rotas=())
+
+        def guion(mensajes, kw):
+            if MockLLM.rol_de(mensajes) == "juez":
+                if "CONTRATO" in MockLLM.ultimo_usuario(mensajes):
+                    return '{"criterios": ["utilidades y app"]}'
+                return '{"cumple": false, "faltantes": ["no se ve que cumpla el pedido"], "confianza": "high"}'
+            return base(mensajes, kw)
+        ws = self.proyecto({})
+        ui = self.ui()
+        ajustes = self.ajustes(tests_primero=False, torneo=False, escalar=False, max_revisiones=0, qa=False,
+                               max_reparaciones=1, juez=True, juez_max_intervenciones=1, git_snapshots=False,
+                               forense=False)
+        grande = ConstructorGrande(MockLLM(guion), ws, ajustes, ui)
+        grande.consultar_cuenta = lambda: None
+        grande.dormir = lambda s: self.fail(f"no debía esperar {s}s")
+        self.assertTrue(grande.iniciar(TestRobustoGrandeSeRecupera.PEDIDO, confirmar=False), ui.texto_registrado()[-3000:])
+        estado = grande.leer()
+        self.assertEqual(estado["estado"], "terminado")                # antes: "integración pendiente" para siempre
+        self.assertIn("no se ve que cumpla", estado["integracion"]["aviso_juez"])
+        self.assertTrue(all(e["estado"] in ("verificada", "validada") for e in estado["maestro"]["etapas"]))

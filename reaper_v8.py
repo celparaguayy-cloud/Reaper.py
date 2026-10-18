@@ -54537,6 +54537,31 @@ class TestCognitivoProsa(BaseTest):
         self.assertEqual(agente.ejecutar("Escribí calc.py").motivo, "sin_herramientas")
 
 
+class TestCognitivoIntegracionConJuezTerco(BaseTest):
+    def test_el_proyecto_termina_si_la_integracion_no_encuentra_nada_que_cambiar(self):
+        base = _PRB_GuionPartible(rotas=())
+
+        def guion(mensajes, kw):
+            if MockLLM.rol_de(mensajes) == "juez":
+                if "CONTRATO" in MockLLM.ultimo_usuario(mensajes):
+                    return '{"criterios": ["utilidades y app"]}'
+                return '{"cumple": false, "faltantes": ["no se ve que cumpla el pedido"], "confianza": "high"}'
+            return base(mensajes, kw)
+        ws = self.proyecto({})
+        ui = self.ui()
+        ajustes = self.ajustes(tests_primero=False, torneo=False, escalar=False, max_revisiones=0, qa=False,
+                               max_reparaciones=1, juez=True, juez_max_intervenciones=1, git_snapshots=False,
+                               forense=False)
+        grande = ConstructorGrande(MockLLM(guion), ws, ajustes, ui)
+        grande.consultar_cuenta = lambda: None
+        grande.dormir = lambda s: self.fail(f"no debía esperar {s}s")
+        self.assertTrue(grande.iniciar(TestRobustoGrandeSeRecupera.PEDIDO, confirmar=False), ui.texto_registrado()[-3000:])
+        estado = grande.leer()
+        self.assertEqual(estado["estado"], "terminado")                # antes: "integración pendiente" para siempre
+        self.assertIn("no se ve que cumpla", estado["integracion"]["aviso_juez"])
+        self.assertTrue(all(e["estado"] in ("verificada", "validada") for e in estado["maestro"]["etapas"]))
+
+
 # ======================================================================
 # MÓDULO: autotest_runner
 # ======================================================================
@@ -61958,13 +61983,23 @@ class ConstructorGrande:
                 + "\n".join(f"- {f}" for f in faltas[:8])
                 + (f"\n\nDiagnóstico real:\n{recortar(resultado['diagnostico'], 2500)}" if resultado["diagnostico"] else "")
                 + f"\n\nPEDIDO ORIGINAL DEL USUARIO:\n{recortar(pedido, 2500)}")
+            huella = self.ws.huella()
             try:
                 informe = self._construir_build(pedido_integracion, False, pedido)
             except LLMError as e:
                 informe = InformeBuild("fallida", diagnostico=str(e))
             if informe.estado == "cancelada":
                 self.ui.aviso("  La build de integración no arrancó (otro /construir pendiente o plan inválido).")
+            sin_cambios = informe.estado != "cancelada" and self.ws.huella() == huella
             resultado = self._verificar_integracion(estado, maestro)
+            if not resultado["ok"] and sin_cambios and resultado["verificacion_ok"] and not resultado["determinista"]:
+                # El juez (modelo) insiste, pero la build de integración no encontró NADA que cambiar y la
+                # verificación real del proyecto entero está en verde: su veto no es accionable (simulador, juez
+                # terco: 5/5 etapas verificadas y el proyecto quedaba "integración pendiente" para siempre).
+                self.ui.aviso("  Juez · insiste en que falta algo, pero la integración no encontró nada que cambiar y "
+                              "la verificación real del proyecto entero está en verde: lo dejo como aviso.")
+                estado["integracion"]["aviso_juez"] = "; ".join(resultado["faltantes"][:3])
+                resultado = dict(resultado, ok=True, estado=resultado["estado_real"])
         estado["integracion"].update({k: resultado[k] for k in ("ok", "estado", "faltantes", "juicio")})
         estado["estado"] = "terminado" if resultado["ok"] else "integracion_pendiente"
         if resultado["ok"]:
@@ -61990,14 +62025,16 @@ class ConstructorGrande:
                     [c for e in maestro.etapas for c in e.criterios][:20],
                     interfaz="\n".join(e.interfaz for e in maestro.etapas if e.interfaz))
         informe = InformeBuild("fallida", plan=plan, cid=cid)
-        informe.estado = estado_final_build(verif, informe)
+        informe.estado = estado_real = estado_final_build(verif, informe)
         informe.criterios_entrega = orq._contrato_de_entrega(estado["pedido"])
         orq._juicio_de_entrega(estado["pedido"], plan, verif, informe)
         juicio = informe.juicio
         faltantes = list(juicio.faltantes) if juicio is not None and juicio.valido and not juicio.cumple else []
         return {"ok": informe.ok, "estado": informe.estado, "faltantes": faltantes,
                 "diagnostico": verif.diagnostico if not verif.ok else "",
-                "juicio": juicio.texto() if juicio is not None else "sin veredicto del juez"}
+                "juicio": juicio.texto() if juicio is not None else "sin veredicto del juez",
+                "verificacion_ok": verif.ok, "estado_real": estado_real,
+                "determinista": bool(juicio is not None and juicio.determinista)}
 
     # ------------------------------------------------------------ salida
     def _cierre(self, estado: dict, maestro: PlanMaestro, segundos: float) -> None:
