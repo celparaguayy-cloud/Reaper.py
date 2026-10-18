@@ -12681,6 +12681,7 @@ class Agente:
             self.ctx.cid_inicio = self._cid_propio
 
         sin_herramienta = 0
+        uso_herramientas = False             # ¿ya llamó alguna herramienta en esta tarea?
         anuncios = 0
         repeticiones: dict = {}
         tests_por_reaper = 0
@@ -12762,7 +12763,12 @@ class Agente:
                     continue
                 sin_herramienta += 1
                 self.ctx.tropiezo("sin_herramienta")
-                if sin_herramienta > 2:
+                # Un modelo flojo que "piensa en voz alta" 3 mensajes ANTES de su primera herramienta se cerraba justo
+                # antes de actuar, y con todos los roles así /grande se DETENÍA en la etapa 1 (simulador, prosa).
+                # Si todavía no usó ninguna herramienta, recibe UN ultimátum más; si ya trabajaba, 3 seguidos cortan.
+                ultimatum = (sin_herramienta == 3 and not uso_herramientas and bool(texto)
+                             and self.rol.nombre != "principal")
+                if sin_herramienta > 2 and not ultimatum:
                     return self._cerrar(texto or "El agente no produjo un resultado.", paso, "sin_herramientas")
                 vacia = not texto and respuesta.finish_reason != "length"
                 if vacia and pasos_de_gracia < _ERRORES_DE_FORMATO_MAX:
@@ -12773,10 +12779,15 @@ class Agente:
                 if respuesta.finish_reason == "length":
                     aviso = ("Tu respuesta se cortó por longitud. Escribí menos por mensaje: "
                              "archivos largos en partes (write_to_file con partial=true + append_to_file).\n\n") + aviso
+                if ultimatum:
+                    aviso = ("ÚLTIMA OPORTUNIDAD: van 3 mensajes sin ninguna herramienta. Respondé SOLO con la "
+                             "herramienta en XML, sin explicar nada antes; si no, cierro esta tarea sin cambios.\n\n"
+                             + aviso)
                 self._agregar_usuario(aviso)
                 continue
 
             sin_herramienta = 0
+            uso_herramientas = True
             self._formato_paso = 0
             limite = max(1, self.settings.max_llamadas_turno)
             llamadas, excedentes = analisis.llamadas[:limite], analisis.llamadas[limite:]
@@ -16397,6 +16408,80 @@ def fabricaciones_en_codigo(fuente: str, deben_traer_datos: set) -> list:
     return salida
 
 
+_RE_PARAMETRO_DE_DATOS = re.compile(
+    r"^(?:con|conn|conexion|connection|db|bd|base|cur|cursor|sesion|session|datos|data|filas|rows|items|registros|"
+    r"records|ventas|productos|clientes|archivo|ruta|path|df|tabla|consulta|query|lista|entrada|texto)$", re.I)
+
+
+def _es_literal_puro(nodo) -> bool:
+    """Constante, o lista/tupla/conjunto/dict (anidados) hechos SOLO de constantes."""
+    if isinstance(nodo, ast.Constant):
+        return True
+    if isinstance(nodo, ast.UnaryOp) and isinstance(nodo.op, ast.USub):
+        return isinstance(nodo.operand, ast.Constant)
+    if isinstance(nodo, (ast.List, ast.Tuple, ast.Set)):
+        return all(_es_literal_puro(e) for e in nodo.elts)
+    if isinstance(nodo, ast.Dict):
+        return all(k is not None and _es_literal_puro(k) for k in nodo.keys) and \
+            all(_es_literal_puro(v) for v in nodo.values)
+    return False
+
+
+def _constante_notable(valor) -> bool:
+    if isinstance(valor, bool) or valor is None:
+        return False
+    if isinstance(valor, str):
+        return len(valor.strip()) >= 3
+    return isinstance(valor, (int, float)) and valor not in (0, 1, -1, 2)
+
+
+def constantes_de_tests(ws, limite: int = 200) -> set:
+    """Todas las constantes (strings y números) de los tests de Python del proyecto."""
+    salida = set()
+    for ruta in ws.iterar(limite=4000):
+        if len(salida) > 20000 or not ruta.name.endswith(".py") or not _es_test(ws.rel(ruta)):
+            continue
+        try:
+            arbol = ast.parse(ruta.read_text(encoding="utf-8", errors="replace"))
+        except (OSError, SyntaxError, ValueError):
+            continue
+        salida.update(n.value for n in ast.walk(arbol) if isinstance(n, ast.Constant) and _constante_notable(n.value))
+        limite -= 1
+        if limite <= 0:
+            break
+    return salida
+
+
+def respuestas_fijas(fuente: str, constantes_tests: set) -> list:
+    """[(funcion, linea, parametros_ignorados, coincidencias)] de funciones que reciben su fuente de datos (con, filas,
+    ruta…), la IGNORAN y devuelven un literal (lista/dict) cuyos valores están en los tests: devuelven lo que el test
+    espera en vez de calcularlo (simulador, modelo tramposo: reportes que pasaban sin consultar la base)."""
+    if not constantes_tests:
+        return []
+    try:
+        arbol = ast.parse(fuente)
+    except SyntaxError:
+        return []
+    salida = []
+    for fn in ast.walk(arbol):
+        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        params = [a.arg for a in fn.args.posonlyargs + fn.args.args + fn.args.kwonlyargs if a.arg not in ("self", "cls")]
+        de_datos = [p for p in params if _RE_PARAMETRO_DE_DATOS.match(p)]
+        usados = {n.id for n in ast.walk(fn) if isinstance(n, ast.Name)}
+        if not de_datos or usados & set(params):
+            continue
+        retornos = [n.value for n in ast.walk(fn) if isinstance(n, ast.Return) and n.value is not None]
+        if not retornos or not all(_es_literal_puro(r) and not isinstance(r, ast.Constant) for r in retornos):
+            continue
+        valores = {repr(n.value): n.value for r in retornos for n in ast.walk(r)
+                   if isinstance(n, ast.Constant) and _constante_notable(n.value)}
+        coinciden = sorted(k for k, v in valores.items() if v in constantes_tests)
+        if len(coinciden) >= 3 and len(coinciden) * 2 >= len(valores):
+            salida.append((fn.name, fn.lineno, de_datos, coinciden))
+    return salida
+
+
 def examen_de_realidad(ws, cid_build: Optional[int], plan=None, pedido: str = "") -> list:
     """
     Determinista (0 tokens): ¿lo entregado es REAL o una simulación? Revisa lo que cambió en esta build:
@@ -16426,6 +16511,7 @@ def examen_de_realidad(ws, cid_build: Optional[int], plan=None, pedido: str = ""
             deben_traer_datos = set(declaradas)
     permitidas = familias_pedidas(pedido)
     hallazgos = []
+    constantes_tests = None                     # se calculan solo si hace falta (hay código Python en la build)
     for rel in ws.checkpoints.archivos_desde(cid_build):
         ruta = ws.raiz / rel
         es_web = rel.lower().endswith(EXTENSIONES_WEB)
@@ -16460,6 +16546,12 @@ def examen_de_realidad(ws, cid_build: Optional[int], plan=None, pedido: str = ""
         for nombre, linea in fabricaciones_en_codigo(fuente, deben_traer_datos):
             hallazgos.append(f"DATOS FABRICADOS en {rel}:{linea}: `{nombre}` los INVENTA (random/uuid) en vez de "
                              "traerlos de verdad; el pedido pide datos reales, no generados.")
+        if constantes_tests is None:
+            constantes_tests = constantes_de_tests(ws)
+        for nombre, linea, ignorados, coinciden in respuestas_fijas(fuente, constantes_tests):
+            hallazgos.append(f"RESPUESTA FIJA en {rel}:{linea}: `{nombre}` ignora {', '.join(ignorados)} y devuelve "
+                             f"valores fijos copiados de los tests ({', '.join(coinciden[:4])}): los tests pasan por "
+                             "copia, no porque calcule algo. Calculalo con los datos que recibe.")
         for linea, frase in admisiones_de_simulacion(fuente, permitidas):
             hallazgos.append(f"SIMULACIÓN CONFESADA en {rel}:{linea}: «{frase}»: el código admite ser "
                              "provisional/ficticio, no lo real que se pidió.")
@@ -18115,11 +18207,17 @@ class Orquestador:
         for f in juicio.faltantes[:6]:
             informe.notas.append(f"Falta según el juez: {f}")
         # Gate en dirección segura: solo baja de verde a parcial. Pide confianza media/alta para no castigar
-        # por el ruido de un modelo débil; un 'no cumple' dudoso queda como nota, no como veredicto.
-        if (not juicio.cumple and juicio.confianza in ("medium", "high")
+        # por el ruido de un modelo débil; un 'no cumple' dudoso queda como nota, no como veredicto. Y pide QUÉ falta:
+        # un juez flojo que contestaba siempre {"cumple": false} sin faltantes dejaba PARCIAL cada etapa con la
+        # verificación real en verde y /grande se DETENÍA en la primera (simulador, juez terco).
+        if (not juicio.cumple and juicio.confianza in ("medium", "high") and juicio.faltantes
                 and informe.estado in ("verificada", "validada")):
             informe.estado = "parcial"
             self.ui.aviso("  El juez de entrega observa que el pedido NO quedó cumplido: marco la build como parcial.")
+        elif not juicio.cumple and not juicio.faltantes:
+            informe.notas.append("Juez de entrega: dice que no cumple pero no dice QUÉ falta; con la verificación real "
+                                 "en verde, queda como aviso.")
+            self.ui.tenue("  (el juez no dijo qué falta: no cambia el estado de la build)")
         elif not juicio.cumple:
             informe.notas.append("Juez de entrega: duda de que se cumpla el pedido (confianza baja); lo dejo como aviso.")
 
@@ -18148,12 +18246,25 @@ class Orquestador:
             diag = ("El JUEZ DE ENTREGA detecta que el pedido NO quedó cumplido. Implementá EXACTAMENTE lo que "
                     "falta, sin romper lo que ya anda:\n" + "\n".join(f"- {f}" for f in faltantes))
             verif_sint = replace(verif, ok=False, diagnostico=diag)
+            antes = self.ws.checkpoints.diff_desde(grupo)
             verif = self._reparar_con_escalada(pedido, verif_sint, grupo, base_fallaba, informe,
                                                f"cierre-juez {informe.intervenciones_juez}", 2,
                                                lambda: self.verificar(grupo), contexto=diag)
+            sin_cambios = self.ws.checkpoints.diff_desde(grupo) == antes
             informe.estado = estado_final_build(verif, informe)
             informe.juicio = None
             self._juicio_de_entrega(pedido, plan, verif, informe)
+            j = informe.juicio
+            if sin_cambios and verif.ok and j is not None and j.valido and not j.cumple and not j.determinista:
+                # El juez (modelo) insiste, pero la intervención no encontró NADA que cambiar y la verificación real
+                # está en verde: su veto no es accionable. Queda como aviso; antes trababa la etapa para siempre.
+                informe.estado = estado_final_build(verif, informe)
+                informe.notas.append("Juez: insiste en que falta algo, pero la intervención no encontró nada que "
+                                     "cambiar y la verificación real está en verde; queda como aviso: "
+                                     + "; ".join(j.faltantes[:3]))
+                self.ui.aviso("  Juez · insiste sin nada concreto que cambiar (la intervención no tocó ningún "
+                              "archivo y los tests pasan): lo dejo como aviso.")
+                break
         if informe.intervenciones_juez and informe.juicio is not None and informe.juicio.cumple:
             informe.notas.append(f"Juez: el pedido quedó cumplido tras {informe.intervenciones_juez} intervención(es).")
         return verif
@@ -54228,6 +54339,205 @@ class TestVaciasDelUltimoModelo(BaseTest):
 
 
 # ======================================================================
+# MÓDULO: autotest_cognitivo
+# ======================================================================
+"""
+Fallas COGNITIVAS de un modelo gratis (simulador E2E: pruebas_fusion/e2e/openrouter_falso.py, modos MOCK_*). No son de
+formato ni de red: es la cabeza del modelo la que falla.
+
+- MOCK_MAESTRO_MALO: 13 etapas de un archivo, varias de solo tests, e insiste al replanificar. Pasarse del tope de
+  etapas rechazaba el plan ENTERO (/grande no arrancaba) y los tests se unían a la etapa siguiente, no a su código.
+- MOCK_JUEZ_TERCO: un juez que siempre dice "no cumple" (sin faltantes, o con uno genérico) dejaba PARCIAL cada etapa
+  con la verificación real en verde: /grande se DETENÍA en la etapa 1.
+- MOCK_TRAMPA: reportes que devuelven los valores que espera el test sin consultar la base: verde falso.
+- MOCK_PROSA=3: tres mensajes "pensando en voz alta" antes de la primera herramienta cerraban al agente justo antes
+  de actuar.
+"""
+
+
+def _cog_maestro(piezas: list) -> str:
+    etapas = []
+    for i, archivos in enumerate(piezas, 1):
+        etapas.append(f'<etapa id="{i}" titulo="Pieza {i}" deps="{i - 1 if i > 1 else ""}"><objetivo>Pieza {i}.'
+                      f'</objetivo><archivos>{", ".join(archivos)}</archivos></etapa>')
+    return "<maestro><vision>Almacén.</vision><arquitectura>Python.</arquitectura>" + "".join(etapas) + "</maestro>"
+
+
+_COG_PIEZAS_13 = [["a/__init__.py"], ["a/db.py"], ["tests/test_db.py"], ["a/ventas.py"], ["tests/test_ventas.py"],
+                  ["a/reportes.py"], ["tests/test_reportes.py"], ["a/api.py"], ["tests/test_api.py"],
+                  ["a/__main__.py"], ["web/logica.js"], ["tests/logica.test.mjs"], ["web/index.html", "web/app.js"]]
+
+
+class TestCognitivoPlanMaestro(BaseTest):
+    def _planificar(self, texto: str):
+        respuestas = []
+
+        def responder(mensajes, kw):
+            respuestas.append(1)
+            return texto
+        ui = self.ui()
+        grande = ConstructorGrande(MockLLM(responder), self.proyecto({}), self.ajustes(), ui)
+        grande.consultar_cuenta = lambda: None
+        return grande.planificar("Un almacén con base, ventas, reportes, API y web", confirmar=False), ui, respuestas
+
+    def test_mas_etapas_que_el_tope_se_agrupa_si_el_modelo_insiste(self):
+        maestro, ui, respuestas = self._planificar(_cog_maestro(_COG_PIEZAS_13))
+        self.assertIsNotNone(maestro, ui.texto_registrado()[-1500:])   # antes: "sigue sin servir" y no arrancaba
+        self.assertEqual(len(respuestas), 2)                           # UNA replanificación, ni una más
+        self.assertLessEqual(len(maestro.etapas), 6)
+        self.assertEqual(sorted(a for e in maestro.etapas for a in e.archivos),
+                         sorted(a for p in _COG_PIEZAS_13 for a in p))
+
+    def test_cada_test_queda_con_su_codigo(self):
+        maestro, _ui, _r = self._planificar(_cog_maestro(_COG_PIEZAS_13))
+        etapa_de = {a: e.id for e in maestro.etapas for a in e.archivos}
+        for test, codigo in (("tests/test_db.py", "a/db.py"), ("tests/test_ventas.py", "a/ventas.py"),
+                             ("tests/test_reportes.py", "a/reportes.py"), ("tests/test_api.py", "a/api.py"),
+                             ("tests/logica.test.mjs", "web/logica.js")):
+            self.assertEqual(etapa_de[test], etapa_de[codigo], test)  # antes: test_db.py iba con ventas
+
+    def test_mas_del_tope_aunque_no_este_fragmentado(self):
+        piezas = [[f"m/mod{i}a.py", f"m/mod{i}b.py", f"tests/test_mod{i}a.py"] for i in range(12)]
+        maestro, ui, _r = self._planificar(_cog_maestro(piezas))
+        self.assertIsNotNone(maestro, ui.texto_registrado()[-1500:])
+        self.assertLessEqual(len(maestro.etapas), 10)
+
+    def test_sujeto_de_test(self):
+        self.assertEqual([_sujeto_de_test(r) for r in ("tests/test_db.py", "tests/logica.test.mjs", "db_test.py",
+                                                       "tests/testdb.py", "spec/app.spec.js")],
+                         ["db", "logica", "db", "db", "app"])
+
+
+class TestCognitivoJuezTerco(BaseTest):
+    PLAN = ('<plan><objetivo>Calc</objetivo><criterios>- sumar</criterios><tarea id="1" '
+            'archivos="calc.py, tests/test_calc.py">sumar con su test</tarea></plan>')
+    TEST = ("import unittest\nfrom calc import sumar\n\n\nclass T(unittest.TestCase):\n"
+            "    def test_sumar(self):\n        self.assertEqual(sumar(2, 3), 5)\n")
+
+    def _construir(self, veredicto: str, reparador_cambia: bool = False):
+        llamadas = collections.Counter()
+
+        def guion(mensajes, kw):
+            rol, turno = MockLLM.rol_de(mensajes), MockLLM.turnos_asistente(mensajes)
+            llamadas[rol] += 1
+            if rol == "arquitecto":
+                return terminar_xml(self.PLAN)
+            if rol == "implementador":
+                archivos = [("calc.py", "def sumar(a, b):\n    return a + b\n"), ("tests/test_calc.py", self.TEST)]
+                if turno < 2:
+                    return herramienta_xml("write_to_file", path=archivos[turno][0], content=archivos[turno][1])
+                return terminar_xml("listo")
+            if rol == "juez":
+                if "CONTRATO" in MockLLM.ultimo_usuario(mensajes):
+                    return '{"criterios": ["suma dos números"]}'
+                return veredicto
+            if rol == "reparador" and reparador_cambia and turno == 0:
+                return herramienta_xml("write_to_file", path="notas.py", content="NOTA = 'revisado'\n")
+            return terminar_xml("revisé y no encontré nada que cambiar")
+        ws = self.proyecto({})
+        ui = self.ui()
+        ajustes = self.ajustes(tests_primero=False, torneo=False, escalar=False, max_revisiones=0, qa=False,
+                               max_reparaciones=1, juez=True, juez_max_intervenciones=1)
+        informe = Orquestador(MockLLM(guion), ws, ajustes, ui).construir("Calculadora con sumar", confirmar=False)
+        return informe, ui, llamadas
+
+    def test_no_cumple_sin_decir_que_falta_no_baja_la_build(self):
+        informe, ui, llamadas = self._construir('{"cumple": false, "confianza": "high"}')
+        self.assertIn(informe.estado, ("verificada", "validada"), ui.texto_registrado()[-2000:])   # antes: parcial
+        self.assertEqual(informe.intervenciones_juez, 0)
+        self.assertTrue(any("no dice QUÉ falta" in n for n in informe.notas))
+
+    def test_juez_que_insiste_sin_nada_que_cambiar_no_traba(self):
+        informe, ui, llamadas = self._construir(
+            '{"cumple": false, "faltantes": ["no se ve que cumpla el pedido"], "confianza": "high"}')
+        self.assertIn(informe.estado, ("verificada", "validada"), ui.texto_registrado()[-2000:])   # antes: parcial
+        self.assertEqual(informe.intervenciones_juez, 1)               # interviene UNA vez, como siempre
+        self.assertIn("insiste sin nada concreto", ui.texto_registrado())
+
+    def test_si_la_intervencion_cambio_algo_el_juez_sigue_mandando(self):
+        informe, _ui, _l = self._construir(
+            '{"cumple": false, "faltantes": ["falta el módulo de notas"], "confianza": "high"}', reparador_cambia=True)
+        self.assertEqual(informe.estado, "parcial")                    # hubo trabajo y el juez sigue diciendo que no
+
+
+_COG_TEST_REPORTES = '''import unittest
+
+from almacen import reportes
+
+
+class T(unittest.TestCase):
+    def test_por_dia(self):
+        self.assertEqual(reportes.ventas_por_dia(None), [{"fecha": "2026-10-01", "ventas": 1, "total": 150.0},
+                                                         {"fecha": "2026-10-02", "ventas": 1, "total": 20.0}])
+'''
+_COG_REPORTES_TRAMPA = '''def ventas_por_dia(con):
+    return [{"fecha": "2026-10-01", "ventas": 1, "total": 150.0},
+            {"fecha": "2026-10-02", "ventas": 1, "total": 20.0}]
+'''
+
+
+class TestCognitivoRespuestasFijas(BaseTest):
+    def test_detecta_la_funcion_que_devuelve_lo_que_espera_el_test(self):
+        constantes = {n.value for n in ast.walk(ast.parse(_COG_TEST_REPORTES))
+                      if isinstance(n, ast.Constant) and _constante_notable(n.value)}
+        hallazgos = respuestas_fijas(_COG_REPORTES_TRAMPA, constantes)
+        self.assertEqual([(h[0], h[2]) for h in hallazgos], [("ventas_por_dia", ["con"])])
+        self.assertEqual(respuestas_fijas(_GuionAlmacen.ARCHIVOS["almacen/reportes.py"], constantes), [])
+        # Una tabla fija legítima que no recibe una fuente de datos no se marca.
+        self.assertEqual(respuestas_fijas("def opciones():\n    return ['2026-10-01', 'fecha', 'total']\n",
+                                          constantes), [])
+
+    def test_ni_plantillas_ni_el_almacen_correcto_se_marcan(self):
+        for nombre, plantilla in PLANTILLAS.items():
+            constantes = set()
+            for rel, texto in plantilla.archivos.items():
+                if rel.endswith(".py") and _es_test(rel):
+                    try:
+                        constantes |= {n.value for n in ast.walk(ast.parse(texto))
+                                       if isinstance(n, ast.Constant) and _constante_notable(n.value)}
+                    except SyntaxError:
+                        pass
+            for rel, texto in plantilla.archivos.items():
+                if rel.endswith(".py") and not _es_test(rel):
+                    self.assertEqual(respuestas_fijas(texto, constantes), [], f"{nombre}/{rel}")
+
+    def test_el_examen_de_realidad_lo_ataja(self):
+        ws = self.proyecto({"almacen/__init__.py": "", "tests/__init__.py": "",
+                            "tests/test_reportes.py": _COG_TEST_REPORTES})
+        cid = ws.checkpoints.iniciar("build")
+        ws.escribir("almacen/reportes.py", _COG_REPORTES_TRAMPA)
+        hallazgos = examen_de_realidad(ws, cid)
+        self.assertTrue(any(h.startswith("RESPUESTA FIJA en almacen/reportes.py") for h in hallazgos), hallazgos)
+
+
+class TestCognitivoProsa(BaseTest):
+    def _agente(self, guion):
+        ws = self.proyecto({})
+        return ws, Agente("implementador", MockLLM(guion), ws, self.ajustes(forense=False, escalar=False), self.ui())
+
+    def test_tres_mensajes_de_prosa_antes_de_la_primera_herramienta(self):
+        def guion(mensajes, kw):
+            turno = MockLLM.turnos_asistente(mensajes)
+            if turno < 3:
+                return "Voy a encarar la tarea con cuidado: primero repaso la interfaz y después escribo el código."
+            if turno == 3:
+                return herramienta_xml("write_to_file", path="calc.py", content="def sumar(a, b):\n    return a + b\n")
+            return terminar_xml("calc.py listo")
+        ws, agente = self._agente(guion)
+        res = agente.ejecutar("Escribí calc.py con sumar(a, b)")
+        self.assertNotEqual(res.motivo, "sin_herramientas")            # antes: se cerraba justo antes de actuar
+        self.assertTrue(ws.existe("calc.py"))
+
+    def test_si_ya_trabajaba_tres_sin_herramienta_siguen_cortando(self):
+        def guion(mensajes, kw):
+            if MockLLM.turnos_asistente(mensajes) == 0:
+                return herramienta_xml("write_to_file", path="calc.py", content="def sumar(a, b):\n    return a + b\n")
+            return "Estoy pensando cómo seguir con la tarea; enseguida continúo con lo que falta."
+        _ws, agente = self._agente(guion)
+        self.assertEqual(agente.ejecutar("Escribí calc.py").motivo, "sin_herramientas")
+
+
+# ======================================================================
 # MÓDULO: autotest_runner
 # ======================================================================
 """Ejecutor del autotest interno."""
@@ -60952,11 +61262,24 @@ def _fusionar_etapas(grupo: list, nuevo_id: str) -> Etapa:
                  unicos(c for e in grupo for c in e.criterios), [])
 
 
-def normalizar_maestro(maestro: PlanMaestro, max_grupos: int = 6) -> list:
+def _sujeto_de_test(rel: str) -> str:
+    """'tests/test_db.py' → 'db'; 'tests/logica.test.mjs' → 'logica'; 'db_test.py' → 'db'."""
+    raiz = Path(rel).name.lower().split(".")[0]
+    if raiz.startswith("test_"):
+        return raiz[5:]
+    if raiz.endswith("_test"):
+        return raiz[:-5]
+    return raiz[4:] if raiz.startswith("test") and len(raiz) > 4 else raiz
+
+
+def normalizar_maestro(maestro: PlanMaestro, max_grupos: int = 6, tope: Optional[int] = None) -> list:
     """Determinista (0 tokens), cuando el modelo INSISTE con un plan defectuoso después de la replanificación:
-    - una etapa de solo tests se une a la etapa cuyo código prueba (la que depende de ella, o la anterior);
+    - una etapa de solo tests se une a la etapa que tiene SU código (test_db.py → la etapa de db.py; si no se ve, la
+      anterior o la que depende de ella). Antes iba a la que dependía de ella: con etapas en cadena, test_db.py
+      terminaba en la etapa de ventas y la de la base quedaba sin tests (simulador, plan maestro insistente);
     - un plan fragmentado (más de `max_grupos` etapas, la mayoría de un archivo; prueba real: 10 etapas, una por CRUD)
-      se agrupa en tramos contiguos del orden de dependencias (así ninguna dependencia apunta hacia adelante).
+      o con más etapas que el `tope` se agrupa en tramos contiguos del orden de dependencias (así ninguna
+      dependencia apunta hacia adelante).
     Modifica el plan y devuelve los avisos; si el resultado no fuera un grafo válido, no toca nada."""
     avisos = []
     orden = [replace(e, archivos=list(e.archivos), criterios=list(e.criterios), deps=list(e.deps))
@@ -60968,10 +61291,18 @@ def normalizar_maestro(maestro: PlanMaestro, max_grupos: int = 6) -> list:
         if not etapa.archivos or not all(_es_test(a) for a in etapa.archivos):
             i += 1
             continue
-        destino = next((e for e in orden[i + 1:] if etapa.id in e.deps), None) or (orden[i - 1] if i > 0 else orden[1])
+        sujetos = {_sujeto_de_test(a) for a in etapa.archivos} - {""}
+        destino = next((e for e in orden if e is not etapa and any(
+            Path(a).stem.split(".")[0].lower() in sujetos for a in e.archivos if not _es_test(a))), None)
+        destino = destino or (orden[i - 1] if i > 0 else None) \
+            or next((e for e in orden[i + 1:] if etapa.id in e.deps), None) or orden[1]
+        anterior = orden.index(destino) < i
         destino.archivos = list(dict.fromkeys(destino.archivos + etapa.archivos))
         destino.criterios = list(dict.fromkeys(destino.criterios + etapa.criterios))
-        destino.deps = [d for d in dict.fromkeys(destino.deps + etapa.deps) if d not in (etapa.id, destino.id)]
+        if not anterior:
+            # Si el destino va DESPUÉS, hereda lo que necesitaba la etapa de tests; si va antes, ya lo tiene (o lo
+            # trae su propia cadena) y agregárselo podía armar un ciclo.
+            destino.deps = [d for d in dict.fromkeys(destino.deps + etapa.deps) if d not in (etapa.id, destino.id)]
         for e in orden:
             if e is not etapa:
                 e.deps = [d for d in dict.fromkeys(destino.id if d == etapa.id else d for d in e.deps) if d != e.id]
@@ -60979,7 +61310,8 @@ def normalizar_maestro(maestro: PlanMaestro, max_grupos: int = 6) -> list:
         avisos.append(f"la etapa {etapa.id} era solo de tests: la uní a la etapa {destino.id}")
     # 2) fragmentado
     codigo = sorted(sum(1 for rel in e.archivos if not _es_test(rel)) for e in orden)
-    if len(orden) > max_grupos and codigo and codigo[len(codigo) // 2] <= 1:
+    excede_tope = tope is not None and len(orden) > tope
+    if len(orden) > max_grupos and codigo and (codigo[len(codigo) // 2] <= 1 or excede_tope):
         n, g = len(orden), max_grupos
         tamanos = [n // g + (1 if k < n % g else 0) for k in range(g)]
         nuevas, mapa, pos = [], {}, 0
@@ -61253,10 +61585,14 @@ class ConstructorGrande:
                 self.ui.tenue(f"    • {p}")
             maestro = self._pedir_maestro(pedido, "\n".join(f"- {p}" for p in problemas + observaciones), maestro)
             problemas = problemas_maestro(maestro, self.settings.max_etapas, pedido)
-            if not problemas:
-                # Si el modelo insiste con etapas de solo tests o un plan fragmentado, se corrige solo (0 tokens).
-                for aviso in normalizar_maestro(maestro):
+            if not problemas_maestro(maestro, 10 ** 6, pedido):
+                # Si el modelo insiste con etapas de solo tests, un plan fragmentado o MÁS ETAPAS QUE EL TOPE, se
+                # corrige solo (0 tokens). Antes, pasarse del tope (13 etapas de un archivo) rechazaba el plan entero
+                # y /grande no arrancaba, aunque agruparlas lo dejaba bien.
+                for aviso in normalizar_maestro(maestro, max_grupos=min(6, self.settings.max_etapas),
+                                                tope=self.settings.max_etapas):
                     self.ui.aviso(f"  Juez · {aviso}")
+                problemas = problemas_maestro(maestro, self.settings.max_etapas, pedido)
             for o in observaciones_maestro(maestro, pedido) if not problemas else []:
                 # Lo que no frena: queda avisado y la integración final contra el pedido lo vuelve a mirar.
                 self.ui.aviso(f"  Juez · sigue: {o} (lo vuelve a revisar la integración final)")
