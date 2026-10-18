@@ -413,8 +413,61 @@ def requiere_busqueda_actual(tarea: str) -> bool:
 
 
 
+_RE_ETIQUETA_ABIERTA = re.compile(r"<\s*([A-Za-záéíóúñ_][\wáéíóúñ-]*)\s*>")
+_ETIQUETAS_NEUTRAS = {"tool_call", "tool_use", "function_call", "tool_calls", "function_calls", "invoke", "tool",
+                      "parameter", "label", "thinking", "think"}
+
+
+def _etiquetas_desconocidas(nombre: str, h, llamada) -> str:
+    """Las etiquetas que el modelo usó dentro de la llamada y que no son parámetros (ni alias) de esa herramienta:
+    un modelo flojo escribe <codigo_fuente>, <ruta_archivo>, <texto>… y solo veía "faltan content"."""
+    validos = {nombre.lower()} | _ETIQUETAS_NEUTRAS
+    for p in h.params:
+        validos.add(p.nombre.lower())
+        validos.update(a.lower() for a in ALIAS_PARAMS.get(p.nombre, ()))
+    extranas = []
+    for etiqueta in _RE_ETIQUETA_ABIERTA.findall(llamada.crudo or ""):
+        if etiqueta.lower() not in validos and etiqueta not in extranas:
+            extranas.append(etiqueta)
+    if not extranas:
+        return ""
+    return (f" No reconozco {', '.join(f'<{e}>' for e in extranas[:5])}: los parámetros de {nombre} son "
+            f"{', '.join(f'<{p.nombre}>' for p in h.params)}.")
+
+
 _RE_ANUNCIA_TESTS = re.compile(r"\b(?:ejecut|corr|cor[ré]|lanz|vuelv\w* a corr|run)\w*\s+(?:de nuevo\s+)?(?:los\s+|las\s+)?"
                                r"(?:tests?|pruebas?|run_tests)\b|\brun_tests\b", re.I)
+# "Voy a leer almacen/db.py…" / "Let me read app.py" sin la herramienta: el verbo de lectura y la ruta, cerca.
+_RE_ANUNCIA_LECTURA = re.compile(
+    r"\b(?:le(?:er|o|amos|yendo)|revis(?:ar|o|emos)|mir(?:ar|o|emos)|abr(?:ir|o)|inspeccion(?:ar|o)|examin(?:ar|o)|"
+    r"read(?:ing)?|open|look\s+at|inspect|examine)\b[^\n]{0,60}?(" + _RE_RUTA_ARCHIVO.pattern + ")", re.I)
+# "Listo, terminé." / "Implementación completada" sin attempt_completion ("listo para…", "terminé de leer…" no).
+_RE_ANUNCIA_FIN = re.compile(
+    r"\b(?:termin[ée]|he\s+terminado|listo|completad[oa]|complet[ée]|finalic[ée]|finalizad[oa]|"
+    r"(?:ya\s+)?(?:est[áa]|qued[óo])\s+(?:hecho|resuelto|implementado)|done|finished|completed)\b"
+    r"(?!\s+(?:para|de|to|with|reading)\b)", re.I)
+# "Completé la primera parte; falta la segunda" no es un cierre.
+_RE_FALTA_ALGO = re.compile(r"\b(?:falta\w*|pendiente\w*|todav[ií]a|a[úu]n\s+(?:no|falta|queda)|queda\w*\s+por|"
+                            r"(?:siguiente|pr[óo]ximo)\s+paso|remaining|still|next\s+step|primera\s+parte)\b", re.I)
+_ERRORES_DE_FORMATO_MAX = 3   # pasos extra por mensajes que solo tuvieron errores de formato (o llegaron vacíos)
+
+
+def _ruta_anunciada_para_leer(texto: str) -> Optional[str]:
+    cola = (texto or "")[-400:]
+    rutas = [m.group(1) for m in _RE_ANUNCIA_LECTURA.finditer(cola)]
+    if not rutas or rutas[-1].startswith("/"):
+        return None
+    return rutas[-1][2:] if rutas[-1].startswith("./") else rutas[-1]
+
+
+def _anuncia_fin(texto: str) -> bool:
+    cola = (texto or "")[-400:]
+    if _RE_FALTA_ALGO.search(cola):
+        return False
+    for m in _RE_ANUNCIA_FIN.finditer(cola):
+        if not _RE_NEGACION.search(cola[max(0, m.start() - 28):m.start()]):
+            return True
+    return False
 
 
 class Agente:
@@ -483,6 +536,7 @@ class Agente:
         self._evidencias: list[tuple[str, str, int]] = []  # (herramienta, ok|fallo|bloqueado|sin_tests, escrituras)
         self._reusos_seguidos = 0
         self._repetidas_seguidas = 0
+        self._formato_paso = 0                   # llamadas de este paso rechazadas por formato (no hicieron nada)
         self._ultima_salida_ok = ""
         self._bucles = RompedorDeBucles()        # v9 Fase 4: oscilación / machaque / error estancado
         self._prohibido: set = set()
@@ -572,9 +626,16 @@ class Agente:
         anuncios = 0
         repeticiones: dict = {}
         tests_por_reaper = 0
+        lecturas_por_reaper = 0
+        cierres_por_reaper = 0
+        # Pruebas reales con modelos gratis: 2–3 mensajes con el formato roto (o vacíos) se comían el límite de pasos
+        # antes de que el modelo hiciera algo útil. Esos pasos se devuelven, hasta _ERRORES_DE_FORMATO_MAX.
+        pasos_de_gracia = 0
         self._ultimo_texto = ""
 
-        for paso in range(1, self.max_pasos + 1):
+        paso = 0
+        while paso < self.max_pasos + pasos_de_gracia:
+            paso += 1
             if CANCELAR.is_set():
                 raise Cancelado()
             vencido = PLAZO.vencido()
@@ -611,11 +672,46 @@ class Agente:
                                           "La próxima vez escribí la herramienta en XML.\n\n" + obs)
                     sin_herramienta = 0
                     continue
+                normal = bool(texto) and respuesta.finish_reason != "length"
+                ruta_leer = _ruta_anunciada_para_leer(texto) \
+                    if normal and anuncia_accion(texto) and not self._aviso_pendiente else None
+                if ruta_leer and "read_file" in self.rol.herramientas and lecturas_por_reaper < 2 \
+                        and self._archivo_existente(ruta_leer):
+                    lecturas_por_reaper += 1
+                    # Igual que con los tests: "Voy a leer almacen/db.py" sin la herramienta. Lo lee REAPER (es
+                    # inofensivo) y le muestra cómo se escribe, en vez de gastar el paso en "no usaste herramientas".
+                    obs, _error = self._ejecutar_herramienta(Llamada("read_file", {"path": ruta_leer}, True, ""),
+                                                             repeticiones)
+                    self._agregar_usuario(f"Anunciaste que ibas a leer {ruta_leer} sin llamar read_file: lo leí yo. "
+                                          "La próxima vez escribí la herramienta así:\n"
+                                          f"<read_file>\n<path>{ruta_leer}</path>\n</read_file>\n\n" + obs)
+                    sin_herramienta = 0
+                    continue
+                if normal and _anuncia_fin(texto) and not anuncia_accion(texto) and not codigo_pegado(texto) \
+                        and self.ctx.cambios and cierres_por_reaper < 2 and self.rol.nombre != "principal" \
+                        and not self.rol.solo_lectura and "attempt_completion" in self.rol.herramientas:
+                    cierres_por_reaper += 1
+                    # "Listo, terminé." sin attempt_completion, con cambios hechos: se intenta el cierre con TODAS las
+                    # verificaciones de siempre (validación real, funciones vacías, evidencia). Si no pasa, el modelo
+                    # recibe el motivo concreto en vez del recordatorio genérico.
+                    aceptado, obs, ok_final = self._intentar_terminar(False, texto)
+                    if aceptado:
+                        nota = self._nota_afirmacion(texto)
+                        return self._cerrar(texto + nota, paso, "completado", ok=ok_final and not nota)
+                    self._agregar_usuario("Dijiste que terminaste pero no llamaste attempt_completion: intenté cerrar "
+                                          "por vos y todavía no se puede.\n\n" + obs)
+                    sin_herramienta = 0
+                    continue
                 sin_herramienta += 1
                 self.ctx.tropiezo("sin_herramienta")
                 if sin_herramienta > 2:
                     return self._cerrar(texto or "El agente no produjo un resultado.", paso, "sin_herramientas")
+                vacia = not texto and respuesta.finish_reason != "length"
+                if vacia and pasos_de_gracia < _ERRORES_DE_FORMATO_MAX:
+                    pasos_de_gracia += 1                    # un mensaje vacío no hizo nada: no cuenta como paso
                 aviso = self._aviso_sin_herramienta(texto)
+                if vacia:
+                    aviso = "Tu respuesta llegó VACÍA (ni texto ni herramienta): no se hizo nada.\n\n" + aviso
                 if respuesta.finish_reason == "length":
                     aviso = ("Tu respuesta se cortó por longitud. Escribí menos por mensaje: "
                              "archivos largos en partes (write_to_file con partial=true + append_to_file).\n\n") + aviso
@@ -623,6 +719,7 @@ class Agente:
                 continue
 
             sin_herramienta = 0
+            self._formato_paso = 0
             limite = max(1, self.settings.max_llamadas_turno)
             llamadas, excedentes = analisis.llamadas[:limite], analisis.llamadas[limite:]
             self._finish_actual = respuesta.finish_reason
@@ -667,6 +764,8 @@ class Agente:
 
             if final is not None:
                 return self._cerrar(final[0], paso, "completado", ok=final[1])
+            if self._formato_paso and self._formato_paso >= len(llamadas) and pasos_de_gracia < _ERRORES_DE_FORMATO_MAX:
+                pasos_de_gracia += 1        # el mensaje solo tuvo errores de formato (no hizo nada): se devuelve el paso
 
             if self._repetidas_seguidas >= 8:
                 # Prueba real: un implementador mandó read_file del MISMO archivo 60 veces seguidas (todas bloqueadas):
@@ -698,7 +797,7 @@ class Agente:
                 diagnostico = self._quizas_escalar(observaciones)
                 if diagnostico:
                     observaciones.append(diagnostico)
-            restantes = self.max_pasos - paso
+            restantes = self.max_pasos + pasos_de_gracia - paso
             if 0 < restantes <= 3:
                 observaciones.append(f"(Te quedan {restantes} pasos: cerrá pronto con attempt_completion.)")
             self._agregar_usuario("\n\n".join(observaciones))
@@ -707,7 +806,7 @@ class Agente:
             "Se alcanzó el límite de pasos sin terminar. Trabajo parcial: "
             + recortar(limpiar_texto_visible(self._ultimo_texto), 400)
             + "\nRevisá /diff y /tests. No se confirmó la finalización. Retomá con una tarea más pequeña.",
-            self.max_pasos,
+            paso,
             "max_pasos",
             ok=False,
         )
@@ -849,6 +948,11 @@ class Agente:
                 elif self.rol.solo_lectura:
                     pista = (" Tu rol es de SOLO LECTURA y no ejecuta comandos: los tests y validadores reales ya los "
                              "corrió REAPER (el resultado está en tu pedido). Revisá leyendo el código y respondé.")
+            parecida = difflib.get_close_matches(nombre, list(self.rol.herramientas), n=1, cutoff=0.6)
+            if parecida and not pista and REGISTRO.get(parecida[0]) is not None:
+                # Un modelo flojo escribe write_file, readfile, run_test…: decirle CUÁL es y cómo se escribe.
+                pista = f" ¿Quisiste decir {parecida[0]}? Se escribe así:\n{REGISTRO[parecida[0]].ejemplo}\n"
+            self._formato_paso += 1
             return obs(f"ERROR: '{nombre}' no existe o no está disponible para tu rol.{pista} "
                        f"Disponibles: {disponibles}"), True
         if not llamada.completa and self._finish_actual != "length" and llamada is self._ultima_llamada \
@@ -866,6 +970,7 @@ class Agente:
                 if espurio:
                     self.ui.resultado_herramienta(False, f"{nombre}: etiqueta de cierre inválida {espurio}")
                     self.ctx.tropiezo("xml_invalido")
+                    self._formato_paso += 1
                     return obs(
                         f"ERROR: la llamada a {nombre} terminó con la etiqueta {espurio}, que NO es un cierre válido "
                         f"(esperaba </{p.nombre}> y </{nombre}>). No modifiqué nada. Reenviá la llamada completa "
@@ -874,10 +979,14 @@ class Agente:
         if not llamada.completa:
             self.ui.resultado_herramienta(False, f"{nombre}: llamada incompleta")
             self.ctx.tropiezo("llamada_incompleta")
+            cierres = [f"</{p}>" for p in sorted(llamada.sin_cierre)] + [f"</{nombre}>"]
+            largo = any(p.largo for p in h.params)
+            self._formato_paso += 1
             return obs(
-                f"ERROR: la llamada a {nombre} quedó incompleta (falta la etiqueta de cierre o se cortó tu "
-                "respuesta). Si el archivo es largo, escribilo por partes: write_to_file con partial=true y "
-                "después append_to_file."
+                f"ERROR: la llamada a {nombre} quedó incompleta: falta cerrar con {' y '.join(cierres)} (o se cortó "
+                f"tu respuesta). No hice nada. Reenviala completa, así:\n{h.ejemplo}"
+                + ("\nSi el archivo es largo, escribilo por partes: write_to_file con partial=true y después "
+                   "append_to_file." if largo else "")
             ), True
 
         faltan = []
@@ -889,7 +998,9 @@ class Agente:
                 faltan.append(p.nombre)
         if faltan:
             self.ui.resultado_herramienta(False, f"{nombre}: faltan {', '.join(faltan)}")
-            return obs(f"ERROR: faltan parámetros: {', '.join(faltan)}. Uso correcto:\n{h.ejemplo}"), True
+            self._formato_paso += 1
+            return obs(f"ERROR: faltan parámetros: {', '.join(faltan)}.{_etiquetas_desconocidas(nombre, h, llamada)} "
+                       f"Uso correcto:\n{h.ejemplo}"), True
 
         prohibicion = self._prohibicion_para(nombre, h)
         if prohibicion:
@@ -1411,6 +1522,12 @@ class Agente:
             self._aviso_pendiente = rechazo_gate
             return None
         return self._cerrar(texto + self._nota_afirmacion(texto), paso, "respuesta")
+
+    def _archivo_existente(self, ruta: str) -> bool:
+        try:
+            return self.ws.ruta(ruta).is_file()
+        except (ErrorRuta, ValueError, OSError):
+            return False
 
     def _aviso_sin_herramienta(self, texto: str) -> str:
         pendiente = self._aviso_pendiente

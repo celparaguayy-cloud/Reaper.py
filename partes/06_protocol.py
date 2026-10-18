@@ -79,10 +79,14 @@ _CORTE_RESULTADO = re.compile(
 _FENCE = re.compile(r"\A\s*```[\w+#.-]*[ \t]*\r?\n(.*?)\r?\n?```\s*\Z", re.S)
 _CDATA = re.compile(r"\A\s*<!\[CDATA\[(.*)\]\]>\s*\Z", re.S)
 _RE_ATRIBUTO = re.compile(r"""([A-Za-z_][\w-]*)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>/]+))""")
+# <parameter name="path">…</parameter> (estilo Cline) y <parameter=path>…</parameter> (Llama/Nemotron/Qwen-coder).
 _RE_PARAMETER = re.compile(
-    r"<\s*parameter\s+name\s*=\s*[\"']?([A-Za-z_][\w-]*)[\"']?\s*>(.*?)(?:<\s*/\s*parameter\s*>|(?=<\s*parameter\b)|\Z)",
+    r"<\s*parameter\s*(?:\s+name\s*)?=\s*[\"']?([A-Za-z_][\w-]*)[\"']?\s*>(.*?)"
+    r"(?:<\s*/\s*parameter\s*>|(?=<\s*parameter\b)|(?=<\s*/\s*(?:function|invoke|tool)\s*>)|\Z)",
     re.S | re.I,
 )
+_RE_HAY_PARAMETER = re.compile(r"<\s*parameter\s*(?:\s+name\s*)?=", re.I)
+_RE_FIN_PARAMETER = re.compile(r"<\s*/\s*parameter\s*>\Z", re.I)
 
 
 @dataclass
@@ -166,13 +170,17 @@ def _extraer_params(cuerpo: str, definicion: list, abiertos: Optional[set] = Non
     completa = True
     enmascarado = cuerpo
 
-    # Estilo <parameter name="path">valor</parameter>.
-    if re.search(r"<\s*parameter\s+name\s*=", cuerpo, re.I):
+    # Estilo <parameter name="path">valor</parameter> o <parameter=path>valor</parameter>.
+    if _RE_HAY_PARAMETER.search(cuerpo):
         largos = {n for n, l in definicion if l}
         for m in _RE_PARAMETER.finditer(cuerpo):
             nombre = _canonico_param(m.group(1))
             valor = m.group(2)
             params[nombre] = limpiar_largo(valor) if nombre in largos else sin_comillas(valor)
+            if nombre in largos and m.end() == len(cuerpo) and not _RE_FIN_PARAMETER.search(m.group(0)):
+                completa = False                            # el archivo se cortó adentro de <parameter=content>
+                if abiertos is not None:
+                    abiertos.add(nombre)
         if params:
             return params, completa
 
@@ -221,27 +229,87 @@ def _extraer_params(cuerpo: str, definicion: list, abiertos: Optional[set] = Non
     return params, completa
 
 
+# Envoltorios de "tool calling" nativo que los modelos emiten cuando ignoran el formato XML de REAPER:
+# <tool_call>{json}</tool_call> (Qwen/Hermes/Nemotron), <tool_use>…</tool_use>, <function_call>…</function_call>.
+_RE_ENVOLTORIO_JSON = re.compile(
+    r"<\s*(tool_call|tool_use|function_call|tool_calls)\s*>(.*?)(?:<\s*/\s*\1\s*>|(?=<\s*\1\s*>)|\Z)", re.S | re.I)
+_RE_TOOL_CALLS_MISTRAL = re.compile(r"\[TOOL_CALLS\]\s*", re.I)
+_RE_FENCE_JSON = re.compile(r"```(?:json|JSON)?[ \t]*\r?\n([\[{].*?[\]}])\s*\r?\n?```", re.S)
+
+
+def _json_suelto(texto: str):
+    """json.loads tolerante: strict=False acepta saltos de línea CRUDOS dentro de los strings (los modelos escriben
+    así el código del archivo dentro de "content")."""
+    try:
+        return json.loads(texto, strict=False)
+    except (json.JSONDecodeError, ValueError):
+        return None
+
+
+def _json_desde(texto: str, inicio: int):
+    """El primer valor JSON que empieza en `inicio` (aunque después siga texto): (valor, fin) o (None, inicio)."""
+    try:
+        return json.JSONDecoder(strict=False).raw_decode(texto, inicio)
+    except (json.JSONDecodeError, ValueError):
+        return None, inicio
+
+
+def _aplanar_json(valor) -> list[dict]:
+    if isinstance(valor, dict):
+        return [valor]
+    if isinstance(valor, list):
+        return [v for v in valor if isinstance(v, dict)]
+    return []
+
+
 def _objetos_json(texto: str) -> list[dict]:
-    candidatos = re.findall(r"```(?:json)?\s*\n(\{.*?\})\s*\n```", texto, re.S)
+    """Objetos JSON que pueden ser llamadas: dentro de envoltorios nativos, después de [TOOL_CALLS] (Mistral), en
+    bloques ```json (objeto o lista) o el texto entero."""
+    objetos: list = []
+    for m in _RE_ENVOLTORIO_JSON.finditer(texto):
+        interior = m.group(2).strip()
+        if interior[:1] in ("[", "{"):
+            valor = _json_suelto(interior)
+            if valor is None:
+                valor, _fin = _json_desde(interior, 0)
+            objetos.extend(_aplanar_json(valor))
+    for m in _RE_TOOL_CALLS_MISTRAL.finditer(texto):
+        valor, _fin = _json_desde(texto, m.end())
+        objetos.extend(_aplanar_json(valor))
+    for interior in _RE_FENCE_JSON.findall(texto):
+        objetos.extend(_aplanar_json(_json_suelto(interior)))
     limpio = texto.strip()
-    if limpio.startswith("{") and limpio.endswith("}"):
-        candidatos.append(limpio)
-    objetos = []
-    for c in candidatos:
-        try:
-            obj = json.loads(c)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(obj, dict):
-            objetos.append(obj)
+    if not objetos and ((limpio.startswith("{") and limpio.endswith("}"))
+                        or (limpio.startswith("[") and limpio.endswith("]"))):
+        objetos.extend(_aplanar_json(_json_suelto(limpio)))
     return objetos
+
+
+_CLAVES_NOMBRE_JSON = ("tool", "name", "herramienta", "tool_name", "function_name")
+_CLAVES_ARGS_JSON = ("args", "arguments", "parameters", "params", "input", "tool_input", "argumentos")
+
+
+def _nombre_y_args_json(obj: dict) -> tuple:
+    """(nombre, args) de una llamada JSON en los dialectos comunes (REAPER, Hermes, Mistral, OpenAI), o (None, None)."""
+    fn = obj.get("function")
+    if isinstance(fn, dict):                                # OpenAI: {"type": "function", "function": {...}}
+        obj = fn
+    nombre = next((obj[k] for k in _CLAVES_NOMBRE_JSON if isinstance(obj.get(k), str)), None)
+    if nombre is None and isinstance(fn, str):
+        nombre = fn
+    if nombre is None:
+        return None, None
+    for clave in _CLAVES_ARGS_JSON:
+        if clave in obj:                                   # "arguments": {} es válido (antes se perdía por falsy)
+            return nombre, obj[clave]
+    excluir = set(_CLAVES_NOMBRE_JSON) | {"type", "function", "id", "index"}
+    return nombre, {k: v for k, v in obj.items() if k not in excluir}
 
 
 def _params_json(args) -> dict:
     if isinstance(args, str):
-        try:
-            args = json.loads(args)
-        except json.JSONDecodeError:
+        args = _json_suelto(args)
+        if args is None:
             return {}
     if not isinstance(args, dict):
         return {}
@@ -257,6 +325,49 @@ def _params_json(args) -> dict:
 
 
 _RE_FUNCION_LLAMA = re.compile(r"<\s*function\s*=\s*([A-Za-z_][\w-]*)\s*>(.*?)(?:<\s*/\s*function\s*>|\Z)", re.S | re.I)
+_RE_FIN_FUNCION_LLAMA = re.compile(r"<\s*/\s*function\s*>\Z", re.I)
+# "clave": "texto… — el último string puede no cerrar (respuesta cortada por longitud).
+_RE_TEXTO_JSON_CORTADO = re.compile(r'"([A-Za-z_][\w-]*)"\s*:\s*"((?:[^"\\]|\\.)*)("?)', re.S)
+_RE_INICIO_JSON_NATIVO = re.compile(r"<\s*(?:tool_call|tool_use|function_call)\s*>\s*(\{.*)\Z|\[TOOL_CALLS\]\s*\[?\s*(\{.*)\Z",
+                                    re.S | re.I)
+
+
+def _texto_json_parcial(crudo: str) -> str:
+    for recorte in range(0, 6):                             # un \u00e cortado a la mitad no se puede decodificar
+        try:
+            return json.loads('"' + crudo[:len(crudo) - recorte] + '"', strict=False)
+        except ValueError:
+            continue
+    return crudo
+
+
+def _json_cortado(texto: str) -> tuple[Optional[str], dict, set]:
+    """Una llamada JSON que se cortó por longitud ({"name": "write_to_file", "arguments": {"path": "a.py",
+    "content": "import os\\n…): (nombre, campos de texto, claves que quedaron abiertas). Sin esto, el JSON inválido
+    se perdía entero y el agente recibía "sin herramientas" en vez de poder continuar el archivo."""
+    campos: dict = {}
+    abiertos: set = set()
+    for m in _RE_TEXTO_JSON_CORTADO.finditer(texto):
+        clave = m.group(1)
+        campos[clave] = _texto_json_parcial(m.group(2))
+        if not m.group(3):
+            abiertos.add(clave)
+    nombre = next((campos.pop(k) for k in _CLAVES_NOMBRE_JSON if k in campos), None)
+    campos.pop("type", None)
+    return nombre, {_canonico_param(k): v for k, v in campos.items()}, {_canonico_param(k) for k in abiertos}
+
+
+def _llamada_json_cortada(nombre: Optional[str], params: dict, abiertos: set, crudo: str,
+                          esquemas: Esquemas, nombres: dict) -> Optional[Llamada]:
+    if not nombre:
+        return None
+    real = nombres.get(nombre.lower(), ALIAS_HERRAMIENTAS.get(nombre.lower(), nombre.lower()))
+    if real not in esquemas:
+        return None
+    largos = {p for p, largo in esquemas[real] if largo}
+    params = {k: v for k, v in params.items() if k not in abiertos or k in largos}   # una ruta cortada no sirve
+    # Sin strings abiertos el JSON es inválido por otra cosa (coma de más, cierre faltante): los valores están enteros.
+    return Llamada(real, params, not abiertos, crudo, frozenset(abiertos & largos))
 
 
 _TAGS_BUSCAR = ("search", "buscar", "find", "old", "old_str", "old_string", "original", "antes")
@@ -374,23 +485,53 @@ def analizar(texto: str, esquemas: Esquemas) -> Analisis:
             nombre = m.group(1).lower()
             real = nombres.get(nombre, ALIAS_HERRAMIENTAS.get(nombre, nombre))
             cuerpo = m.group(2).strip()
-            params = _params_json(cuerpo) if cuerpo.startswith("{") else _extraer_params(cuerpo, esquemas.get(real, []))[0]
-            llamadas.append(Llamada(real, params, True, m.group(0)))
+            # Sin </function> al final la respuesta pudo cortarse adentro del archivo: se marca incompleta para que
+            # el agente guarde lo parcial y pida seguir, en vez de escribir medio archivo como si estuviera entero.
+            cerrada = bool(_RE_FIN_FUNCION_LLAMA.search(m.group(0)))
+            abiertos_llama: set = set()
+            if cuerpo.startswith("{"):
+                params, completa = _params_json(cuerpo), True
+                if _json_suelto(cuerpo) is None and not cerrada:
+                    cortada = _llamada_json_cortada(real, *_json_cortado(cuerpo)[1:], m.group(0), esquemas, nombres)
+                    if cortada is not None:
+                        llamadas.append(cortada)
+                        continue
+            else:
+                params, completa = _extraer_params(cuerpo, esquemas.get(real, []), abiertos_llama)
+            llamadas.append(Llamada(real, params, completa or cerrada, m.group(0), frozenset(abiertos_llama)))
         if llamadas:
             fuera = [_RE_FUNCION_LLAMA.sub("", limpio)]
 
     if not llamadas:
+        # "Tool calling" nativo cuando el modelo ignora el XML: <tool_call>{json}</tool_call> (Qwen/Hermes/Nemotron),
+        # [TOOL_CALLS][...] (Mistral), {"type": "function", "function": {...}} (OpenAI), ```json [...]```.
         for obj in _objetos_json(limpio):
-            nombre = obj.get("tool") or obj.get("name") or obj.get("herramienta")
+            nombre, args = _nombre_y_args_json(obj)
             if not isinstance(nombre, str):
                 continue
-            args = obj.get("args") or obj.get("arguments") or obj.get("parameters") or obj.get("params")
-            if args is None or (not isinstance(args, (dict, str))):
-                args = {k: v for k, v in obj.items() if k not in ("tool", "name", "herramienta")}
-            real = ALIAS_HERRAMIENTAS.get(nombre.lower(), nombre.lower())
+            if not isinstance(args, (dict, str)):
+                args = {}
+            real = nombres.get(nombre.lower(), ALIAS_HERRAMIENTAS.get(nombre.lower(), nombre.lower()))
+            if real not in esquemas and not isinstance(obj.get("function"), dict) \
+                    and not any(clave in obj for clave in _CLAVES_ARGS_JSON):
+                continue                                    # {"name": "Juan", "edad": 3} son DATOS, no una llamada
             llamadas.append(Llamada(real, _params_json(args), True, json.dumps(obj, ensure_ascii=False)))
         if llamadas:
-            fuera = []
+            # Lo que el modelo escribió ALREDEDOR de las llamadas sigue siendo texto visible.
+            visible = _RE_FENCE_JSON.sub("", _RE_ENVOLTORIO_JSON.sub("", limpio))
+            corte = _RE_TOOL_CALLS_MISTRAL.search(visible)
+            visible = visible[:corte.start()] if corte else visible
+            fuera = [] if visible.strip()[:1] in ("[", "{") else [visible]
+
+    if not llamadas:
+        # <tool_call>{"name": "write_to_file", "arguments": {..., "content": "… y la respuesta se cortó por longitud.
+        inicio = _RE_INICIO_JSON_NATIVO.search(limpio)
+        crudo = (inicio.group(1) or inicio.group(2)) if inicio else ""
+        if crudo and _json_desde(crudo, 0)[0] is None:
+            cortada = _llamada_json_cortada(*_json_cortado(crudo), crudo, esquemas, nombres)
+            if cortada is not None:
+                llamadas.append(cortada)
+                fuera = [limpio[:inicio.start()]]
 
     if not llamadas:
         # Modelos entrenados con "tool calling" nativo a veces mandan SOLO los argumentos en JSON, sin el nombre
