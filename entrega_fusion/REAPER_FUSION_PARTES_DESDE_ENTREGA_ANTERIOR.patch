@@ -1683,7 +1683,7 @@ index 473dc36..bf7642d 100644
                      aplicados.append(c.rel)
              except (ErrorRuta, OSError):
 diff --git a/partes/10_validators.py b/partes/10_validators.py
-index b59a923..a6fa594 100644
+index b59a923..ee64ce8 100644
 --- a/partes/10_validators.py
 +++ b/partes/10_validators.py
 @@ -19,7 +19,12 @@ try:
@@ -1897,7 +1897,58 @@ index b59a923..a6fa594 100644
  
  
  # ==================================================================
-@@ -689,9 +785,44 @@ def _validar_python(ws: Workspace, ruta: Path, rel: str) -> list[Resultado]:
+@@ -615,6 +711,42 @@ def es_archivo_de_test(rel: str) -> bool:
+             or "/test/" in f"/{rel}") and rel.endswith(".py")
+ 
+ 
++_RE_SQL_LITERAL = re.compile(r"^\s*(?:SELECT|INSERT|UPDATE|DELETE|CREATE|REPLACE)\b", re.I)
++_RE_OBJETIVO_CONEXION = re.compile(r"(?:^|[._])(?:get_)?(?:connection|conexion|conn|connect|conectar|cursor|"
++                                   r"get_db|db_connection|sqlite3\.connect)$", re.I)
++
++
++def acoples_a_la_implementacion(texto: str) -> list[str]:
++    """Tests que prueban CÓMO está hecho el código y no QUÉ hace: afirman el SQL exacto o mockean la conexión a la
++    base del propio proyecto. Prueba real (teléfono): la especificación hacía patch('almacen.sales.get_connection') y
++    exigía "SELECT stock FROM products WHERE id = ?"; el implementador reusó db.get_product (razonable), el mock dejó
++    de aplicar y la etapa 2 murió en reparaciones."""
++    try:
++        arbol = ast.parse(texto)
++    except SyntaxError:
++        return []
++    hallazgos = []
++    for nodo in ast.walk(arbol):
++        if not isinstance(nodo, ast.Call):
++            continue
++        nombre = ast.unparse(nodo.func)
++        primero = nodo.args[0] if nodo.args else None
++        literal = primero.value if isinstance(primero, ast.Constant) and isinstance(primero.value, str) else ""
++        if nombre.endswith(("assert_called_with", "assert_called_once_with", "assert_any_call")) and \
++                _RE_SQL_LITERAL.match(literal):
++            hallazgos.append(f"línea {nodo.lineno}: afirma el SQL exacto ({recortar(literal, 50)}): cualquier consulta "
++                             "equivalente lo rompe; verificá el RESULTADO con una base sqlite real")
++        elif (nombre.endswith("patch") or nombre in ("mock.patch", "unittest.mock.patch")) and literal and \
++                _RE_OBJETIVO_CONEXION.search(literal):
++            hallazgos.append(f"línea {nodo.lineno}: mockea la conexión a la base ({literal}): usá una base sqlite REAL "
++                             "temporal (':memory:' o tempfile) con datos de prueba")
++    vistos = []
++    for h in hallazgos:
++        if h not in vistos:
++            vistos.append(h)
++    return vistos[:6]
++
++
+ def advertencias_tests_python(texto: str) -> list[str]:
+     """
+     Tests que un modelo chico suele escribir mal (se vio en Termux: cadenas de isinstance cada vez más largas):
+@@ -654,6 +786,7 @@ def advertencias_tests_python(texto: str) -> list[str]:
+             avisos.append(f"{donde}: usa input(); simulalo con unittest.mock.patch('builtins.input')")
+         if any(n.endswith(("urlopen", "requests.get", "requests.post", "http.client.HTTPConnection")) for n in nombres):
+             avisos.append(f"{donde}: hace pedidos de red reales; reemplazá la función con un mock")
++    avisos.extend(f"acoplado a la implementación, {h}" for h in acoples_a_la_implementacion(texto))
+     return avisos[:8]
+ 
+ 
+@@ -689,9 +822,44 @@ def _validar_python(ws: Workspace, ruta: Path, rel: str) -> list[Resultado]:
      rotos = imports_locales_rotos(ws, ruta, arbol)
      if rotos:
          resultados.append(Resultado(False, f"imports-locales {rel}", 1, stderr="\n".join(rotos), archivo=rel))
@@ -1942,7 +1993,7 @@ index b59a923..a6fa594 100644
  def pista_sintaxis_python(texto: str, error: SyntaxError) -> str:
      """Pistas concretas para los errores de sintaxis más comunes de un modelo chico."""
      msg = (error.msg or "").lower()
-@@ -819,28 +950,121 @@ _SCRIPT_HTML = re.compile(r"<script(?![^>]*\bsrc\s*=)([^>]*)>(.*?)</script\s*>",
+@@ -819,28 +987,121 @@ _SCRIPT_HTML = re.compile(r"<script(?![^>]*\bsrc\s*=)([^>]*)>(.*?)</script\s*>",
  _RECURSOS_HTML = re.compile(r"""<(?:script|link|img|source)\b[^>]*?\b(?:src|href)\s*=\s*["']([^"'#?]+)""", re.I)
  
  
@@ -2070,7 +2121,7 @@ index b59a923..a6fa594 100644
      if not shutil.which("node"):
          return resultados
      for numero, m in enumerate(_SCRIPT_HTML.finditer(texto), start=1):
-@@ -1106,6 +1330,157 @@ def validar_proyecto(ws: Workspace, rels: list[str]) -> list[Resultado]:
+@@ -1106,6 +1367,157 @@ def validar_proyecto(ws: Workspace, rels: list[str]) -> list[Resultado]:
      return salida
  
  
@@ -2228,7 +2279,7 @@ index b59a923..a6fa594 100644
  def fallos(resultados: list[Resultado]) -> list[Resultado]:
      return [r for r in resultados if not r.ok]
  
-@@ -1139,30 +1514,37 @@ def detectar_comando_tests(ws: Workspace, completo: bool = False) -> Optional[tu
+@@ -1139,30 +1551,37 @@ def detectar_comando_tests(ws: Workspace, completo: bool = False) -> Optional[tu
          or any(raiz.glob("test_*.py"))
          or any(raiz.glob("*_test.py"))
      )
@@ -2288,7 +2339,7 @@ index b59a923..a6fa594 100644
      if (raiz / "go.mod").is_file() and shutil.which("go"):
          return "go test ./...", "go test"
      if (raiz / "Cargo.toml").is_file() and shutil.which("cargo"):
-@@ -1177,6 +1559,33 @@ def detectar_comando_tests(ws: Workspace, completo: bool = False) -> Optional[tu
+@@ -1177,6 +1596,33 @@ def detectar_comando_tests(ws: Workspace, completo: bool = False) -> Optional[tu
      return _detectar_tests_otros(raiz)
  
  
@@ -2322,7 +2373,7 @@ index b59a923..a6fa594 100644
  def _detectar_tests_otros(raiz: Path) -> Optional[tuple[str, str]]:
      """Ruby (minitest), Perl (prove), PHP (phpunit o runner propio), Bash y Java sin build tool."""
      if shutil.which("ruby"):
-@@ -1212,7 +1621,12 @@ def ejecutar_tests(ws: Workspace, timeout: int = 300, completo: bool = False) ->
+@@ -1212,7 +1658,12 @@ def ejecutar_tests(ws: Workspace, timeout: int = 300, completo: bool = False) ->
      comando, _nombre = detectado
      r = ejecutar(comando, cwd=ws.raiz, timeout=timeout, shell=True)
      combinado = r.stdout + r.stderr
@@ -2703,7 +2754,7 @@ index d8102fb..b6ebe29 100644
          'File "<string>"', 'File "<fragmento>"')
      if not r.ok and parece_interactivo(f"{r.stdout}\n{r.stderr}"):
 diff --git a/partes/19_roles.py b/partes/19_roles.py
-index 4e3765c..1fff5fc 100644
+index 4e3765c..c9d8775 100644
 --- a/partes/19_roles.py
 +++ b/partes/19_roles.py
 @@ -43,7 +43,7 @@ necesario, editar, verificar con herramientas reales y reportar.
@@ -2736,7 +2787,18 @@ index 4e3765c..1fff5fc 100644
  Tu attempt_completion DEBE contener el plan EXACTAMENTE con este formato:
  <plan>
  <objetivo>una frase</objetivo>
-@@ -184,6 +189,14 @@ DIAGNÓSTICO: qué falla y por qué (la causa raíz, no el síntoma)
+@@ -100,6 +105,10 @@ tus tests DEBEN fallar ahora y pasar cuando alguien implemente el plan correctam
+   sin red, sin input(), rápidos; archivos temporales con tempfile.
+ - Tests SIMPLES: assertEqual(funcion(entrada), esperado). Nada de cadenas de isinstance, ifs ni lógica
+   dentro del test; si un test se vuelve largo, partilo en varios.
++- Probá el COMPORTAMIENTO por la interfaz pública, no cómo está hecho: NO mockees la conexión a la base ni
++  funciones internas del propio proyecto (patch('paquete.modulo.get_connection')) y NO afirmes el SQL exacto
++  ni qué función interna se llamó. Con sqlite usá una base REAL temporal (':memory:' o un archivo en tempfile)
++  cargada con datos de prueba y verificá el resultado. Mocks solo para lo externo (red, reloj, input()).
+ - NO implementes el código de la aplicación (solo podés escribir archivos de tests).
+ - NO inventes requisitos: tus tests solo pueden exigir lo que el usuario/el plan pidieron (la INTERFAZ y los
+   CRITERIOS). No exijas efectos que la spec no menciona (crear un archivo con tal nombre, una ruta fija, un
+@@ -184,6 +193,14 @@ DIAGNÓSTICO: qué falla y por qué (la causa raíz, no el síntoma)
  ARREGLO: los cambios exactos, archivo por archivo. Para cada uno, la función/clase COMPLETA corregida en un
  bloque de código, o bloques SEARCH/REPLACE copiando el texto actual exacto.
  VERIFICACIÓN: qué test o comando debería pasar después.
@@ -2751,7 +2813,7 @@ index 4e3765c..1fff5fc 100644
  Sé concreto y breve. No propongas reescribir lo que funciona.""",
          LECTURA + ("attempt_completion",),
          0.1,
-@@ -259,6 +272,82 @@ AFIRMACIÓN → NIVEL (qué evidencia la respalda y qué faltaría para subir de
+@@ -259,6 +276,82 @@ AFIRMACIÓN → NIVEL (qué evidencia la respalda y qué faltaría para subir de
          0.1,
          solo_lectura=True,
      ),
@@ -2834,7 +2896,7 @@ index 4e3765c..1fff5fc 100644
  }
  
  ROLES_DELEGABLES = ("explorador", "implementador", "revisor", "qa", "reparador", "arquitecto", "especificador",
-@@ -278,6 +367,12 @@ PRINCIPIOS
+@@ -278,6 +371,12 @@ PRINCIPIOS
     el test. Un test en rojo no implica que el código esté mal (puede ser el test, la ruta, una dependencia,
     un fixture, la entrada o un flaky): decidí QUÉ falla antes de tocar nada.
  7. Seguridad ofensiva solo en sistemas propios, laboratorios, CTF o con autorización explícita.
@@ -2847,7 +2909,7 @@ index 4e3765c..1fff5fc 100644
  
  CÓMO USAR LAS HERRAMIENTAS
  - Escribí la herramienta como etiquetas XML, igual que en los ejemplos. Podés poner 1-3 frases de
-@@ -351,8 +446,11 @@ def _entorno() -> str:
+@@ -351,8 +450,11 @@ def _entorno() -> str:
      sistema = "Termux en Android" if termux else f"{platform.system()} {platform.release()}"
      herramientas = [n for n in ("node", "npm", "git", "ruff", "go", "cargo", "make", "clang", "php")
                      if shutil.which(n)]
@@ -2859,7 +2921,7 @@ index 4e3765c..1fff5fc 100644
          f"- Python: {sys.version.split()[0]} ({sys.executable})\n"
          f"- Herramientas disponibles: {', '.join(herramientas) or 'solo python'}"
      )
-@@ -367,6 +465,12 @@ def system_prompt(rol: Rol, ws: Workspace, max_llamadas: int = 4, arbol: bool =
+@@ -367,6 +469,12 @@ def system_prompt(rol: Rol, ws: Workspace, max_llamadas: int = 4, arbol: bool =
          f"\n# TU ROL: {rol.nombre.upper()}\n{rol.mision}",
          "\n# HERRAMIENTAS DISPONIBLES\n" + documentacion(list(rol.herramientas)),
          f"\n# ENTORNO\n- Workspace: {ws.raiz}\n{_entorno()}",
@@ -2873,7 +2935,7 @@ index 4e3765c..1fff5fc 100644
      if rol.rutas_permitidas:
          partes.append("- Solo podés escribir archivos de tests (" + ", ".join(rol.rutas_permitidas[:6]) + " ...).")
 diff --git a/partes/20_agent.py b/partes/20_agent.py
-index 3789b97..07e648a 100644
+index 3789b97..11492d3 100644
 --- a/partes/20_agent.py
 +++ b/partes/20_agent.py
 @@ -64,6 +64,105 @@ class Cancelado(Exception):
@@ -2995,7 +3057,7 @@ index 3789b97..07e648a 100644
  
  
  def pide_cambios(tarea: str) -> bool:
-@@ -286,6 +389,30 @@ def codigo_pegado(texto: str) -> bool:
+@@ -286,6 +389,34 @@ def codigo_pegado(texto: str) -> bool:
      return False
  
  
@@ -3023,10 +3085,14 @@ index 3789b97..07e648a 100644
 +
 +
 +
++_RE_ANUNCIA_TESTS = re.compile(r"\b(?:ejecut|corr|cor[ré]|lanz|vuelv\w* a corr|run)\w*\s+(?:de nuevo\s+)?(?:los\s+|las\s+)?"
++                               r"(?:tests?|pruebas?|run_tests)\b|\brun_tests\b", re.I)
++
++
  class Agente:
      def __init__(
          self,
-@@ -323,7 +450,8 @@ class Agente:
+@@ -323,7 +454,8 @@ class Agente:
                  memoria = None
          self.memoria = memoria
          self.ctx = Contexto(ws, settings, ui, self.etiqueta, set(), [], cid_inicio, memoria=memoria,
@@ -3036,7 +3102,7 @@ index 3789b97..07e648a 100644
          base = settings.max_pasos if rol == "principal" else settings.max_pasos_sub
          self.max_pasos = max_pasos or self.rol.max_pasos or base
          self.temperatura = self.rol.temperatura if temperatura is None else temperatura
-@@ -350,6 +478,7 @@ class Agente:
+@@ -350,6 +482,7 @@ class Agente:
          self._escrituras = 0                     # se incrementa con cada escritura exitosa
          self._evidencias: list[tuple[str, str, int]] = []  # (herramienta, ok|fallo|bloqueado|sin_tests, escrituras)
          self._reusos_seguidos = 0
@@ -3044,7 +3110,7 @@ index 3789b97..07e648a 100644
          self._ultima_salida_ok = ""
          self._bucles = RompedorDeBucles()        # v9 Fase 4: oscilación / machaque / error estancado
          self._prohibido: set = set()
-@@ -393,7 +522,19 @@ class Agente:
+@@ -393,7 +526,19 @@ class Agente:
              self.mensajes[0] = {"role": "system", "content": prompt}
          else:
              self.mensajes = [{"role": "system", "content": prompt}]
@@ -3065,7 +3131,7 @@ index 3789b97..07e648a 100644
          self._indice_tarea = len(self.mensajes) - 1
          self.ctx.cambios = set()
          self.ctx.parciales = {}
-@@ -406,6 +547,7 @@ class Agente:
+@@ -406,6 +551,7 @@ class Agente:
          self._escrituras = 0
          self._evidencias = []
          self._reusos_seguidos = 0
@@ -3073,7 +3139,13 @@ index 3789b97..07e648a 100644
          self._ultima_salida_ok = ""
          self._bucles = RompedorDeBucles()
          self._guardia = None
-@@ -430,6 +572,10 @@ class Agente:
+@@ -425,11 +571,16 @@ class Agente:
+         sin_herramienta = 0
+         anuncios = 0
+         repeticiones: dict = {}
++        tests_por_reaper = 0
+         self._ultimo_texto = ""
+ 
          for paso in range(1, self.max_pasos + 1):
              if CANCELAR.is_set():
                  raise Cancelado()
@@ -3084,7 +3156,24 @@ index 3789b97..07e648a 100644
              self._compactar()
              respuesta = self._llamar_con_recuperacion()
              analisis = analizar(respuesta.texto, self._esquemas)
-@@ -507,6 +653,12 @@ class Agente:
+@@ -450,6 +601,16 @@ class Agente:
+                         return cierre
+                 if texto and anuncia_accion(texto):
+                     anuncios += 1
++                if texto and _RE_ANUNCIA_TESTS.search(texto) and "run_tests" in self.rol.herramientas \
++                        and self.rol.nombre != "principal" and tests_por_reaper < 2:
++                    tests_por_reaper += 1
++                    # Prueba real: el reparador escribió 3 veces "Ahora, ejecutemos los tests" sin llamar run_tests y
++                    # se cerró "sin herramientas". Si lo anuncia, los corre REAPER y le muestra el resultado real.
++                    obs, _error = self._ejecutar_herramienta(Llamada("run_tests", {}, True, ""), repeticiones)
++                    self._agregar_usuario("Anunciaste que ibas a correr los tests sin llamar run_tests: los corrí yo. "
++                                          "La próxima vez escribí la herramienta en XML.\n\n" + obs)
++                    sin_herramienta = 0
++                    continue
+                 sin_herramienta += 1
+                 self.ctx.tropiezo("sin_herramienta")
+                 if sin_herramienta > 2:
+@@ -507,6 +668,12 @@ class Agente:
              if final is not None:
                  return self._cerrar(final[0], paso, "completado", ok=final[1])
  
@@ -3097,7 +3186,7 @@ index 3789b97..07e648a 100644
              if self._reusos_seguidos >= 2 and (self.rol.nombre == "principal" or self._reusos_seguidos >= 4):
                  # El modelo pide una y otra vez lo mismo que ya tiene: se corta el bucle. Si había obtenido
                  # un resultado (ej. 2+2 → 4) se responde con eso; Claude Code tampoco ejecuta tres veces "2+2".
-@@ -537,7 +689,9 @@ class Agente:
+@@ -537,7 +704,9 @@ class Agente:
              self._agregar_usuario("\n\n".join(observaciones))
  
          return self._cerrar(
@@ -3108,7 +3197,7 @@ index 3789b97..07e648a 100644
              self.max_pasos,
              "max_pasos",
              ok=False,
-@@ -672,12 +826,36 @@ class Agente:
+@@ -672,12 +841,36 @@ class Agente:
          if h is None or nombre not in self.rol.herramientas:
              disponibles = ", ".join(self.rol.herramientas)
              self.ui.resultado_herramienta(False, f"herramienta no disponible: {nombre}")
@@ -3147,7 +3236,7 @@ index 3789b97..07e648a 100644
          if not llamada.completa:
              self.ui.resultado_herramienta(False, f"{nombre}: llamada incompleta")
              self.ctx.tropiezo("llamada_incompleta")
-@@ -730,6 +908,7 @@ class Agente:
+@@ -730,6 +923,7 @@ class Agente:
                                         "usá lo que ya sabés y avanzá con el próximo paso.)\n")
              elif veces >= 3:
                  self.ui.resultado_herramienta(False, f"{nombre}: llamada repetida")
@@ -3155,7 +3244,7 @@ index 3789b97..07e648a 100644
                  self._registrar_evidencia(nombre, "bloqueado")
                  return obs(
                      f"ERROR: ya hiciste exactamente esta llamada {veces} veces sin cambiar nada en el proyecto y el "
-@@ -754,7 +933,17 @@ class Agente:
+@@ -754,7 +948,17 @@ class Agente:
              error = True
          if nombre == "run_tests" and salida.startswith("Tests FALLARON"):
              error = True
@@ -3174,7 +3263,7 @@ index 3789b97..07e648a 100644
          if error:
              self._registrar_error(nombre, llamada.params.get("path", ""), salida)
              if self.settings.pistas_errores and "PISTAS DE REAPER" not in salida:
-@@ -777,6 +966,7 @@ class Agente:
+@@ -777,6 +981,7 @@ class Agente:
          if h.escribe and not error:
              self._escrituras += 1
          self._reusos_seguidos = 0
@@ -3182,7 +3271,7 @@ index 3789b97..07e648a 100644
          if nombre in ("run_tests", "validate", "execute_command", "run_python"):
              self._registrar_evidencia(nombre, self._estado_evidencia(nombre, llamada.params, salida, error),
                                        llamada.params.get("command", ""))
-@@ -1381,6 +1571,9 @@ class Agente:
+@@ -1381,6 +1586,9 @@ class Agente:
          ok = True
          if self.ctx.cambios:
              resultados = validar_archivos(self.ws, sorted(self.ctx.cambios))
@@ -3192,7 +3281,7 @@ index 3789b97..07e648a 100644
              if fallos(resultados):
                  if self._rechazos < 2:
                      self._rechazos += 1
-@@ -1598,19 +1791,19 @@ def ejecutar_subagentes(
+@@ -1598,19 +1806,19 @@ def ejecutar_subagentes(
              raise
          except Exception as e:
              res = ResultadoAgente(False, f"{type(e).__name__}: {e}", sorted(agente.ctx.cambios), 0, "error", rol)
@@ -3406,7 +3495,7 @@ index 4eba772..e986b98 100644
                  (self.ws.raiz / rel).unlink()
                  self.restaurados.append(f"{rel} (creado por los tests, borrado)")
 diff --git a/partes/25_pipeline.py b/partes/25_pipeline.py
-index ad78b6b..6253a39 100644
+index ad78b6b..6897758 100644
 --- a/partes/25_pipeline.py
 +++ b/partes/25_pipeline.py
 @@ -40,6 +40,599 @@ _RE_VEREDICTO = re.compile(r"VEREDICTO\s*:?\s*\**\s*(APROBADO|CAMBIOS|RECHAZADO)
@@ -4669,7 +4758,7 @@ index ad78b6b..6253a39 100644
          if not res.ok:
              self.ui.aviso("El arquitecto no terminó limpio; uso lo que produjo.")
          motivo = plan_degenerado(plan, pedido, texto)
-@@ -363,26 +1504,71 @@ class Orquestador:
+@@ -363,26 +1504,101 @@ class Orquestador:
              "falta de implementación (ImportError/AttributeError/assert) y pasar cuando el plan esté hecho."
          )
          res = self._sub("especificador", texto, cid, titulo="escribe los tests ANTES de implementar")
@@ -4711,6 +4800,36 @@ index ad78b6b..6253a39 100644
 +                self._spec_rotos = sorted(siguen)            # sin proteger, pero la tarea igual los tiene que pasar
 +                if not tests:
 +                    return {}
++        acoplados = {}
++        for rel in tests:
++            if rel.endswith(".py"):
++                try:
++                    hallazgos = acoples_a_la_implementacion(self.ws.leer(rel))
++                except (OSError, ValueError, ErrorRuta):
++                    hallazgos = []
++                if hallazgos:
++                    acoplados[rel] = hallazgos
++        if acoplados:
++            # Una sola vez: si el modelo insiste, siguen (el implementador igual los ve), pero sin quemar pedidos.
++            self.ui.aviso("  Tests de la especificación acoplados a la implementación (mockean la base o exigen el SQL "
++                          "exacto): le pido al especificador que los reescriba con una base real.")
++            detalle = "\n".join(f"{rel}:\n" + "\n".join(f"  - {h}" for h in hs) for rel, hs in acoplados.items())
++            self._sub("especificador",
++                      "Estos tests prueban CÓMO está hecho el código, no QUÉ hace: cualquier implementación correcta "
++                      "pero distinta los rompe.\n" + detalle + "\n\nReescribilos con una base sqlite REAL temporal "
++                      "(sqlite3 ':memory:' o un archivo en tempfile) cargada con datos de prueba, llamando a las "
++                      "funciones públicas de la INTERFAZ y verificando el RESULTADO. Sin mocks de la conexión y sin "
++                      "afirmar SQL.", cid, titulo="reescribe los tests acoplados")
++            tests = sorted(set(tests) | {x for x in self.ws.checkpoints.archivos_desde(cid)
++                                         if _es_test(x) and (self.ws.raiz / x).is_file()})
++            rotos_ahora = {r.archivo for r in tests_de_especificacion_rotos(validar_archivos(self.ws, tests))}
++            if rotos_ahora:
++                # La reescritura no puede dejar protegido un test roto.
++                self.ui.aviso("  La reescritura dejó tests rotos (" + ", ".join(sorted(rotos_ahora)) + "): no los protejo.")
++                self._spec_rotos = sorted(set(getattr(self, "_spec_rotos", [])) | rotos_ahora)
++                tests = [t for t in tests if t not in rotos_ahora]
++                if not tests:
++                    return {}
          r = ejecutar_tests(self.ws, timeout=self.settings.tests_timeout, completo=True)
          conteo = conteo_de_resultado(r)
 +        codigo_plan = [a for a in plan.archivos() if not _es_test(a)]
@@ -4750,7 +4869,7 @@ index ad78b6b..6253a39 100644
          else:
              self.ui.ok(f"especificación lista: {len(tests)} archivo(s) de test")
          return copiar_contenidos(self.ws, tests)
-@@ -421,27 +1607,42 @@ class Orquestador:
+@@ -421,27 +1637,42 @@ class Orquestador:
          return torneo.correr(texto, archivos=", ".join(tarea.archivos), titulo=titulo,
                               n=self.settings.candidatos if usar_torneo else 1, protegidos=protegidos, cid=cid)
  
@@ -4797,7 +4916,7 @@ index ad78b6b..6253a39 100644
          detectado = detectar_comando_tests(self.ws)
          criterios = "\n".join(f"- {c}" for c in plan.criterios) or "- (derivalos del pedido)"
          texto = (
-@@ -452,9 +1653,39 @@ class Orquestador:
+@@ -452,9 +1683,39 @@ class Orquestador:
              "Escribí (o completá) tests automáticos que verifiquen los criterios y corrélos con run_tests. "
              "Reportá el resultado REAL."
          )
@@ -4838,7 +4957,7 @@ index ad78b6b..6253a39 100644
          archivos = [r for r in self.ws.checkpoints.archivos_desde(cid) if (self.ws.raiz / r).is_file()]
          validaciones = validar_archivos(self.ws, archivos)
          tests = ejecutar_tests(self.ws, timeout=self.settings.tests_timeout, completo=True)
-@@ -462,13 +1693,35 @@ class Orquestador:
+@@ -462,13 +1723,35 @@ class Orquestador:
          malos = fallos(validaciones)
          tests_ok = tests is None or tests.ok
          partes = [r.resumen(2500) for r in malos]
@@ -4876,7 +4995,7 @@ index ad78b6b..6253a39 100644
  
      def reparar(self, pedido: str, verif: Verificacion, cid: int, base_fallaba: bool,
                  diagnostico_experto: str = "", contexto: str = "") -> ResultadoAgente:
-@@ -482,10 +1735,19 @@ class Orquestador:
+@@ -482,10 +1765,19 @@ class Orquestador:
          if base_fallaba:
              texto += "Ojo: la suite de tests ya fallaba ANTES de esta build; priorizá los fallos causados por los cambios.\n"
          texto += "Encontrá la causa raíz y corregila. No debilites ni borres tests."
@@ -4897,7 +5016,7 @@ index ad78b6b..6253a39 100644
                                                                                      if diagnostico_experto else ""),
                           protegidos=protegidos)
  
-@@ -513,7 +1775,17 @@ class Orquestador:
+@@ -513,7 +1805,17 @@ class Orquestador:
          intentos_txt: list[str] = []
          forense_hecho = False
          informe_forense = ""
@@ -4915,15 +5034,30 @@ index ad78b6b..6253a39 100644
              firma = _firma_error(verif.diagnostico)
              if diagnosticos_vistos.count(firma) >= 3:
                  informe.notas.append(f"{etiqueta}: la reparación no logró avances (mismo diagnóstico repetido).")
-@@ -549,6 +1821,7 @@ class Orquestador:
+@@ -547,8 +1849,21 @@ class Orquestador:
+             if intentos_txt:
+                 contexto_intento += ("\n\nINTENTOS ANTERIORES QUE NO FUNCIONARON (no los repitas; entendé por qué fallaron):\n"
                                       + "\n---\n".join(intentos_txt[-2:]))
-             res = self.reparar(pedido, verif, rcid, base_fallaba, experto, contexto_intento.strip())
+-            res = self.reparar(pedido, verif, rcid, base_fallaba, experto, contexto_intento.strip())
++            try:
++                res = self.reparar(pedido, verif, rcid, base_fallaba, experto, contexto_intento.strip())
++            except LLMError as e:
++                if e.detiene_todo:
++                    raise
++                # Prueba real (teléfono): se agotó el tiempo de la tarea 2 en medio de un reintento (Nvidia 500) y el
++                # error subió como "el modelo no responde": /grande se DETENÍA entero. Es el fin de ESTA reparación:
++                # la tarea queda con sus fallos, la build sigue y /grande la retoma con tiempo nuevo.
++                motivo = _primera_linea_util(str(e))
++                informe.notas.append(f"{etiqueta}: el reparador no pudo terminar ({recortar(motivo, 200)}).")
++                self.ui.aviso(f"  {etiqueta}: el reparador no pudo terminar ({recortar(motivo, 160)}); dejo la "
++                              "reparación acá.")
++                break
              intentos_txt.append(recortar(res.resumen, 1200))
 +            sin_cambios = 0 if self.ws.checkpoints.diff_desde(rcid).strip() else sin_cambios + 1
              verif = verificador()
              self._mostrar_verificacion(verif)
              if verif.ok:
-@@ -566,6 +1839,221 @@ class Orquestador:
+@@ -566,6 +1881,221 @@ class Orquestador:
                  verif = antes
          return verif
  
@@ -5145,7 +5279,7 @@ index ad78b6b..6253a39 100644
      # ------------------------------------------------------------ flujos
      def _mostrar_plan(self, plan: Plan) -> None:
          self.ui.titulo("PLAN")
-@@ -575,10 +2063,47 @@ class Orquestador:
+@@ -575,10 +2105,47 @@ class Orquestador:
          self.ui.fase(1, "Exploración")
          exploracion = self.explorar(pedido)
          self.ui.fase(2, "Arquitectura")
@@ -5195,7 +5329,7 @@ index ad78b6b..6253a39 100644
                  return plan, exploracion
              feedback = self.ui.preguntar("¿Qué cambiarías del plan? (Enter vacío = cancelar)")
              if not feedback:
-@@ -598,22 +2123,131 @@ class Orquestador:
+@@ -598,22 +2165,131 @@ class Orquestador:
          ))
          return ruta
  
@@ -5332,7 +5466,7 @@ index ad78b6b..6253a39 100644
              retroceso = conteo.pasados < antes.pasados
              mas_errores = conteo.errores > antes.errores
              if retroceso or mas_errores or nuevos_fallos:
-@@ -626,10 +2260,22 @@ class Orquestador:
+@@ -626,10 +2302,22 @@ class Orquestador:
                  )
          elif tests is not None and not tests.ok and not conteo.reconocido and antes.ok:
              problemas.append("TESTS: la suite pasaba antes de la tarea y ahora falla.\n" + tests.resumen(4000))
@@ -5356,7 +5490,7 @@ index ad78b6b..6253a39 100644
                  problemas.append("SIN PROGRESO: el implementador no terminó y no cambió ningún archivo.")
              elif tests is not None and not tests.ok and conteo.reconocido and conteo.pasados <= antes.pasados:
                  problemas.append(
-@@ -642,30 +2288,258 @@ class Orquestador:
+@@ -642,30 +2330,258 @@ class Orquestador:
              diagnostico = anexar_pistas(diagnostico, 2)
          return Verificacion(not problemas, validaciones, tests, diagnostico, archivos, conteo)
  
@@ -5630,7 +5764,7 @@ index ad78b6b..6253a39 100644
  
          self.ui.fase(numero_fase, "Implementación" + (" · torneo" if self.settings.torneo and self.settings.candidatos > 1 else ""))
          numero_fase += 1
-@@ -676,35 +2550,129 @@ class Orquestador:
+@@ -676,35 +2592,129 @@ class Orquestador:
          if [t.id for t in orden] != [t.id for t in plan.tareas]:
              self.ui.tenue("  Orden por dependencias: " + " → ".join(t.id for t in orden))
              plan.tareas = orden
@@ -5766,7 +5900,7 @@ index ad78b6b..6253a39 100644
                  continue
  
              for ronda in range(self.settings.max_revisiones):
-@@ -712,16 +2680,51 @@ class Orquestador:
+@@ -712,16 +2722,51 @@ class Orquestador:
                  if not diff.strip():
                      informe.notas.append(f"Tarea {tarea.id}: sin cambios en archivos.")
                      break
@@ -5819,7 +5953,7 @@ index ad78b6b..6253a39 100644
  
          archivos = [r for r in self.ws.checkpoints.archivos_desde(grupo) if (self.ws.raiz / r).is_file()]
          hay_tests_build = any(_es_test(a) for a in archivos)
-@@ -734,21 +2737,43 @@ class Orquestador:
+@@ -734,21 +2779,43 @@ class Orquestador:
          self.ui.fase(numero_fase, "Verificación real")
          verif = self.verificar(grupo)
          self._mostrar_verificacion(verif)
@@ -5867,7 +6001,7 @@ index ad78b6b..6253a39 100644
          informe.ruta_informe = self._guardar_informe(pedido, informe)
          self._mostrar_cierre(informe)
          return informe
-@@ -769,19 +2794,51 @@ class Orquestador:
+@@ -769,19 +2836,51 @@ class Orquestador:
          else:
              self.ui.error(f"tests: fallaron ({verif.conteo.texto() if verif.conteo.reconocido else verif.tests.comando})")
              self.ui.tenue(recortar(fallos_relevantes(verif.tests.stdout + "\n" + verif.tests.stderr, 2, 1500), 1500))
@@ -5921,7 +6055,7 @@ index ad78b6b..6253a39 100644
                     if informe.spec_tests else "")
                  + (f"## Escaladas al modelo fuerte\n{informe.escaladas}\n\n" if informe.escaladas else "")
                  + ("## Lecciones aprendidas\n" + "\n".join(f"- {l}" for l in informe.lecciones) + "\n\n" if informe.lecciones else "")
-@@ -790,40 +2847,80 @@ class Orquestador:
+@@ -790,40 +2889,80 @@ class Orquestador:
                  + ("## Notas\n" + "\n".join(f"- {n}" for n in informe.notas) + "\n" if informe.notas else "")
              )
              ruta = self.ws.raiz / ".reaper" / "informes" / f"build_{datetime.now():%Y%m%d_%H%M%S}.md"
@@ -13384,6 +13518,144 @@ index 0000000..dbabddd
 +        self.assertTrue(informe.ok, texto[-3000:])
 +        self.assertRegex(texto, r"La tarea \d+ no pasó su verificación")
 +        self.assertNotIn("REPARACIÓN final", texto)                                # se arregla en la tarea
+diff --git a/partes/48zn_autotest_prueba_real3.py b/partes/48zn_autotest_prueba_real3.py
+new file mode 100644
+index 0000000..1abc4ca
+--- /dev/null
++++ b/partes/48zn_autotest_prueba_real3.py
+@@ -0,0 +1,132 @@
++"""
++Tercera prueba REAL de /grande en el teléfono: la etapa 1 quedó verificada; la 2 (ventas) se detuvo.
++
++- La especificación mockeaba la conexión del propio proyecto (patch('almacen.sales.get_connection')) y exigía el SQL
++  exacto: el implementador reusó db.get_product (razonable), el mock dejó de aplicar y nadie lo pudo arreglar.
++- El reparador escribió 3 veces "Ahora, ejecutemos los tests" sin llamar run_tests y se cerró "sin herramientas".
++- Se agotó el tiempo de la tarea en medio de un reintento (Nvidia 500) y el error subió como "el modelo no responde":
++  /grande se DETENÍA entero en vez de dar la tarea por fallida y seguir.
++"""
++
++_PR3_TEST_ACOPLADO = '''import unittest
++from unittest.mock import MagicMock, patch
++
++from almacen.sales import validate_stock
++
++
++class TestValidateStock(unittest.TestCase):
++    def test_stock_suficiente(self):
++        conn = MagicMock()
++        conn.execute.return_value.fetchone.return_value = {"stock": 10}
++        with patch("almacen.sales.get_connection", return_value=conn):
++            self.assertTrue(validate_stock(1, 5))
++        conn.execute.assert_called_with("SELECT stock FROM products WHERE id = ?", (1,))
++'''
++_PR3_TEST_REAL = '''import unittest
++
++from almacen import db
++from almacen.sales import validate_stock
++
++
++class TestValidateStock(unittest.TestCase):
++    def test_stock_suficiente(self):
++        con = db.conectar(":memory:")
++        db.agregar_producto(con, 1, 10)
++        self.assertTrue(validate_stock(con, 1, 5))
++        self.assertFalse(validate_stock(con, 1, 11))
++'''
++
++
++class TestTestsAcopladosALaImplementacion(BaseTest):
++    def test_detecta_mock_de_la_conexion_y_sql_exacto(self):
++        hallazgos = acoples_a_la_implementacion(_PR3_TEST_ACOPLADO)
++        self.assertEqual(len(hallazgos), 2, hallazgos)
++        self.assertTrue(any("mockea la conexión" in h for h in hallazgos))
++        self.assertTrue(any("SQL exacto" in h for h in hallazgos))
++        self.assertEqual(acoples_a_la_implementacion(_PR3_TEST_REAL), [])
++        self.assertEqual(acoples_a_la_implementacion(
++            "from unittest.mock import patch\nwith patch('builtins.input', return_value='s'):\n    pass\n"), [])
++        self.assertTrue(any("acoplado a la implementación" in a for a in advertencias_tests_python(_PR3_TEST_ACOPLADO)))
++
++    def test_el_especificador_los_reescribe_una_vez(self):
++        ws = self.proyecto({})
++        pedidos = []
++
++        def guion(mensajes, kw):
++            if MockLLM.rol_de(mensajes) != "especificador":
++                return terminar_xml("listo")
++            if MockLLM.turnos_asistente(mensajes) == 0:
++                primero = MockLLM.ultimo_usuario(mensajes)
++                pedidos.append(primero)
++                contenido = _PR3_TEST_REAL if "CÓMO está hecho" in primero else _PR3_TEST_ACOPLADO
++                return herramienta_xml("write_to_file", path="tests/test_sales.py", content=contenido)
++            return terminar_xml("tests escritos")
++        ui = self.ui()
++        orq = Orquestador(MockLLM(guion), ws, self.ajustes(tests_primero=True), ui)
++        plan = Plan("Ventas", [Tarea("1", "validate_stock", ["almacen/sales.py", "tests/test_sales.py"])], [])
++        espec = orq.especificar("Ventas del almacén", plan, ws.checkpoints.iniciar("espec"))
++        self.assertEqual(len(pedidos), 2)
++        self.assertIn("almacen.sales.get_connection", pedidos[1])
++        self.assertEqual(espec.get("tests/test_sales.py"), _PR3_TEST_REAL)
++        self.assertIn("acoplados a la implementación", ui.texto_registrado())
++
++
++class TestReparadorQueNoPuedeTerminar(BaseTest):
++    def test_si_el_reparador_falla_la_tarea_queda_fallida_y_la_build_sigue(self):
++        ws = self.proyecto({})
++
++        def guion(mensajes, kw):
++            rol, turno = MockLLM.rol_de(mensajes), MockLLM.turnos_asistente(mensajes)
++            if rol == "arquitecto":
++                return terminar_xml('<plan><objetivo>Calc</objetivo><criterios>- sumar</criterios>'
++                                    '<tarea id="1" archivos="calc.py, tests/test_calc.py">sumar con test</tarea></plan>')
++            if rol == "implementador":
++                archivos = [("calc.py", "def sumar(a, b):\n    return a - b\n"),
++                            ("tests/test_calc.py", "import unittest\nfrom calc import sumar\n\n\n"
++                                                   "class T(unittest.TestCase):\n    def test_sumar(self):\n"
++                                                   "        self.assertEqual(sumar(2, 3), 5)\n")]
++                if turno < len(archivos):
++                    return herramienta_xml("write_to_file", path=archivos[turno][0], content=archivos[turno][1])
++                return terminar_xml("listo")
++            if rol == "reparador":
++                raise LLMError("Error del proveedor durante el streaming: Upstream error from Nvidia: Internal server "
++                               "error (no reintento: se agotó el tiempo de la tarea 1)")
++            return terminar_xml("listo")
++        ui = self.ui()
++        informe = Orquestador(MockLLM(guion), ws, self.ajustes(juez=False, max_reparaciones=1), ui).construir(
++            "Calculadora con sumar", confirmar=False)                               # antes: LLMError hacia arriba
++        self.assertFalse(informe.ok)
++        self.assertIn("el reparador no pudo terminar", ui.texto_registrado())
++        self.assertTrue(any("el reparador no pudo terminar" in n for n in informe.notas))
++
++    def test_cupo_diario_en_el_reparador_sigue_frenando_todo(self):
++        ws = self.proyecto({"calc.py": "def sumar(a, b):\n    return a - b\n",
++                            "tests/test_calc.py": "import unittest\nfrom calc import sumar\n\n\n"
++                                                  "class T(unittest.TestCase):\n    def test_sumar(self):\n"
++                                                  "        self.assertEqual(sumar(2, 3), 5)\n"})
++        orq = Orquestador(MockLLM(lambda m, k: terminar_xml("x")), ws, self.ajustes(), self.ui())
++        orq.reparar = lambda *a, **k: (_ for _ in ()).throw(_cupo_agotado(6 * 3600))
++        verif = orq.verificar(ws.checkpoints.iniciar("x"))
++        with self.assertRaises(LLMError) as ctx:
++            orq._reparar_con_escalada("p", verif, ws.checkpoints.iniciar("g"), False, InformeBuild("fallida"),
++                                      "final", 2, lambda: verif)
++        self.assertTrue(ctx.exception.cupo_diario)
++
++
++class TestAgenteQueAnunciaLosTests(BaseTest):
++    def test_si_anuncia_que_corre_los_tests_los_corre_reaper(self):
++        ws = self.proyecto({"calc.py": "def sumar(a, b):\n    return a + b\n",
++                            "tests/test_calc.py": "import unittest\nfrom calc import sumar\n\n\n"
++                                                  "class T(unittest.TestCase):\n    def test_sumar(self):\n"
++                                                  "        self.assertEqual(sumar(2, 3), 5)\n"})
++        vistos = []
++
++        def guion(mensajes, kw):
++            vistos.append(MockLLM.ultimo_usuario(mensajes))
++            if MockLLM.turnos_asistente(mensajes) < 2:
++                return "VERIFICACIÓN\n\nAhora, ejecutemos los tests para ver si pasan."
++            return terminar_xml("Los tests pasan: 1 pasó.")
++        res = Agente("reparador", MockLLM(guion), ws, self.ajustes(forense=False, escalar=False), self.ui()).ejecutar(
++            "Arreglá los fallos")
++        self.assertNotEqual(res.motivo if hasattr(res, "motivo") else "", "sin_herramientas")
++        self.assertTrue(any("los corrí yo" in v and "PASARON" in v for v in vistos), vistos[-1][:500])
 diff --git a/partes/49_autotest_runner.py b/partes/49_autotest_runner.py
 index 541aee7..02a88e9 100644
 --- a/partes/49_autotest_runner.py

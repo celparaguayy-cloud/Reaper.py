@@ -5665,6 +5665,42 @@ def es_archivo_de_test(rel: str) -> bool:
             or "/test/" in f"/{rel}") and rel.endswith(".py")
 
 
+_RE_SQL_LITERAL = re.compile(r"^\s*(?:SELECT|INSERT|UPDATE|DELETE|CREATE|REPLACE)\b", re.I)
+_RE_OBJETIVO_CONEXION = re.compile(r"(?:^|[._])(?:get_)?(?:connection|conexion|conn|connect|conectar|cursor|"
+                                   r"get_db|db_connection|sqlite3\.connect)$", re.I)
+
+
+def acoples_a_la_implementacion(texto: str) -> list[str]:
+    """Tests que prueban CÓMO está hecho el código y no QUÉ hace: afirman el SQL exacto o mockean la conexión a la
+    base del propio proyecto. Prueba real (teléfono): la especificación hacía patch('almacen.sales.get_connection') y
+    exigía "SELECT stock FROM products WHERE id = ?"; el implementador reusó db.get_product (razonable), el mock dejó
+    de aplicar y la etapa 2 murió en reparaciones."""
+    try:
+        arbol = ast.parse(texto)
+    except SyntaxError:
+        return []
+    hallazgos = []
+    for nodo in ast.walk(arbol):
+        if not isinstance(nodo, ast.Call):
+            continue
+        nombre = ast.unparse(nodo.func)
+        primero = nodo.args[0] if nodo.args else None
+        literal = primero.value if isinstance(primero, ast.Constant) and isinstance(primero.value, str) else ""
+        if nombre.endswith(("assert_called_with", "assert_called_once_with", "assert_any_call")) and \
+                _RE_SQL_LITERAL.match(literal):
+            hallazgos.append(f"línea {nodo.lineno}: afirma el SQL exacto ({recortar(literal, 50)}): cualquier consulta "
+                             "equivalente lo rompe; verificá el RESULTADO con una base sqlite real")
+        elif (nombre.endswith("patch") or nombre in ("mock.patch", "unittest.mock.patch")) and literal and \
+                _RE_OBJETIVO_CONEXION.search(literal):
+            hallazgos.append(f"línea {nodo.lineno}: mockea la conexión a la base ({literal}): usá una base sqlite REAL "
+                             "temporal (':memory:' o tempfile) con datos de prueba")
+    vistos = []
+    for h in hallazgos:
+        if h not in vistos:
+            vistos.append(h)
+    return vistos[:6]
+
+
 def advertencias_tests_python(texto: str) -> list[str]:
     """
     Tests que un modelo chico suele escribir mal (se vio en Termux: cadenas de isinstance cada vez más largas):
@@ -5704,6 +5740,7 @@ def advertencias_tests_python(texto: str) -> list[str]:
             avisos.append(f"{donde}: usa input(); simulalo con unittest.mock.patch('builtins.input')")
         if any(n.endswith(("urlopen", "requests.get", "requests.post", "http.client.HTTPConnection")) for n in nombres):
             avisos.append(f"{donde}: hace pedidos de red reales; reemplazá la función con un mock")
+    avisos.extend(f"acoplado a la implementación, {h}" for h in acoples_a_la_implementacion(texto))
     return avisos[:8]
 
 
@@ -11220,6 +11257,10 @@ tus tests DEBEN fallar ahora y pasar cuando alguien implemente el plan correctam
   sin red, sin input(), rápidos; archivos temporales con tempfile.
 - Tests SIMPLES: assertEqual(funcion(entrada), esperado). Nada de cadenas de isinstance, ifs ni lógica
   dentro del test; si un test se vuelve largo, partilo en varios.
+- Probá el COMPORTAMIENTO por la interfaz pública, no cómo está hecho: NO mockees la conexión a la base ni
+  funciones internas del propio proyecto (patch('paquete.modulo.get_connection')) y NO afirmes el SQL exacto
+  ni qué función interna se llamó. Con sqlite usá una base REAL temporal (':memory:' o un archivo en tempfile)
+  cargada con datos de prueba y verificá el resultado. Mocks solo para lo externo (red, reloj, input()).
 - NO implementes el código de la aplicación (solo podés escribir archivos de tests).
 - NO inventes requisitos: tus tests solo pueden exigir lo que el usuario/el plan pidieron (la INTERFAZ y los
   CRITERIOS). No exijas efectos que la spec no menciona (crear un archivo con tal nombre, una ruta fija, un
@@ -12022,6 +12063,10 @@ def requiere_busqueda_actual(tarea: str) -> bool:
 
 
 
+_RE_ANUNCIA_TESTS = re.compile(r"\b(?:ejecut|corr|cor[ré]|lanz|vuelv\w* a corr|run)\w*\s+(?:de nuevo\s+)?(?:los\s+|las\s+)?"
+                               r"(?:tests?|pruebas?|run_tests)\b|\brun_tests\b", re.I)
+
+
 class Agente:
     def __init__(
         self,
@@ -12176,6 +12221,7 @@ class Agente:
         sin_herramienta = 0
         anuncios = 0
         repeticiones: dict = {}
+        tests_por_reaper = 0
         self._ultimo_texto = ""
 
         for paso in range(1, self.max_pasos + 1):
@@ -12205,6 +12251,16 @@ class Agente:
                         return cierre
                 if texto and anuncia_accion(texto):
                     anuncios += 1
+                if texto and _RE_ANUNCIA_TESTS.search(texto) and "run_tests" in self.rol.herramientas \
+                        and self.rol.nombre != "principal" and tests_por_reaper < 2:
+                    tests_por_reaper += 1
+                    # Prueba real: el reparador escribió 3 veces "Ahora, ejecutemos los tests" sin llamar run_tests y
+                    # se cerró "sin herramientas". Si lo anuncia, los corre REAPER y le muestra el resultado real.
+                    obs, _error = self._ejecutar_herramienta(Llamada("run_tests", {}, True, ""), repeticiones)
+                    self._agregar_usuario("Anunciaste que ibas a correr los tests sin llamar run_tests: los corrí yo. "
+                                          "La próxima vez escribí la herramienta en XML.\n\n" + obs)
+                    sin_herramienta = 0
+                    continue
                 sin_herramienta += 1
                 self.ctx.tropiezo("sin_herramienta")
                 if sin_herramienta > 2:
@@ -16808,6 +16864,36 @@ class Orquestador:
                 self._spec_rotos = sorted(siguen)            # sin proteger, pero la tarea igual los tiene que pasar
                 if not tests:
                     return {}
+        acoplados = {}
+        for rel in tests:
+            if rel.endswith(".py"):
+                try:
+                    hallazgos = acoples_a_la_implementacion(self.ws.leer(rel))
+                except (OSError, ValueError, ErrorRuta):
+                    hallazgos = []
+                if hallazgos:
+                    acoplados[rel] = hallazgos
+        if acoplados:
+            # Una sola vez: si el modelo insiste, siguen (el implementador igual los ve), pero sin quemar pedidos.
+            self.ui.aviso("  Tests de la especificación acoplados a la implementación (mockean la base o exigen el SQL "
+                          "exacto): le pido al especificador que los reescriba con una base real.")
+            detalle = "\n".join(f"{rel}:\n" + "\n".join(f"  - {h}" for h in hs) for rel, hs in acoplados.items())
+            self._sub("especificador",
+                      "Estos tests prueban CÓMO está hecho el código, no QUÉ hace: cualquier implementación correcta "
+                      "pero distinta los rompe.\n" + detalle + "\n\nReescribilos con una base sqlite REAL temporal "
+                      "(sqlite3 ':memory:' o un archivo en tempfile) cargada con datos de prueba, llamando a las "
+                      "funciones públicas de la INTERFAZ y verificando el RESULTADO. Sin mocks de la conexión y sin "
+                      "afirmar SQL.", cid, titulo="reescribe los tests acoplados")
+            tests = sorted(set(tests) | {x for x in self.ws.checkpoints.archivos_desde(cid)
+                                         if _es_test(x) and (self.ws.raiz / x).is_file()})
+            rotos_ahora = {r.archivo for r in tests_de_especificacion_rotos(validar_archivos(self.ws, tests))}
+            if rotos_ahora:
+                # La reescritura no puede dejar protegido un test roto.
+                self.ui.aviso("  La reescritura dejó tests rotos (" + ", ".join(sorted(rotos_ahora)) + "): no los protejo.")
+                self._spec_rotos = sorted(set(getattr(self, "_spec_rotos", [])) | rotos_ahora)
+                tests = [t for t in tests if t not in rotos_ahora]
+                if not tests:
+                    return {}
         r = ejecutar_tests(self.ws, timeout=self.settings.tests_timeout, completo=True)
         conteo = conteo_de_resultado(r)
         codigo_plan = [a for a in plan.archivos() if not _es_test(a)]
@@ -17093,7 +17179,19 @@ class Orquestador:
             if intentos_txt:
                 contexto_intento += ("\n\nINTENTOS ANTERIORES QUE NO FUNCIONARON (no los repitas; entendé por qué fallaron):\n"
                                      + "\n---\n".join(intentos_txt[-2:]))
-            res = self.reparar(pedido, verif, rcid, base_fallaba, experto, contexto_intento.strip())
+            try:
+                res = self.reparar(pedido, verif, rcid, base_fallaba, experto, contexto_intento.strip())
+            except LLMError as e:
+                if e.detiene_todo:
+                    raise
+                # Prueba real (teléfono): se agotó el tiempo de la tarea 2 en medio de un reintento (Nvidia 500) y el
+                # error subió como "el modelo no responde": /grande se DETENÍA entero. Es el fin de ESTA reparación:
+                # la tarea queda con sus fallos, la build sigue y /grande la retoma con tiempo nuevo.
+                motivo = _primera_linea_util(str(e))
+                informe.notas.append(f"{etiqueta}: el reparador no pudo terminar ({recortar(motivo, 200)}).")
+                self.ui.aviso(f"  {etiqueta}: el reparador no pudo terminar ({recortar(motivo, 160)}); dejo la "
+                              "reparación acá.")
+                break
             intentos_txt.append(recortar(res.resumen, 1200))
             sin_cambios = 0 if self.ws.checkpoints.diff_desde(rcid).strip() else sin_cambios + 1
             verif = verificador()
@@ -51963,6 +52061,143 @@ class TestEspecificacionPropiaEnRojo(BaseTest):
         self.assertTrue(informe.ok, texto[-3000:])
         self.assertRegex(texto, r"La tarea \d+ no pasó su verificación")
         self.assertNotIn("REPARACIÓN final", texto)                                # se arregla en la tarea
+
+
+# ======================================================================
+# MÓDULO: autotest_prueba_real3
+# ======================================================================
+"""
+Tercera prueba REAL de /grande en el teléfono: la etapa 1 quedó verificada; la 2 (ventas) se detuvo.
+
+- La especificación mockeaba la conexión del propio proyecto (patch('almacen.sales.get_connection')) y exigía el SQL
+  exacto: el implementador reusó db.get_product (razonable), el mock dejó de aplicar y nadie lo pudo arreglar.
+- El reparador escribió 3 veces "Ahora, ejecutemos los tests" sin llamar run_tests y se cerró "sin herramientas".
+- Se agotó el tiempo de la tarea en medio de un reintento (Nvidia 500) y el error subió como "el modelo no responde":
+  /grande se DETENÍA entero en vez de dar la tarea por fallida y seguir.
+"""
+
+_PR3_TEST_ACOPLADO = '''import unittest
+from unittest.mock import MagicMock, patch
+
+from almacen.sales import validate_stock
+
+
+class TestValidateStock(unittest.TestCase):
+    def test_stock_suficiente(self):
+        conn = MagicMock()
+        conn.execute.return_value.fetchone.return_value = {"stock": 10}
+        with patch("almacen.sales.get_connection", return_value=conn):
+            self.assertTrue(validate_stock(1, 5))
+        conn.execute.assert_called_with("SELECT stock FROM products WHERE id = ?", (1,))
+'''
+_PR3_TEST_REAL = '''import unittest
+
+from almacen import db
+from almacen.sales import validate_stock
+
+
+class TestValidateStock(unittest.TestCase):
+    def test_stock_suficiente(self):
+        con = db.conectar(":memory:")
+        db.agregar_producto(con, 1, 10)
+        self.assertTrue(validate_stock(con, 1, 5))
+        self.assertFalse(validate_stock(con, 1, 11))
+'''
+
+
+class TestTestsAcopladosALaImplementacion(BaseTest):
+    def test_detecta_mock_de_la_conexion_y_sql_exacto(self):
+        hallazgos = acoples_a_la_implementacion(_PR3_TEST_ACOPLADO)
+        self.assertEqual(len(hallazgos), 2, hallazgos)
+        self.assertTrue(any("mockea la conexión" in h for h in hallazgos))
+        self.assertTrue(any("SQL exacto" in h for h in hallazgos))
+        self.assertEqual(acoples_a_la_implementacion(_PR3_TEST_REAL), [])
+        self.assertEqual(acoples_a_la_implementacion(
+            "from unittest.mock import patch\nwith patch('builtins.input', return_value='s'):\n    pass\n"), [])
+        self.assertTrue(any("acoplado a la implementación" in a for a in advertencias_tests_python(_PR3_TEST_ACOPLADO)))
+
+    def test_el_especificador_los_reescribe_una_vez(self):
+        ws = self.proyecto({})
+        pedidos = []
+
+        def guion(mensajes, kw):
+            if MockLLM.rol_de(mensajes) != "especificador":
+                return terminar_xml("listo")
+            if MockLLM.turnos_asistente(mensajes) == 0:
+                primero = MockLLM.ultimo_usuario(mensajes)
+                pedidos.append(primero)
+                contenido = _PR3_TEST_REAL if "CÓMO está hecho" in primero else _PR3_TEST_ACOPLADO
+                return herramienta_xml("write_to_file", path="tests/test_sales.py", content=contenido)
+            return terminar_xml("tests escritos")
+        ui = self.ui()
+        orq = Orquestador(MockLLM(guion), ws, self.ajustes(tests_primero=True), ui)
+        plan = Plan("Ventas", [Tarea("1", "validate_stock", ["almacen/sales.py", "tests/test_sales.py"])], [])
+        espec = orq.especificar("Ventas del almacén", plan, ws.checkpoints.iniciar("espec"))
+        self.assertEqual(len(pedidos), 2)
+        self.assertIn("almacen.sales.get_connection", pedidos[1])
+        self.assertEqual(espec.get("tests/test_sales.py"), _PR3_TEST_REAL)
+        self.assertIn("acoplados a la implementación", ui.texto_registrado())
+
+
+class TestReparadorQueNoPuedeTerminar(BaseTest):
+    def test_si_el_reparador_falla_la_tarea_queda_fallida_y_la_build_sigue(self):
+        ws = self.proyecto({})
+
+        def guion(mensajes, kw):
+            rol, turno = MockLLM.rol_de(mensajes), MockLLM.turnos_asistente(mensajes)
+            if rol == "arquitecto":
+                return terminar_xml('<plan><objetivo>Calc</objetivo><criterios>- sumar</criterios>'
+                                    '<tarea id="1" archivos="calc.py, tests/test_calc.py">sumar con test</tarea></plan>')
+            if rol == "implementador":
+                archivos = [("calc.py", "def sumar(a, b):\n    return a - b\n"),
+                            ("tests/test_calc.py", "import unittest\nfrom calc import sumar\n\n\n"
+                                                   "class T(unittest.TestCase):\n    def test_sumar(self):\n"
+                                                   "        self.assertEqual(sumar(2, 3), 5)\n")]
+                if turno < len(archivos):
+                    return herramienta_xml("write_to_file", path=archivos[turno][0], content=archivos[turno][1])
+                return terminar_xml("listo")
+            if rol == "reparador":
+                raise LLMError("Error del proveedor durante el streaming: Upstream error from Nvidia: Internal server "
+                               "error (no reintento: se agotó el tiempo de la tarea 1)")
+            return terminar_xml("listo")
+        ui = self.ui()
+        informe = Orquestador(MockLLM(guion), ws, self.ajustes(juez=False, max_reparaciones=1), ui).construir(
+            "Calculadora con sumar", confirmar=False)                               # antes: LLMError hacia arriba
+        self.assertFalse(informe.ok)
+        self.assertIn("el reparador no pudo terminar", ui.texto_registrado())
+        self.assertTrue(any("el reparador no pudo terminar" in n for n in informe.notas))
+
+    def test_cupo_diario_en_el_reparador_sigue_frenando_todo(self):
+        ws = self.proyecto({"calc.py": "def sumar(a, b):\n    return a - b\n",
+                            "tests/test_calc.py": "import unittest\nfrom calc import sumar\n\n\n"
+                                                  "class T(unittest.TestCase):\n    def test_sumar(self):\n"
+                                                  "        self.assertEqual(sumar(2, 3), 5)\n"})
+        orq = Orquestador(MockLLM(lambda m, k: terminar_xml("x")), ws, self.ajustes(), self.ui())
+        orq.reparar = lambda *a, **k: (_ for _ in ()).throw(_cupo_agotado(6 * 3600))
+        verif = orq.verificar(ws.checkpoints.iniciar("x"))
+        with self.assertRaises(LLMError) as ctx:
+            orq._reparar_con_escalada("p", verif, ws.checkpoints.iniciar("g"), False, InformeBuild("fallida"),
+                                      "final", 2, lambda: verif)
+        self.assertTrue(ctx.exception.cupo_diario)
+
+
+class TestAgenteQueAnunciaLosTests(BaseTest):
+    def test_si_anuncia_que_corre_los_tests_los_corre_reaper(self):
+        ws = self.proyecto({"calc.py": "def sumar(a, b):\n    return a + b\n",
+                            "tests/test_calc.py": "import unittest\nfrom calc import sumar\n\n\n"
+                                                  "class T(unittest.TestCase):\n    def test_sumar(self):\n"
+                                                  "        self.assertEqual(sumar(2, 3), 5)\n"})
+        vistos = []
+
+        def guion(mensajes, kw):
+            vistos.append(MockLLM.ultimo_usuario(mensajes))
+            if MockLLM.turnos_asistente(mensajes) < 2:
+                return "VERIFICACIÓN\n\nAhora, ejecutemos los tests para ver si pasan."
+            return terminar_xml("Los tests pasan: 1 pasó.")
+        res = Agente("reparador", MockLLM(guion), ws, self.ajustes(forense=False, escalar=False), self.ui()).ejecutar(
+            "Arreglá los fallos")
+        self.assertNotEqual(res.motivo if hasattr(res, "motivo") else "", "sin_herramientas")
+        self.assertTrue(any("los corrí yo" in v and "PASARON" in v for v in vistos), vistos[-1][:500])
 
 
 # ======================================================================
