@@ -1623,6 +1623,28 @@ def tests_node(raiz: Path) -> list:
     return sorted(encontrados)
 
 
+_SUFIJOS_JS = (".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx")
+AVISO_SIN_NODE = "TESTS DE JAVASCRIPT SIN CORRER"
+
+
+def tests_js_sin_node(raiz: Path, cambiados: Iterable[str]) -> list:
+    """Tests de JS que NO se pueden correr porque falta node, cuando lo que se cambió toca JavaScript. Sin node la suite
+    corría solo los tests de Python y daba "verificada" una web cuya lógica JS nunca se probó (simulador sin node, como
+    un Termux recién instalado). Un cambio que no toca JS no se frena por tests de JS ajenos."""
+    if shutil.which("node"):
+        return []
+    js = tests_node(raiz)
+    if not js or not any(str(c).endswith(_SUFIJOS_JS) for c in cambiados):
+        return []
+    return [p.relative_to(raiz).as_posix() for p in js]
+
+
+def mensaje_sin_node(tests_js: Sequence[str]) -> str:
+    return (f"{AVISO_SIN_NODE} ({', '.join(tests_js[:6])}): node no está instalado y sin node no se pueden ejecutar, "
+            "así que esto no se puede dar por verificado. No se arregla cambiando código: instalá node (en Termux: "
+            "pkg install nodejs) y seguí con /construir continuar o /grande continuar.")
+
+
 def _detectar_tests_otros(raiz: Path) -> Optional[tuple[str, str]]:
     """Ruby (minitest), Perl (prove), PHP (phpunit o runner propio), Bash y Java sin build tool."""
     if shutil.which("ruby"):

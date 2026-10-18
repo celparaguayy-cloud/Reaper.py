@@ -1008,6 +1008,7 @@ class Verificacion:
     archivos: list
     conteo: ConteoTests = field(default_factory=ConteoTests)
     aceptacion: Optional[Resultado] = None
+    solo_entorno: bool = False          # lo ÚNICO que falla es el entorno (p. ej. falta node): no se repara con código
 
 
 @dataclass
@@ -1669,7 +1670,11 @@ class Orquestador:
             tests = sorted(set(tests) | {x for x in self.ws.checkpoints.archivos_desde(cid)
                                           if _es_test(x) and (self.ws.raiz / x).is_file()})
         if r is not None and conteo.reconocido:
-            if conteo.ok and conteo.pasados:
+            sin_node = tests_js_sin_node(self.ws.raiz, tests)
+            if sin_node:
+                self.ui.aviso(f"  Los tests de JavaScript de la especificación ({', '.join(sin_node[:4])}) no se pueden "
+                              "correr: node no está instalado (pkg install nodejs). Sin node no quedan verificados.")
+            elif conteo.ok and conteo.pasados:
                 self.ui.aviso(f"  Ojo: la especificación ya pasa entera ({conteo.texto()}); quizá la función ya existía.")
             else:
                 previos = f"; {ya_pasaban} ya pasaban de antes" if ya_pasaban else ""
@@ -1825,11 +1830,15 @@ class Orquestador:
         partes.extend(arranque)
         debilitados = self._tests_debilitados()
         partes.extend(debilitados)
+        sin_node = tests_js_sin_node(self.ws.raiz, archivos)
+        resto_ok = not malos and tests_ok and aceptacion_ok and not arranque and not debilitados
+        if sin_node:
+            partes.append(mensaje_sin_node(sin_node))
         diagnostico = "\n\n".join(partes)
-        if diagnostico and self.settings.pistas_errores:
+        if diagnostico and self.settings.pistas_errores and not (sin_node and resto_ok):
             diagnostico = anexar_pistas(diagnostico, 3)
-        return Verificacion(not malos and tests_ok and aceptacion_ok and not arranque and not debilitados, validaciones,
-                            tests, diagnostico, archivos, conteo, aceptacion)
+        return Verificacion(resto_ok and not sin_node, validaciones, tests, diagnostico, archivos, conteo, aceptacion,
+                            solo_entorno=bool(sin_node) and resto_ok)
 
     def reparar(self, pedido: str, verif: Verificacion, cid: int, base_fallaba: bool,
                 diagnostico_experto: str = "", contexto: str = "") -> ResultadoAgente:
@@ -1890,6 +1899,11 @@ class Orquestador:
         liberacion_hecha = False
         experto_usado = False
         while not verif.ok:
+            if verif.solo_entorno:
+                # Falta algo del ENTORNO (node): ningún reparador lo arregla tocando código; antes se gastaban pedidos.
+                informe.notas.append(f"{etiqueta}: {_primera_linea_util(verif.diagnostico, 300)}")
+                self.ui.aviso(f"  {etiqueta}: no lo reparo con código — {_primera_linea_util(verif.diagnostico, 220)}")
+                break
             sin_avance = len(inutiles) >= 2 or sin_cambios >= 2
             if intento >= max_intentos and (liberacion_hecha or not sin_avance):
                 break                       # sin intentos: solo hay UNO más si abajo se libera la especificación
@@ -2508,6 +2522,11 @@ class Orquestador:
                              + ", ".join(rojos_propios[:8]) + "\n"
                              + fallos_relevantes(f"{tests.stdout}\n{tests.stderr}", maximo=3, limite=4000))
         problemas.extend(self._tests_debilitados())
+        sin_node = tests_js_sin_node(self.ws.raiz, archivos)
+        if sin_node:
+            problemas.append(mensaje_sin_node(sin_node))
+            if len(problemas) == 1:
+                return Verificacion(False, validaciones, tests, problemas[0], archivos, conteo, solo_entorno=True)
         if exigir_progreso and not problemas:
             # El implementador NO terminó (límite de pasos, error...). "No romper nada" no alcanza:
             # tiene que haber cambios reales y, si hay tests fallando, alguno más tiene que pasar.

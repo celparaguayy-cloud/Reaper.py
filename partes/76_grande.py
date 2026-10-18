@@ -342,6 +342,10 @@ def normalizar_maestro(maestro: PlanMaestro, max_grupos: int = 6) -> list:
     return avisos
 
 
+def _tests_js_de(etapa: Etapa) -> list:
+    return [a for a in etapa.archivos if _RE_TEST_JS.match(Path(a).name)]
+
+
 def partir_etapa(etapa: Etapa, motivo: str) -> Optional[tuple]:
     """Una etapa que falló se parte en dos más chicas (0 tokens): la mitad de sus archivos de código con sus tests y el
     resto. None si no se puede partir (menos de 2 archivos de código)."""
@@ -566,6 +570,10 @@ class ConstructorGrande:
                   f"ARCHIVOS QUE YA EXISTEN EN EL PROYECTO ({len(existentes)}):\n"
                   + ("\n".join(f"- {a}" for a in existentes[:150]) or "(ninguno: proyecto nuevo)")
                   + f"\n\nTope: {self.settings.max_etapas} etapas, cada una de hasta {self.settings.max_tareas} tareas.")
+        if not shutil.which("node"):
+            prompt += ("\n\nENTORNO: node NO está instalado en este dispositivo. No planifiques tests de JavaScript "
+                       "(*.test.mjs, node --test): no se podrían correr y esa etapa no quedaría verificada. Probá la "
+                       "lógica con tests de Python; la web se valida con los chequeos de HTML y recursos.")
         if anterior is not None and feedback:
             prompt += (f"\n\nTU PLAN MAESTRO ANTERIOR:\n{anterior.como_texto()}\n\n"
                        f"CORREGÍ ESTO:\n{feedback}")
@@ -709,6 +717,12 @@ class ConstructorGrande:
                                      "roles": dict(s.modelos_rol or {}), "torneo": s.torneo,
                                      "candidatos": s.candidatos, "tests_primero": s.tests_primero, "rpm": s.rpm,
                                      "juez": getattr(s, "juez", None), "fecha": datetime.now().isoformat(timespec="seconds")}
+        pendientes_js = [(e.id, _tests_js_de(e)) for e in maestro.etapas if not e.ok and _tests_js_de(e)]
+        if pendientes_js and not shutil.which("node"):
+            self.ui.aviso("  Ojo: " + "; ".join(f"la etapa {eid} tiene tests de JavaScript ({', '.join(t)})"
+                                                for eid, t in pendientes_js)
+                          + " y node no está instalado. Cuando llegue ahí me voy a frenar sin gastar pedidos. Para "
+                            "evitarlo, instalalo antes: pkg install nodejs")
         restaurar = self._ahorro_de_pedidos()
         try:
             return self._ejecutar_etapas(estado, maestro)
@@ -735,6 +749,13 @@ class ConstructorGrande:
                                      + (f": {_primera_linea_util(etapa.motivo)}" if etapa.motivo else "")
                                      + ".\nPara reintentarla desde el último estado verificado: /grande deshacer y "
                                        "después /grande continuar")
+            js = _tests_js_de(etapa)
+            if js and not shutil.which("node"):
+                # Antes de gastar pedidos: sin node esos tests no corren y la etapa no podría quedar verificada (sin esto
+                # quedaba "verificada" sin haber corrido nunca la lógica JS, o se gastaba la etapa entera para frenar).
+                return self._detener(estado, maestro, f"la etapa {etapa.id} tiene tests de JavaScript ({', '.join(js)}) y "
+                                     "node no está instalado: no se podrían correr ni verificar.\nInstalalo con: pkg "
+                                     "install nodejs — y seguí con /grande continuar")
             self.ui.linea("")
             self.ui.titulo(f"Etapa {etapa.id} ({n}/{len(maestro.etapas)}) · {etapa.titulo}")
             terminadas, esperado, esperas = 0, 0.0, 0
@@ -765,14 +786,15 @@ class ConstructorGrande:
                                              + (_texto_reinicio(e.reinicio) or " Se renueva en unas horas.").strip())
                     return self._detener(estado, maestro, f"el modelo no responde ({recortar(str(e), 160)})")
                 terminadas += 1
-                if etapa.ok or informe.estado == "cancelada" or terminadas >= 2:
+                if etapa.ok or informe.estado == "cancelada" or terminadas >= 2 or AVISO_SIN_NODE in (etapa.motivo or ""):
                     break
                 if etapa.intentos >= MAX_INTENTOS_ETAPA:
                     break
                 self.ui.aviso(f"  La etapa {etapa.id} quedó {etapa.estado.upper()}: la retomo una vez (sin replanificar) "
                               "para que el reparador termine lo que falta.")
             if not etapa.ok:
-                if informe.estado != "cancelada" and self._recuperar_etapa(estado, maestro, etapa):
+                sin_node = AVISO_SIN_NODE in (etapa.motivo or "")      # del entorno: reintentar o partir no sirve
+                if informe.estado != "cancelada" and not sin_node and self._recuperar_etapa(estado, maestro, etapa):
                     return self._ejecutar_etapas(estado, maestro, inicio)   # sigue con las dos partes, sin el usuario
                 return self._detener(estado, maestro, f"la etapa {etapa.id} quedó {etapa.estado.upper()}"
                                      + (f": {_primera_linea_util(etapa.motivo)}" if etapa.motivo else ""))

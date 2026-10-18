@@ -457,6 +457,9 @@ def _entorno() -> str:
         f"- Fecha y hora local del dispositivo: {fecha}\n"
         f"- Python: {sys.version.split()[0]} ({sys.executable})\n"
         f"- Herramientas disponibles: {', '.join(herramientas) or 'solo python'}"
+        + ("" if "node" in herramientas else
+           "\n- node NO está instalado: no planifiques ni escribas tests de JavaScript (node --test no se podría "
+           "correr y la tarea no quedaría verificada); probá la lógica con tests de Python")
     )
 
 

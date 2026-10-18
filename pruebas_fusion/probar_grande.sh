@@ -2,7 +2,7 @@
 # Prueba GRANDE de REAPER en Termux, en un solo comando:
 #   1) baja la última versión y verifica que llegó entera (SHA-256 publicado en el repo);
 #   2) la instala (tu config y tu clave en ~/reaper no se tocan);
-#   3) muestra el diagnóstico y el cupo de pedidos gratis de hoy;
+#   3) muestra el diagnóstico y el cupo de pedidos gratis de hoy (e instala node si falta: lo usan los tests de la web);
 #   4) construye el proyecto grande por etapas (o lo RETOMA si ya había empezado);
 #   5) arma el ZIP de /reporte (sin claves) y lo copia a Descargas para mandarlo.
 #
@@ -54,6 +54,17 @@ paso "3/5 · Diagnóstico y cupo de pedidos gratis de hoy"
 # Con --perfil gratis: así el diagnóstico mira los MISMOS modelos que va a usar la prueba y muestra el cupo de hoy.
 $REAPER --perfil gratis --doctor || true
 echo "  (sin crédito comprado: 50 pedidos gratis por día; con 10 o más de crédito: 1000)"
+
+if ! command -v node >/dev/null 2>&1; then
+  # La web del proyecto se prueba con node --test: sin node esos tests no corren y REAPER frena esa etapa.
+  if command -v pkg >/dev/null 2>&1; then
+    echo "  Falta node (hace falta para correr los tests de la web): lo instalo con pkg install nodejs…"
+    pkg install -y nodejs >/dev/null 2>&1 && echo "  OK: $(node --version)" \
+      || echo "  No pude instalar node. Hacelo a mano con: pkg install nodejs (si no, REAPER frena en la etapa de la web)."
+  else
+    echo "  Ojo: falta node. Sin node REAPER frena en la etapa de la web (instalalo y volvé a correr este script)."
+  fi
+fi
 
 if command -v termux-wake-lock >/dev/null 2>&1; then
   termux-wake-lock && echo "  Pantalla bloqueada sin cortar: termux-wake-lock activo."

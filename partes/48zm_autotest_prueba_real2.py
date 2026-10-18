@@ -257,15 +257,14 @@ class TestEspecificacionPropiaEnRojo(BaseTest):
                             ("almacen/__main__.py", _PR2_MAIN)]
                 if turno < len(archivos):
                     return herramienta_xml("write_to_file", path=archivos[turno][0], content=archivos[turno][1])
-            if rol == "reparador" and turno == 0 and "F821" in primero:
+            # ruff dice F821, pyflakes "undefined name" y el detector propio (Termux sin ruff) "nombre indefinido".
+            if rol == "reparador" and turno == 0 and re.search(r"F821|undefined name|nombre indefinido", primero):
                 return herramienta_xml("write_to_file", path="tests/test_cli.py", content=_PR2_TEST_BIEN)
             return terminar_xml("listo")
         ui = self.ui()
         informe = Orquestador(MockLLM(guion), ws, self.ajustes(tests_primero=True, juez=False), ui).construir(
             "CLI del almacén con --puerto", confirmar=False)
         texto = ui.texto_registrado()
-        if not shutil.which("ruff"):
-            self.skipTest("sin ruff el diagnóstico no trae el código F821")
         self.assertTrue(informe.ok, texto[-3000:])
         self.assertRegex(texto, r"La tarea \d+ no pasó su verificación")
         self.assertNotIn("REPARACIÓN final", texto)                                # se arregla en la tarea

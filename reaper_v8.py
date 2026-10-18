@@ -6910,6 +6910,28 @@ def tests_node(raiz: Path) -> list:
     return sorted(encontrados)
 
 
+_SUFIJOS_JS = (".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx")
+AVISO_SIN_NODE = "TESTS DE JAVASCRIPT SIN CORRER"
+
+
+def tests_js_sin_node(raiz: Path, cambiados: Iterable[str]) -> list:
+    """Tests de JS que NO se pueden correr porque falta node, cuando lo que se cambió toca JavaScript. Sin node la suite
+    corría solo los tests de Python y daba "verificada" una web cuya lógica JS nunca se probó (simulador sin node, como
+    un Termux recién instalado). Un cambio que no toca JS no se frena por tests de JS ajenos."""
+    if shutil.which("node"):
+        return []
+    js = tests_node(raiz)
+    if not js or not any(str(c).endswith(_SUFIJOS_JS) for c in cambiados):
+        return []
+    return [p.relative_to(raiz).as_posix() for p in js]
+
+
+def mensaje_sin_node(tests_js: Sequence[str]) -> str:
+    return (f"{AVISO_SIN_NODE} ({', '.join(tests_js[:6])}): node no está instalado y sin node no se pueden ejecutar, "
+            "así que esto no se puede dar por verificado. No se arregla cambiando código: instalá node (en Termux: "
+            "pkg install nodejs) y seguí con /construir continuar o /grande continuar.")
+
+
 def _detectar_tests_otros(raiz: Path) -> Optional[tuple[str, str]]:
     """Ruby (minitest), Perl (prove), PHP (phpunit o runner propio), Bash y Java sin build tool."""
     if shutil.which("ruby"):
@@ -12017,6 +12039,9 @@ def _entorno() -> str:
         f"- Fecha y hora local del dispositivo: {fecha}\n"
         f"- Python: {sys.version.split()[0]} ({sys.executable})\n"
         f"- Herramientas disponibles: {', '.join(herramientas) or 'solo python'}"
+        + ("" if "node" in herramientas else
+           "\n- node NO está instalado: no planifiques ni escribas tests de JavaScript (node --test no se podría "
+           "correr y la tarea no quedaría verificada); probá la lógica con tests de Python")
     )
 
 
@@ -16875,6 +16900,7 @@ class Verificacion:
     archivos: list
     conteo: ConteoTests = field(default_factory=ConteoTests)
     aceptacion: Optional[Resultado] = None
+    solo_entorno: bool = False          # lo ÚNICO que falla es el entorno (p. ej. falta node): no se repara con código
 
 
 @dataclass
@@ -17536,7 +17562,11 @@ class Orquestador:
             tests = sorted(set(tests) | {x for x in self.ws.checkpoints.archivos_desde(cid)
                                           if _es_test(x) and (self.ws.raiz / x).is_file()})
         if r is not None and conteo.reconocido:
-            if conteo.ok and conteo.pasados:
+            sin_node = tests_js_sin_node(self.ws.raiz, tests)
+            if sin_node:
+                self.ui.aviso(f"  Los tests de JavaScript de la especificación ({', '.join(sin_node[:4])}) no se pueden "
+                              "correr: node no está instalado (pkg install nodejs). Sin node no quedan verificados.")
+            elif conteo.ok and conteo.pasados:
                 self.ui.aviso(f"  Ojo: la especificación ya pasa entera ({conteo.texto()}); quizá la función ya existía.")
             else:
                 previos = f"; {ya_pasaban} ya pasaban de antes" if ya_pasaban else ""
@@ -17692,11 +17722,15 @@ class Orquestador:
         partes.extend(arranque)
         debilitados = self._tests_debilitados()
         partes.extend(debilitados)
+        sin_node = tests_js_sin_node(self.ws.raiz, archivos)
+        resto_ok = not malos and tests_ok and aceptacion_ok and not arranque and not debilitados
+        if sin_node:
+            partes.append(mensaje_sin_node(sin_node))
         diagnostico = "\n\n".join(partes)
-        if diagnostico and self.settings.pistas_errores:
+        if diagnostico and self.settings.pistas_errores and not (sin_node and resto_ok):
             diagnostico = anexar_pistas(diagnostico, 3)
-        return Verificacion(not malos and tests_ok and aceptacion_ok and not arranque and not debilitados, validaciones,
-                            tests, diagnostico, archivos, conteo, aceptacion)
+        return Verificacion(resto_ok and not sin_node, validaciones, tests, diagnostico, archivos, conteo, aceptacion,
+                            solo_entorno=bool(sin_node) and resto_ok)
 
     def reparar(self, pedido: str, verif: Verificacion, cid: int, base_fallaba: bool,
                 diagnostico_experto: str = "", contexto: str = "") -> ResultadoAgente:
@@ -17757,6 +17791,11 @@ class Orquestador:
         liberacion_hecha = False
         experto_usado = False
         while not verif.ok:
+            if verif.solo_entorno:
+                # Falta algo del ENTORNO (node): ningún reparador lo arregla tocando código; antes se gastaban pedidos.
+                informe.notas.append(f"{etiqueta}: {_primera_linea_util(verif.diagnostico, 300)}")
+                self.ui.aviso(f"  {etiqueta}: no lo reparo con código — {_primera_linea_util(verif.diagnostico, 220)}")
+                break
             sin_avance = len(inutiles) >= 2 or sin_cambios >= 2
             if intento >= max_intentos and (liberacion_hecha or not sin_avance):
                 break                       # sin intentos: solo hay UNO más si abajo se libera la especificación
@@ -18375,6 +18414,11 @@ class Orquestador:
                              + ", ".join(rojos_propios[:8]) + "\n"
                              + fallos_relevantes(f"{tests.stdout}\n{tests.stderr}", maximo=3, limite=4000))
         problemas.extend(self._tests_debilitados())
+        sin_node = tests_js_sin_node(self.ws.raiz, archivos)
+        if sin_node:
+            problemas.append(mensaje_sin_node(sin_node))
+            if len(problemas) == 1:
+                return Verificacion(False, validaciones, tests, problemas[0], archivos, conteo, solo_entorno=True)
         if exigir_progreso and not problemas:
             # El implementador NO terminó (límite de pasos, error...). "No romper nada" no alcanza:
             # tiene que haber cambios reales y, si hay tests fallando, alguno más tiene que pasar.
@@ -52820,15 +52864,14 @@ class TestEspecificacionPropiaEnRojo(BaseTest):
                             ("almacen/__main__.py", _PR2_MAIN)]
                 if turno < len(archivos):
                     return herramienta_xml("write_to_file", path=archivos[turno][0], content=archivos[turno][1])
-            if rol == "reparador" and turno == 0 and "F821" in primero:
+            # ruff dice F821, pyflakes "undefined name" y el detector propio (Termux sin ruff) "nombre indefinido".
+            if rol == "reparador" and turno == 0 and re.search(r"F821|undefined name|nombre indefinido", primero):
                 return herramienta_xml("write_to_file", path="tests/test_cli.py", content=_PR2_TEST_BIEN)
             return terminar_xml("listo")
         ui = self.ui()
         informe = Orquestador(MockLLM(guion), ws, self.ajustes(tests_primero=True, juez=False), ui).construir(
             "CLI del almacén con --puerto", confirmar=False)
         texto = ui.texto_registrado()
-        if not shutil.which("ruff"):
-            self.skipTest("sin ruff el diagnóstico no trae el código F821")
         self.assertTrue(informe.ok, texto[-3000:])
         self.assertRegex(texto, r"La tarea \d+ no pasó su verificación")
         self.assertNotIn("REPARACIÓN final", texto)                                # se arregla en la tarea
@@ -54225,6 +54268,132 @@ class TestVaciasDelUltimoModelo(BaseTest):
         c, pedidos = self._cliente([vacia(), vacia(), "ok"], modelo="a/pago", fallbacks=["b/pago"])
         self.assertEqual(c.chat([{"role": "user", "content": "x"}]).texto, "ok")
         self.assertEqual(pedidos, ["a/pago", "a/pago", "b/pago"])
+
+
+# ======================================================================
+# MÓDULO: autotest_termux_pelado
+# ======================================================================
+"""
+Termux recién instalado (solo python y git; sin node, ruff ni pytest) — corrida E2E del almacén en ese entorno:
+
+- Sin node, la suite corría solo los tests de Python y la etapa Web quedaba "✓ BUILD VERIFICADA · validadores + tests
+  reales" aunque tests/logica.test.mjs no se había ejecutado NUNCA (falso verde). El especificador además decía "la
+  especificación ya pasa entera".
+- Ahora: si lo que se cambió toca JavaScript y hay tests de JS que no pueden correr, no queda verificada; si es lo
+  único que falla, no se gastan reparaciones (no se arregla con código); /grande se frena ANTES de gastar pedidos en esa
+  etapa y avisa al empezar; el maestro y los roles saben que no hay node para no planificar tests de JS.
+"""
+import contextlib as _ztp_contextlib
+
+
+@_ztp_contextlib.contextmanager
+def _ztp_sin_node():
+    from unittest.mock import patch
+    original = shutil.which
+    with patch("shutil.which", lambda nombre, *a, **k: None if nombre == "node" else original(nombre, *a, **k)):
+        yield
+
+
+_ZTP_TEST_JS = ('import { test } from "node:test";\nimport assert from "node:assert/strict";\n'
+                'import { doble } from "../web/logica.js";\n\ntest("doble", () => { assert.equal(doble(2), 4); });\n')
+_ZTP_LOGICA = "export function doble(x) {\n  return x * 2;\n}\n"
+_ZTP_TEST_PY = ("import unittest\n\nfrom ops import suma\n\n\nclass T(unittest.TestCase):\n    def test_suma(self):\n"
+                "        self.assertEqual(suma(2, 3), 5)\n")
+
+
+class TestSinNodeNoHayFalsoVerde(BaseTest):
+    def test_detecta_tests_js_que_no_pueden_correr(self):
+        ws = self.proyecto({"tests/logica.test.mjs": _ZTP_TEST_JS, "web/logica.js": _ZTP_LOGICA, "ops.py": "x = 1\n"})
+        with _ztp_sin_node():
+            self.assertEqual(tests_js_sin_node(ws.raiz, ["web/logica.js"]), ["tests/logica.test.mjs"])
+            self.assertEqual(tests_js_sin_node(ws.raiz, ["ops.py"]), [])        # un cambio de Python no se frena
+        if shutil.which("node"):
+            self.assertEqual(tests_js_sin_node(ws.raiz, ["web/logica.js"]), [])
+
+    def test_la_build_no_queda_verificada_y_no_se_repara_a_ciegas(self):
+        ws = self.proyecto({"ops.py": "def suma(a, b):\n    return a + b\n", "tests/test_ops.py": _ZTP_TEST_PY})
+        orq = Orquestador(MockLLM(lambda m, k: terminar_xml("x")), ws, self.ajustes(forense=False), self.ui())
+        cid = ws.checkpoints.iniciar("web")
+        ws.escribir("web/logica.js", _ZTP_LOGICA)
+        ws.escribir("tests/logica.test.mjs", _ZTP_TEST_JS)
+        llamadas = []
+        orq.reparar = lambda *a, **k: llamadas.append(1) or ResultadoAgente(True, "listo")
+        with _ztp_sin_node():
+            verif = orq.verificar(cid)
+            self.assertFalse(verif.ok)                                      # antes: verificada (solo corrían los .py)
+            self.assertTrue(verif.solo_entorno)
+            self.assertIn("TESTS DE JAVASCRIPT SIN CORRER", verif.diagnostico)
+            self.assertIn("pkg install nodejs", verif.diagnostico)
+            informe = InformeBuild("fallida")
+            final = orq._reparar_con_escalada("web", verif, cid, False, informe, "final", 3, lambda: orq.verificar(cid))
+        self.assertFalse(final.ok)
+        self.assertEqual(llamadas, [])                                      # no se gastan reparaciones
+        self.assertTrue(any("TESTS DE JAVASCRIPT SIN CORRER" in n for n in informe.notas))
+
+    def test_los_roles_saben_que_no_hay_node(self):
+        with _ztp_sin_node():
+            self.assertIn("node NO está instalado", _entorno())
+        if shutil.which("node"):
+            self.assertNotIn("node NO está instalado", _entorno())
+
+
+class _ZTP_GuionWeb:
+    MAESTRO = """<maestro>
+<vision>Una utilidad de números y una web.</vision>
+<arquitectura>Python 3 y JS sin dependencias. Tests con unittest y node:test.</arquitectura>
+<etapa id="1" titulo="Números" deps="">
+<objetivo>suma(a, b)</objetivo>
+<archivos>ops.py, tests/test_ops.py</archivos>
+</etapa>
+<etapa id="2" titulo="Web" deps="1">
+<objetivo>doble(x) en JS</objetivo>
+<archivos>web/logica.js, tests/logica.test.mjs</archivos>
+</etapa>
+</maestro>"""
+
+    def __init__(self):
+        self.prompts_maestro = []
+        self.arquitecto = 0
+
+    def __call__(self, mensajes, kw):
+        rol = MockLLM.rol_de(mensajes)
+        primero = next((m["content"] for m in mensajes if m["role"] == "user"), "")
+        if rol == "maestro":
+            self.prompts_maestro.append(primero)
+            return self.MAESTRO
+        if rol == "arquitecto":
+            self.arquitecto += 1
+            return terminar_xml('<plan><objetivo>N</objetivo><tarea id="1" archivos="ops.py, tests/test_ops.py">'
+                                'suma con test</tarea></plan>')
+        if rol == "implementador":
+            archivos = [("ops.py", "def suma(a, b):\n    return a + b\n"), ("tests/test_ops.py", _ZTP_TEST_PY)]
+            turno = _turno(mensajes)
+            if turno < len(archivos):
+                return herramienta_xml("write_to_file", path=archivos[turno][0], content=archivos[turno][1])
+        return terminar_xml("listo")
+
+
+class TestGrandeSinNode(BaseTest):
+    def test_se_frena_antes_de_gastar_pedidos_en_la_etapa_de_js(self):
+        ws = self.proyecto({})
+        guion = _ZTP_GuionWeb()
+        ui = self.ui()
+        ajustes = self.ajustes(tests_primero=False, torneo=False, escalar=False, max_revisiones=0, qa=False,
+                               juez=False, git_snapshots=False, forense=False)
+        grande = ConstructorGrande(MockLLM(guion), ws, ajustes, ui)
+        grande.consultar_cuenta = lambda: None
+        grande.dormir = lambda s: self.fail(f"no debía esperar {s}s")
+        with _ztp_sin_node():
+            self.assertFalse(grande.iniciar("Números y una web con su lógica en JS", confirmar=False))
+        estado = grande.leer()
+        etapas = {e["id"]: e for e in estado["maestro"]["etapas"]}
+        self.assertEqual(etapas["1"]["estado"], "verificada")
+        self.assertEqual(etapas["2"]["estado"], "pendiente")                 # ni se intentó
+        self.assertEqual(guion.arquitecto, 1)                               # cero pedidos para la etapa 2
+        self.assertIn("pkg install nodejs", estado["motivo"])
+        texto = ui.texto_registrado()
+        self.assertIn("Ojo: la etapa 2 tiene tests de JavaScript", texto)    # avisado al empezar
+        self.assertIn("ENTORNO: node NO está instalado", guion.prompts_maestro[0])
 
 
 # ======================================================================
@@ -61004,6 +61173,10 @@ def normalizar_maestro(maestro: PlanMaestro, max_grupos: int = 6) -> list:
     return avisos
 
 
+def _tests_js_de(etapa: Etapa) -> list:
+    return [a for a in etapa.archivos if _RE_TEST_JS.match(Path(a).name)]
+
+
 def partir_etapa(etapa: Etapa, motivo: str) -> Optional[tuple]:
     """Una etapa que falló se parte en dos más chicas (0 tokens): la mitad de sus archivos de código con sus tests y el
     resto. None si no se puede partir (menos de 2 archivos de código)."""
@@ -61228,6 +61401,10 @@ class ConstructorGrande:
                   f"ARCHIVOS QUE YA EXISTEN EN EL PROYECTO ({len(existentes)}):\n"
                   + ("\n".join(f"- {a}" for a in existentes[:150]) or "(ninguno: proyecto nuevo)")
                   + f"\n\nTope: {self.settings.max_etapas} etapas, cada una de hasta {self.settings.max_tareas} tareas.")
+        if not shutil.which("node"):
+            prompt += ("\n\nENTORNO: node NO está instalado en este dispositivo. No planifiques tests de JavaScript "
+                       "(*.test.mjs, node --test): no se podrían correr y esa etapa no quedaría verificada. Probá la "
+                       "lógica con tests de Python; la web se valida con los chequeos de HTML y recursos.")
         if anterior is not None and feedback:
             prompt += (f"\n\nTU PLAN MAESTRO ANTERIOR:\n{anterior.como_texto()}\n\n"
                        f"CORREGÍ ESTO:\n{feedback}")
@@ -61371,6 +61548,12 @@ class ConstructorGrande:
                                      "roles": dict(s.modelos_rol or {}), "torneo": s.torneo,
                                      "candidatos": s.candidatos, "tests_primero": s.tests_primero, "rpm": s.rpm,
                                      "juez": getattr(s, "juez", None), "fecha": datetime.now().isoformat(timespec="seconds")}
+        pendientes_js = [(e.id, _tests_js_de(e)) for e in maestro.etapas if not e.ok and _tests_js_de(e)]
+        if pendientes_js and not shutil.which("node"):
+            self.ui.aviso("  Ojo: " + "; ".join(f"la etapa {eid} tiene tests de JavaScript ({', '.join(t)})"
+                                                for eid, t in pendientes_js)
+                          + " y node no está instalado. Cuando llegue ahí me voy a frenar sin gastar pedidos. Para "
+                            "evitarlo, instalalo antes: pkg install nodejs")
         restaurar = self._ahorro_de_pedidos()
         try:
             return self._ejecutar_etapas(estado, maestro)
@@ -61397,6 +61580,13 @@ class ConstructorGrande:
                                      + (f": {_primera_linea_util(etapa.motivo)}" if etapa.motivo else "")
                                      + ".\nPara reintentarla desde el último estado verificado: /grande deshacer y "
                                        "después /grande continuar")
+            js = _tests_js_de(etapa)
+            if js and not shutil.which("node"):
+                # Antes de gastar pedidos: sin node esos tests no corren y la etapa no podría quedar verificada (sin esto
+                # quedaba "verificada" sin haber corrido nunca la lógica JS, o se gastaba la etapa entera para frenar).
+                return self._detener(estado, maestro, f"la etapa {etapa.id} tiene tests de JavaScript ({', '.join(js)}) y "
+                                     "node no está instalado: no se podrían correr ni verificar.\nInstalalo con: pkg "
+                                     "install nodejs — y seguí con /grande continuar")
             self.ui.linea("")
             self.ui.titulo(f"Etapa {etapa.id} ({n}/{len(maestro.etapas)}) · {etapa.titulo}")
             terminadas, esperado, esperas = 0, 0.0, 0
@@ -61427,14 +61617,15 @@ class ConstructorGrande:
                                              + (_texto_reinicio(e.reinicio) or " Se renueva en unas horas.").strip())
                     return self._detener(estado, maestro, f"el modelo no responde ({recortar(str(e), 160)})")
                 terminadas += 1
-                if etapa.ok or informe.estado == "cancelada" or terminadas >= 2:
+                if etapa.ok or informe.estado == "cancelada" or terminadas >= 2 or AVISO_SIN_NODE in (etapa.motivo or ""):
                     break
                 if etapa.intentos >= MAX_INTENTOS_ETAPA:
                     break
                 self.ui.aviso(f"  La etapa {etapa.id} quedó {etapa.estado.upper()}: la retomo una vez (sin replanificar) "
                               "para que el reparador termine lo que falta.")
             if not etapa.ok:
-                if informe.estado != "cancelada" and self._recuperar_etapa(estado, maestro, etapa):
+                sin_node = AVISO_SIN_NODE in (etapa.motivo or "")      # del entorno: reintentar o partir no sirve
+                if informe.estado != "cancelada" and not sin_node and self._recuperar_etapa(estado, maestro, etapa):
                     return self._ejecutar_etapas(estado, maestro, inicio)   # sigue con las dos partes, sin el usuario
                 return self._detener(estado, maestro, f"la etapa {etapa.id} quedó {etapa.estado.upper()}"
                                      + (f": {_primera_linea_util(etapa.motivo)}" if etapa.motivo else ""))
