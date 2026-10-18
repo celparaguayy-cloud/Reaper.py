@@ -98,6 +98,7 @@ class Etapa:
     segundos: float = 0.0
     consumo: int = 0                    # tokens (entrada + salida) de sus builds
     pedidos: int = 0                    # pedidos al modelo de sus builds (lo que cuenta para el cupo diario gratis)
+    origen: str = ""                    # si es una parte de una etapa que falló y se partió: el id de la original
 
     @property
     def ok(self) -> bool:
@@ -276,6 +277,95 @@ def observaciones_maestro(maestro: PlanMaestro, pedido: str = "") -> list:
         salida.append(f"el plan está muy fragmentado ({len(maestro.etapas)} etapas, la mayoría de un solo archivo): "
                       "agrupá piezas relacionadas y apuntá a 3–6 etapas")
     return salida
+
+
+def _fusionar_etapas(grupo: list, nuevo_id: str) -> Etapa:
+    def unicos(valores):
+        return list(dict.fromkeys(v for v in valores if v))
+    return Etapa(nuevo_id, recortar(" + ".join(e.titulo for e in grupo), 140),
+                 "\n".join(f"- {e.titulo}: {e.objetivo}" for e in grupo) if len(grupo) > 1 else grupo[0].objetivo,
+                 unicos(a for e in grupo for a in e.archivos),
+                 "\n".join(e.interfaz.strip() for e in grupo if e.interfaz.strip()),
+                 unicos(c for e in grupo for c in e.criterios), [])
+
+
+def normalizar_maestro(maestro: PlanMaestro, max_grupos: int = 6) -> list:
+    """Determinista (0 tokens), cuando el modelo INSISTE con un plan defectuoso después de la replanificación:
+    - una etapa de solo tests se une a la etapa cuyo código prueba (la que depende de ella, o la anterior);
+    - un plan fragmentado (más de `max_grupos` etapas, la mayoría de un archivo; prueba real: 10 etapas, una por CRUD)
+      se agrupa en tramos contiguos del orden de dependencias (así ninguna dependencia apunta hacia adelante).
+    Modifica el plan y devuelve los avisos; si el resultado no fuera un grafo válido, no toca nada."""
+    avisos = []
+    orden = [replace(e, archivos=list(e.archivos), criterios=list(e.criterios), deps=list(e.deps))
+             for e in GrafoTareas(maestro.etapas).orden()]
+    # 1) etapas de solo tests
+    i = 0
+    while i < len(orden) and len(orden) > 1:
+        etapa = orden[i]
+        if not etapa.archivos or not all(_es_test(a) for a in etapa.archivos):
+            i += 1
+            continue
+        destino = next((e for e in orden[i + 1:] if etapa.id in e.deps), None) or (orden[i - 1] if i > 0 else orden[1])
+        destino.archivos = list(dict.fromkeys(destino.archivos + etapa.archivos))
+        destino.criterios = list(dict.fromkeys(destino.criterios + etapa.criterios))
+        destino.deps = [d for d in dict.fromkeys(destino.deps + etapa.deps) if d not in (etapa.id, destino.id)]
+        for e in orden:
+            if e is not etapa:
+                e.deps = [d for d in dict.fromkeys(destino.id if d == etapa.id else d for d in e.deps) if d != e.id]
+        orden.pop(i)
+        avisos.append(f"la etapa {etapa.id} era solo de tests: la uní a la etapa {destino.id}")
+    # 2) fragmentado
+    codigo = sorted(sum(1 for rel in e.archivos if not _es_test(rel)) for e in orden)
+    if len(orden) > max_grupos and codigo and codigo[len(codigo) // 2] <= 1:
+        n, g = len(orden), max_grupos
+        tamanos = [n // g + (1 if k < n % g else 0) for k in range(g)]
+        nuevas, mapa, pos = [], {}, 0
+        for tam in tamanos:
+            grupo = orden[pos:pos + tam]
+            pos += tam
+            nueva = _fusionar_etapas(grupo, grupo[0].id)
+            for e in grupo:
+                mapa[e.id] = nueva.id
+            nueva.deps = list(dict.fromkeys(mapa.get(d, d) for e in grupo for d in e.deps
+                                            if mapa.get(d, d) != nueva.id))
+            nuevas.append(nueva)
+        avisos.append(f"el plan seguía fragmentado ({n} etapas): lo agrupé en {len(nuevas)}")
+        orden = nuevas
+    if not avisos:
+        return []
+    ids = {e.id for e in orden}
+    grafo = GrafoTareas(orden)
+    if grafo.tiene_ciclo() or any(d not in ids for e in orden for d in e.deps):
+        return []
+    maestro.etapas = grafo.orden()
+    return avisos
+
+
+def partir_etapa(etapa: Etapa, motivo: str) -> Optional[tuple]:
+    """Una etapa que falló se parte en dos más chicas (0 tokens): la mitad de sus archivos de código con sus tests y el
+    resto. None si no se puede partir (menos de 2 archivos de código)."""
+    codigo = [a for a in etapa.archivos if not _es_test(a)]
+    tests = [a for a in etapa.archivos if _es_test(a)]
+    if len(codigo) < 2:
+        return None
+    mitad = (len(codigo) + 1) // 2
+    partes = []
+    for k, cod in enumerate((codigo[:mitad], codigo[mitad:])):
+        tallos = {Path(c).stem.lower() for c in cod}
+        if k == 0:
+            suyos = [t for t in tests if any(tallo in Path(t).stem.lower() for tallo in tallos)]
+        else:
+            suyos = [t for t in tests if t not in partes[0].archivos]
+        archivos = cod + suyos
+        interfaz = "\n".join(l for l in etapa.interfaz.splitlines()
+                             if not re.search(r"[\w/.-]+\.\w{1,5}", l) or any(a in l for a in archivos))
+        objetivo = (f"{etapa.objetivo}\nEN ESTA PARTE ({k + 1} de 2) construí SOLO: {', '.join(archivos)}."
+                    + (f"\nLa etapa entera falló antes ({recortar(motivo, 300)}): hacelo más simple y verificable."
+                       if motivo else ""))
+        partes.append(Etapa(f"{etapa.id}{'ab'[k]}", f"{etapa.titulo} (parte {k + 1} de 2)", objetivo, archivos,
+                            interfaz, list(etapa.criterios) if k == 1 else [],
+                            list(etapa.deps) if k == 0 else [f"{etapa.id}a"] + list(etapa.deps), origen=etapa.id))
+    return partes[0], partes[1]
 
 
 def pedido_de_etapa(pedido: str, maestro: PlanMaestro, etapa: Etapa) -> str:
@@ -500,6 +590,10 @@ class ConstructorGrande:
                 self.ui.tenue(f"    • {p}")
             maestro = self._pedir_maestro(pedido, "\n".join(f"- {p}" for p in problemas + observaciones), maestro)
             problemas = problemas_maestro(maestro, self.settings.max_etapas, pedido)
+            if not problemas:
+                # Si el modelo insiste con etapas de solo tests o un plan fragmentado, se corrige solo (0 tokens).
+                for aviso in normalizar_maestro(maestro):
+                    self.ui.aviso(f"  Juez · {aviso}")
             for o in observaciones_maestro(maestro, pedido) if not problemas else []:
                 # Lo que no frena: queda avisado y la integración final contra el pedido lo vuelve a mirar.
                 self.ui.aviso(f"  Juez · sigue: {o} (lo vuelve a revisar la integración final)")
@@ -620,8 +714,8 @@ class ConstructorGrande:
         finally:
             restaurar()
 
-    def _ejecutar_etapas(self, estado: dict, maestro: PlanMaestro) -> bool:
-        inicio = time.monotonic()
+    def _ejecutar_etapas(self, estado: dict, maestro: PlanMaestro, inicio: Optional[float] = None) -> bool:
+        inicio = time.monotonic() if inicio is None else inicio
         grafo = GrafoTareas(maestro.etapas)
         for n, etapa in enumerate(grafo.orden(), start=1):
             if etapa.ok:
@@ -664,6 +758,8 @@ class ConstructorGrande:
                 self.ui.aviso(f"  La etapa {etapa.id} quedó {etapa.estado.upper()}: la retomo una vez (sin replanificar) "
                               "para que el reparador termine lo que falta.")
             if not etapa.ok:
+                if informe.estado != "cancelada" and self._recuperar_etapa(estado, maestro, etapa):
+                    return self._ejecutar_etapas(estado, maestro, inicio)   # sigue con las dos partes, sin el usuario
                 return self._detener(estado, maestro, f"la etapa {etapa.id} quedó {etapa.estado.upper()}"
                                      + (f": {_primera_linea_util(etapa.motivo)}" if etapa.motivo else ""))
         ok = self._integrar(estado, maestro)
@@ -725,6 +821,43 @@ class ConstructorGrande:
             if nombres:
                 salida[eid] = nombres
         return salida
+
+    def _recuperar_etapa(self, estado: dict, maestro: PlanMaestro, etapa: Etapa) -> bool:
+        """Una etapa que quedó FALLIDA/PARCIAL tras su reintento: en vez de DETENIDO (esperando al usuario horas), UNA
+        recuperación acotada: se deshace la etapa (vuelve al último estado verificado) y se la parte en dos más chicas
+        con el motivo real del fallo como contexto. Si una de esas partes también falla, DETENIDO con el motivo real."""
+        if etapa.origen:
+            return False                                 # ya es una parte de una etapa recuperada: no se parte más
+        motivo = _primera_linea_util(etapa.motivo) if etapa.motivo else f"quedó {etapa.estado.upper()}"
+        partes = partir_etapa(etapa, motivo)
+        if partes is None or any(maestro.por_id(p.id) for p in partes):
+            return False
+        try:
+            build = RegistroBuild(self.ws).leer()
+        except ValueError:
+            return False
+        if not build or build.get("estado") in ESTADOS_OK_ETAPA \
+                or not mismo_pedido(build.get("pedido"), pedido_de_etapa(estado["pedido"], maestro, etapa)):
+            return False                                 # no sé qué revertir sin tocar lo verificado: mejor detener
+        grupo = build.get("grupo")
+        tocados = self.ws.checkpoints.deshacer(grupo) if grupo in self.ws.checkpoints.ids() else []
+        RegistroBuild(self.ws).borrar()
+        indice_de(self.ws).invalidar()
+        a, b = partes
+        posicion = next(i for i, e in enumerate(maestro.etapas) if e.id == etapa.id)
+        maestro.etapas[posicion:posicion + 1] = [a, b]
+        for e in maestro.etapas:
+            if e is not a and e is not b:
+                e.deps = [b.id if d == etapa.id else d for d in e.deps]
+        estado.setdefault("recuperaciones", []).append({"etapa": etapa.id, "motivo": recortar(motivo, 300),
+                                                        "revertidos": len(tocados)})
+        self.guardar(estado, maestro)
+        self.ui.aviso(f"  La etapa {etapa.id} no quedó verificada ({recortar(motivo, 140)}). En vez de detenerme, la "
+                      f"deshago ({len(tocados)} archivo(s) vuelven al último estado verificado) y la parto en dos "
+                      "más chicas:")
+        for parte in (a, b):
+            self.ui.tenue(f"    {parte.id} · {', '.join(parte.archivos)}")
+        return True
 
     def deshacer_etapa(self) -> bool:
         """Vuelve al ÚLTIMO ESTADO VERIFICADO: revierte los cambios de la etapa que quedó a medias o fallida, descarta

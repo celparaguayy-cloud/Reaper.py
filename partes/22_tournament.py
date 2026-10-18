@@ -32,6 +32,7 @@ class Candidato:
     discriminacion: float = 1.0        # v9 Fase 9: ¿los tests del candidato realmente discriminan?
     error: str = ""
     segundos: float = 0.0
+    imports_protegidos: dict = field(default_factory=dict)   # tests protegidos a los que SOLO agregó imports
 
     @property
     def validaciones_ok(self) -> bool:
@@ -121,8 +122,18 @@ class Torneo:
     def _evaluar(self, cand: Candidato, protegidos: dict[str, Optional[str]], existentes: dict[str, Optional[str]]) -> None:
         copia = cand.copia
         assert copia is not None and copia.ws is not None
+        # 0) lo único que se le acepta a un test protegido: AGREGARLE imports (un test que llama main() sin
+        #    importarlo, prueba real). Antes se lo pisaba con el original y el candidato que lo arreglaba perdía.
+        cand.imports_protegidos = {}
+        for rel, original in protegidos.items():
+            try:
+                version = copia.ws.leer(rel) if copia.ws.existe(rel) else None
+            except (OSError, ValueError, ErrorRuta):
+                version = None
+            if original is not None and solo_agrega_imports(original, version):
+                cand.imports_protegidos[rel] = version
         # 1) restaurar especificación y tests previos
-        copia.forzar_contenidos({**existentes, **protegidos})
+        copia.forzar_contenidos({**existentes, **protegidos, **cand.imports_protegidos})
         cambios = copia.cambios()
         # 2) apartar tests nuevos del candidato mientras se puntúa
         nuevos_tests = {c.rel: c.despues for c in cambios
@@ -136,7 +147,7 @@ class Torneo:
         finally:
             if nuevos_tests:
                 copia.forzar_contenidos(nuevos_tests)
-        cand.cambios = [c for c in copia.cambios() if c.rel not in protegidos]
+        cand.cambios = [c for c in copia.cambios() if c.rel not in protegidos or c.rel in cand.imports_protegidos]
         rels = [c.rel for c in cand.cambios if c.tipo != "borrado"]
         cand.validaciones = validar_archivos(copia.ws, rels)
         cand.lineas = sum(c.lineas_cambiadas() for c in cand.cambios)
@@ -236,7 +247,8 @@ class Torneo:
         if cid is not None:
             self.ws.checkpoints.actual = cid
         assert ganador.copia is not None
-        resultado.aplicados = ganador.copia.aplicar_a(self.ws, ganador.cambios, excluir=protegidos.keys())
+        resultado.aplicados = ganador.copia.aplicar_a(
+            self.ws, ganador.cambios, excluir=[r for r in protegidos if r not in ganador.imports_protegidos])
         resultado.todos_pasan = ganador.conteo.ok and ganador.conteo.reconocido and ganador.conteo.pasados > 0
         indice_de(self.ws).invalidar()
         self.ui.ok(f"Ganó el candidato #{ganador.indice + 1} (t={ganador.temperatura:.1f}): "
@@ -261,7 +273,7 @@ class Torneo:
             # Si el agente igual tocó la especificación (p. ej. con execute_command), se restaura.
             for rel, contenido in protegidos.items():
                 actual = self.ws.leer(rel) if self.ws.existe(rel) else None
-                if actual != contenido and contenido is not None:
+                if actual != contenido and contenido is not None and not solo_agrega_imports(contenido, actual):
                     self.ws.escribir(rel, contenido)
         cand.tests = ejecutar_tests(self.ws, timeout=self.settings.tests_timeout, completo=True)
         cand.conteo = conteo_de_resultado(cand.tests)
