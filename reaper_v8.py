@@ -3076,9 +3076,11 @@ class LLMClient:
                     # 4 veces el mismo, ~35 s por modelo, y con varios :free saturados la build parecía colgada).
                     raise LLMError(f"{modelo}: saturado en el proveedor (pool gratis compartido)",
                                    probar_otro_modelo=True) from e
-                if vacias >= 2 and intento < intentos:
+                if vacias >= 2 and intento < intentos and hay_alternativa:
                     # Dos respuestas vacías seguidas: ese modelo no está respondiendo (típico de :free saturados);
-                    # mejor pasar a otra IA del equipo que esperar ~30 s más de reintentos.
+                    # mejor pasar a otra IA del equipo que esperar ~30 s más de reintentos. Si es el ÚLTIMO que queda,
+                    # sigue con sus reintentos: cortar ahí frenaba la build entera y /grande esperaba 2 y 5 minutos
+                    # antes de retomarla (simulador, caos extremo), cuando el reintento siguiente respondía.
                     raise LLMError(f"{modelo}: {vacias} respuestas vacías seguidas", probar_otro_modelo=True) from e
                 if intento >= intentos:
                     raise LLMError(
@@ -54193,6 +54195,36 @@ class TestLiberadosDebilitamiento(BaseTest):
         self.assertEqual(orq._minimo_tests, {"tests/test_sales.py": 1})
         ws.escribir("tests/test_sales.py", _LIB_TEST_VACIO)
         self.assertTrue(orq._tests_debilitados())
+
+
+class TestVaciasDelUltimoModelo(BaseTest):
+    """Caos extremo del simulador: el último modelo del equipo dio 2 respuestas vacías seguidas, el error subió hasta
+    /grande y este esperó 2 y 5 minutos antes de retomar la build, cuando el reintento siguiente respondía."""
+
+    def _cliente(self, eventos, **ajustes):
+        pedidos = []
+        base = transporte_falso(eventos)
+
+        def transporte(url, headers, payload, timeout):
+            pedidos.append(payload.get("model"))
+            return base(url, headers, payload, timeout)
+        valores = dict(rpm=0, respaldo_equipo=False, reintentos=4)
+        valores.update(ajustes)
+        c = LLMClient("clave", self.ajustes(**valores), url="http://falso", transporte=transporte)
+        c.dormir = lambda s: None
+        return c, pedidos
+
+    def test_el_ultimo_modelo_sigue_reintentando(self):
+        vacia = lambda: _Transitorio("El modelo devolvió una respuesta vacía.", vacia=True)
+        c, pedidos = self._cliente([vacia(), vacia(), "ok"], modelo="a/uno:free", fallbacks=[])
+        self.assertEqual(c.chat([{"role": "user", "content": "x"}]).texto, "ok")   # antes: LLMError
+        self.assertEqual(pedidos, ["a/uno:free"] * 3)
+
+    def test_con_otro_modelo_disponible_cambia_enseguida(self):
+        vacia = lambda: _Transitorio("El modelo devolvió una respuesta vacía.", vacia=True)
+        c, pedidos = self._cliente([vacia(), vacia(), "ok"], modelo="a/pago", fallbacks=["b/pago"])
+        self.assertEqual(c.chat([{"role": "user", "content": "x"}]).texto, "ok")
+        self.assertEqual(pedidos, ["a/pago", "a/pago", "b/pago"])
 
 
 # ======================================================================

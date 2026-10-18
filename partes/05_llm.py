@@ -764,9 +764,11 @@ class LLMClient:
                     # 4 veces el mismo, ~35 s por modelo, y con varios :free saturados la build parecía colgada).
                     raise LLMError(f"{modelo}: saturado en el proveedor (pool gratis compartido)",
                                    probar_otro_modelo=True) from e
-                if vacias >= 2 and intento < intentos:
+                if vacias >= 2 and intento < intentos and hay_alternativa:
                     # Dos respuestas vacías seguidas: ese modelo no está respondiendo (típico de :free saturados);
-                    # mejor pasar a otra IA del equipo que esperar ~30 s más de reintentos.
+                    # mejor pasar a otra IA del equipo que esperar ~30 s más de reintentos. Si es el ÚLTIMO que queda,
+                    # sigue con sus reintentos: cortar ahí frenaba la build entera y /grande esperaba 2 y 5 minutos
+                    # antes de retomarla (simulador, caos extremo), cuando el reintento siguiente respondía.
                     raise LLMError(f"{modelo}: {vacias} respuestas vacías seguidas", probar_otro_modelo=True) from e
                 if intento >= intentos:
                     raise LLMError(
