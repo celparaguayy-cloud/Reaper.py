@@ -13,6 +13,19 @@ primero, torneo, revisor, qa, juez). Fallas configurables por variables de entor
                            reescribe; el reparador lo cambia por un test con sqlite real si lo dejan tocarlo
   MOCK_DEBILITA=1        → (con MOCK_ACOPLADO) cuando lo dejan tocar el test, el reparador primero lo VACÍA
                            (assertTrue(True)); recién si REAPER se lo rechaza escribe el test real
+  Fallas COGNITIVAS (lo que hace mal la cabeza del modelo, no el formato ni la red):
+  MOCK_INTERFAZ=1        → el implementador escribe registrar_venta(items, con, cliente_id) (parámetros en otro orden);
+                           el reparador la corrige SOLO si el diagnóstico que recibe trae el error real del test
+  MOCK_TRAMPA=1          → el implementador de reportes devuelve valores FIJOS copiados de los tests (no consulta la
+                           base); el reparador escribe la versión real solo si REAPER le dice que son valores fijos
+  MOCK_MAESTRO_MALO=1    → el plan maestro viene fragmentado (13 etapas de un archivo, varias de solo tests) y el modelo
+                           INSISTE igual cuando se le pide rehacerlo
+  MOCK_JUEZ_TERCO=1      → el juez siempre dice {"cumple": false, "confianza": "high"}, sin faltantes ni evidencia
+                           (=2: además con un faltante genérico, "no se ve que cumpla el pedido")
+  MOCK_TRUNCA=1          → el implementador manda cada archivo largo cortado por longitud (finish_reason=length a mitad
+                           de una línea) y recién cuando REAPER le pide seguir manda el resto con append_to_file
+  MOCK_PROSA=n           → los roles que escriben contestan n turnos en prosa sin herramientas ("voy a…") antes de
+                           usar una (1 equivale a 2)
   MOCK_CAOS=nivel        → MODELO GRATIS FLOJO (0 apagado, 1 moderado, 2 fuerte), con las fallas reales del teléfono:
                            cohere piensa sin responder (salvo razonamiento none/minimal) y tiene límite 15/min; Nvidia
                            da 500; respuestas vacías; "Upstream idle timeout"; herramientas mal escritas (<contenido>,
@@ -79,6 +92,72 @@ def _etapa(texto):
     return m.group(1) if m else "1"
 
 
+_RE_ARCHIVOS_ETAPA = re.compile(r"CONSTRUÍ AHORA SOLO ESTA ETAPA[^\n]*\n(?:.*\n)*?Archivos: ([^\n]+)")
+_PROSA = ("Entendido. Voy a encarar esta tarea con cuidado: primero repaso la interfaz que pide el plan y las "
+          "restricciones de la arquitectura, después escribo el módulo con sus funciones y por último me aseguro de "
+          "que los tests pasen.",
+          "Perfecto, ya tengo claro el enfoque. La implementación va a respetar las firmas del plan, validar las "
+          "entradas y devolver resultados consistentes. Ahora sigo con el código.",
+          "Antes de escribir, resumo: voy a mantener el estilo del proyecto, usar solo la librería estándar y no "
+          "tocar lo que ya funciona.")
+
+
+def _marcas(texto):
+    """Las tareas (marcas T1…T5b) de la etapa en curso. Con MOCK_MAESTRO_MALO las etapas no coinciden con las del
+    guion: se deducen de los ARCHIVOS de la etapa (como haría un modelo con el pedido de la etapa)."""
+    if os.environ.get("MOCK_MAESTRO_MALO"):
+        m = _RE_ARCHIVOS_ETAPA.search(texto)
+        if m:
+            archivos = {a.strip() for a in m.group(1).split(",")}
+            return [t for t, fs in G.TAREAS.items() if archivos & set(fs)]
+    return _tareas_de(_etapa(texto))
+
+
+def _plan_de_marcas(marcas):
+    tareas = []
+    for i, t in enumerate(marcas, 1):
+        deps = f' deps="{i - 1}"' if i > 1 else ""
+        tareas.append(f'<tarea id="{i}" archivos="{", ".join(G.TAREAS[t])}"{deps}>Construir '
+                      f'{", ".join(G.TAREAS[t])} ({t}).</tarea>')
+    return f'<plan><objetivo>Etapa</objetivo>{"".join(tareas)}</plan>'
+
+
+def _maestro_malo():
+    """13 etapas de un archivo en cadena (como el teléfono: "una etapa por cosa"), varias de SOLO tests."""
+    vision = re.search(r"<vision>.*?</vision>", G.MAESTRO, re.S).group(0)
+    arquitectura = re.search(r"<arquitectura>.*?</arquitectura>", G.MAESTRO, re.S).group(0)
+    piezas = [["almacen/__init__.py"], ["almacen/db.py"], ["tests/test_db.py"], ["almacen/ventas.py"],
+              ["tests/test_ventas.py"], ["almacen/reportes.py"], ["tests/test_reportes.py"], ["almacen/api.py"],
+              ["tests/test_api.py"], ["almacen/__main__.py"], ["web/logica.js"], ["tests/logica.test.mjs"],
+              ["web/index.html", "web/app.js", "web/style.css"]]
+    etapas = []
+    for i, archivos in enumerate(piezas, 1):
+        titulo = ("Tests de " if archivos[0].startswith("tests/") else "Crear ") + archivos[0]
+        etapas.append(f'<etapa id="{i}" titulo="{titulo}" deps="{i - 1 if i > 1 else ""}">\n'
+                      f"<objetivo>{titulo}.</objetivo>\n<archivos>{', '.join(archivos)}</archivos>\n</etapa>")
+    return "<maestro>\n" + vision + "\n" + arquitectura + "\n" + "\n".join(etapas) + "\n</maestro>"
+
+
+def _seguir_corte(mensajes):
+    """MOCK_TRUNCA: si REAPER avisó que la respuesta se cortó, manda el RESTO del archivo con append_to_file."""
+    m = re.search(r"Guardé ([\w./-]+) hasta la línea (\d+)", R.MockLLM.ultimo_usuario(mensajes))
+    if not m or m.group(1) not in G.ARCHIVOS:
+        return None
+    lineas = G.ARCHIVOS[m.group(1)].splitlines(keepends=True)
+    resto = "".join(lineas[int(m.group(2)):])
+    return ("tool", "append_to_file", {"path": m.group(1), "content": resto, "last": "true"})
+
+
+def _cortado(rel, contenido, mensajes):
+    """MOCK_TRUNCA: la PRIMERA vez que escribe un archivo largo, la respuesta se corta a mitad de una línea."""
+    if not os.environ.get("MOCK_TRUNCA") or contenido.count("\n") < 12:
+        return None
+    if any(f"Guardé {rel} hasta" in m["content"] for m in mensajes if m["role"] == "user"):
+        return None
+    corte = len(contenido) // 2 + 7
+    return ("trunca", f"<write_to_file>\n<path>{rel}</path>\n<content>\n{contenido[:corte]}")
+
+
 def cerebro(mensajes):
     rol = R.MockLLM.rol_de(mensajes)
     primero = next((m["content"] for m in mensajes if m["role"] == "user"), "")
@@ -88,11 +167,21 @@ def cerebro(mensajes):
     etapa = _etapa(primero + sistema)
     turno = _turno(mensajes)
     if rol == "maestro":
-        return rol, G.MAESTRO
+        return rol, (_maestro_malo() if os.environ.get("MOCK_MAESTRO_MALO") else G.MAESTRO)
     if rol == "arquitecto":
+        if os.environ.get("MOCK_MAESTRO_MALO"):
+            return rol, R.terminar_xml(_plan_de_marcas(_marcas(primero + sistema)))
         return rol, R.terminar_xml(G.PLANES.get(etapa, G.PLANES["1"]))
+    prosa = int(os.environ.get("MOCK_PROSA", "0") or 0)
+    if prosa and rol in ("implementador", "especificador", "reparador", "integrador") \
+            and turno < (2 if prosa == 1 else prosa):
+        return rol, _PROSA[turno % len(_PROSA)]
+    if rol in ("implementador", "reparador", "integrador"):
+        seguir = _seguir_corte(mensajes)
+        if seguir:
+            return rol, seguir
     if rol == "especificador":
-        tests = [a for t in _tareas_de(etapa) for a in G.TAREAS[t] if a.startswith("tests/")]
+        tests = [a for t in _marcas(primero + sistema) for a in G.TAREAS[t] if a.startswith("tests/")]
         pendientes = [a for a in tests if a not in _escritos(mensajes)]
         if pendientes:
             contenido = G.ARCHIVOS[pendientes[0]]
@@ -108,22 +197,41 @@ def cerebro(mensajes):
         archivos = G.TAREAS[marca.group(1)] if marca else []
         if marca is None:
             # Sin la marca no sé qué tarea es: escribo todo lo que falte de la etapa (como un modelo "proactivo").
-            archivos = [a for t in _tareas_de(etapa) for a in G.TAREAS[t]]
+            archivos = [a for t in _marcas(primero + sistema) for a in G.TAREAS[t]]
         codigo = [a for a in archivos if not a.startswith("tests/") and a not in _escritos(mensajes)]
         if codigo:
             contenido = G.ARCHIVOS[codigo[0]]
             if os.environ.get("MOCK_FLOJO") and codigo[0] == "almacen/ventas.py":
                 contenido = _VENTAS_FLOJA                 # vende aunque no haya stock
-            return rol, ("tool", "write_to_file", {"path": codigo[0], "content": contenido})
+            if os.environ.get("MOCK_INTERFAZ") and codigo[0] == "almacen/ventas.py":
+                contenido = _VENTAS_INTERFAZ              # parámetros en otro orden que el plan
+            if os.environ.get("MOCK_TRAMPA") and codigo[0] == "almacen/reportes.py":
+                contenido = _REPORTES_TRAMPA              # devuelve lo que piden los tests, sin consultar la base
+            return rol, (_cortado(codigo[0], contenido, mensajes)
+                         or ("tool", "write_to_file", {"path": codigo[0], "content": contenido}))
         return rol, R.terminar_xml("listo: implementado y con los tests en verde")
     if rol == "juez":
         texto = R.MockLLM.ultimo_usuario(mensajes)
         if "TAREA: CONTRATO" in texto:
             return rol, '{"criterios": ["lo pedido funciona y tiene tests"]}'
+        terco = os.environ.get("MOCK_JUEZ_TERCO", "")
+        if terco == "2":
+            return rol, '{"cumple": false, "faltantes": ["no se ve que cumpla el pedido"], "confianza": "high"}'
+        if terco:
+            return rol, '{"cumple": false, "confianza": "high"}'
         return rol, '{"cumple": true, "confianza": "high", "evidence_ids": ["EV-TESTS"]}'
     if rol in ("reparador", "integrador") and ("AGREGARLE las líneas import" in primero or "nombres indefinidos" in primero) \
             and "tests/test_db.py" not in _escritos(mensajes) and "tests/test_db.py" in primero:
         return rol, ("tool", "write_to_file", {"path": "tests/test_db.py", "content": G.ARCHIVOS["tests/test_db.py"]})
+    if rol in ("reparador", "integrador") and os.environ.get("MOCK_INTERFAZ") and "almacen/ventas.py" not in \
+            _escritos(mensajes) and re.search(r"TypeError|AttributeError|AssertionError|context manager", primero) \
+            and ("ventas" in primero or "registrar_venta" in primero):
+        # Ve el error real del test (el orden de los parámetros no coincide) y vuelve a la firma del plan.
+        return rol, ("tool", "write_to_file", {"path": "almacen/ventas.py", "content": G.ARCHIVOS["almacen/ventas.py"]})
+    if rol in ("reparador", "integrador") and os.environ.get("MOCK_TRAMPA") and "almacen/reportes.py" not in \
+            _escritos(mensajes) and re.search(r"valores? fij|hardcode|RESPUESTA FIJA|copiad", primero, re.I):
+        return rol, ("tool", "write_to_file", {"path": "almacen/reportes.py",
+                                               "content": G.ARCHIVOS["almacen/reportes.py"]})
     if rol in ("reparador", "integrador") and "ventas" in primero and os.environ.get("MOCK_FLOJO") \
             and "almacen/ventas.py" not in _escritos(mensajes):
         # El reparador ve el test que falla (SinStock no se lanzó) y escribe la versión correcta.
@@ -203,6 +311,29 @@ _VENTAS_FLOJA = G.ARCHIVOS["almacen/ventas.py"].replace(
     '            if fila["stock"] < cantidad:\n', '            if False:\n')
 assert _VENTAS_FLOJA != G.ARCHIVOS["almacen/ventas.py"]
 
+
+_VENTAS_INTERFAZ = G.ARCHIVOS["almacen/ventas.py"].replace(
+    "def registrar_venta(con, cliente_id, items, fecha=None):", "def registrar_venta(items, con, cliente_id=None, fecha=None):")
+assert _VENTAS_INTERFAZ != G.ARCHIVOS["almacen/ventas.py"]
+
+_REPORTES_TRAMPA = G.ARCHIVOS["almacen/reportes.py"].split("def ventas_por_dia")[0] + '''def ventas_por_dia(con):
+    return [{"fecha": "2026-10-01", "ventas": 1, "total": 150.0},
+            {"fecha": "2026-10-02", "ventas": 1, "total": 20.0}]
+
+
+def mas_vendidos(con, limite=5):
+    return [{"codigo": "B2", "nombre": "Azúcar", "unidades": 7}, {"codigo": "A1", "nombre": "Yerba", "unidades": 1}]
+
+
+def exportar_csv(filas):
+    if not filas:
+        return ""
+    salida = io.StringIO()
+    escritor = csv.DictWriter(salida, fieldnames=list(filas[0]))
+    escritor.writeheader()
+    escritor.writerows(filas)
+    return salida.getvalue()
+'''
 
 _TEST_DB_ROTO = G.ARCHIVOS["tests/test_db.py"].replace("from almacen import db\n", "")
 assert _TEST_DB_ROTO != G.ARCHIVOS["tests/test_db.py"]
@@ -287,7 +418,10 @@ class Manejador(BaseHTTPRequestHandler):
         rng = random.Random(f"{SEMILLA}-{n}")
         registro = {"n": n, "modelo": modelo, "rol": rol, "max_tokens": pedido.get("max_tokens"),
                     "reasoning": pedido.get("reasoning"), "status": 200}
-        if isinstance(texto, tuple):
+        fin = "stop"
+        if isinstance(texto, tuple) and texto[0] == "trunca":
+            texto, fin, registro["desorden"] = texto[1], "length", "trunca"
+        elif isinstance(texto, tuple):
             texto, desorden = _render(rol, texto[1], texto[2], rng)
             if desorden:
                 registro["desorden"] = desorden
@@ -344,7 +478,7 @@ class Manejador(BaseHTTPRequestHandler):
                           {"error": {"message": "Upstream idle timeout exceeded"}}]
             else:
                 trozos = [{"choices": [{"delta": {"content": texto[i:i + 400]}}]} for i in range(0, len(texto), 400)]
-                trozos.append({"choices": [{"delta": {}, "finish_reason": "stop"}],
+                trozos.append({"choices": [{"delta": {}, "finish_reason": fin}],
                                "usage": {"prompt_tokens": 1000, "completion_tokens": len(texto) // 4, "cost": 0}})
             self.wfile.write(b": OPENROUTER PROCESSING\n\n")
             for t in trozos:

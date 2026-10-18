@@ -290,11 +290,24 @@ def _fusionar_etapas(grupo: list, nuevo_id: str) -> Etapa:
                  unicos(c for e in grupo for c in e.criterios), [])
 
 
-def normalizar_maestro(maestro: PlanMaestro, max_grupos: int = 6) -> list:
+def _sujeto_de_test(rel: str) -> str:
+    """'tests/test_db.py' → 'db'; 'tests/logica.test.mjs' → 'logica'; 'db_test.py' → 'db'."""
+    raiz = Path(rel).name.lower().split(".")[0]
+    if raiz.startswith("test_"):
+        return raiz[5:]
+    if raiz.endswith("_test"):
+        return raiz[:-5]
+    return raiz[4:] if raiz.startswith("test") and len(raiz) > 4 else raiz
+
+
+def normalizar_maestro(maestro: PlanMaestro, max_grupos: int = 6, tope: Optional[int] = None) -> list:
     """Determinista (0 tokens), cuando el modelo INSISTE con un plan defectuoso después de la replanificación:
-    - una etapa de solo tests se une a la etapa cuyo código prueba (la que depende de ella, o la anterior);
+    - una etapa de solo tests se une a la etapa que tiene SU código (test_db.py → la etapa de db.py; si no se ve, la
+      anterior o la que depende de ella). Antes iba a la que dependía de ella: con etapas en cadena, test_db.py
+      terminaba en la etapa de ventas y la de la base quedaba sin tests (simulador, plan maestro insistente);
     - un plan fragmentado (más de `max_grupos` etapas, la mayoría de un archivo; prueba real: 10 etapas, una por CRUD)
-      se agrupa en tramos contiguos del orden de dependencias (así ninguna dependencia apunta hacia adelante).
+      o con más etapas que el `tope` se agrupa en tramos contiguos del orden de dependencias (así ninguna
+      dependencia apunta hacia adelante).
     Modifica el plan y devuelve los avisos; si el resultado no fuera un grafo válido, no toca nada."""
     avisos = []
     orden = [replace(e, archivos=list(e.archivos), criterios=list(e.criterios), deps=list(e.deps))
@@ -306,10 +319,18 @@ def normalizar_maestro(maestro: PlanMaestro, max_grupos: int = 6) -> list:
         if not etapa.archivos or not all(_es_test(a) for a in etapa.archivos):
             i += 1
             continue
-        destino = next((e for e in orden[i + 1:] if etapa.id in e.deps), None) or (orden[i - 1] if i > 0 else orden[1])
+        sujetos = {_sujeto_de_test(a) for a in etapa.archivos} - {""}
+        destino = next((e for e in orden if e is not etapa and any(
+            Path(a).stem.split(".")[0].lower() in sujetos for a in e.archivos if not _es_test(a))), None)
+        destino = destino or (orden[i - 1] if i > 0 else None) \
+            or next((e for e in orden[i + 1:] if etapa.id in e.deps), None) or orden[1]
+        anterior = orden.index(destino) < i
         destino.archivos = list(dict.fromkeys(destino.archivos + etapa.archivos))
         destino.criterios = list(dict.fromkeys(destino.criterios + etapa.criterios))
-        destino.deps = [d for d in dict.fromkeys(destino.deps + etapa.deps) if d not in (etapa.id, destino.id)]
+        if not anterior:
+            # Si el destino va DESPUÉS, hereda lo que necesitaba la etapa de tests; si va antes, ya lo tiene (o lo
+            # trae su propia cadena) y agregárselo podía armar un ciclo.
+            destino.deps = [d for d in dict.fromkeys(destino.deps + etapa.deps) if d not in (etapa.id, destino.id)]
         for e in orden:
             if e is not etapa:
                 e.deps = [d for d in dict.fromkeys(destino.id if d == etapa.id else d for d in e.deps) if d != e.id]
@@ -317,7 +338,8 @@ def normalizar_maestro(maestro: PlanMaestro, max_grupos: int = 6) -> list:
         avisos.append(f"la etapa {etapa.id} era solo de tests: la uní a la etapa {destino.id}")
     # 2) fragmentado
     codigo = sorted(sum(1 for rel in e.archivos if not _es_test(rel)) for e in orden)
-    if len(orden) > max_grupos and codigo and codigo[len(codigo) // 2] <= 1:
+    excede_tope = tope is not None and len(orden) > tope
+    if len(orden) > max_grupos and codigo and (codigo[len(codigo) // 2] <= 1 or excede_tope):
         n, g = len(orden), max_grupos
         tamanos = [n // g + (1 if k < n % g else 0) for k in range(g)]
         nuevas, mapa, pos = [], {}, 0
@@ -603,10 +625,14 @@ class ConstructorGrande:
                 self.ui.tenue(f"    • {p}")
             maestro = self._pedir_maestro(pedido, "\n".join(f"- {p}" for p in problemas + observaciones), maestro)
             problemas = problemas_maestro(maestro, self.settings.max_etapas, pedido)
-            if not problemas:
-                # Si el modelo insiste con etapas de solo tests o un plan fragmentado, se corrige solo (0 tokens).
-                for aviso in normalizar_maestro(maestro):
+            if not problemas_maestro(maestro, 10 ** 6, pedido):
+                # Si el modelo insiste con etapas de solo tests, un plan fragmentado o MÁS ETAPAS QUE EL TOPE, se
+                # corrige solo (0 tokens). Antes, pasarse del tope (13 etapas de un archivo) rechazaba el plan entero
+                # y /grande no arrancaba, aunque agruparlas lo dejaba bien.
+                for aviso in normalizar_maestro(maestro, max_grupos=min(6, self.settings.max_etapas),
+                                                tope=self.settings.max_etapas):
                     self.ui.aviso(f"  Juez · {aviso}")
+                problemas = problemas_maestro(maestro, self.settings.max_etapas, pedido)
             for o in observaciones_maestro(maestro, pedido) if not problemas else []:
                 # Lo que no frena: queda avisado y la integración final contra el pedido lo vuelve a mirar.
                 self.ui.aviso(f"  Juez · sigue: {o} (lo vuelve a revisar la integración final)")
@@ -986,13 +1012,23 @@ class ConstructorGrande:
                 + "\n".join(f"- {f}" for f in faltas[:8])
                 + (f"\n\nDiagnóstico real:\n{recortar(resultado['diagnostico'], 2500)}" if resultado["diagnostico"] else "")
                 + f"\n\nPEDIDO ORIGINAL DEL USUARIO:\n{recortar(pedido, 2500)}")
+            huella = self.ws.huella()
             try:
                 informe = self._construir_build(pedido_integracion, False, pedido)
             except LLMError as e:
                 informe = InformeBuild("fallida", diagnostico=str(e))
             if informe.estado == "cancelada":
                 self.ui.aviso("  La build de integración no arrancó (otro /construir pendiente o plan inválido).")
+            sin_cambios = informe.estado != "cancelada" and self.ws.huella() == huella
             resultado = self._verificar_integracion(estado, maestro)
+            if not resultado["ok"] and sin_cambios and resultado["verificacion_ok"] and not resultado["determinista"]:
+                # El juez (modelo) insiste, pero la build de integración no encontró NADA que cambiar y la
+                # verificación real del proyecto entero está en verde: su veto no es accionable (simulador, juez
+                # terco: 5/5 etapas verificadas y el proyecto quedaba "integración pendiente" para siempre).
+                self.ui.aviso("  Juez · insiste en que falta algo, pero la integración no encontró nada que cambiar y "
+                              "la verificación real del proyecto entero está en verde: lo dejo como aviso.")
+                estado["integracion"]["aviso_juez"] = "; ".join(resultado["faltantes"][:3])
+                resultado = dict(resultado, ok=True, estado=resultado["estado_real"])
         estado["integracion"].update({k: resultado[k] for k in ("ok", "estado", "faltantes", "juicio")})
         estado["estado"] = "terminado" if resultado["ok"] else "integracion_pendiente"
         if resultado["ok"]:
@@ -1018,14 +1054,16 @@ class ConstructorGrande:
                     [c for e in maestro.etapas for c in e.criterios][:20],
                     interfaz="\n".join(e.interfaz for e in maestro.etapas if e.interfaz))
         informe = InformeBuild("fallida", plan=plan, cid=cid)
-        informe.estado = estado_final_build(verif, informe)
+        informe.estado = estado_real = estado_final_build(verif, informe)
         informe.criterios_entrega = orq._contrato_de_entrega(estado["pedido"])
         orq._juicio_de_entrega(estado["pedido"], plan, verif, informe)
         juicio = informe.juicio
         faltantes = list(juicio.faltantes) if juicio is not None and juicio.valido and not juicio.cumple else []
         return {"ok": informe.ok, "estado": informe.estado, "faltantes": faltantes,
                 "diagnostico": verif.diagnostico if not verif.ok else "",
-                "juicio": juicio.texto() if juicio is not None else "sin veredicto del juez"}
+                "juicio": juicio.texto() if juicio is not None else "sin veredicto del juez",
+                "verificacion_ok": verif.ok, "estado_real": estado_real,
+                "determinista": bool(juicio is not None and juicio.determinista)}
 
     # ------------------------------------------------------------ salida
     def _cierre(self, estado: dict, maestro: PlanMaestro, segundos: float) -> None:

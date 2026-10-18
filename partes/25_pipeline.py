@@ -530,6 +530,80 @@ def fabricaciones_en_codigo(fuente: str, deben_traer_datos: set) -> list:
     return salida
 
 
+_RE_PARAMETRO_DE_DATOS = re.compile(
+    r"^(?:con|conn|conexion|connection|db|bd|base|cur|cursor|sesion|session|datos|data|filas|rows|items|registros|"
+    r"records|ventas|productos|clientes|archivo|ruta|path|df|tabla|consulta|query|lista|entrada|texto)$", re.I)
+
+
+def _es_literal_puro(nodo) -> bool:
+    """Constante, o lista/tupla/conjunto/dict (anidados) hechos SOLO de constantes."""
+    if isinstance(nodo, ast.Constant):
+        return True
+    if isinstance(nodo, ast.UnaryOp) and isinstance(nodo.op, ast.USub):
+        return isinstance(nodo.operand, ast.Constant)
+    if isinstance(nodo, (ast.List, ast.Tuple, ast.Set)):
+        return all(_es_literal_puro(e) for e in nodo.elts)
+    if isinstance(nodo, ast.Dict):
+        return all(k is not None and _es_literal_puro(k) for k in nodo.keys) and \
+            all(_es_literal_puro(v) for v in nodo.values)
+    return False
+
+
+def _constante_notable(valor) -> bool:
+    if isinstance(valor, bool) or valor is None:
+        return False
+    if isinstance(valor, str):
+        return len(valor.strip()) >= 3
+    return isinstance(valor, (int, float)) and valor not in (0, 1, -1, 2)
+
+
+def constantes_de_tests(ws, limite: int = 200) -> set:
+    """Todas las constantes (strings y números) de los tests de Python del proyecto."""
+    salida = set()
+    for ruta in ws.iterar(limite=4000):
+        if len(salida) > 20000 or not ruta.name.endswith(".py") or not _es_test(ws.rel(ruta)):
+            continue
+        try:
+            arbol = ast.parse(ruta.read_text(encoding="utf-8", errors="replace"))
+        except (OSError, SyntaxError, ValueError):
+            continue
+        salida.update(n.value for n in ast.walk(arbol) if isinstance(n, ast.Constant) and _constante_notable(n.value))
+        limite -= 1
+        if limite <= 0:
+            break
+    return salida
+
+
+def respuestas_fijas(fuente: str, constantes_tests: set) -> list:
+    """[(funcion, linea, parametros_ignorados, coincidencias)] de funciones que reciben su fuente de datos (con, filas,
+    ruta…), la IGNORAN y devuelven un literal (lista/dict) cuyos valores están en los tests: devuelven lo que el test
+    espera en vez de calcularlo (simulador, modelo tramposo: reportes que pasaban sin consultar la base)."""
+    if not constantes_tests:
+        return []
+    try:
+        arbol = ast.parse(fuente)
+    except SyntaxError:
+        return []
+    salida = []
+    for fn in ast.walk(arbol):
+        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        params = [a.arg for a in fn.args.posonlyargs + fn.args.args + fn.args.kwonlyargs if a.arg not in ("self", "cls")]
+        de_datos = [p for p in params if _RE_PARAMETRO_DE_DATOS.match(p)]
+        usados = {n.id for n in ast.walk(fn) if isinstance(n, ast.Name)}
+        if not de_datos or usados & set(params):
+            continue
+        retornos = [n.value for n in ast.walk(fn) if isinstance(n, ast.Return) and n.value is not None]
+        if not retornos or not all(_es_literal_puro(r) and not isinstance(r, ast.Constant) for r in retornos):
+            continue
+        valores = {repr(n.value): n.value for r in retornos for n in ast.walk(r)
+                   if isinstance(n, ast.Constant) and _constante_notable(n.value)}
+        coinciden = sorted(k for k, v in valores.items() if v in constantes_tests)
+        if len(coinciden) >= 3 and len(coinciden) * 2 >= len(valores):
+            salida.append((fn.name, fn.lineno, de_datos, coinciden))
+    return salida
+
+
 def examen_de_realidad(ws, cid_build: Optional[int], plan=None, pedido: str = "") -> list:
     """
     Determinista (0 tokens): ¿lo entregado es REAL o una simulación? Revisa lo que cambió en esta build:
@@ -559,6 +633,7 @@ def examen_de_realidad(ws, cid_build: Optional[int], plan=None, pedido: str = ""
             deben_traer_datos = set(declaradas)
     permitidas = familias_pedidas(pedido)
     hallazgos = []
+    constantes_tests = None                     # se calculan solo si hace falta (hay código Python en la build)
     for rel in ws.checkpoints.archivos_desde(cid_build):
         ruta = ws.raiz / rel
         es_web = rel.lower().endswith(EXTENSIONES_WEB)
@@ -593,6 +668,12 @@ def examen_de_realidad(ws, cid_build: Optional[int], plan=None, pedido: str = ""
         for nombre, linea in fabricaciones_en_codigo(fuente, deben_traer_datos):
             hallazgos.append(f"DATOS FABRICADOS en {rel}:{linea}: `{nombre}` los INVENTA (random/uuid) en vez de "
                              "traerlos de verdad; el pedido pide datos reales, no generados.")
+        if constantes_tests is None:
+            constantes_tests = constantes_de_tests(ws)
+        for nombre, linea, ignorados, coinciden in respuestas_fijas(fuente, constantes_tests):
+            hallazgos.append(f"RESPUESTA FIJA en {rel}:{linea}: `{nombre}` ignora {', '.join(ignorados)} y devuelve "
+                             f"valores fijos copiados de los tests ({', '.join(coinciden[:4])}): los tests pasan por "
+                             "copia, no porque calcule algo. Calculalo con los datos que recibe.")
         for linea, frase in admisiones_de_simulacion(fuente, permitidas):
             hallazgos.append(f"SIMULACIÓN CONFESADA en {rel}:{linea}: «{frase}»: el código admite ser "
                              "provisional/ficticio, no lo real que se pidió.")
@@ -2264,11 +2345,17 @@ class Orquestador:
         for f in juicio.faltantes[:6]:
             informe.notas.append(f"Falta según el juez: {f}")
         # Gate en dirección segura: solo baja de verde a parcial. Pide confianza media/alta para no castigar
-        # por el ruido de un modelo débil; un 'no cumple' dudoso queda como nota, no como veredicto.
-        if (not juicio.cumple and juicio.confianza in ("medium", "high")
+        # por el ruido de un modelo débil; un 'no cumple' dudoso queda como nota, no como veredicto. Y pide QUÉ falta:
+        # un juez flojo que contestaba siempre {"cumple": false} sin faltantes dejaba PARCIAL cada etapa con la
+        # verificación real en verde y /grande se DETENÍA en la primera (simulador, juez terco).
+        if (not juicio.cumple and juicio.confianza in ("medium", "high") and juicio.faltantes
                 and informe.estado in ("verificada", "validada")):
             informe.estado = "parcial"
             self.ui.aviso("  El juez de entrega observa que el pedido NO quedó cumplido: marco la build como parcial.")
+        elif not juicio.cumple and not juicio.faltantes:
+            informe.notas.append("Juez de entrega: dice que no cumple pero no dice QUÉ falta; con la verificación real "
+                                 "en verde, queda como aviso.")
+            self.ui.tenue("  (el juez no dijo qué falta: no cambia el estado de la build)")
         elif not juicio.cumple:
             informe.notas.append("Juez de entrega: duda de que se cumpla el pedido (confianza baja); lo dejo como aviso.")
 
@@ -2297,12 +2384,25 @@ class Orquestador:
             diag = ("El JUEZ DE ENTREGA detecta que el pedido NO quedó cumplido. Implementá EXACTAMENTE lo que "
                     "falta, sin romper lo que ya anda:\n" + "\n".join(f"- {f}" for f in faltantes))
             verif_sint = replace(verif, ok=False, diagnostico=diag)
+            antes = self.ws.checkpoints.diff_desde(grupo)
             verif = self._reparar_con_escalada(pedido, verif_sint, grupo, base_fallaba, informe,
                                                f"cierre-juez {informe.intervenciones_juez}", 2,
                                                lambda: self.verificar(grupo), contexto=diag)
+            sin_cambios = self.ws.checkpoints.diff_desde(grupo) == antes
             informe.estado = estado_final_build(verif, informe)
             informe.juicio = None
             self._juicio_de_entrega(pedido, plan, verif, informe)
+            j = informe.juicio
+            if sin_cambios and verif.ok and j is not None and j.valido and not j.cumple and not j.determinista:
+                # El juez (modelo) insiste, pero la intervención no encontró NADA que cambiar y la verificación real
+                # está en verde: su veto no es accionable. Queda como aviso; antes trababa la etapa para siempre.
+                informe.estado = estado_final_build(verif, informe)
+                informe.notas.append("Juez: insiste en que falta algo, pero la intervención no encontró nada que "
+                                     "cambiar y la verificación real está en verde; queda como aviso: "
+                                     + "; ".join(j.faltantes[:3]))
+                self.ui.aviso("  Juez · insiste sin nada concreto que cambiar (la intervención no tocó ningún "
+                              "archivo y los tests pasan): lo dejo como aviso.")
+                break
         if informe.intervenciones_juez and informe.juicio is not None and informe.juicio.cumple:
             informe.notas.append(f"Juez: el pedido quedó cumplido tras {informe.intervenciones_juez} intervención(es).")
         return verif

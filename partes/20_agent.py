@@ -626,6 +626,7 @@ class Agente:
             self.ctx.cid_inicio = self._cid_propio
 
         sin_herramienta = 0
+        uso_herramientas = False             # ¿ya llamó alguna herramienta en esta tarea?
         anuncios = 0
         repeticiones: dict = {}
         tests_por_reaper = 0
@@ -707,7 +708,12 @@ class Agente:
                     continue
                 sin_herramienta += 1
                 self.ctx.tropiezo("sin_herramienta")
-                if sin_herramienta > 2:
+                # Un modelo flojo que "piensa en voz alta" 3 mensajes ANTES de su primera herramienta se cerraba justo
+                # antes de actuar, y con todos los roles así /grande se DETENÍA en la etapa 1 (simulador, prosa).
+                # Si todavía no usó ninguna herramienta, recibe UN ultimátum más; si ya trabajaba, 3 seguidos cortan.
+                ultimatum = (sin_herramienta == 3 and not uso_herramientas and bool(texto)
+                             and self.rol.nombre != "principal")
+                if sin_herramienta > 2 and not ultimatum:
                     return self._cerrar(texto or "El agente no produjo un resultado.", paso, "sin_herramientas")
                 vacia = not texto and respuesta.finish_reason != "length"
                 if vacia and pasos_de_gracia < _ERRORES_DE_FORMATO_MAX:
@@ -718,10 +724,15 @@ class Agente:
                 if respuesta.finish_reason == "length":
                     aviso = ("Tu respuesta se cortó por longitud. Escribí menos por mensaje: "
                              "archivos largos en partes (write_to_file con partial=true + append_to_file).\n\n") + aviso
+                if ultimatum:
+                    aviso = ("ÚLTIMA OPORTUNIDAD: van 3 mensajes sin ninguna herramienta. Respondé SOLO con la "
+                             "herramienta en XML, sin explicar nada antes; si no, cierro esta tarea sin cambios.\n\n"
+                             + aviso)
                 self._agregar_usuario(aviso)
                 continue
 
             sin_herramienta = 0
+            uso_herramientas = True
             self._formato_paso = 0
             limite = max(1, self.settings.max_llamadas_turno)
             llamadas, excedentes = analisis.llamadas[:limite], analisis.llamadas[limite:]
