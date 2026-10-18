@@ -780,6 +780,7 @@ test, primero lo cambia por `self.assertTrue(callable(registrar_venta) or True)`
 | `assertTrue(x or True)`, `assertFalse(not True)`, `assert f or 1`: siempre verdaderos, ahora son tautologías (también para el examen de realidad) | `_siempre_verdadero` / `_siempre_falso` (`15c`) |
 | Con 2 intentos por tarea (`umbral_escalada=1`), la liberación se decidía después del último intento y nunca servía. Ahora hay UN intento más, solo si se liberó algo | `_reparar_con_escalada` |
 | Con los tests en verde pero sin quedar verificada, la pantalla decía "✓ tests: pasaron" y arrancaba otra reparación sin explicar nada. Ahora muestra "pero no queda verificada: <motivo>" | `_mostrar_verificacion` |
+| El último modelo del equipo cortaba con "2 respuestas vacías seguidas" aunque no hubiera otro a quien pasar. El error frenaba la build y /grande esperaba minutos. Ahora sigue con sus reintentos; con otro modelo disponible, se sigue cambiando enseguida | `_con_reintentos` (`05_llm`) |
 
 Un primer intento de la guardia daba un falso positivo con tests que solo verifican con un mock
 (`run.assert_called_once_with(9999)`). Lo atajó `TestEspecificacionPropiaEnRojo` en la suite completa, y por eso ahora
@@ -791,10 +792,10 @@ se compara contra lo que verificaba el original.
 |---|---|
 | Reparador que vacía el test liberado (`MOCK_ACOPLADO=1 MOCK_DEBILITA=1`) | antes: TERMINADO con el test vacío (falso verde); **ahora: lo rechaza ("pero no queda verificada: TEST DEBILITADO") y queda el test real**, 5/5 |
 | Caos fuerte (nivel 2), semillas 4–9 | **6/6 terminadas**, 73 a 87 pedidos |
-| Caos extremo (nivel 3), semillas 1–3 | (medición en curso; se completa en la próxima entrega) |
+| Caos extremo (nivel 3), semillas 1–3 | **3/3 terminadas** (91, 91, 99 pedidos), pero dos tardaron 12m41s y 10m31s: el último modelo que quedaba dio 2 respuestas vacías seguidas, la build se cortó y /grande esperó 2 y 5 minutos antes de retomarla. Con el arreglo de abajo: **6m22s y 6m47s, sin ninguna espera** |
 | Tests acoplados + caos moderado (semillas 1–2) / test roto + implementador flojo + caos moderado (semillas 1–2) | 4/4 terminadas (73, 74, 84, 84 pedidos) |
 | Cupo diario agotado a los 40 pedidos y `continuar` "al otro día" | se detiene; al otro día termina 5/5 con 60 pedidos en total, sin rehacer nada |
 | Ctrl+C a los 90 s y el mismo comando otra vez | "Interrumpido" con el comando para seguir; retoma y termina 5/5 |
 
-Tests: +8 (`48zr_autotest_liberados.py`). Con el código anterior fallan 4; los otros son guardas. Regresión: **1217
+Tests: +9 (`48zr_autotest_liberados.py`). Con el código anterior fallan 7; los otros 2 son guardas. Regresión: **1219
 tests OK** en Python 3.10/3.11/3.12/3.13. **NO VERIFICADO con un modelo real.**
