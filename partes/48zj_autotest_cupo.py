@@ -172,6 +172,7 @@ class TestGrandeConLimites(BaseTest):
         def espiar(pedido, reanudar, usuario):
             visto.setdefault("torneo", ajustes.torneo)
             visto.setdefault("revisiones", ajustes.max_revisiones)
+            visto.setdefault("contrato", ajustes.juez_contrato)
             return real(pedido, reanudar, usuario)
         grande._construir_build = espiar
         self.assertTrue(grande.iniciar("Un gestor de biblioteca con préstamos y CLI", confirmar=False))
@@ -179,8 +180,8 @@ class TestGrandeConLimites(BaseTest):
         self.assertIn("Pedidos estimados al modelo", texto)
         self.assertIn("no alcanza", texto)
         self.assertIn("Ahorro de pedidos", texto)
-        self.assertEqual(visto, {"torneo": False, "revisiones": 0})                 # durante la corrida
-        self.assertEqual((ajustes.torneo, ajustes.max_revisiones), (True, 1))      # tu config, intacta después
+        self.assertEqual(visto, {"torneo": False, "revisiones": 0, "contrato": False})   # durante la corrida
+        self.assertEqual((ajustes.torneo, ajustes.max_revisiones, ajustes.juez_contrato), (True, 1, True))  # intacta
         self.assertTrue(all(e["pedidos"] > 0 for e in grande.leer()["maestro"]["etapas"]))
 
     def test_plan_maestro_con_formatos_de_modelos_reales(self):

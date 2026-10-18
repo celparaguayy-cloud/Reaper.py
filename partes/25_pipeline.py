@@ -2191,7 +2191,7 @@ class Orquestador:
         """Motor central, paso 1: el juez convierte el PEDIDO en criterios de aceptación ANTES de construir.
         Una sola llamada chica (max_tokens 350). Si el juez está apagado o no responde en contrato, devuelve [] y
         el build sigue con los criterios del plan: nunca bloquea por esto."""
-        if not getattr(self.settings, "juez", True):
+        if not getattr(self.settings, "juez", True) or not getattr(self.settings, "juez_contrato", True):
             return []
         prompt = (f"TAREA: CONTRATO. Convertí este PEDIDO en criterios de aceptación concretos y verificables, "
                   f"sin inventar extras.\n\nPEDIDO:\n{recortar(pedido, 1500)}")

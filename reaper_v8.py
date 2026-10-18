@@ -1744,6 +1744,9 @@ class Settings:
     # de reparación hacia los faltantes y vuelve a juzgar. 0 = solo avisa, no interviene. Acotado para no entrar en
     # bucle: insiste "hasta que se haga" pero con tope (y corta si una pasada no logra avances).
     juez_max_intervenciones: int = 2
+    # El juez convierte el pedido en criterios ANTES de construir (1 pedido por build). /grande lo apaga con cupo chico:
+    # cada etapa ya trae sus criterios del plan maestro y el juez de cierre los usa igual.
+    juez_contrato: bool = True
     # Al verificar, correr el punto de entrada (python -m paquete / script CLI) con --help: si se cae al CARGAR
     # (ModuleNotFoundError, SyntaxError...) la build no queda verificada aunque los tests pasen.
     verificar_arranque: bool = True
@@ -18086,7 +18089,7 @@ class Orquestador:
         """Motor central, paso 1: el juez convierte el PEDIDO en criterios de aceptación ANTES de construir.
         Una sola llamada chica (max_tokens 350). Si el juez está apagado o no responde en contrato, devuelve [] y
         el build sigue con los criterios del plan: nunca bloquea por esto."""
-        if not getattr(self.settings, "juez", True):
+        if not getattr(self.settings, "juez", True) or not getattr(self.settings, "juez_contrato", True):
             return []
         prompt = (f"TAREA: CONTRATO. Convertí este PEDIDO en criterios de aceptación concretos y verificables, "
                   f"sin inventar extras.\n\nPEDIDO:\n{recortar(pedido, 1500)}")
@@ -51923,6 +51926,7 @@ class TestGrandeConLimites(BaseTest):
         def espiar(pedido, reanudar, usuario):
             visto.setdefault("torneo", ajustes.torneo)
             visto.setdefault("revisiones", ajustes.max_revisiones)
+            visto.setdefault("contrato", ajustes.juez_contrato)
             return real(pedido, reanudar, usuario)
         grande._construir_build = espiar
         self.assertTrue(grande.iniciar("Un gestor de biblioteca con préstamos y CLI", confirmar=False))
@@ -51930,8 +51934,8 @@ class TestGrandeConLimites(BaseTest):
         self.assertIn("Pedidos estimados al modelo", texto)
         self.assertIn("no alcanza", texto)
         self.assertIn("Ahorro de pedidos", texto)
-        self.assertEqual(visto, {"torneo": False, "revisiones": 0})                 # durante la corrida
-        self.assertEqual((ajustes.torneo, ajustes.max_revisiones), (True, 1))      # tu config, intacta después
+        self.assertEqual(visto, {"torneo": False, "revisiones": 0, "contrato": False})   # durante la corrida
+        self.assertEqual((ajustes.torneo, ajustes.max_revisiones, ajustes.juez_contrato), (True, 1, True))  # intacta
         self.assertTrue(all(e["pedidos"] > 0 for e in grande.leer()["maestro"]["etapas"]))
 
     def test_plan_maestro_con_formatos_de_modelos_reales(self):
@@ -61401,16 +61405,20 @@ class ConstructorGrande:
                           + comando_para_seguir(self.ws, "grande", self.settings))
 
     def _ahorro_de_pedidos(self) -> Callable[[], None]:
-        """Cuenta con 50 pedidos gratis por día: sin torneo ni revisor en ESTA corrida (cada candidato del torneo es
-        una implementación entera). Tu configuración vuelve a como estaba al terminar."""
-        if not self._cupo_chico() or not (self.settings.torneo or self.settings.max_revisiones):
+        """Cuenta con 50 pedidos gratis por día: sin torneo, sin revisor y sin el contrato del juez por etapa en ESTA
+        corrida (cada candidato del torneo es una implementación entera; cada etapa ya trae sus criterios del plan
+        maestro). Con eso el almacén de 5 etapas del simulador baja de 52 a 47 pedidos: entra en un día. Tu
+        configuración vuelve a como estaba al terminar."""
+        s = self.settings
+        if not self._cupo_chico() or not (s.torneo or s.max_revisiones or getattr(s, "juez_contrato", True)):
             return lambda: None
-        antes = (self.settings.torneo, self.settings.max_revisiones)
-        self.settings.torneo, self.settings.max_revisiones = False, 0
-        self.ui.tenue("  Ahorro de pedidos (cupo de 50 por día): sin torneo ni revisor en esta corrida.")
+        antes = (s.torneo, s.max_revisiones, getattr(s, "juez_contrato", True))
+        s.torneo, s.max_revisiones, s.juez_contrato = False, 0, False
+        self.ui.tenue("  Ahorro de pedidos (cupo de 50 por día): sin torneo, revisor ni contrato del juez por etapa en "
+                      "esta corrida (los criterios salen del plan maestro).")
 
         def restaurar() -> None:
-            self.settings.torneo, self.settings.max_revisiones = antes
+            s.torneo, s.max_revisiones, s.juez_contrato = antes
         return restaurar
 
     def _espera_para(self, error: LLMError, esperado: float, esperas: int) -> float:

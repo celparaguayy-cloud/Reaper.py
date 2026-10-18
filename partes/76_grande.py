@@ -497,16 +497,20 @@ class ConstructorGrande:
                           + comando_para_seguir(self.ws, "grande", self.settings))
 
     def _ahorro_de_pedidos(self) -> Callable[[], None]:
-        """Cuenta con 50 pedidos gratis por día: sin torneo ni revisor en ESTA corrida (cada candidato del torneo es
-        una implementación entera). Tu configuración vuelve a como estaba al terminar."""
-        if not self._cupo_chico() or not (self.settings.torneo or self.settings.max_revisiones):
+        """Cuenta con 50 pedidos gratis por día: sin torneo, sin revisor y sin el contrato del juez por etapa en ESTA
+        corrida (cada candidato del torneo es una implementación entera; cada etapa ya trae sus criterios del plan
+        maestro). Con eso el almacén de 5 etapas del simulador baja de 52 a 47 pedidos: entra en un día. Tu
+        configuración vuelve a como estaba al terminar."""
+        s = self.settings
+        if not self._cupo_chico() or not (s.torneo or s.max_revisiones or getattr(s, "juez_contrato", True)):
             return lambda: None
-        antes = (self.settings.torneo, self.settings.max_revisiones)
-        self.settings.torneo, self.settings.max_revisiones = False, 0
-        self.ui.tenue("  Ahorro de pedidos (cupo de 50 por día): sin torneo ni revisor en esta corrida.")
+        antes = (s.torneo, s.max_revisiones, getattr(s, "juez_contrato", True))
+        s.torneo, s.max_revisiones, s.juez_contrato = False, 0, False
+        self.ui.tenue("  Ahorro de pedidos (cupo de 50 por día): sin torneo, revisor ni contrato del juez por etapa en "
+                      "esta corrida (los criterios salen del plan maestro).")
 
         def restaurar() -> None:
-            self.settings.torneo, self.settings.max_revisiones = antes
+            s.torneo, s.max_revisiones, s.juez_contrato = antes
         return restaurar
 
     def _espera_para(self, error: LLMError, esperado: float, esperas: int) -> float:

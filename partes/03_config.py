@@ -219,6 +219,9 @@ class Settings:
     # de reparación hacia los faltantes y vuelve a juzgar. 0 = solo avisa, no interviene. Acotado para no entrar en
     # bucle: insiste "hasta que se haga" pero con tope (y corta si una pasada no logra avances).
     juez_max_intervenciones: int = 2
+    # El juez convierte el pedido en criterios ANTES de construir (1 pedido por build). /grande lo apaga con cupo chico:
+    # cada etapa ya trae sus criterios del plan maestro y el juez de cierre los usa igual.
+    juez_contrato: bool = True
     # Al verificar, correr el punto de entrada (python -m paquete / script CLI) con --help: si se cae al CARGAR
     # (ModuleNotFoundError, SyntaxError...) la build no queda verificada aunque los tests pasen.
     verificar_arranque: bool = True
