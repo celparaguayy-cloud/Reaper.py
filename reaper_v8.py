@@ -9256,6 +9256,31 @@ def _ti_src(nodo) -> str:
         return ""
 
 
+def _siempre_verdadero(nodo) -> bool:
+    """Expresiones que valen True sin importar el código: `x or True`, `not False`, `True and 1`..."""
+    if isinstance(nodo, ast.Constant):
+        return bool(nodo.value)
+    if isinstance(nodo, ast.BoolOp):
+        if isinstance(nodo.op, ast.Or):
+            return any(_siempre_verdadero(v) for v in nodo.values)
+        return all(_siempre_verdadero(v) for v in nodo.values)
+    if isinstance(nodo, ast.UnaryOp) and isinstance(nodo.op, ast.Not):
+        return _siempre_falso(nodo.operand)
+    return False
+
+
+def _siempre_falso(nodo) -> bool:
+    if isinstance(nodo, ast.Constant):
+        return not nodo.value
+    if isinstance(nodo, ast.BoolOp):
+        if isinstance(nodo.op, ast.And):
+            return any(_siempre_falso(v) for v in nodo.values)
+        return all(_siempre_falso(v) for v in nodo.values)
+    if isinstance(nodo, ast.UnaryOp) and isinstance(nodo.op, ast.Not):
+        return _siempre_verdadero(nodo.operand)
+    return False
+
+
 def _es_tautologia(nodo) -> Optional[str]:
     """Si el assert/compare no puede distinguir nada, devuelve el motivo."""
     # assert <constante>  → assert True / assert 1 / assert "x"
@@ -9270,6 +9295,12 @@ def _es_tautologia(nodo) -> Optional[str]:
             return f"{izq} != {der}: siempre falso"
         if isinstance(nodo.left, ast.Constant) and isinstance(nodo.comparators[0], ast.Constant):
             return f"dos constantes ({izq} {_ti_sym(op)} {der}): no depende del código"
+    if isinstance(nodo, (ast.BoolOp, ast.UnaryOp)):
+        # Un reparador "arreglaba" un test liberado con `assertTrue(callable(f) or True)`: siempre verdadero.
+        if _siempre_verdadero(nodo):
+            return f"{_ti_src(nodo)}: siempre verdadero, no depende del código"
+        if _siempre_falso(nodo):
+            return f"{_ti_src(nodo)}: siempre falso, no depende del código"
     return None
 
 
@@ -9296,6 +9327,10 @@ def _tautologia_en_assert_metodo(call: ast.Call) -> Optional[str]:
                 return f"{metodo}({a.value!r}): siempre verdadero"
             if metodo == "assertFalse" and not a.value:
                 return f"{metodo}({a.value!r}): siempre verdadero"
+        elif metodo == "assertTrue" and _siempre_verdadero(a):
+            return f"{metodo}({_ti_src(a)}): siempre verdadero, no depende del código"
+        elif metodo == "assertFalse" and _siempre_falso(a):
+            return f"{metodo}({_ti_src(a)}): siempre verdadero (la expresión es siempre falsa)"
     if metodo in _ASSERT_DOS and len(args) >= 2:
         a, b = _ti_src(args[0]), _ti_src(args[1])
         if a == b and metodo in ("assertEqual", "assertIs", "assertAlmostEqual", "assertGreaterEqual",
@@ -9454,6 +9489,21 @@ def analizar_tests_python(fuente: str) -> ResultadoInteligencia:
             info.nivel_real = "integration" if corre_io_real else "unit"
         res.tests.append(info)
     return res
+
+
+def debilitamiento_de_test(fuente: str, minimo: int) -> list[str]:
+    """Un test de la especificación que se liberó (estaba roto o acoplado a la implementación) se puede REESCRIBIR para
+    que pruebe el comportamiento, pero no VACIAR: no puede quedar con menos tests que el original ni con tests sin un
+    assert real (sin assert o solo tautologías)."""
+    res = analizar_tests_python(fuente)
+    problemas = []
+    if len(res.tests) < minimo:
+        problemas.append(f"tenía {minimo} test(s) y ahora tiene {len(res.tests)}")
+    vacios = sorted({p.test for p in res.problemas if p.tipo == "SIN_ASSERT"}
+                    | {t.nombre for t in res.tests if 0 < t.asserts <= t.tautologias})
+    if vacios:
+        problemas.append("tests sin un assert real: " + ", ".join(vacios[:6]))
+    return problemas
 
 
 def inteligencia_para_prompt(fuente: str, maximo: int = 8) -> str:
@@ -16877,7 +16927,7 @@ def _resumen_diff(diff: str) -> str:
 _RE_DIAGNOSTICO_OBVIO = re.compile(
     r"NameError|ImportError|ModuleNotFoundError|No module named|SyntaxError|IndentationError|F821|Undefined name|"
     r"is not defined|no define '|has no attribute|missing \d+ required positional|takes \d+ positional|"
-    r"ENTREGA INCOMPLETA|DESVÍO|TRAMPA PARA LOS TESTS")
+    r"ENTREGA INCOMPLETA|DESVÍO|TRAMPA PARA LOS TESTS|TEST DEBILITADO")
 
 
 def diagnostico_obvio(diagnostico: str) -> bool:
@@ -17381,7 +17431,7 @@ class Orquestador:
                 self.ui.aviso("  Siguen rotos " + ", ".join(sorted(siguen)) + ": no los protejo (los puede corregir "
                               "el implementador).")
                 tests = [t for t in tests if t not in siguen]
-                self._spec_rotos = sorted(siguen)            # sin proteger, pero la tarea igual los tiene que pasar
+                self._marcar_spec_rotos(siguen)              # sin proteger, pero la tarea igual los tiene que pasar
                 if not tests:
                     return {}
         acoplados = {}
@@ -17410,7 +17460,7 @@ class Orquestador:
             if rotos_ahora:
                 # La reescritura no puede dejar protegido un test roto.
                 self.ui.aviso("  La reescritura dejó tests rotos (" + ", ".join(sorted(rotos_ahora)) + "): no los protejo.")
-                self._spec_rotos = sorted(set(getattr(self, "_spec_rotos", [])) | rotos_ahora)
+                self._marcar_spec_rotos(rotos_ahora)
                 tests = [t for t in tests if t not in rotos_ahora]
                 if not tests:
                     return {}
@@ -17426,7 +17476,7 @@ class Orquestador:
                 # implementador puede reescribirlos), pero la tarea igual tiene que dejarlos en verde.
                 self.ui.aviso("  Siguen acoplados a la implementación (" + ", ".join(sorted(siguen_acoplados))
                               + "): no los protejo (el implementador los puede corregir).")
-                self._spec_rotos = sorted(set(getattr(self, "_spec_rotos", [])) | siguen_acoplados)
+                self._marcar_spec_rotos(siguen_acoplados)
                 tests = [t for t in tests if t not in siguen_acoplados]
                 if not tests:
                     return {}
@@ -17613,10 +17663,12 @@ class Orquestador:
         # ¿Arranca? Que los tests pasen no prueba que `python -m paquete` cargue: si se cae al importar, está roto.
         arranque = verificar_arranque(self.ws) if getattr(self.settings, "verificar_arranque", True) else []
         partes.extend(arranque)
+        debilitados = self._tests_debilitados()
+        partes.extend(debilitados)
         diagnostico = "\n\n".join(partes)
         if diagnostico and self.settings.pistas_errores:
             diagnostico = anexar_pistas(diagnostico, 3)
-        return Verificacion(not malos and tests_ok and aceptacion_ok and not arranque, validaciones,
+        return Verificacion(not malos and tests_ok and aceptacion_ok and not arranque and not debilitados, validaciones,
                             tests, diagnostico, archivos, conteo, aceptacion)
 
     def reparar(self, pedido: str, verif: Verificacion, cid: int, base_fallaba: bool,
@@ -17677,15 +17729,20 @@ class Orquestador:
         inutiles: list[str] = []
         liberacion_hecha = False
         experto_usado = False
-        while not verif.ok and intento < max_intentos:
+        while not verif.ok:
+            sin_avance = len(inutiles) >= 2 or sin_cambios >= 2
+            if intento >= max_intentos and (liberacion_hecha or not sin_avance):
+                break                       # sin intentos: solo hay UNO más si abajo se libera la especificación
             vencido = PLAZO.vencido()
             if vencido:
                 informe.notas.append(f"{etiqueta}: se agotó el tiempo de {vencido}; quedan fallos sin reparar.")
                 self.ui.aviso(f"  ⏱ {etiqueta}: se agotó el tiempo de {vencido}; no sigo reparando.")
                 break
-            if (len(inutiles) >= 2 or sin_cambios >= 2) and not liberacion_hecha:
+            liberados = []
+            if sin_avance and not liberacion_hecha:
                 # Antes de rendirse: ¿lo que bloquea es un test de la especificación que está roto o acoplado a la
-                # implementación? Protegido, nadie lo podía corregir (prueba real). Se libera UNA vez.
+                # implementación? Protegido, nadie lo podía corregir (prueba real). Se libera UNA vez; con 2 intentos
+                # por tarea (umbral_escalada=1) la liberación caía justo después del último y no servía de nada.
                 liberacion_hecha = True
                 liberados = self._liberar_especificacion_mala(verif, informe)
                 if liberados:
@@ -17695,6 +17752,8 @@ class Orquestador:
                     contexto = (contexto + "\n\nLIBERADOS: " + ", ".join(liberados) + " tenían problemas propios (rotos "
                                 "o acoplados a la implementación). Ahora podés corregirlos para que prueben el "
                                 "COMPORTAMIENTO pedido, sin debilitarlos.").strip()
+            if intento >= max_intentos and not liberados:
+                break
             if len(inutiles) >= 2 or sin_cambios >= 2:
                 if not experto_usado and self.escalador.disponible():
                     # Última carta antes de cortar: UN intento con el diagnóstico del modelo fuerte.
@@ -17786,6 +17845,38 @@ class Orquestador:
                 verif = antes
         return verif
 
+    def _marcar_spec_rotos(self, rels) -> None:
+        """Tests de la especificación SIN proteger (rotos o acoplados): la tarea igual los tiene que dejar en verde, y
+        se anota cuántos tests tenían para que nadie los "arregle" vaciándolos (ver _tests_debilitados)."""
+        self._spec_rotos = sorted(set(getattr(self, "_spec_rotos", [])) | set(rels))
+        minimos = self.__dict__.setdefault("_minimo_tests", {})
+        for rel in rels:
+            if not rel.endswith(".py") or rel in minimos:
+                continue
+            try:
+                minimos[rel] = len(analizar_tests_python(self.ws.leer(rel)).tests)
+            except (OSError, ValueError, ErrorRuta):
+                continue
+
+    def _tests_debilitados(self) -> list[str]:
+        """Un test liberado se corrige para que pruebe el COMPORTAMIENTO; vaciarlo (borrar tests, dejarlos sin assert)
+        no cuenta como arreglo, aunque la suite quede en verde."""
+        problemas = []
+        for rel, minimo in sorted(getattr(self, "_minimo_tests", {}).items()):
+            if not (self.ws.raiz / rel).is_file():
+                problemas.append(f"TEST DEBILITADO ({rel}): se borró un test de la especificación.")
+                continue
+            try:
+                hallazgos = debilitamiento_de_test(self.ws.leer(rel), minimo)
+            except (OSError, ValueError, ErrorRuta):
+                continue
+            if hallazgos:
+                problemas.append(f"TEST DEBILITADO ({rel}): " + "; ".join(hallazgos) + ". Es un test de la "
+                                 "especificación que se liberó para CORREGIRLO (que pruebe el comportamiento pedido con "
+                                 "datos reales), no para vaciarlo: mantené todos sus casos con asserts que verifiquen "
+                                 "resultados.")
+        return problemas
+
     def _liberar_especificacion_mala(self, verif: Verificacion, informe: InformeBuild) -> list:
         """Tests de la especificación de ESTA build que están protegidos, participan del fallo y tienen problemas
         propios (rotos o acoplados a la implementación): se desprotegen para que se puedan corregir. La tarea igual
@@ -17810,13 +17901,14 @@ class Orquestador:
             self._protegidos.pop(rel, None)
             liberados.append(rel)
         if liberados:
-            self._spec_rotos = sorted(set(getattr(self, "_spec_rotos", [])) | set(liberados))
+            self._marcar_spec_rotos(liberados)
             diario = getattr(self, "_diario_build", None)
             if diario is not None:
                 registro, previo = diario
                 for rel in liberados:
                     previo.setdefault("tests_protegidos", {}).pop(rel, None)
                 previo["spec_rotos"] = list(self._spec_rotos)
+                previo["minimo_tests"] = dict(self._minimo_tests)
                 registro.guardar(previo)
             self.ui.aviso("  La reparación no avanza y el bloqueo es la especificación (" + ", ".join(liberados)
                           + ": rota o acoplada a la implementación). La libero para que se pueda corregir.")
@@ -18255,6 +18347,7 @@ class Orquestador:
             problemas.append("LA ESPECIFICACIÓN DE ESTA TAREA SIGUE EN ROJO (" + ", ".join(sorted(propios)) + "): "
                              + ", ".join(rojos_propios[:8]) + "\n"
                              + fallos_relevantes(f"{tests.stdout}\n{tests.stderr}", maximo=3, limite=4000))
+        problemas.extend(self._tests_debilitados())
         if exigir_progreso and not problemas:
             # El implementador NO terminó (límite de pasos, error...). "No romper nada" no alcanza:
             # tiene que haber cambios reales y, si hay tests fallando, alguno más tiene que pasar.
@@ -18325,6 +18418,7 @@ class Orquestador:
         inicio = time.monotonic()
         self._protegidos: dict[str, Optional[str]] = {}
         self._spec_rotos: list = []
+        self._minimo_tests: dict[str, int] = {}
         self._tokens_juez = 0
         self._tokens_inicio = _tokens_usados(self.llm)
         registro_build = RegistroBuild(self.ws)
@@ -18524,6 +18618,7 @@ class Orquestador:
             previo["spec_tests"] = list(espec)
             previo["tests_protegidos"] = {p: self.ws.hash(p) for p in self._protegidos}
             previo["spec_rotos"] = list(self._spec_rotos)
+            previo["minimo_tests"] = dict(self._minimo_tests)
             previo["especificacion_completa"] = True
             _cerrar_fase(previo)
             avisos_fusion = fusionar_tareas_de_solo_tests(
@@ -18537,6 +18632,9 @@ class Orquestador:
         elif reanudar:
             informe.spec_tests = list(previo.get("spec_tests", self._protegidos))
             self._spec_rotos = [r for r in previo.get("spec_rotos", []) if isinstance(r, str)]
+            minimos = previo.get("minimo_tests", {})
+            self._minimo_tests = {r: n for r, n in (minimos.items() if isinstance(minimos, dict) else ())
+                                  if isinstance(r, str) and isinstance(n, int)}
 
         self.ui.fase(numero_fase, "Implementación" + (" · torneo" if self.settings.torneo and self.settings.candidatos > 1 else ""))
         numero_fase += 1
@@ -53946,6 +54044,120 @@ class TestRobustoGrandeDiarioDeOtraCarpeta(BaseTest):
         self.assertNotIn("el modelo no responde", motivo)
         self.assertIn("otro proyecto", motivo)
         self.assertIn("/construir descartar", motivo)
+
+
+# ======================================================================
+# MÓDULO: autotest_liberados
+# ======================================================================
+"""
+Tests de la especificación liberados (rotos o acoplados a la implementación) — huecos que quedaron tras el arreglo:
+
+- Un test liberado se podía "arreglar" vaciándolo (borrar casos, dejar `assertTrue(True)`): la suite quedaba en verde
+  y nadie lo frenaba salvo el examen de realidad del final.
+- Con 2 intentos por tarea (umbral_escalada=1) la liberación se decidía justo DESPUÉS del último intento: nunca servía.
+"""
+
+_LIB_TEST_VACIO = ("import unittest\n\nfrom almacen.sales import validate_stock\n\n\n"
+                   "class TestValidateStock(unittest.TestCase):\n    def test_stock_suficiente(self):\n"
+                   "        self.assertTrue(True)\n")
+_LIB_TEST_DOS = _PR3_TEST_REAL + ("\n    def test_sin_producto(self):\n        con = db.conectar(\":memory:\")\n"
+                                  "        self.assertFalse(validate_stock(con, 9, 1))\n")
+
+
+class TestLiberadosDebilitamiento(BaseTest):
+    def test_detecta_casos_borrados_y_asserts_vacios(self):
+        self.assertEqual(debilitamiento_de_test(_PR3_TEST_REAL, 1), [])
+        self.assertEqual(debilitamiento_de_test(_LIB_TEST_DOS, 2), [])
+        self.assertTrue(any("tenía 2 test(s) y ahora tiene 1" in h for h in debilitamiento_de_test(_PR3_TEST_REAL, 2)))
+        self.assertTrue(any("sin un assert real" in h for h in debilitamiento_de_test(_LIB_TEST_VACIO, 1)))
+        sin_assert = _LIB_TEST_VACIO.replace("self.assertTrue(True)", "validate_stock(None, 1, 1)")
+        self.assertTrue(any("test_stock_suficiente" in h for h in debilitamiento_de_test(sin_assert, 1)))
+
+    def test_siempre_verdadero_disfrazado_es_tautologia(self):
+        for disfraz in ("self.assertTrue(callable(validate_stock) or True)", "self.assertFalse(not True)",
+                        "assert validate_stock or 1", "self.assertTrue(not (x and False))"):
+            texto = _LIB_TEST_VACIO.replace("self.assertTrue(True)", disfraz)
+            self.assertTrue(debilitamiento_de_test(texto, 1), disfraz)            # antes: contaba como assert real
+        for real in ("self.assertTrue(validate_stock(con, 1, 5))", "assert validate_stock(con, 1, 5) or x"):
+            texto = _LIB_TEST_VACIO.replace("self.assertTrue(True)", real)
+            self.assertEqual(debilitamiento_de_test(texto, 1), [], real)
+
+    def _orq(self):
+        ws = self.proyecto({"almacen/__init__.py": "", "almacen/db.py": _PRB_DB, "almacen/sales.py": _PRB_SALES,
+                            "tests/__init__.py": "", "tests/test_sales.py": _PR3_TEST_ACOPLADO})
+        ui = self.ui()
+        orq = Orquestador(MockLLM(lambda m, k: terminar_xml("x")), ws, self.ajustes(forense=False), ui)
+        orq._protegidos = {"tests/test_sales.py": _PR3_TEST_ACOPLADO}
+        informe = InformeBuild("fallida")
+        informe.spec_tests = ["tests/test_sales.py"]
+        return ws, ui, orq, informe
+
+    def _reparar(self, orq, ws, informe, max_intentos):
+        cid = ws.checkpoints.iniciar("tarea")
+        return orq._reparar_con_escalada("ventas", orq.verificar(cid), cid, False, informe, "tarea 1", max_intentos,
+                                         lambda: orq.verificar(cid))
+
+    def test_vaciar_el_test_liberado_no_cuenta_como_arreglo(self):
+        ws, _ui, orq, informe = self._orq()
+        vistos = []
+
+        def reparar(pedido, verif, cid, base_fallaba, experto="", contexto=""):
+            vistos.append(verif.diagnostico)
+            if "tests/test_sales.py" not in orq._protegidos:          # liberado: primero lo vacía, después lo arregla
+                ws.escribir("tests/test_sales.py", _LIB_TEST_VACIO if len(vistos) == 3 else _PR3_TEST_REAL)
+            return ResultadoAgente(True, "listo")
+        orq.reparar = reparar
+        final = self._reparar(orq, ws, informe, 5)
+        self.assertTrue(final.ok, final.diagnostico[-1500:])
+        self.assertEqual(len(vistos), 4)
+        self.assertIn("TEST DEBILITADO (tests/test_sales.py)", vistos[3])   # antes: verde con assertTrue(True)
+        self.assertIn("sin un assert real", vistos[3])
+        self.assertEqual(ws.leer("tests/test_sales.py"), _PR3_TEST_REAL)
+
+    def test_borrar_el_test_liberado_tampoco(self):
+        ws, _ui, orq, informe = self._orq()
+
+        def reparar(pedido, verif, cid, base_fallaba, experto="", contexto=""):
+            if "tests/test_sales.py" not in orq._protegidos and ws.existe("tests/test_sales.py"):
+                (ws.raiz / "tests/test_sales.py").unlink()
+            return ResultadoAgente(True, "listo")
+        orq.reparar = reparar
+        final = self._reparar(orq, ws, informe, 3)
+        self.assertFalse(final.ok)
+        self.assertIn("TEST DEBILITADO (tests/test_sales.py): se borró", final.diagnostico)
+
+    def test_con_dos_intentos_la_liberacion_llega_a_tiempo(self):
+        ws, ui, orq, informe = self._orq()
+        vistos = []
+
+        def reparar(pedido, verif, cid, base_fallaba, experto="", contexto=""):
+            vistos.append(set(orq._protegidos))
+            if "tests/test_sales.py" not in orq._protegidos:
+                ws.escribir("tests/test_sales.py", _PR3_TEST_REAL)
+            return ResultadoAgente(True, "listo")
+        orq.reparar = reparar
+        final = self._reparar(orq, ws, informe, 2)
+        self.assertTrue(final.ok, final.diagnostico[-1500:])            # antes: cortaba en rojo tras el 2.º intento
+        self.assertEqual(len(vistos), 3)                                # UN intento de más, solo por la liberación
+        self.assertIn("La libero", ui.texto_registrado())
+
+    def test_sin_nada_que_liberar_no_hay_intento_de_mas(self):
+        ws = self.proyecto({"calc.py": "def sumar(a, b):\n    return a - b\n", "tests/test_calc.py": _PRB_TEST_CALC})
+        orq = Orquestador(MockLLM(lambda m, k: terminar_xml("x")), ws, self.ajustes(forense=False), self.ui())
+        llamadas = []
+        orq.reparar = lambda *a, **k: llamadas.append(1) or ResultadoAgente(True, "no pude")
+        cid = ws.checkpoints.iniciar("tarea")
+        final = orq._reparar_con_escalada("calc", orq.verificar(cid), cid, False, InformeBuild("fallida"), "tarea 1",
+                                          2, lambda: orq.verificar(cid))
+        self.assertFalse(final.ok)
+        self.assertEqual(len(llamadas), 2)
+
+    def test_marcar_anota_cuantos_tests_tenia(self):
+        ws, _ui, orq, informe = self._orq()
+        orq._marcar_spec_rotos(["tests/test_sales.py"])
+        self.assertEqual(orq._minimo_tests, {"tests/test_sales.py": 1})
+        ws.escribir("tests/test_sales.py", _LIB_TEST_VACIO)
+        self.assertTrue(orq._tests_debilitados())
 
 
 # ======================================================================

@@ -78,6 +78,31 @@ def _ti_src(nodo) -> str:
         return ""
 
 
+def _siempre_verdadero(nodo) -> bool:
+    """Expresiones que valen True sin importar el código: `x or True`, `not False`, `True and 1`..."""
+    if isinstance(nodo, ast.Constant):
+        return bool(nodo.value)
+    if isinstance(nodo, ast.BoolOp):
+        if isinstance(nodo.op, ast.Or):
+            return any(_siempre_verdadero(v) for v in nodo.values)
+        return all(_siempre_verdadero(v) for v in nodo.values)
+    if isinstance(nodo, ast.UnaryOp) and isinstance(nodo.op, ast.Not):
+        return _siempre_falso(nodo.operand)
+    return False
+
+
+def _siempre_falso(nodo) -> bool:
+    if isinstance(nodo, ast.Constant):
+        return not nodo.value
+    if isinstance(nodo, ast.BoolOp):
+        if isinstance(nodo.op, ast.And):
+            return any(_siempre_falso(v) for v in nodo.values)
+        return all(_siempre_falso(v) for v in nodo.values)
+    if isinstance(nodo, ast.UnaryOp) and isinstance(nodo.op, ast.Not):
+        return _siempre_verdadero(nodo.operand)
+    return False
+
+
 def _es_tautologia(nodo) -> Optional[str]:
     """Si el assert/compare no puede distinguir nada, devuelve el motivo."""
     # assert <constante>  → assert True / assert 1 / assert "x"
@@ -92,6 +117,12 @@ def _es_tautologia(nodo) -> Optional[str]:
             return f"{izq} != {der}: siempre falso"
         if isinstance(nodo.left, ast.Constant) and isinstance(nodo.comparators[0], ast.Constant):
             return f"dos constantes ({izq} {_ti_sym(op)} {der}): no depende del código"
+    if isinstance(nodo, (ast.BoolOp, ast.UnaryOp)):
+        # Un reparador "arreglaba" un test liberado con `assertTrue(callable(f) or True)`: siempre verdadero.
+        if _siempre_verdadero(nodo):
+            return f"{_ti_src(nodo)}: siempre verdadero, no depende del código"
+        if _siempre_falso(nodo):
+            return f"{_ti_src(nodo)}: siempre falso, no depende del código"
     return None
 
 
@@ -118,6 +149,10 @@ def _tautologia_en_assert_metodo(call: ast.Call) -> Optional[str]:
                 return f"{metodo}({a.value!r}): siempre verdadero"
             if metodo == "assertFalse" and not a.value:
                 return f"{metodo}({a.value!r}): siempre verdadero"
+        elif metodo == "assertTrue" and _siempre_verdadero(a):
+            return f"{metodo}({_ti_src(a)}): siempre verdadero, no depende del código"
+        elif metodo == "assertFalse" and _siempre_falso(a):
+            return f"{metodo}({_ti_src(a)}): siempre verdadero (la expresión es siempre falsa)"
     if metodo in _ASSERT_DOS and len(args) >= 2:
         a, b = _ti_src(args[0]), _ti_src(args[1])
         if a == b and metodo in ("assertEqual", "assertIs", "assertAlmostEqual", "assertGreaterEqual",
@@ -276,6 +311,21 @@ def analizar_tests_python(fuente: str) -> ResultadoInteligencia:
             info.nivel_real = "integration" if corre_io_real else "unit"
         res.tests.append(info)
     return res
+
+
+def debilitamiento_de_test(fuente: str, minimo: int) -> list[str]:
+    """Un test de la especificación que se liberó (estaba roto o acoplado a la implementación) se puede REESCRIBIR para
+    que pruebe el comportamiento, pero no VACIAR: no puede quedar con menos tests que el original ni con tests sin un
+    assert real (sin assert o solo tautologías)."""
+    res = analizar_tests_python(fuente)
+    problemas = []
+    if len(res.tests) < minimo:
+        problemas.append(f"tenía {minimo} test(s) y ahora tiene {len(res.tests)}")
+    vacios = sorted({p.test for p in res.problemas if p.tipo == "SIN_ASSERT"}
+                    | {t.nombre for t in res.tests if 0 < t.asserts <= t.tautologias})
+    if vacios:
+        problemas.append("tests sin un assert real: " + ", ".join(vacios[:6]))
+    return problemas
 
 
 def inteligencia_para_prompt(fuente: str, maximo: int = 8) -> str:

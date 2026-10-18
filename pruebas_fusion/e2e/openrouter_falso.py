@@ -11,6 +11,8 @@ primero, torneo, revisor, qa, juez). Fallas configurables por variables de entor
   MOCK_ACOPLADO=1        → (tercera prueba real) el especificador escribe tests/test_ventas.py acoplado a la
                            implementación (mockea la conexión y exige el SQL exacto) y, aunque se lo pidan, no lo
                            reescribe; el reparador lo cambia por un test con sqlite real si lo dejan tocarlo
+  MOCK_DEBILITA=1        → (con MOCK_ACOPLADO) cuando lo dejan tocar el test, el reparador primero lo VACÍA
+                           (assertTrue(True)); recién si REAPER se lo rechaza escribe el test real
   MOCK_CAOS=nivel        → MODELO GRATIS FLOJO (0 apagado, 1 moderado, 2 fuerte), con las fallas reales del teléfono:
                            cohere piensa sin responder (salvo razonamiento none/minimal) y tiene límite 15/min; Nvidia
                            da 500; respuestas vacías; "Upstream idle timeout"; herramientas mal escritas (<contenido>,
@@ -131,6 +133,8 @@ def cerebro(mensajes):
         if "tests/test_ventas.py es parte de la especificación" in R.MockLLM.ultimo_usuario(mensajes):
             # Como en el teléfono: el test protegido exige un SQL que el código correcto no usa; no hay salida.
             return rol, R.terminar_xml("no puedo: el test protegido exige el SQL exacto y mockea la conexión")
+        if os.environ.get("MOCK_DEBILITA") and "TEST DEBILITADO" not in primero:
+            return rol, ("tool", "write_to_file", {"path": "tests/test_ventas.py", "content": _TEST_VENTAS_VACIO})
         return rol, ("tool", "write_to_file", {"path": "tests/test_ventas.py", "content": G.ARCHIVOS["tests/test_ventas.py"]})
     if rol in ("revisor", "qa", "reparador", "integrador", "explorador"):
         return rol, R.terminar_xml("revisado: sin cambios necesarios")
@@ -219,6 +223,16 @@ class TestVentas(unittest.TestCase):
         con.execute.assert_called_with("SELECT stock FROM productos WHERE codigo = ?", ("A1",))
 '''
 assert len(R.acoples_a_la_implementacion(_TEST_VENTAS_ACOPLADO)) == 2
+
+_TEST_VENTAS_VACIO = '''import unittest
+
+from almacen.ventas import registrar_venta
+
+
+class TestVentas(unittest.TestCase):
+    def test_sin_stock_no_vende(self):
+        self.assertTrue(callable(registrar_venta) or True)
+'''
 
 
 def _tareas_de(etapa):

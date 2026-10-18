@@ -1087,7 +1087,7 @@ def _resumen_diff(diff: str) -> str:
 _RE_DIAGNOSTICO_OBVIO = re.compile(
     r"NameError|ImportError|ModuleNotFoundError|No module named|SyntaxError|IndentationError|F821|Undefined name|"
     r"is not defined|no define '|has no attribute|missing \d+ required positional|takes \d+ positional|"
-    r"ENTREGA INCOMPLETA|DESVÍO|TRAMPA PARA LOS TESTS")
+    r"ENTREGA INCOMPLETA|DESVÍO|TRAMPA PARA LOS TESTS|TEST DEBILITADO")
 
 
 def diagnostico_obvio(diagnostico: str) -> bool:
@@ -1591,7 +1591,7 @@ class Orquestador:
                 self.ui.aviso("  Siguen rotos " + ", ".join(sorted(siguen)) + ": no los protejo (los puede corregir "
                               "el implementador).")
                 tests = [t for t in tests if t not in siguen]
-                self._spec_rotos = sorted(siguen)            # sin proteger, pero la tarea igual los tiene que pasar
+                self._marcar_spec_rotos(siguen)              # sin proteger, pero la tarea igual los tiene que pasar
                 if not tests:
                     return {}
         acoplados = {}
@@ -1620,7 +1620,7 @@ class Orquestador:
             if rotos_ahora:
                 # La reescritura no puede dejar protegido un test roto.
                 self.ui.aviso("  La reescritura dejó tests rotos (" + ", ".join(sorted(rotos_ahora)) + "): no los protejo.")
-                self._spec_rotos = sorted(set(getattr(self, "_spec_rotos", [])) | rotos_ahora)
+                self._marcar_spec_rotos(rotos_ahora)
                 tests = [t for t in tests if t not in rotos_ahora]
                 if not tests:
                     return {}
@@ -1636,7 +1636,7 @@ class Orquestador:
                 # implementador puede reescribirlos), pero la tarea igual tiene que dejarlos en verde.
                 self.ui.aviso("  Siguen acoplados a la implementación (" + ", ".join(sorted(siguen_acoplados))
                               + "): no los protejo (el implementador los puede corregir).")
-                self._spec_rotos = sorted(set(getattr(self, "_spec_rotos", [])) | siguen_acoplados)
+                self._marcar_spec_rotos(siguen_acoplados)
                 tests = [t for t in tests if t not in siguen_acoplados]
                 if not tests:
                     return {}
@@ -1823,10 +1823,12 @@ class Orquestador:
         # ¿Arranca? Que los tests pasen no prueba que `python -m paquete` cargue: si se cae al importar, está roto.
         arranque = verificar_arranque(self.ws) if getattr(self.settings, "verificar_arranque", True) else []
         partes.extend(arranque)
+        debilitados = self._tests_debilitados()
+        partes.extend(debilitados)
         diagnostico = "\n\n".join(partes)
         if diagnostico and self.settings.pistas_errores:
             diagnostico = anexar_pistas(diagnostico, 3)
-        return Verificacion(not malos and tests_ok and aceptacion_ok and not arranque, validaciones,
+        return Verificacion(not malos and tests_ok and aceptacion_ok and not arranque and not debilitados, validaciones,
                             tests, diagnostico, archivos, conteo, aceptacion)
 
     def reparar(self, pedido: str, verif: Verificacion, cid: int, base_fallaba: bool,
@@ -1887,15 +1889,20 @@ class Orquestador:
         inutiles: list[str] = []
         liberacion_hecha = False
         experto_usado = False
-        while not verif.ok and intento < max_intentos:
+        while not verif.ok:
+            sin_avance = len(inutiles) >= 2 or sin_cambios >= 2
+            if intento >= max_intentos and (liberacion_hecha or not sin_avance):
+                break                       # sin intentos: solo hay UNO más si abajo se libera la especificación
             vencido = PLAZO.vencido()
             if vencido:
                 informe.notas.append(f"{etiqueta}: se agotó el tiempo de {vencido}; quedan fallos sin reparar.")
                 self.ui.aviso(f"  ⏱ {etiqueta}: se agotó el tiempo de {vencido}; no sigo reparando.")
                 break
-            if (len(inutiles) >= 2 or sin_cambios >= 2) and not liberacion_hecha:
+            liberados = []
+            if sin_avance and not liberacion_hecha:
                 # Antes de rendirse: ¿lo que bloquea es un test de la especificación que está roto o acoplado a la
-                # implementación? Protegido, nadie lo podía corregir (prueba real). Se libera UNA vez.
+                # implementación? Protegido, nadie lo podía corregir (prueba real). Se libera UNA vez; con 2 intentos
+                # por tarea (umbral_escalada=1) la liberación caía justo después del último y no servía de nada.
                 liberacion_hecha = True
                 liberados = self._liberar_especificacion_mala(verif, informe)
                 if liberados:
@@ -1905,6 +1912,8 @@ class Orquestador:
                     contexto = (contexto + "\n\nLIBERADOS: " + ", ".join(liberados) + " tenían problemas propios (rotos "
                                 "o acoplados a la implementación). Ahora podés corregirlos para que prueben el "
                                 "COMPORTAMIENTO pedido, sin debilitarlos.").strip()
+            if intento >= max_intentos and not liberados:
+                break
             if len(inutiles) >= 2 or sin_cambios >= 2:
                 if not experto_usado and self.escalador.disponible():
                     # Última carta antes de cortar: UN intento con el diagnóstico del modelo fuerte.
@@ -1996,6 +2005,38 @@ class Orquestador:
                 verif = antes
         return verif
 
+    def _marcar_spec_rotos(self, rels) -> None:
+        """Tests de la especificación SIN proteger (rotos o acoplados): la tarea igual los tiene que dejar en verde, y
+        se anota cuántos tests tenían para que nadie los "arregle" vaciándolos (ver _tests_debilitados)."""
+        self._spec_rotos = sorted(set(getattr(self, "_spec_rotos", [])) | set(rels))
+        minimos = self.__dict__.setdefault("_minimo_tests", {})
+        for rel in rels:
+            if not rel.endswith(".py") or rel in minimos:
+                continue
+            try:
+                minimos[rel] = len(analizar_tests_python(self.ws.leer(rel)).tests)
+            except (OSError, ValueError, ErrorRuta):
+                continue
+
+    def _tests_debilitados(self) -> list[str]:
+        """Un test liberado se corrige para que pruebe el COMPORTAMIENTO; vaciarlo (borrar tests, dejarlos sin assert)
+        no cuenta como arreglo, aunque la suite quede en verde."""
+        problemas = []
+        for rel, minimo in sorted(getattr(self, "_minimo_tests", {}).items()):
+            if not (self.ws.raiz / rel).is_file():
+                problemas.append(f"TEST DEBILITADO ({rel}): se borró un test de la especificación.")
+                continue
+            try:
+                hallazgos = debilitamiento_de_test(self.ws.leer(rel), minimo)
+            except (OSError, ValueError, ErrorRuta):
+                continue
+            if hallazgos:
+                problemas.append(f"TEST DEBILITADO ({rel}): " + "; ".join(hallazgos) + ". Es un test de la "
+                                 "especificación que se liberó para CORREGIRLO (que pruebe el comportamiento pedido con "
+                                 "datos reales), no para vaciarlo: mantené todos sus casos con asserts que verifiquen "
+                                 "resultados.")
+        return problemas
+
     def _liberar_especificacion_mala(self, verif: Verificacion, informe: InformeBuild) -> list:
         """Tests de la especificación de ESTA build que están protegidos, participan del fallo y tienen problemas
         propios (rotos o acoplados a la implementación): se desprotegen para que se puedan corregir. La tarea igual
@@ -2020,13 +2061,14 @@ class Orquestador:
             self._protegidos.pop(rel, None)
             liberados.append(rel)
         if liberados:
-            self._spec_rotos = sorted(set(getattr(self, "_spec_rotos", [])) | set(liberados))
+            self._marcar_spec_rotos(liberados)
             diario = getattr(self, "_diario_build", None)
             if diario is not None:
                 registro, previo = diario
                 for rel in liberados:
                     previo.setdefault("tests_protegidos", {}).pop(rel, None)
                 previo["spec_rotos"] = list(self._spec_rotos)
+                previo["minimo_tests"] = dict(self._minimo_tests)
                 registro.guardar(previo)
             self.ui.aviso("  La reparación no avanza y el bloqueo es la especificación (" + ", ".join(liberados)
                           + ": rota o acoplada a la implementación). La libero para que se pueda corregir.")
@@ -2465,6 +2507,7 @@ class Orquestador:
             problemas.append("LA ESPECIFICACIÓN DE ESTA TAREA SIGUE EN ROJO (" + ", ".join(sorted(propios)) + "): "
                              + ", ".join(rojos_propios[:8]) + "\n"
                              + fallos_relevantes(f"{tests.stdout}\n{tests.stderr}", maximo=3, limite=4000))
+        problemas.extend(self._tests_debilitados())
         if exigir_progreso and not problemas:
             # El implementador NO terminó (límite de pasos, error...). "No romper nada" no alcanza:
             # tiene que haber cambios reales y, si hay tests fallando, alguno más tiene que pasar.
@@ -2535,6 +2578,7 @@ class Orquestador:
         inicio = time.monotonic()
         self._protegidos: dict[str, Optional[str]] = {}
         self._spec_rotos: list = []
+        self._minimo_tests: dict[str, int] = {}
         self._tokens_juez = 0
         self._tokens_inicio = _tokens_usados(self.llm)
         registro_build = RegistroBuild(self.ws)
@@ -2734,6 +2778,7 @@ class Orquestador:
             previo["spec_tests"] = list(espec)
             previo["tests_protegidos"] = {p: self.ws.hash(p) for p in self._protegidos}
             previo["spec_rotos"] = list(self._spec_rotos)
+            previo["minimo_tests"] = dict(self._minimo_tests)
             previo["especificacion_completa"] = True
             _cerrar_fase(previo)
             avisos_fusion = fusionar_tareas_de_solo_tests(
@@ -2747,6 +2792,9 @@ class Orquestador:
         elif reanudar:
             informe.spec_tests = list(previo.get("spec_tests", self._protegidos))
             self._spec_rotos = [r for r in previo.get("spec_rotos", []) if isinstance(r, str)]
+            minimos = previo.get("minimo_tests", {})
+            self._minimo_tests = {r: n for r, n in (minimos.items() if isinstance(minimos, dict) else ())
+                                  if isinstance(r, str) and isinstance(n, int)}
 
         self.ui.fase(numero_fase, "Implementación" + (" · torneo" if self.settings.torneo and self.settings.candidatos > 1 else ""))
         numero_fase += 1
