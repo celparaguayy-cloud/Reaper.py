@@ -404,3 +404,62 @@ class TestRobustoGrandeSeRecupera(BaseTest):
         self.assertIn("cupo diario", estado["motivo"])
         self.assertNotIn("recuperaciones", estado)                      # ni se deshace ni se parte
         self.assertEqual([e["id"] for e in estado["maestro"]["etapas"]], ["1", "2"])
+
+
+class TestRobustoGrandeEtapaAlTope(BaseTest):
+    """Una etapa que ya gastó sus intentos (p. ej. tras varios /grande continuar): antes DETENIDO con "partila o
+    corregila a mano" (no hay comando para partirla) y /grande deshacer no le devolvía los intentos."""
+
+    def _detenida_en_1(self):
+        guion = _PRB_GuionPartible(rotas=("E1",))
+        ws, ui, grande = TestRobustoGrandeSeRecupera._grande(self, guion)
+        grande._recuperar_etapa = lambda *a: False                  # como la versión vieja: se detiene en la 1
+        self.assertFalse(grande.iniciar(TestRobustoGrandeSeRecupera.PEDIDO, confirmar=False))
+        del grande._recuperar_etapa
+        return ws, ui, grande, guion
+
+    def _al_tope(self, grande):
+        estado = grande.leer()
+        maestro = grande.maestro_de(estado)
+        maestro.etapas[0].intentos = MAX_INTENTOS_ETAPA
+        grande.guardar(estado, maestro)
+
+    def test_al_tope_se_parte_sola_en_vez_de_pedir_imposibles(self):
+        ws, ui, grande, guion = self._detenida_en_1()
+        self._al_tope(grande)
+        antes = guion.llamadas["arquitecto"]
+        self.assertTrue(grande.continuar(), ui.texto_registrado()[-3000:])
+        estado = grande.leer()
+        self.assertEqual(estado["estado"], "terminado")
+        self.assertEqual([e["id"] for e in estado["maestro"]["etapas"]], ["1a", "1b", "2"])
+        self.assertEqual(guion.llamadas["arquitecto"] - antes, 3)       # 1a, 1b y 2: la 1 entera no se reintentó
+        self.assertNotIn("a mano", ui.texto_registrado())
+        self.assertTrue(ejecutar_tests(ws, timeout=120).ok)
+
+    def test_deshacer_le_devuelve_los_intentos(self):
+        _ws, ui, grande, _guion = self._detenida_en_1()
+        self._al_tope(grande)
+        self.assertTrue(grande.deshacer_etapa())
+        self.assertEqual(grande.leer()["maestro"]["etapas"][0]["intentos"], 0)
+
+    def test_estado_viejo_deshecho_y_al_tope_se_parte_sin_diario(self):
+        ws, ui, grande, _guion = self._detenida_en_1()
+        self.assertTrue(grande.deshacer_etapa())
+        self._al_tope(grande)                                          # un estado de antes de este arreglo
+        self.assertIsNone(RegistroBuild(ws).leer())
+        self.assertTrue(grande.continuar(), ui.texto_registrado()[-3000:])
+        self.assertEqual(grande.leer()["estado"], "terminado")
+
+    def test_una_parte_al_tope_se_detiene_con_el_motivo_y_como_seguir(self):
+        guion = _PRB_GuionPartible(rotas=("E1", "E1b"))
+        _ws, ui, grande = TestRobustoGrandeSeRecupera._grande(self, guion)
+        self.assertFalse(grande.iniciar(TestRobustoGrandeSeRecupera.PEDIDO, confirmar=False))
+        estado = grande.leer()
+        maestro = grande.maestro_de(estado)
+        maestro.por_id("1b").intentos = MAX_INTENTOS_ETAPA
+        grande.guardar(estado, maestro)
+        self.assertFalse(grande.continuar())
+        motivo = grande.leer()["motivo"]
+        self.assertIn("ya se intentó", motivo)
+        self.assertIn("/grande deshacer", motivo)
+        self.assertNotIn("a mano", motivo)

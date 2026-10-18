@@ -726,8 +726,14 @@ class ConstructorGrande:
                 return self._detener(estado, maestro, f"la etapa {etapa.id} depende de {', '.join(rotas)}, que no "
                                                       "quedó verificada")
             if etapa.intentos >= MAX_INTENTOS_ETAPA:
+                # Antes: "partila o corregila a mano" (no hay comando para partirla). Ahora se parte sola si se puede.
+                if self._recuperar_etapa(estado, maestro, etapa):
+                    return self._ejecutar_etapas(estado, maestro, inicio)
                 return self._detener(estado, maestro, f"la etapa {etapa.id} ya se intentó {etapa.intentos} veces sin "
-                                                      "quedar verificada: revisá su informe y partila o corregila a mano")
+                                                      "quedar verificada"
+                                     + (f": {_primera_linea_util(etapa.motivo)}" if etapa.motivo else "")
+                                     + ".\nPara reintentarla desde el último estado verificado: /grande deshacer y "
+                                       "después /grande continuar")
             self.ui.linea("")
             self.ui.titulo(f"Etapa {etapa.id} ({n}/{len(maestro.etapas)}) · {etapa.titulo}")
             terminadas, esperado, esperas = 0, 0.0, 0
@@ -836,12 +842,15 @@ class ConstructorGrande:
             build = RegistroBuild(self.ws).leer()
         except ValueError:
             return False
-        if not build or build.get("estado") in ESTADOS_OK_ETAPA \
-                or not mismo_pedido(build.get("pedido"), pedido_de_etapa(estado["pedido"], maestro, etapa)):
-            return False                                 # no sé qué revertir sin tocar lo verificado: mejor detener
-        grupo = build.get("grupo")
-        tocados = self.ws.checkpoints.deshacer(grupo) if grupo in self.ws.checkpoints.ids() else []
-        RegistroBuild(self.ws).borrar()
+        tocados = []
+        if build:
+            if build.get("estado") in ESTADOS_OK_ETAPA \
+                    or not mismo_pedido(build.get("pedido"), pedido_de_etapa(estado["pedido"], maestro, etapa)):
+                return False                             # no sé qué revertir sin tocar lo verificado: mejor detener
+            grupo = build.get("grupo")
+            tocados = self.ws.checkpoints.deshacer(grupo) if grupo in self.ws.checkpoints.ids() else []
+            RegistroBuild(self.ws).borrar()
+        # Sin diario de build (la etapa ya se deshizo con /grande deshacer): el disco ya está en lo verificado.
         indice_de(self.ws).invalidar()
         a, b = partes
         posicion = next(i for i, e in enumerate(maestro.etapas) if e.id == etapa.id)
@@ -883,6 +892,7 @@ class ConstructorGrande:
         tocados = self.ws.checkpoints.deshacer(grupo) if grupo in self.ws.checkpoints.ids() else []
         RegistroBuild(self.ws).borrar()
         etapa.estado, etapa.motivo = "pendiente", f"deshecha a pedido ({len(tocados)} archivo(s) revertidos)"
+        etapa.intentos = 0                       # se rehace de cero: si no, "continuar" la frenaba por intentos viejos
         estado["estado"] = "detenido"
         estado["motivo"] = f"la etapa {etapa.id} se deshizo: /grande continuar la rehace desde el último estado verificado"
         self.guardar(estado, maestro)

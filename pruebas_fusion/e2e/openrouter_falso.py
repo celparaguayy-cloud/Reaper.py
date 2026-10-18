@@ -8,6 +8,9 @@ primero, torneo, revisor, qa, juez). Fallas configurables por variables de entor
   MOCK_ESTADO=archivo    → contador persistente de pedidos (para simular el día siguiente: se borra)
   MOCK_FLOJO=1           → el implementador escribe una venta que NO controla el stock; el reparador la arregla
   MOCK_TEST_ROTO=1       → el especificador escribe tests/test_db.py usando db SIN importarlo y no lo corrige
+  MOCK_ACOPLADO=1        → (tercera prueba real) el especificador escribe tests/test_ventas.py acoplado a la
+                           implementación (mockea la conexión y exige el SQL exacto) y, aunque se lo pidan, no lo
+                           reescribe; el reparador lo cambia por un test con sqlite real si lo dejan tocarlo
   MOCK_CAOS=nivel        → MODELO GRATIS FLOJO (0 apagado, 1 moderado, 2 fuerte), con las fallas reales del teléfono:
                            cohere piensa sin responder (salvo razonamiento none/minimal) y tiene límite 15/min; Nvidia
                            da 500; respuestas vacías; "Upstream idle timeout"; herramientas mal escritas (<contenido>,
@@ -93,6 +96,8 @@ def cerebro(mensajes):
             contenido = G.ARCHIVOS[pendientes[0]]
             if os.environ.get("MOCK_TEST_ROTO") and pendientes[0] == "tests/test_db.py":
                 contenido = _TEST_DB_ROTO                 # usa db sin importarlo (como el teléfono) y no lo corrige
+            if os.environ.get("MOCK_ACOPLADO") and pendientes[0] == "tests/test_ventas.py":
+                contenido = _TEST_VENTAS_ACOPLADO         # insiste aunque le pidan probar QUÉ hace y no CÓMO
             return rol, ("tool", "write_to_file", {"path": pendientes[0], "content": contenido})
         return rol, R.terminar_xml("tests escritos: fallan por ImportError hasta que exista el código (esperado)")
     if rol == "implementador":
@@ -121,6 +126,12 @@ def cerebro(mensajes):
             and "almacen/ventas.py" not in _escritos(mensajes):
         # El reparador ve el test que falla (SinStock no se lanzó) y escribe la versión correcta.
         return rol, ("tool", "write_to_file", {"path": "almacen/ventas.py", "content": G.ARCHIVOS["almacen/ventas.py"]})
+    if rol in ("reparador", "integrador") and os.environ.get("MOCK_ACOPLADO") and "test_ventas" in primero \
+            and "tests/test_ventas.py" not in _escritos(mensajes):
+        if "tests/test_ventas.py es parte de la especificación" in R.MockLLM.ultimo_usuario(mensajes):
+            # Como en el teléfono: el test protegido exige un SQL que el código correcto no usa; no hay salida.
+            return rol, R.terminar_xml("no puedo: el test protegido exige el SQL exacto y mockea la conexión")
+        return rol, ("tool", "write_to_file", {"path": "tests/test_ventas.py", "content": G.ARCHIVOS["tests/test_ventas.py"]})
     if rol in ("revisor", "qa", "reparador", "integrador", "explorador"):
         return rol, R.terminar_xml("revisado: sin cambios necesarios")
     return rol or "?", R.terminar_xml("sin cambios")
@@ -191,6 +202,23 @@ assert _VENTAS_FLOJA != G.ARCHIVOS["almacen/ventas.py"]
 
 _TEST_DB_ROTO = G.ARCHIVOS["tests/test_db.py"].replace("from almacen import db\n", "")
 assert _TEST_DB_ROTO != G.ARCHIVOS["tests/test_db.py"]
+
+_TEST_VENTAS_ACOPLADO = '''import unittest
+from unittest.mock import MagicMock, patch
+
+from almacen.ventas import SinStock, registrar_venta
+
+
+class TestVentas(unittest.TestCase):
+    def test_sin_stock_no_vende(self):
+        con = MagicMock()
+        con.execute.return_value.fetchone.return_value = {"precio": 100.0, "stock": 1}
+        with patch("almacen.db.conectar", return_value=con):
+            with self.assertRaises(SinStock):
+                registrar_venta(con, 1, [("A1", 5)])
+        con.execute.assert_called_with("SELECT stock FROM productos WHERE codigo = ?", ("A1",))
+'''
+assert len(R.acoples_a_la_implementacion(_TEST_VENTAS_ACOPLADO)) == 2
 
 
 def _tareas_de(etapa):
