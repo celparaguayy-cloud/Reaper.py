@@ -105,6 +105,10 @@ tus tests DEBEN fallar ahora y pasar cuando alguien implemente el plan correctam
   sin red, sin input(), rápidos; archivos temporales con tempfile.
 - Tests SIMPLES: assertEqual(funcion(entrada), esperado). Nada de cadenas de isinstance, ifs ni lógica
   dentro del test; si un test se vuelve largo, partilo en varios.
+- Probá el COMPORTAMIENTO por la interfaz pública, no cómo está hecho: NO mockees la conexión a la base ni
+  funciones internas del propio proyecto (patch('paquete.modulo.get_connection')) y NO afirmes el SQL exacto
+  ni qué función interna se llamó. Con sqlite usá una base REAL temporal (':memory:' o un archivo en tempfile)
+  cargada con datos de prueba y verificá el resultado. Mocks solo para lo externo (red, reloj, input()).
 - NO implementes el código de la aplicación (solo podés escribir archivos de tests).
 - NO inventes requisitos: tus tests solo pueden exigir lo que el usuario/el plan pidieron (la INTERFAZ y los
   CRITERIOS). No exijas efectos que la spec no menciona (crear un archivo con tal nombre, una ruta fija, un

@@ -252,3 +252,15 @@ otras formas de inyectar nombres (`globals()` de otro módulo vía `importlib`, 
 última lo exige.
 Regresión 1144 tests OK en Python 3.10/3.11/3.12/3.13.
 
+## 17. Tercera prueba real: etapa 1 verificada; tests acoplados y reparador sin tiempo (NO VERIFICADO)
+
+Detalle en `REAPER_FUSION_PRUEBAS.md` §23. Cambios: `acoples_a_la_implementacion` (aviso en `advertencias_tests_python`
+y reescritura única en `especificar`), misión del especificador, `_RE_ANUNCIA_TESTS` en el bucle del agente, `try/except
+LLMError` alrededor de `reparar` en `_reparar_con_escalada`.
+
+**A auditar:** (a) `acoples_a_la_implementacion` solo mira mocks de la conexión y SQL literal: otros acoples (patch de
+funciones internas del módulo bajo prueba) siguen pasando; (b) absorber el `LLMError` del reparador hace que una
+build con TODOS los modelos caídos termine sus tareas como fallidas en vez de cortar: ¿conviene cortar si fallan dos
+reparaciones seguidas por el modelo?
+Regresión 1149 tests OK en Python 3.10/3.11/3.12/3.13.
+

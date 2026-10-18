@@ -711,6 +711,42 @@ def es_archivo_de_test(rel: str) -> bool:
             or "/test/" in f"/{rel}") and rel.endswith(".py")
 
 
+_RE_SQL_LITERAL = re.compile(r"^\s*(?:SELECT|INSERT|UPDATE|DELETE|CREATE|REPLACE)\b", re.I)
+_RE_OBJETIVO_CONEXION = re.compile(r"(?:^|[._])(?:get_)?(?:connection|conexion|conn|connect|conectar|cursor|"
+                                   r"get_db|db_connection|sqlite3\.connect)$", re.I)
+
+
+def acoples_a_la_implementacion(texto: str) -> list[str]:
+    """Tests que prueban CÓMO está hecho el código y no QUÉ hace: afirman el SQL exacto o mockean la conexión a la
+    base del propio proyecto. Prueba real (teléfono): la especificación hacía patch('almacen.sales.get_connection') y
+    exigía "SELECT stock FROM products WHERE id = ?"; el implementador reusó db.get_product (razonable), el mock dejó
+    de aplicar y la etapa 2 murió en reparaciones."""
+    try:
+        arbol = ast.parse(texto)
+    except SyntaxError:
+        return []
+    hallazgos = []
+    for nodo in ast.walk(arbol):
+        if not isinstance(nodo, ast.Call):
+            continue
+        nombre = ast.unparse(nodo.func)
+        primero = nodo.args[0] if nodo.args else None
+        literal = primero.value if isinstance(primero, ast.Constant) and isinstance(primero.value, str) else ""
+        if nombre.endswith(("assert_called_with", "assert_called_once_with", "assert_any_call")) and \
+                _RE_SQL_LITERAL.match(literal):
+            hallazgos.append(f"línea {nodo.lineno}: afirma el SQL exacto ({recortar(literal, 50)}): cualquier consulta "
+                             "equivalente lo rompe; verificá el RESULTADO con una base sqlite real")
+        elif (nombre.endswith("patch") or nombre in ("mock.patch", "unittest.mock.patch")) and literal and \
+                _RE_OBJETIVO_CONEXION.search(literal):
+            hallazgos.append(f"línea {nodo.lineno}: mockea la conexión a la base ({literal}): usá una base sqlite REAL "
+                             "temporal (':memory:' o tempfile) con datos de prueba")
+    vistos = []
+    for h in hallazgos:
+        if h not in vistos:
+            vistos.append(h)
+    return vistos[:6]
+
+
 def advertencias_tests_python(texto: str) -> list[str]:
     """
     Tests que un modelo chico suele escribir mal (se vio en Termux: cadenas de isinstance cada vez más largas):
@@ -750,6 +786,7 @@ def advertencias_tests_python(texto: str) -> list[str]:
             avisos.append(f"{donde}: usa input(); simulalo con unittest.mock.patch('builtins.input')")
         if any(n.endswith(("urlopen", "requests.get", "requests.post", "http.client.HTTPConnection")) for n in nombres):
             avisos.append(f"{donde}: hace pedidos de red reales; reemplazá la función con un mock")
+    avisos.extend(f"acoplado a la implementación, {h}" for h in acoples_a_la_implementacion(texto))
     return avisos[:8]
 
 

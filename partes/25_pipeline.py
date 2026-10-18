@@ -1534,6 +1534,36 @@ class Orquestador:
                 self._spec_rotos = sorted(siguen)            # sin proteger, pero la tarea igual los tiene que pasar
                 if not tests:
                     return {}
+        acoplados = {}
+        for rel in tests:
+            if rel.endswith(".py"):
+                try:
+                    hallazgos = acoples_a_la_implementacion(self.ws.leer(rel))
+                except (OSError, ValueError, ErrorRuta):
+                    hallazgos = []
+                if hallazgos:
+                    acoplados[rel] = hallazgos
+        if acoplados:
+            # Una sola vez: si el modelo insiste, siguen (el implementador igual los ve), pero sin quemar pedidos.
+            self.ui.aviso("  Tests de la especificación acoplados a la implementación (mockean la base o exigen el SQL "
+                          "exacto): le pido al especificador que los reescriba con una base real.")
+            detalle = "\n".join(f"{rel}:\n" + "\n".join(f"  - {h}" for h in hs) for rel, hs in acoplados.items())
+            self._sub("especificador",
+                      "Estos tests prueban CÓMO está hecho el código, no QUÉ hace: cualquier implementación correcta "
+                      "pero distinta los rompe.\n" + detalle + "\n\nReescribilos con una base sqlite REAL temporal "
+                      "(sqlite3 ':memory:' o un archivo en tempfile) cargada con datos de prueba, llamando a las "
+                      "funciones públicas de la INTERFAZ y verificando el RESULTADO. Sin mocks de la conexión y sin "
+                      "afirmar SQL.", cid, titulo="reescribe los tests acoplados")
+            tests = sorted(set(tests) | {x for x in self.ws.checkpoints.archivos_desde(cid)
+                                         if _es_test(x) and (self.ws.raiz / x).is_file()})
+            rotos_ahora = {r.archivo for r in tests_de_especificacion_rotos(validar_archivos(self.ws, tests))}
+            if rotos_ahora:
+                # La reescritura no puede dejar protegido un test roto.
+                self.ui.aviso("  La reescritura dejó tests rotos (" + ", ".join(sorted(rotos_ahora)) + "): no los protejo.")
+                self._spec_rotos = sorted(set(getattr(self, "_spec_rotos", [])) | rotos_ahora)
+                tests = [t for t in tests if t not in rotos_ahora]
+                if not tests:
+                    return {}
         r = ejecutar_tests(self.ws, timeout=self.settings.tests_timeout, completo=True)
         conteo = conteo_de_resultado(r)
         codigo_plan = [a for a in plan.archivos() if not _es_test(a)]
@@ -1819,7 +1849,19 @@ class Orquestador:
             if intentos_txt:
                 contexto_intento += ("\n\nINTENTOS ANTERIORES QUE NO FUNCIONARON (no los repitas; entendé por qué fallaron):\n"
                                      + "\n---\n".join(intentos_txt[-2:]))
-            res = self.reparar(pedido, verif, rcid, base_fallaba, experto, contexto_intento.strip())
+            try:
+                res = self.reparar(pedido, verif, rcid, base_fallaba, experto, contexto_intento.strip())
+            except LLMError as e:
+                if e.detiene_todo:
+                    raise
+                # Prueba real (teléfono): se agotó el tiempo de la tarea 2 en medio de un reintento (Nvidia 500) y el
+                # error subió como "el modelo no responde": /grande se DETENÍA entero. Es el fin de ESTA reparación:
+                # la tarea queda con sus fallos, la build sigue y /grande la retoma con tiempo nuevo.
+                motivo = _primera_linea_util(str(e))
+                informe.notas.append(f"{etiqueta}: el reparador no pudo terminar ({recortar(motivo, 200)}).")
+                self.ui.aviso(f"  {etiqueta}: el reparador no pudo terminar ({recortar(motivo, 160)}); dejo la "
+                              "reparación acá.")
+                break
             intentos_txt.append(recortar(res.resumen, 1200))
             sin_cambios = 0 if self.ws.checkpoints.diff_desde(rcid).strip() else sin_cambios + 1
             verif = verificador()

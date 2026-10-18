@@ -413,6 +413,10 @@ def requiere_busqueda_actual(tarea: str) -> bool:
 
 
 
+_RE_ANUNCIA_TESTS = re.compile(r"\b(?:ejecut|corr|cor[ré]|lanz|vuelv\w* a corr|run)\w*\s+(?:de nuevo\s+)?(?:los\s+|las\s+)?"
+                               r"(?:tests?|pruebas?|run_tests)\b|\brun_tests\b", re.I)
+
+
 class Agente:
     def __init__(
         self,
@@ -567,6 +571,7 @@ class Agente:
         sin_herramienta = 0
         anuncios = 0
         repeticiones: dict = {}
+        tests_por_reaper = 0
         self._ultimo_texto = ""
 
         for paso in range(1, self.max_pasos + 1):
@@ -596,6 +601,16 @@ class Agente:
                         return cierre
                 if texto and anuncia_accion(texto):
                     anuncios += 1
+                if texto and _RE_ANUNCIA_TESTS.search(texto) and "run_tests" in self.rol.herramientas \
+                        and self.rol.nombre != "principal" and tests_por_reaper < 2:
+                    tests_por_reaper += 1
+                    # Prueba real: el reparador escribió 3 veces "Ahora, ejecutemos los tests" sin llamar run_tests y
+                    # se cerró "sin herramientas". Si lo anuncia, los corre REAPER y le muestra el resultado real.
+                    obs, _error = self._ejecutar_herramienta(Llamada("run_tests", {}, True, ""), repeticiones)
+                    self._agregar_usuario("Anunciaste que ibas a correr los tests sin llamar run_tests: los corrí yo. "
+                                          "La próxima vez escribí la herramienta en XML.\n\n" + obs)
+                    sin_herramienta = 0
+                    continue
                 sin_herramienta += 1
                 self.ctx.tropiezo("sin_herramienta")
                 if sin_herramienta > 2:

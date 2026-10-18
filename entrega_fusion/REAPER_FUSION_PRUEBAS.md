@@ -713,3 +713,16 @@ reparador agrega el import en la tarea y el proyecto termina verificado. El esce
 Tests: +16 (`48zm_autotest_prueba_real2.py`), todos fallan con el código anterior. Regresión: **1144 tests OK** en
 Python 3.10/3.11/3.12/3.13. **NO VERIFICADO con un modelo real.**
 
+## 23. Tercera prueba REAL de `/grande` (teléfono, versión `75b97061`): etapa 1 verificada, la 2 se detuvo
+
+Primera vez que una etapa quedó **verificada con modelos reales** (1/6). La etapa 2 (ventas) se detuvo por tres cosas:
+
+| Lo que pasó | Arreglo |
+|---|---|
+| La especificación mockeaba la conexión del propio proyecto (`patch("almacen.sales.get_connection")`) y exigía el SQL exacto (`"SELECT stock FROM products WHERE id = ?"`). El implementador reusó `db.get_product` (razonable), el mock dejó de aplicar y `validate_stock` daba `False`; el reparador intentó cambiar el test y la guardia de regresión lo revirtió | `acoples_a_la_implementacion`: aviso al escribir el test y, si la especificación los trae, UN pedido al especificador para reescribirlos con una base sqlite real; la misión del especificador lo pide desde el principio (comportamiento por la interfaz, sin mockear la base ni afirmar SQL) |
+| El reparador escribió 3 veces "Ahora, ejecutemos los tests" sin llamar `run_tests` → cerrado "sin herramientas" | Si un agente (no el principal) anuncia que corre los tests y no lo hace, REAPER los corre y le muestra el resultado (hasta 2 veces por agente) |
+| Se agotó el tiempo de la tarea en medio de un reintento (Nvidia 500) y el error subió como "el modelo no responde": **/grande se detuvo entero** | Un error del modelo en el reparador termina ESA reparación (la tarea queda con sus fallos, la build sigue y /grande retoma la etapa con tiempo nuevo); el presupuesto y el cupo diario siguen frenando todo |
+
+Tests: +5 (`48zn_autotest_prueba_real3.py`), todos fallan con el código anterior. Regresión: **1149 tests OK** en
+Python 3.10/3.11/3.12/3.13. **NO VERIFICADO con un modelo real.**
+
