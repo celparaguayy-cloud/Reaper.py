@@ -799,3 +799,55 @@ se compara contra lo que verificaba el original.
 
 Tests: +9 (`48zr_autotest_liberados.py`). Con el código anterior fallan 7; los otros 2 son guardas. Regresión: **1219
 tests OK** en Python 3.10/3.11/3.12/3.13. **NO VERIFICADO con un modelo real.**
+
+## 26. Ronda profunda: Termux pelado, fallas cognitivas y revisión adversarial (NO VERIFICADO con un modelo real)
+
+Tres frentes en paralelo: yo corrí REAPER como en un Termux recién instalado y dos subagentes trabajaron en ramas
+aisladas (fallas cognitivas en el simulador y revisión adversarial de todo lo cambiado desde `2edcb50`).
+
+**Termux pelado** (`PATH=/usr/bin:/bin PYTHONNOUSERSITE=1`: solo python y git, sin node, ruff, pytest ni pyflakes):
+
+| Lo que pasó | Arreglo |
+|---|---|
+| **Falso verde:** sin node, la suite corría solo los tests de Python y la etapa Web quedaba "✓ BUILD VERIFICADA · validadores + tests reales" con `tests/logica.test.mjs` sin ejecutar nunca. El especificador encima decía "la especificación ya pasa entera". Los tests del almacén con web se salteaban sin node, así que ese camino nunca se había probado | `tests_js_sin_node`: si lo cambiado toca JS y hay tests de JS que no pueden correr, la verificación falla con "TESTS DE JAVASCRIPT SIN CORRER". Si es lo único que falla, no se repara (`Verificacion.solo_entorno`). `/grande` avisa al empezar, frena ANTES de gastar pedidos en esa etapa y no la reintenta ni la parte. El maestro y los roles saben que no hay node. `probar_grande.sh` instala nodejs con pkg si falta |
+| `TestEspecificacionPropiaEnRojo` se salteaba sin ruff, aunque REAPER detecta igual los nombres indefinidos con pyflakes o su propio detector | El guion del test reconoce los tres mensajes: ahora corre también en Termux |
+
+Suite completa en el entorno pelado: **1239 OK (37 salteados por herramientas ausentes: go, php, ruby, javac…)**. E2E
+del almacén sin node: avisa al empezar y frena en la etapa 5 con 43 pedidos (cero en la etapa 5) y la instrucción
+`pkg install nodejs`. Con node: 5/5.
+
+**Cupo de 50 pedidos por día:** el simulador fingía una cuenta de 1000. Con `MOCK_CUPO_DIA=50` el almacén usaba 52
+pedidos (el revisor ya se apagaba solo). Ahora `/grande` con cupo chico apaga también el contrato del juez por etapa
+(`Settings.juez_contrato`; cada etapa ya trae sus criterios del plan maestro) y usa **46: entra en un día**.
+
+**Subagente D, fallas cognitivas** (`MOCK_INTERFAZ`, `MOCK_TRAMPA`, `MOCK_MAESTRO_MALO`, `MOCK_JUEZ_TERCO=1|2`,
+`MOCK_TRUNCA`, `MOCK_PROSA=2|3`):
+
+| Modo (caos 0, semilla 1) | Antes | Después |
+|---|---|---|
+| Implementador que devuelve valores fijos copiados de los tests (`MOCK_TRAMPA`) | 5/5 **con falso verde** | 5/5 con `reportes.py` real: "RESPUESTA FIJA" en el examen de realidad (0 falsos positivos en 128 archivos legítimos y en REAPER) |
+| Maestro con un plan de 13 etapas que insiste | **cancelado en la planificación** | 6/6: se agrupa antes de rechazar |
+| Juez que siempre dice "no cumple" sin decir qué falta | **0/6, detenido** | 5/5: un veto sin faltantes, o que la intervención no puede convertir en cambios, queda como aviso |
+| Modelo que contesta 3 veces en prosa sin herramientas | **0/6, detenido** | 5/5: ultimátum en vez de cerrar "sin herramientas" |
+| Interfaz con los parámetros cambiados / archivos cortados por longitud | 5/5 | 5/5 (quedan como banco de regresión) |
+
+**Subagente E, revisión adversarial:**
+- Confirmó y arregló 2 bugs:
+  - el rescate de "terminé" cerraba al reparador a mitad de trabajo con frases como "quedó hecho, pero los tests fallan";
+  - el título del intento extra decía "3/2".
+- Descartó, con el motivo, una decena de sospechas: interacción de pasos devueltos con el límite de pasos, equipo vacío por el disyuntor, deshacer algo ya verificado, `normalizar_maestro` con 3000 planes aleatorios, y otras.
+- ruff y pyflakes no dieron nombres indefinidos.
+
+**Medición de la versión combinada** (CLI real contra el OpenRouter simulado):
+
+| Escenario | Resultado |
+|---|---|
+| Caos fuerte, semillas 1–3 | 3/3 · 77, 86, 71 pedidos |
+| Caos moderado, semillas 1–3 | 3/3 · 69, 69, 64 pedidos |
+| Respuestas fijas / juez terco / maestro malo / tests acoplados / reparador que vacía el test liberado | 5/5, 5/5, 6/6, 5/5, 5/5 |
+| Cuenta de 50 por día | 5/5 · **46 pedidos** |
+| Termux sin node | se frena en la etapa 5 sin gastar pedidos ahí, con la instrucción para seguir |
+
+Tests: +20 en total (de 1219 a 1239: `48zu` Termux pelado, `48zs` cognitivo, `48zt` revisión, y el de cupo
+ampliado). Cada test nuevo falla con el código anterior, salvo las guardas. Regresión: **1239 tests OK** en Python 3.10/3.11/3.12/3.13 y en
+el entorno pelado. **NO VERIFICADO con un modelo real.**

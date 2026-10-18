@@ -301,3 +301,18 @@ equipo hace sus reintentos completos.
 - (c) El intento extra solo existe si se liberó algo; ¿conviene limitarlo al rol reparador de la tarea y no a la reparación final?
 
 Regresión 1219 tests OK en Python 3.10/3.11/3.12/3.13.
+
+## 20. Ronda profunda: Termux pelado, fallas cognitivas y revisión adversarial (NO VERIFICADO con un modelo real)
+
+Detalle en `REAPER_FUSION_PRUEBAS.md` §26.
+- **Sin node:** `tests_js_sin_node` y `mensaje_sin_node` (`10_validators`), `Verificacion.solo_entorno` y el corte en `_reparar_con_escalada` (`25_pipeline`), `_tests_js_de` y el freno previo por etapa (`76_grande`), `_entorno` (`19_roles`) y el prompt del maestro.
+- **Cupo chico:** `Settings.juez_contrato` y `_ahorro_de_pedidos`.
+- **Subagente D:** `respuestas_fijas`/`constantes_de_tests` en `examen_de_realidad`; `_aplicar_juicio` y `_cerrar_con_juez` (un veto sin faltantes o no accionable queda como aviso); `normalizar_maestro(tope=)` y `_sujeto_de_test`; ultimátum en prosa en `20_agent`.
+- **Subagente E:** `_RE_FALTA_ALGO` en `20_agent`; el título del intento extra.
+
+**A auditar:**
+- (a) Que el veto del juez quede como aviso cuando la intervención no cambia nada puede aceptar un faltante real que ningún test cubre; queda anotado en el informe.
+- (b) `respuestas_fijas` solo detecta funciones que IGNORAN su parámetro de datos; un `if` sobre los datos de prueba que sí lo use no se detecta.
+- (c) `tests_js_sin_node` solo frena cuando lo cambiado toca JS: un proyecto mixto sin node verifica cambios de Python sin correr los tests de JS ajenos.
+
+Regresión 1239 tests OK en Python 3.10/3.11/3.12/3.13 y en el entorno pelado.
