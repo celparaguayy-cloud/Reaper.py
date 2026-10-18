@@ -446,9 +446,12 @@ _RE_ANUNCIA_FIN = re.compile(
     r"\b(?:termin[ée]|he\s+terminado|listo|completad[oa]|complet[ée]|finalic[ée]|finalizad[oa]|"
     r"(?:ya\s+)?(?:est[áa]|qued[óo])\s+(?:hecho|resuelto|implementado)|done|finished|completed)\b"
     r"(?!\s+(?:para|de|to|with|reading)\b)", re.I)
-# "Completé la primera parte; falta la segunda" no es un cierre.
+# "Completé la primera parte; falta la segunda" no es un cierre. Tampoco "quedó hecho, pero los tests fallan: hay que
+# revisar la consulta" (revisión: cerraba al reparador a mitad de trabajo).
 _RE_FALTA_ALGO = re.compile(r"\b(?:falta\w*|pendiente\w*|todav[ií]a|a[úu]n\s+(?:no|falta|queda)|queda\w*\s+por|"
-                            r"(?:siguiente|pr[óo]ximo)\s+paso|remaining|still|next\s+step|primera\s+parte)\b", re.I)
+                            r"(?:siguiente|pr[óo]ximo)\s+paso|remaining|still|next\s+step|primera\s+parte|"
+                            r"fall(?:a|an|ó|aron|ando)|errore?s?|hay\s+que|tengo\s+que|tenemos\s+que|deb(?:o|emos)|"
+                            r"fail\w*)\b", re.I)
 _ERRORES_DE_FORMATO_MAX = 3   # pasos extra por mensajes que solo tuvieron errores de formato (o llegaron vacíos)
 
 

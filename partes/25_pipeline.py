@@ -1950,7 +1950,9 @@ class Orquestador:
                     informe.notas.append(f"{etiqueta}: se usó el modo forense")
                 except (OSError, ValueError, LLMError) as e:
                     self.ui.aviso(f"  el modo forense falló: {e}")
-            self.ui.titulo(f"REPARACIÓN {etiqueta} {intento}/{max_intentos}" + (" · con experto" if experto else "")
+            # El intento extra tras liberar la especificación se veía "3/2".
+            self.ui.titulo(f"REPARACIÓN {etiqueta} {intento}/{max(max_intentos, intento)}"
+                           + (" · con experto" if experto else "")
                            + (" · con informe forense" if informe_forense else ""))
             rcid = self.ws.checkpoints.iniciar(f"reparación {etiqueta} {intento}", grupo=grupo)
             antes = verif
