@@ -53930,6 +53930,24 @@ class TestRobustoGrandeEtapaAlTope(BaseTest):
         self.assertNotIn("a mano", motivo)
 
 
+class TestRobustoGrandeDiarioDeOtraCarpeta(BaseTest):
+    def test_no_le_echa_la_culpa_al_modelo_y_dice_como_seguir(self):
+        guion = _PRB_GuionPartible(rotas=("E1",))
+        ws, ui, grande = TestRobustoGrandeSeRecupera._grande(self, guion)
+        grande._recuperar_etapa = lambda *a: False
+        self.assertFalse(grande.iniciar(TestRobustoGrandeSeRecupera.PEDIDO, confirmar=False))
+        del grande._recuperar_etapa
+        diario = RegistroBuild(ws).ruta
+        datos = json.loads(diario.read_text(encoding="utf-8"))
+        datos["proyecto"] = "/otra/carpeta/almacen"                     # el proyecto se movió de carpeta
+        diario.write_text(json.dumps(datos), encoding="utf-8")
+        self.assertFalse(grande.continuar())
+        motivo = grande.leer()["motivo"]
+        self.assertNotIn("el modelo no responde", motivo)
+        self.assertIn("otro proyecto", motivo)
+        self.assertIn("/construir descartar", motivo)
+
+
 # ======================================================================
 # MÓDULO: autotest_runner
 # ======================================================================
@@ -60402,6 +60420,7 @@ ESPERAS_LIMITE = (120, 300, 600)
 _RE_LIMITE_PASAJERO = re.compile(r"enfriamiento|429|rate|satura|50[0-4]|timeout|no respondi|red |network|"
                                  r"vac[ií]a|overloaded|temporar|unavailable|cort[oó] el streaming", re.I)
 ESTADOS_OK_ETAPA = ("verificada", "validada")
+_DIARIO_ILEGIBLE = "el diario de la build de esta etapa no se puede usar"
 
 MISION_MAESTRO = """Sos el ARQUITECTO DE UN PROYECTO GRANDE. No escribís código: dividís el pedido en ETAPAS que otro
 equipo va a construir UNA POR VEZ, cada una con su propio plan, sus tests y su verificación.
@@ -61106,6 +61125,13 @@ class ConstructorGrande:
                 try:
                     informe = self._correr_etapa(estado, maestro, etapa)
                 except LLMError as e:
+                    if str(e).startswith(_DIARIO_ILEGIBLE):
+                        # No es el modelo (antes decía "el modelo no responde"): el diario de la build está roto o es
+                        # de otra carpeta (proyecto movido). Se dice qué es y cómo seguir.
+                        etapa.estado = "pendiente"
+                        return self._detener(estado, maestro, f"{e}.\nRevisalo con /construir estado; si está roto o "
+                                             "es de otra carpeta: /construir descartar (no borra archivos) y después "
+                                             "/grande continuar")
                     espera = self._espera_para(e, esperado, esperas)
                     if espera:
                         # Límite pasajero (o cupo que se renueva pronto): esperar y seguir SOLO, sin perder lo hecho.
@@ -61142,7 +61168,7 @@ class ConstructorGrande:
         try:
             pendiente = RegistroBuild(self.ws).leer()
         except ValueError as e:
-            raise LLMError(f"diario de build ilegible: {e}", probar_otro_modelo=False)
+            raise LLMError(f"{_DIARIO_ILEGIBLE}: {e}", probar_otro_modelo=False)
         reanudar = bool(pendiente and pendiente.get("estado") not in ESTADOS_OK_ETAPA)
         if reanudar and not mismo_pedido(pendiente.get("pedido"), pedido_etapa):
             etapa.estado, etapa.motivo = "pendiente", "hay otro /construir sin terminar en la carpeta"

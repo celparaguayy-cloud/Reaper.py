@@ -463,3 +463,21 @@ class TestRobustoGrandeEtapaAlTope(BaseTest):
         self.assertIn("ya se intentó", motivo)
         self.assertIn("/grande deshacer", motivo)
         self.assertNotIn("a mano", motivo)
+
+
+class TestRobustoGrandeDiarioDeOtraCarpeta(BaseTest):
+    def test_no_le_echa_la_culpa_al_modelo_y_dice_como_seguir(self):
+        guion = _PRB_GuionPartible(rotas=("E1",))
+        ws, ui, grande = TestRobustoGrandeSeRecupera._grande(self, guion)
+        grande._recuperar_etapa = lambda *a: False
+        self.assertFalse(grande.iniciar(TestRobustoGrandeSeRecupera.PEDIDO, confirmar=False))
+        del grande._recuperar_etapa
+        diario = RegistroBuild(ws).ruta
+        datos = json.loads(diario.read_text(encoding="utf-8"))
+        datos["proyecto"] = "/otra/carpeta/almacen"                     # el proyecto se movió de carpeta
+        diario.write_text(json.dumps(datos), encoding="utf-8")
+        self.assertFalse(grande.continuar())
+        motivo = grande.leer()["motivo"]
+        self.assertNotIn("el modelo no responde", motivo)
+        self.assertIn("otro proyecto", motivo)
+        self.assertIn("/construir descartar", motivo)
