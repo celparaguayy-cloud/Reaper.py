@@ -34,11 +34,13 @@ class LLMError(RuntimeError):
 class _Transitorio(Exception):
     """Error que vale la pena reintentar (429, 5xx, red, respuesta vacía)."""
 
-    def __init__(self, mensaje: str, espera: Optional[float] = None, vacia: bool = False, saturado: bool = False):
+    def __init__(self, mensaje: str, espera: Optional[float] = None, vacia: bool = False, saturado: bool = False,
+                 limite_rpm: Optional[int] = None):
         super().__init__(mensaje)
         self.espera = espera
         self.vacia = vacia          # el modelo respondió 200 pero sin contenido
         self.saturado = saturado    # 429 del pool compartido del proveedor (típico de :free): no se libera en segundos
+        self.limite_rpm = limite_rpm  # 429 que dice el límite propio del modelo ("limited to 15 requests per minute")
 
 
 @dataclass
@@ -118,6 +120,46 @@ _RE_MODELO_RETIRADO = re.compile(
 _RE_POOL_SATURADO = re.compile(r"rate-limited upstream|upstream_provider_shared_pool|shared pool", re.I)
 
 
+_RE_LIMITE_POR_MINUTO = re.compile(r"limited to (\d+) requests? per minute|(\d+)\s*requests? per minute|"
+                                   r"limit_rpm/(\d+)", re.I)
+
+
+def limite_por_minuto(cuerpo: str, cabeceras=None) -> Optional[int]:
+    """El límite POR MINUTO de un modelo, si el 429 lo dice (prueba real: "High demand for cohere/north-mini-code:free
+    on OpenRouter - limited to 15 requests per minute") o lo trae X-RateLimit-Limit con reinicio dentro del minuto.
+    None si no se sabe (no se inventa)."""
+    m = _RE_LIMITE_POR_MINUTO.search(cuerpo or "")
+    if m:
+        valor = int(next(g for g in m.groups() if g))
+        return valor if 0 < valor <= 600 else None
+    leer = (lambda k: cabeceras.get(k)) if cabeceras is not None else (lambda k: None)
+    try:
+        limite = int(str(leer("X-RateLimit-Limit") or leer("x-ratelimit-limit") or "").strip())
+    except ValueError:
+        return None
+    reinicio = _epoch_reinicio(leer("X-RateLimit-Reset") or leer("x-ratelimit-reset"))
+    if 0 < limite <= 120 and reinicio is not None and reinicio - time.time() <= 90:
+        return limite
+    return None
+
+
+def _primera_linea_llm(texto: str) -> str:
+    return next((l.strip() for l in str(texto).splitlines() if l.strip()), "")
+
+
+def _segundos_restantes_plazo() -> Optional[float]:
+    """Cuánto le queda al plazo de pared más cercano (tarea/build), o None si no hay plazo abierto."""
+    plazo = globals().get("PLAZO")
+    pila, reloj = getattr(plazo, "_pila", None), getattr(plazo, "reloj", None)
+    if not pila or reloj is None:
+        return None
+    try:
+        ahora = reloj()
+        return min(limite - ahora for _token, limite, _motivo in list(pila))
+    except (TypeError, ValueError):
+        return None
+
+
 def _detalle_error(cuerpo: str, limite: int = 220) -> str:
     """Lo que dice el proveedor, legible: el campo útil del JSON (metadata.raw o message) en vez del JSON crudo de
     400 caracteres cortado a la mitad que se repetía en cada reintento (prueba real con OpenRouter :free)."""
@@ -192,7 +234,9 @@ def _lanzar_http(status: int, cuerpo: str, retry_after: Optional[str], cabeceras
         except ValueError:
             espera = None
         saturado = status == 429 and bool(_RE_POOL_SATURADO.search(cuerpo or ""))
-        raise _Transitorio(f"{motivo} HTTP {status}. {detalle}".strip(), espera, saturado=saturado)
+        limite = limite_por_minuto(cuerpo, cabeceras) if status == 429 else None
+        raise _Transitorio(f"{motivo} HTTP {status}. {detalle}".strip(), espera, saturado=saturado,
+                           limite_rpm=limite)
     excedido = status in (400, 413) and bool(_RE_CONTEXTO.search(cuerpo or ""))
     if excedido and status == 400:
         motivo = "Pedido rechazado por el proveedor: contexto demasiado largo."
@@ -315,6 +359,7 @@ class LimitadorTasa:
 
 
 HORAS_RAZONAMIENTO_APRENDIDO = 24.0
+UMBRAL_RAZONAMIENTO_DESBOCADO = 16000      # caracteres pensados sin una sola palabra de respuesta
 
 
 def _ruta_razonamiento() -> Optional[Path]:
@@ -382,6 +427,41 @@ class LLMClient:
         # sin parámetro → "low" → "none" (lo apaga) → se deja de usar en la sesión.
         self._nivel_razonamiento: dict = cargar_razonamiento_aprendido()
         self._solo_razona: collections.Counter = collections.Counter()
+        # Salud de cada modelo en corridas ANTERIORES (24 h): se empieza por el que anduvo, no por el que se cayó.
+        self.disyuntor.salud_previa = cargar_salud_modelos()
+        # Límite propio de cada modelo, aprendido de sus 429 ("limited to 15 requests per minute").
+        self._limitadores_modelo: dict = {}
+
+    def _guardar_salud(self, renovar: Sequence[str] = ()) -> None:
+        d = self.disyuntor
+        guardar_salud_modelos({**d.salud_previa, **d.salud_sesion}, renovar=renovar)
+
+    def _marcar_salud(self, modelo: str, motivo: str) -> None:
+        """Anota que `modelo` falló (para la próxima corrida y para que el juez no lo elija)."""
+        motivo = recortar(motivo, 160)
+        if self.disyuntor.salud_sesion.get(modelo) != motivo:
+            self.disyuntor.salud_sesion[modelo] = motivo
+            self._guardar_salud(renovar=(modelo,))
+
+    def _limpiar_salud(self, modelo: str) -> None:
+        """Respondió: deja de ser sospechoso (en esta corrida y en las próximas)."""
+        d = self.disyuntor
+        if (d.salud_previa.pop(modelo, None), d.salud_sesion.pop(modelo, None)) != (None, None):
+            self._guardar_salud()
+
+    def _limitador_de(self, modelo: str) -> Optional["LimitadorTasa"]:
+        return self._limitadores_modelo.get(modelo)
+
+    def _aprender_limite(self, modelo: str, limite_rpm: int) -> None:
+        """Respeta el límite POR MODELO que dijo el proveedor (además del rpm global), con 1 de margen."""
+        objetivo = max(1, int(limite_rpm) - 1)
+        actual = self._limitadores_modelo.get(modelo)
+        if actual is None or actual.rpm != objetivo:
+            self._limitadores_modelo[modelo] = LimitadorTasa(objetivo, reloj=self.limitador._reloj,
+                                                             dormir=lambda s: self.dormir(s))
+            if self.on_evento:
+                self.on_evento(f"{modelo} acepta {limite_rpm} pedidos por minuto: de acá en más le mando como "
+                               f"mucho {objetivo}")
 
     def _es_free_openrouter(self, modelo: str) -> bool:
         try:
@@ -498,8 +578,11 @@ class LLMClient:
             raise LLMError(
                 f"Todos los modelos están en enfriamiento o retirados ({estados}). Esperá unos segundos o "
                 "elegí otro modelo/proveedor (/modelo <alias>, /equipo auto).", probar_otro_modelo=False)
+        if not sin_respaldo:
+            orden = self.disyuntor.ordenar_por_salud(orden)
 
         ultimo: Optional[LLMError] = None
+        fallidos: list = []
         for n, candidato in enumerate(orden):
             if self.cupo_free_agotado() and self._es_free_openrouter(candidato):
                 continue                                # mismo cupo diario agotado: ni lo intento
@@ -509,6 +592,7 @@ class LLMClient:
                     hay_alternativa=n + 1 < len(orden), reintentos=reintentos,
                 )
                 self.disyuntor.exito(candidato)
+                self._limpiar_salud(candidato)
                 if candidato != principal:
                     with self._lock:
                         self.uso.respaldos += 1
@@ -524,6 +608,10 @@ class LLMClient:
                         self.on_evento("cupo diario de modelos gratis agotado: solo sigo con modelos de otro proveedor")
                 if not e.probar_otro_modelo:
                     raise
+                fallidos.append((candidato, e))
+                por_limite = bool(getattr(e.__cause__, "limite_rpm", None))     # 429 por minuto: no es falla
+                if not (e.cupo_diario or e.contexto_excedido or por_limite):
+                    self._marcar_salud(candidato, _primera_linea_llm(str(e)))
                 if _RE_MODELO_RETIRADO.search(str(e)):      # 404 model_not_found → cuarentena de esa ruta
                     self.disyuntor.retirar(candidato)
                     if self.on_evento:
@@ -537,6 +625,17 @@ class LLMClient:
                 if self.on_evento and siguiente:
                     self.on_evento(f"{candidato} falló ({e}); pruebo con {siguiente}")
         assert ultimo is not None
+        if len(fallidos) > 1:
+            # Todos los del equipo fallaron: un mensaje que diga QUÉ pasó con cada uno, no solo el último error
+            # (que va completo al final).
+            def con_nombre(modelo: str, error: Exception, completo: bool) -> str:
+                texto = str(error) if completo else recortar(_primera_linea_llm(str(error)), 110)
+                return texto if texto.startswith(f"{modelo}:") else f"{modelo}: {texto}"
+            partes = [con_nombre(m, err, err is ultimo) for m, err in fallidos]
+            raise LLMError("Ningún modelo del equipo respondió: " + "; ".join(partes),
+                           probar_otro_modelo=ultimo.probar_otro_modelo, contexto_excedido=ultimo.contexto_excedido,
+                           presupuesto=ultimo.presupuesto, solo_razonamiento=ultimo.solo_razonamiento,
+                           cupo_diario=ultimo.cupo_diario, reinicio=ultimo.reinicio) from ultimo
         raise ultimo
 
     def chat_simple(self, prompt: str, *, sistema: str = "", modelo: Optional[str] = None,
@@ -616,6 +715,9 @@ class LLMClient:
         for intento in range(intentos + 2):
             try:
                 self.limitador.adquirir(cancelado)
+                propio = self._limitador_de(modelo)
+                if propio is not None:
+                    propio.adquirir(cancelado)
                 return self._una_vez(modelo, payload, on_progress)
             except LLMError as e:
                 # Modelo de razonamiento que se quedó sin tokens PENSANDO (finish=length, sin texto): con los pedidos
@@ -648,6 +750,15 @@ class LLMClient:
                 with self._lock:
                     self.uso.reintentos += 1
                 vacias += int(getattr(e, "vacia", False))
+                if getattr(e, "limite_rpm", None):
+                    self._aprender_limite(modelo, e.limite_rpm)
+                if hay_alternativa and self._es_free_openrouter(modelo):
+                    # Modelos gratis inestables (prueba real: vacías de cohere, "Upstream error from Nvidia: Internal
+                    # server error", "Upstream idle timeout exceeded", 429 "limited to 15 requests per minute"): con
+                    # otro modelo del equipo disponible se cambia YA, sin backoff (el límite aprendido queda para los
+                    # próximos pedidos). El ÚLTIMO del equipo sí hace los reintentos completos (no pierde resiliencia).
+                    raise LLMError(f"{modelo}: {_primera_linea_llm(str(e))} (paso al siguiente del equipo)",
+                                   probar_otro_modelo=True) from e
                 if getattr(e, "saturado", False) and hay_alternativa:
                     # Pool gratis del proveedor saturado: con otro modelo disponible, pasar YA (antes se reintentaba
                     # 4 veces el mismo, ~35 s por modelo, y con varios :free saturados la build parecía colgada).
@@ -670,6 +781,11 @@ class LLMClient:
                 espera = e.espera
                 if espera is None:
                     espera = min(60.0, 2.0 * (2 ** intento)) + random.uniform(0, 1)
+                restante = _segundos_restantes_plazo()
+                if restante is not None and restante < min(espera, 120.0) + 10:
+                    # No empezar una espera + reintento que no entra en el plazo (antes se descubría DESPUÉS).
+                    raise LLMError(f"{e} (no reintento: quedan {max(0, restante):.0f}s de plazo y la espera es de "
+                                   f"{espera:.0f}s)", probar_otro_modelo=False) from e
                 if self.on_evento:
                     self.on_evento(f"reintento {intento + 1}/{intentos} en {espera:.0f}s: {e}")
                 self._dormir_cancelable(min(espera, 120.0), cancelado)
@@ -741,7 +857,8 @@ class LLMClient:
                     cab = (meta or {}).get("headers") if isinstance(meta, dict) else None
                     _lanzar_http(429, mensaje, None, cab if isinstance(cab, dict) else None)
                 if codigo is None or codigo in TRANSITORIOS:
-                    raise _Transitorio(f"Error del proveedor durante el streaming: {mensaje}")
+                    raise _Transitorio(f"Error del proveedor durante el streaming: {mensaje}",
+                                       limite_rpm=limite_por_minuto(mensaje) if codigo in (429, None) else None)
                 raise LLMError(f"Error del proveedor: {mensaje}", probar_otro_modelo=True)
 
             uso = evento.get("usage")
@@ -756,6 +873,14 @@ class LLMClient:
                 pensado = delta.get("reasoning") or delta.get("reasoning_content")
                 if isinstance(pensado, str):
                     razonamiento += len(pensado)
+                    if (not total and razonamiento > UMBRAL_RAZONAMIENTO_DESBOCADO
+                            and self._nivel_razonamiento.get(modelo) in ("low", "none", "minimal")):
+                        # Ya se le pidió pensar menos y lo ignora (prueba real: cohere/north-mini-code:free con 25 000
+                        # caracteres de razonamiento y ninguna respuesta): se corta acá en vez de esperar al final.
+                        raise LLMError(
+                            f"{modelo} solo devolvió razonamiento ({razonamiento} caracteres) y ninguna respuesta "
+                            "(finish=length: lo corté, ignora el razonamiento bajo).",
+                            probar_otro_modelo=True, solo_razonamiento=True)
                 if contenido:
                     if not primer:
                         primer = time.monotonic() - inicio

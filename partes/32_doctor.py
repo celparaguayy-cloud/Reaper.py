@@ -143,6 +143,19 @@ def _chequeo_cuenta_openrouter(settings: Settings) -> Optional[Chequeo]:
                           "modelos :free sube a 1000 por día." if cuenta.sin_credito else ""))
 
 
+def _chequeo_salud_modelos(ruta: Optional[Path] = None) -> Optional[Chequeo]:
+    """Modelos que fallaron en las últimas 24 h (sondeo o pedidos): REAPER empieza por los otros y el juez no los
+    elige. Solo informa; None si no hay ninguno."""
+    salud = cargar_salud_modelos(ruta)
+    if not salud:
+        return None
+    detalle = "; ".join(f"{m} ({recortar(motivo, 60)})" for m, motivo in sorted(salud.items())[:4])
+    if len(salud) > 4:
+        detalle += f"; y {len(salud) - 4} más"
+    return Chequeo("modelos caídos", False, f"{len(salud)} fallaron en las últimas 24 h: {detalle}",
+                   "nada que hacer: van al final y se olvidan cuando responden o a las 24 h")
+
+
 def chequeos_sistema(settings: Settings) -> list[Chequeo]:
     chequeos = []
     version = sys.version_info
@@ -154,6 +167,9 @@ def chequeos_sistema(settings: Settings) -> list[Chequeo]:
     cuenta = _chequeo_cuenta_openrouter(settings)
     if cuenta is not None:
         chequeos.append(cuenta)
+    salud = _chequeo_salud_modelos()
+    if salud is not None:
+        chequeos.append(salud)
     chequeos.append(_chequeo_modulo("httpx", "streaming más robusto; sin él se usa urllib"))
     chequeos.append(_chequeo_modulo("pyflakes", "nombres indefinidos más precisos (REAPER tiene un detector propio)"))
     chequeos.append(_chequeo_modulo("readline", "historial y autocompletado en el REPL", "gnureadline"))

@@ -70,6 +70,11 @@ def modelo_sano(settings, modelo: str, disyuntor=None) -> tuple:
                 return False, "viene fallando seguido (disyuntor abierto)"
         except (AttributeError, TypeError, ValueError):
             pass
+        sospecha = getattr(disyuntor, "sospechoso", None)
+        motivo = sospecha(modelo) if callable(sospecha) else None
+        if motivo:
+            # Prueba real: el juez le dio el reparador a un :free que no había respondido el sondeo.
+            return False, f"falló hace poco ({recortar(str(motivo), 80)})"
     return True, ""
 
 
@@ -410,25 +415,69 @@ def _probar_modelo(llm, modelo: str) -> dict:
         return {"estado": "FALLA", "detalle": f"{type(e).__name__}: {e}"[:120]}
 
 
-def free_que_responden(llm, candidatos: list, cuantos: int = 4, max_probar: int = 8, on_probar=None) -> list:
-    """Prueba DE VERDAD (pedido mínimo, modelos gratis: $0) los candidatos del catálogo y devuelve los que
-    responden, en orden. El catálogo no dice cuáles están caídos o dan 403 "solo en harnesses agénticos": en la
-    prueba real de octubre 2026, inkling e inkling-small salían 2.º y 3.º del catálogo y no servían."""
-    vivos = []
-    for modelo in candidatos[:max_probar]:
+_SONDEO_HERRAMIENTA = ("Prueba de formato (REAPER_OK). Respondé ÚNICAMENTE con esta llamada de herramienta en XML, "
+                       "sin texto antes ni después:\n<read_file>\n<path>REAPER_OK.txt</path>\n</read_file>")
+
+
+def sondear_modelo(llm, modelo: str) -> dict:
+    """UN pedido corto que mide lo que de verdad importa en una build: ¿responde Y emite una llamada de herramienta
+    en el formato XML de REAPER? (prueba real: los :free que "respondían" al REAPER_OK después pensaban 25 000
+    caracteres sin contestar o no escribían ninguna herramienta). → {"estado": HERRAMIENTAS | TEXTO | FALLA,
+    "ms": latencia, "detalle": ...}. TEXTO = responde pero no sigue el formato (sirve solo de respaldo)."""
+    t0 = time.monotonic()
+    try:
+        resp = llm.chat([{"role": "user", "content": _SONDEO_HERRAMIENTA}], modelo=modelo, max_tokens=128,
+                        temperatura=0, sin_respaldo=True, rol="probe", reintentos=0)
+    except LLMError as e:
+        motivo = ("solo razonamiento, sin respuesta" if getattr(e, "solo_razonamiento", False)
+                  else recortar(str(e), 120))
+        return {"estado": "FALLA", "ms": round((time.monotonic() - t0) * 1000), "detalle": motivo}
+    except (OSError, ValueError, RuntimeError) as e:
+        return {"estado": "FALLA", "ms": round((time.monotonic() - t0) * 1000), "detalle": f"{type(e).__name__}: {e}"[:120]}
+    ms = round((time.monotonic() - t0) * 1000)
+    visible = str(getattr(resp, "texto", "") or "").strip()
+    try:
+        llamadas = analizar(visible, esquemas(["read_file"])).llamadas
+    except (ValueError, TypeError, KeyError, NameError):
+        llamadas = []
+    if any(l.nombre == "read_file" and str(l.params.get("path", "")).strip().endswith("REAPER_OK.txt")
+           for l in llamadas):
+        return {"estado": "HERRAMIENTAS", "ms": ms, "detalle": f"{ms}ms · llamada de herramienta correcta"}
+    if "REAPER_OK" in visible.upper():
+        return {"estado": "TEXTO", "ms": ms, "detalle": f"{ms}ms · responde, pero sin la llamada de herramienta"}
+    return {"estado": "FALLA", "ms": ms, "detalle": f"{ms}ms · respuesta de prueba no verificable"}
+
+
+def free_que_responden(llm, candidatos: list, cuantos: int = 4, max_probar: int = 8, on_probar=None,
+                       resultados: Optional[dict] = None) -> list:
+    """Prueba DE VERDAD (un pedido corto por modelo, modelos gratis: $0) los candidatos del catálogo y devuelve los
+    que responden, los que usan bien las herramientas PRIMERO y después por latencia. El catálogo no dice cuáles
+    están caídos o dan 403 "solo en harnesses agénticos": en la prueba real de octubre 2026, inkling e inkling-small
+    salían 2.º y 3.º del catálogo y no servían. Los que fallan quedan anotados como sospechosos 24 h (salud)."""
+    vivos = []                       # (clase, latencia en tramos de 3 s, orden original, modelo)
+    for indice, modelo in enumerate(candidatos[:max_probar]):
         if on_probar is not None:
             on_probar(modelo)
-        if _probar_modelo(llm, modelo).get("estado") == "RESPONDE":
-            vivos.append(modelo)
-            if len(vivos) >= cuantos:
-                break
+        r = sondear_modelo(llm, modelo)
+        if resultados is not None:
+            resultados[modelo] = r
+        marcar, limpiar = getattr(llm, "_marcar_salud", None), getattr(llm, "_limpiar_salud", None)
+        if r["estado"] == "FALLA":
+            if callable(marcar):
+                marcar(modelo, f"no respondió el sondeo: {r['detalle']}")
+        else:
+            if callable(limpiar):
+                limpiar(modelo)
+            vivos.append((0 if r["estado"] == "HERRAMIENTAS" else 1, int(r.get("ms", 0)) // 3000, indice, modelo))
+            if sum(1 for v in vivos if v[0] == 0) >= cuantos or len(vivos) >= 2 * cuantos:
+                break                # suficientes que usan bien las herramientas (o ya no vale gastar más cupo)
         agotado = getattr(llm, "cupo_free_agotado", None)
         if callable(agotado) and agotado():
             break                   # comparten el cupo diario: los demás :free tampoco van a responder hoy
-    return vivos
+    return [m for *_orden, m in sorted(vivos)][:cuantos]
 
 
-def free_vivos(llm, catalogo: list, on_probar=None, horas: float = 6.0, refrescar: bool = False,
+def free_vivos(llm, catalogo: list, on_probar=None, horas: float = 12.0, refrescar: bool = False,
                cache: Optional[Path] = None) -> list:
     """free_que_responden con memoria: el resultado vale `horas` para ESE catálogo. Cada sondeo es un pedido real que
     cuenta para el cupo diario (50 sin crédito), así que no se repite en cada corrida de --perfil gratis."""
@@ -442,7 +491,10 @@ def free_vivos(llm, catalogo: list, on_probar=None, horas: float = 6.0, refresca
             datos = json.loads(cache.read_text(encoding="utf-8"))
             if (datos.get("catalogo") == clave and time.time() - float(datos.get("ts", 0)) < horas * 3600
                     and datos.get("vivos")):
-                return list(datos["vivos"])
+                vivos = list(datos["vivos"])
+                disyuntor = getattr(llm, "disyuntor", None)
+                # Lo que falló DESPUÉS del sondeo (en la build) va al final: no se vuelve a empezar por él.
+                return disyuntor.ordenar_por_salud(vivos) if hasattr(disyuntor, "ordenar_por_salud") else vivos
         except (OSError, ValueError, TypeError, AttributeError):
             pass
     vivos = free_que_responden(llm, catalogo, on_probar=on_probar)
