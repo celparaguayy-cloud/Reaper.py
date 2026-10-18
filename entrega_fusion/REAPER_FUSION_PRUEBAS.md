@@ -726,3 +726,43 @@ Primera vez que una etapa quedó **verificada con modelos reales** (1/6). La eta
 Tests: +5 (`48zn_autotest_prueba_real3.py`), todos fallan con el código anterior. Regresión: **1149 tests OK** en
 Python 3.10/3.11/3.12/3.13. **NO VERIFICADO con un modelo real.**
 
+
+## 24. Arreglo con tres subagentes y simulador de modelo gratis flojo (NO VERIFICADO con un modelo real)
+
+Tres subagentes en ramas aisladas, cada uno con su parte y sus tests (cada test nuevo falla con el código anterior,
+salvo guardas que deben pasar en ambas versiones). Los junté y medí antes y después con el mismo banco.
+
+| Rama | Qué arregla |
+|---|---|
+| `arreglo/capa-modelo` (22 tests, `48zo`) | Entiende las llamadas como las escriben los modelos gratis: `<tool_call>{json}` (Hermes/Qwen/Nemotron), `[TOOL_CALLS]` (Mistral), `function` de OpenAI, listas JSON en ```` ```json ```` y `<function=x><parameter=y>`. Las respuestas cortadas por longitud quedan como incompletas con lo parcial, en vez de escribir medio archivo como entero. "Voy a leer X" lo lee REAPER; "listo, terminé" con cambios intenta el cierre. Los pasos que solo tuvieron errores de formato o vinieron vacíos se devuelven (hasta 3). Mensajes correctores con el ejemplo correcto |
+| `arreglo/modelos-gratis` (17 tests, `48zp`) | El sondeo pide una llamada de herramienta real y ordena los modelos por herramientas, después texto, después latencia. La salud de los modelos se guarda 24 h, así la próxima corrida empieza por el que anduvo. Respeta el límite por modelo que viene en el 429 ("limited to 15 requests per minute"). Un `:free` inestable cede de inmediato al siguiente. No arranca una espera que no entra en el plazo. Corta el razonamiento desbocado (16 000 caracteres sin respuesta). El juez no elige modelos caídos. Perfil gratis sin torneo (2 candidatos duplicaban pedidos y cupo), 2400 s por tarea y 7200 s por build |
+| `arreglo/pipeline` (17 + 5 tests, `48zq`) | La especificación nunca bloquea: un test acoplado que sigue acoplado tras pedir la reescritura no se protege, y un test de la especificación roto o acoplado que traba la reparación se libera una vez (igual tiene que quedar en verde). La reparación corta tras 2 intentos inútiles, y cada intento ve el diff del anterior. No usa el modo forense ante errores obvios. Las tareas de solo tests que van antes de su código se unen con esa tarea. Un plan maestro fragmentado se agrupa. Una etapa FALLIDA se deshace y se parte en dos, una sola vez |
+
+Después de juntarlas agregué tres arreglos (+5 tests):
+- Una etapa que llegó al tope de intentos se parte sola. Antes quedaba DETENIDA con "partila o corregila a mano", y no hay comando para partirla.
+- `/grande deshacer` reinicia los intentos de la etapa. Antes, `continuar` la volvía a frenar por los intentos viejos.
+- Un diario de build roto o de otra carpeta ya no se informa como "el modelo no responde": dice qué pasó y cómo seguir.
+
+**Simulador de modelo gratis flojo** (`pruebas_fusion/e2e/caos.sh`, `MOCK_CAOS`). Es la CLI real contra el OpenRouter
+simulado por HTTP, con las fallas vistas en el teléfono:
+- cohere piensa sin responder y tiene un límite de 15 pedidos por minuto;
+- Nvidia devuelve 500, respuestas vacías y "Upstream idle timeout";
+- herramientas mal escritas (`<contenido>`, código sin `<content>`, `<tool_call>{json}`, `<function=…>`, basura, duplicadas);
+- acciones anunciadas sin hacerlas;
+- el juez a veces no devuelve JSON.
+
+Con la misma semilla, la secuencia de fallas es la misma. El pedido es el almacén de 5 etapas de `probar_grande.sh`.
+
+| Escenario | Antes (`2edcb50`) | Después |
+|---|---|---|
+| Caos fuerte (nivel 2), semillas 1–3 | 2/3 terminadas: 119, 128 y 95 pedidos. La semilla 3 se detuvo en la etapa 5: el especificador escribió `<tool_call>{json}` (no se entendía), después anunció dos veces sin hacer nada y el reparador no escribió el test que faltaba | **3/3 terminadas**: 74, 86 y 71 pedidos (−35 %) |
+| Caos moderado (nivel 1), semillas 1–3 | 3/3: 99, 95 y 90 pedidos | (medición en curso; se completa en la próxima entrega) |
+| Tercera prueba real (`MOCK_ACOPLADO=1`): el especificador escribe `tests/test_ventas.py` acoplado (mockea la conexión y exige el SQL exacto) y no lo corrige aunque se lo pidan | **Etapa 2 FALLIDA, 1/5**, igual que en el teléfono | **5/5 terminadas**, 64 pedidos: no lo protege, falla y el reparador lo reescribe con sqlite real |
+| El proyecto trabado por la versión vieja + `--grande continuar` con la nueva (lo que tiene que hacer el usuario) | — | **5/5 terminadas**, 52 pedidos. Dos intentos chocan con el test protegido, REAPER lo libera y el tercero lo reescribe |
+| Normal / test roto (`MOCK_TEST_ROTO`) / implementador flojo (`MOCK_FLOJO`) | 78 pedidos (normal) | 59 / 66 / 63 pedidos, todos terminados |
+
+**Lo que el simulador NO prueba:** si un modelo real sigue escribiendo tests acoplados de otra forma (patch de funciones
+internas, no de la conexión), si un test liberado se debilita (lo frena solo el examen de realidad que ya existía) y
+cuánto tarda un modelo real. **NO VERIFICADO con un modelo real.**
+
+Regresión: **1210 tests OK** en Python 3.10/3.11/3.12/3.13.

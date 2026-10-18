@@ -264,3 +264,25 @@ build con TODOS los modelos caídos termine sus tareas como fallidas en vez de c
 reparaciones seguidas por el modelo?
 Regresión 1149 tests OK en Python 3.10/3.11/3.12/3.13.
 
+
+## 18. Arreglo con tres subagentes y simulador de modelo gratis flojo (NO VERIFICADO con un modelo real)
+
+Detalle y mediciones en `REAPER_FUSION_PRUEBAS.md` §24.
+
+| Rama | Dónde está el cambio |
+|---|---|
+| `arreglo/capa-modelo` | `06_protocol.py` (formatos nativos y cortes), `20_agent.py` (rescates de acciones anunciadas, pasos devueltos) |
+| `arreglo/modelos-gratis` | `05_llm.py` (límite por modelo, failover inmediato, plazo, corte de razonamiento), `70_equipo.py` (sondeo con herramienta, `salud_modelos.json`), `03_config.py` (perfil gratis) |
+| `arreglo/pipeline` | `25_pipeline.py` (`_liberar_especificacion_mala`, `inutiles`, `diagnostico_obvio`, `fusionar_tareas_de_solo_tests`), `76_grande.py` (`normalizar_maestro`, `partir_etapa`, `_recuperar_etapa`), `22_tournament.py` |
+
+Simulador: `pruebas_fusion/e2e/caos.sh` (`MOCK_CAOS`, `MOCK_SEMILLA`) y `MOCK_ACOPLADO` en `openrouter_falso.py`. Con caos
+fuerte, el almacén de 5 etapas pasó de 2/3 a 3/3 terminadas, con 35 % menos pedidos. La tercera prueba real reproducida
+pasó de etapa 2 FALLIDA a 5/5.
+
+**A auditar:**
+- (a) `_liberar_especificacion_mala` desprotege un test de la especificación si está roto o acoplado y participa del fallo: ¿puede un reparador aprovecharlo para debilitarlo? Hoy lo frena solo el examen de realidad (tautologías, tests sin assert).
+- (b) La liberación se decide arriba del bucle de reparación, tras 2 intentos inútiles. Con `umbral_escalada=1` la tarea tiene 2 intentos y la liberación no llega a correr dentro de la tarea (sí en la reparación final).
+- (c) `partir_etapa` no parte etapas con un solo archivo de código.
+- (d) Los formatos nativos que entiende el parser amplían lo que se toma como llamada: revisar falsos positivos con JSON de datos en la respuesta.
+
+Regresión 1210 tests OK en Python 3.10/3.11/3.12/3.13.
