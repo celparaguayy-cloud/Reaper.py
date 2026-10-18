@@ -13,6 +13,55 @@ enfriamiento, el cliente devuelve un diagnóstico claro en vez de insistir. Un 4
 """
 
 
+HORAS_SALUD_MODELOS = 24.0
+
+
+def _ruta_salud_modelos() -> Optional[Path]:
+    if os.getenv("REAPER_SIN_RED"):                 # autotests: nada se arrastra de una prueba a otra
+        return None
+    return CACHE_DIR / "salud_modelos.json"
+
+
+def cargar_salud_modelos(ruta: Optional[Path] = None) -> dict:
+    """Modelos que en corridas anteriores (últimas 24 h) quedaron retirados o fallando seguido → {modelo: motivo}.
+    Prueba real (teléfono): cada corrida volvía a empezar por cohere/north-mini-code:free, que pensaba sin responder
+    o devolvía vacías, y recién después de varios pedidos perdidos pasaba al que andaba."""
+    ruta = ruta or _ruta_salud_modelos()
+    if ruta is None:
+        return {}
+    try:
+        datos = json.loads(ruta.read_text(encoding="utf-8"))
+        limite = time.time() - HORAS_SALUD_MODELOS * 3600
+        return {m: str(d.get("motivo", "falló"))[:200] for m, d in datos.items()
+                if isinstance(d, dict) and float(d.get("ts", 0)) > limite}
+    except (OSError, ValueError, TypeError, AttributeError):
+        return {}
+
+
+def guardar_salud_modelos(salud: dict, ruta: Optional[Path] = None, renovar: Sequence[str] = ()) -> None:
+    """Guarda {modelo: motivo}. El sello de tiempo de cada entrada se conserva si ya existía (guardar por otro modelo
+    no la renueva); los de `renovar` acaban de fallar otra vez y cuentan 24 h desde ahora."""
+    ruta = ruta or _ruta_salud_modelos()
+    if ruta is None:
+        return
+    try:
+        previos = json.loads(ruta.read_text(encoding="utf-8")) if ruta.is_file() else {}
+    except (OSError, ValueError):
+        previos = {}
+    ahora = time.time()
+
+    def sello(modelo: str) -> float:
+        previo = previos.get(modelo) if isinstance(previos, dict) else None
+        if modelo in renovar or not isinstance(previo, dict):
+            return ahora
+        return previo.get("ts", ahora)
+    datos = {m: {"motivo": motivo, "ts": sello(m)} for m, motivo in salud.items() if motivo}
+    try:
+        escritura_atomica(ruta, json.dumps(datos, ensure_ascii=False))
+    except (OSError, TypeError, ValueError):
+        pass
+
+
 class DisyuntorModelos:
     def __init__(self, umbral: int = 3, enfriamiento: float = 45.0,
                  reloj: Callable[[], float] = time.monotonic):
@@ -23,6 +72,19 @@ class DisyuntorModelos:
         self._abierto_hasta: dict = {}                              # modelo → instante de reapertura
         self._retirados: set = set()                               # modelo → retirado (404) hasta que responda
         self._lock = threading.Lock()
+        # Lo que se sabe de corridas ANTERIORES (no excluye: ordena y le avisa al juez). Lo carga LLMClient.
+        self.salud_previa: dict = {}
+        # Lo que falló en ESTA corrida (sondeo o pedidos): se guarda para la próxima y el juez no lo elige, pero no
+        # reordena la sesión actual (de eso ya se encarga el disyuntor con su enfriamiento).
+        self.salud_sesion: dict = {}
+
+    def sospechoso(self, modelo: str) -> Optional[str]:
+        """Por qué este modelo falló en esta corrida o en una anterior (últimas 24 h), o None."""
+        return self.salud_sesion.get(modelo) or self.salud_previa.get(modelo)
+
+    def ordenar_por_salud(self, candidatos: Sequence[str]) -> list:
+        """Los que no fallaron antes, primero (orden estable): se empieza por el que anda, no por el que se cayó ayer."""
+        return sorted(candidatos, key=lambda m: m in self.salud_previa)
 
     def disponible(self, modelo: str) -> bool:
         """¿Se puede intentar este modelo ahora? (cerrado o medio = sí; abierto/retirado = no)."""

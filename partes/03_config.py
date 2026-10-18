@@ -413,12 +413,15 @@ class Settings:
 
 PERFILES = {
     "gratis": {
-        "descripcion": "modelos :free, 2 candidatos, sin escalada paga, 14 solicitudes/min y tope de costo ~0",
+        "descripcion": "modelos :free, sin torneo, sin escalada paga, 14 solicitudes/min y tope de costo ~0",
         # R-010: el perfil gratis impone un techo de costo casi cero. Los modelos :free reportan costo 0, así
         # que no estorba; pero si por error se usa uno pago, el presupuesto de la sesión corta enseguida.
         # Sin red, este modelo fijo (existe y respondió en la prueba real 2026-10; dolphin…:free fue retirado).
+        # Sin torneo: con modelos gratis flojos, 2 candidatos duplicaban los pedidos (y el cupo) sin mejorar el
+        # resultado; y más tiempo por tarea/build porque cada respuesta tarda (a 14 por minuto y con razonamiento).
         "valores": {"modelo": "nvidia/nemotron-3-super-120b-a12b:free", "paralelo": 1, "paralelo_torneo": 1,
-                    "candidatos": 2, "rpm": 14, "escalar": False, "costo_maximo": 0.01},
+                    "torneo": False, "candidatos": 1, "rpm": 14, "escalar": False, "costo_maximo": 0.01,
+                    "tiempo_max_tarea": 2400, "tiempo_max_build": 7200},
     },
     "rapido": {
         "descripcion": "sin torneo ni tests previos: un intento por tarea (barato y veloz)",

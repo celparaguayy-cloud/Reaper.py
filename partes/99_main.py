@@ -195,7 +195,8 @@ def main(argv: Optional[list] = None) -> int:
     if (args.perfil or "").strip().lower() == "gratis" and settings.proveedor == "openrouter" and api_key \
             and (args.construir or args.grande):
         # Igual que /perfil gratis: solo los :free que RESPONDEN hoy (el catálogo no dice cuáles dan 403 o están
-        # caídos). Con memoria de 6 h: cada sondeo es un pedido del cupo diario.
+        # caídos), los que usan bien las herramientas primero. Con memoria de 12 h: cada sondeo es un pedido del cupo
+        # diario; lo que falló después (salud de modelos, 24 h) va al final de la lista.
         catalogo = catalogo_free_openrouter()
         if catalogo:
             vivos = free_vivos(llm, catalogo, on_probar=lambda m: ui.tenue(f"  probando {m}"))
