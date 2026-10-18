@@ -1084,6 +1084,66 @@ def _resumen_diff(diff: str) -> str:
     return f"{archivos} archivo(s) · +{mas} −{menos}"
 
 
+_RE_DIAGNOSTICO_OBVIO = re.compile(
+    r"NameError|ImportError|ModuleNotFoundError|No module named|SyntaxError|IndentationError|F821|Undefined name|"
+    r"is not defined|no define '|has no attribute|missing \d+ required positional|takes \d+ positional|"
+    r"ENTREGA INCOMPLETA|DESVÍO|TRAMPA PARA LOS TESTS")
+
+
+def diagnostico_obvio(diagnostico: str) -> bool:
+    """Errores que se arreglan leyendo el mensaje (un import, un nombre, la sintaxis, un archivo que falta): el modo
+    forense (varias llamadas de experimentos) no aporta y solo gasta pedidos y tiempo."""
+    return bool(_RE_DIAGNOSTICO_OBVIO.search(diagnostico or ""))
+
+
+def verificacion_mejor(despues: "Verificacion", antes: "Verificacion") -> bool:
+    """¿Hubo avance medible (más tests pasando o menos fallos)?"""
+    d, a = despues.conteo, antes.conteo
+    if not (d.reconocido and a.reconocido):
+        return False
+    return d.pasados > a.pasados or (d.fallados + d.errores) < (a.fallados + a.errores)
+
+
+def fusionar_tareas_de_solo_tests(plan: "Plan", ya_escritos: Optional[set] = None) -> list:
+    """Una tarea que SOLO escribe tests y va ANTES del código que prueba nunca puede quedar verde (sus tests fallan
+    hasta que otra tarea escriba el código): se reparaba en vano y bloqueaba a las que dependían de ella (prueba real:
+    "2. Escribir prueba unitaria…" antes de "3. Implementar main"). Se fusiona con la tarea de código que la usa; los
+    tests que van DESPUÉS del código (o que dependen de él) se dejan, igual que los que ya escribió la especificación
+    (`ya_escritos`: esa tarea se da por cubierta). Modifica el plan y devuelve los avisos; si la fusión dejara el grafo
+    inválido, no toca nada."""
+    ya_escritos = set(ya_escritos or ())
+    tareas = [replace(t, archivos=list(t.archivos), deps=list(t.deps)) for t in plan.tareas]
+    avisos = []
+    i = 0
+    while i < len(tareas):
+        tarea = tareas[i]
+        if not tarea.archivos or not all(_es_test(a) for a in tarea.archivos) \
+                or all(a in ya_escritos for a in tarea.archivos):
+            i += 1
+            continue
+        con_codigo = [t for t in tareas[i + 1:] if any(not _es_test(a) for a in t.archivos)]
+        destino = next((t for t in con_codigo if tarea.id in t.deps), None)
+        if destino is None and not tarea.deps and con_codigo:
+            destino = con_codigo[0]
+        if destino is None:
+            i += 1
+            continue
+        destino.archivos = list(dict.fromkeys(list(destino.archivos) + list(tarea.archivos)))
+        destino.descripcion = destino.descripcion.rstrip() + "\nIncluye también sus tests: " + tarea.descripcion.strip()
+        destino.deps = [d for d in dict.fromkeys(list(destino.deps) + list(tarea.deps)) if d not in (tarea.id, destino.id)]
+        for otra in tareas:
+            if otra is not tarea and tarea.id in otra.deps:
+                otra.deps = [d for d in dict.fromkeys(destino.id if d == tarea.id else d for d in otra.deps)
+                             if d != otra.id]
+        tareas.pop(i)
+        avisos.append(f"Tarea {tarea.id} (solo tests, antes de su código) unida a la tarea {destino.id}: "
+                      f"{', '.join(tarea.archivos)}")
+    if avisos and not errores_grafo_build(replace(plan, tareas=tareas)):
+        plan.tareas = tareas
+        return avisos
+    return []
+
+
 def tests_de_especificacion_rotos(validaciones: list) -> list:
     """Fallos que son errores DEL TEST (sintaxis o nombres que el test nunca importó ni definió), no el rojo
     esperado de tests primero (importar un módulo que todavía no existe)."""
@@ -1544,7 +1604,7 @@ class Orquestador:
                 if hallazgos:
                     acoplados[rel] = hallazgos
         if acoplados:
-            # Una sola vez: si el modelo insiste, siguen (el implementador igual los ve), pero sin quemar pedidos.
+            # Una sola vez (sin quemar pedidos): si el modelo insiste, siguen en disco pero SIN proteger (abajo).
             self.ui.aviso("  Tests de la especificación acoplados a la implementación (mockean la base o exigen el SQL "
                           "exacto): le pido al especificador que los reescriba con una base real.")
             detalle = "\n".join(f"{rel}:\n" + "\n".join(f"  - {h}" for h in hs) for rel, hs in acoplados.items())
@@ -1562,6 +1622,22 @@ class Orquestador:
                 self.ui.aviso("  La reescritura dejó tests rotos (" + ", ".join(sorted(rotos_ahora)) + "): no los protejo.")
                 self._spec_rotos = sorted(set(getattr(self, "_spec_rotos", [])) | rotos_ahora)
                 tests = [t for t in tests if t not in rotos_ahora]
+                if not tests:
+                    return {}
+            siguen_acoplados = set()
+            for rel in tests:
+                try:
+                    if rel.endswith(".py") and acoples_a_la_implementacion(self.ws.leer(rel)):
+                        siguen_acoplados.add(rel)
+                except (OSError, ValueError, ErrorRuta):
+                    continue
+            if siguen_acoplados:
+                # La especificación nunca bloquea: si después del pedido siguen acoplados, NO se protegen (el
+                # implementador puede reescribirlos), pero la tarea igual tiene que dejarlos en verde.
+                self.ui.aviso("  Siguen acoplados a la implementación (" + ", ".join(sorted(siguen_acoplados))
+                              + "): no los protejo (el implementador los puede corregir).")
+                self._spec_rotos = sorted(set(getattr(self, "_spec_rotos", [])) | siguen_acoplados)
+                tests = [t for t in tests if t not in siguen_acoplados]
                 if not tests:
                     return {}
         r = ejecutar_tests(self.ws, timeout=self.settings.tests_timeout, completo=True)
@@ -1806,16 +1882,38 @@ class Orquestador:
         forense_hecho = False
         informe_forense = ""
         sin_cambios = 0
+        # Intentos que no sirvieron (no cambiaron nada, la guardia los revirtió o dejaron el MISMO error). En el
+        # teléfono un reparador giraba en vacío horas: 2 seguidos cortan, con el motivo a la vista.
+        inutiles: list[str] = []
+        liberacion_hecha = False
+        experto_usado = False
         while not verif.ok and intento < max_intentos:
             vencido = PLAZO.vencido()
             if vencido:
                 informe.notas.append(f"{etiqueta}: se agotó el tiempo de {vencido}; quedan fallos sin reparar.")
                 self.ui.aviso(f"  ⏱ {etiqueta}: se agotó el tiempo de {vencido}; no sigo reparando.")
                 break
-            if sin_cambios >= 2:
-                informe.notas.append(f"{etiqueta}: el reparador no cambió ningún archivo en 2 intentos seguidos.")
-                self.ui.aviso(f"  {etiqueta}: 2 intentos sin cambios reales; corto la reparación (sin avance).")
-                break
+            if (len(inutiles) >= 2 or sin_cambios >= 2) and not liberacion_hecha:
+                # Antes de rendirse: ¿lo que bloquea es un test de la especificación que está roto o acoplado a la
+                # implementación? Protegido, nadie lo podía corregir (prueba real). Se libera UNA vez.
+                liberacion_hecha = True
+                liberados = self._liberar_especificacion_mala(verif, informe)
+                if liberados:
+                    inutiles.clear()
+                    sin_cambios = 0
+                    diagnosticos_vistos.clear()
+                    contexto = (contexto + "\n\nLIBERADOS: " + ", ".join(liberados) + " tenían problemas propios (rotos "
+                                "o acoplados a la implementación). Ahora podés corregirlos para que prueben el "
+                                "COMPORTAMIENTO pedido, sin debilitarlos.").strip()
+            if len(inutiles) >= 2 or sin_cambios >= 2:
+                if not experto_usado and self.escalador.disponible():
+                    # Última carta antes de cortar: UN intento con el diagnóstico del modelo fuerte.
+                    fallos_seguidos = max(fallos_seguidos, self.settings.umbral_escalada)
+                else:
+                    motivo = "; ".join(inutiles[-2:]) or "sin cambios reales"
+                    informe.notas.append(f"{etiqueta}: la reparación no avanzó en 2 intentos seguidos ({motivo}).")
+                    self.ui.aviso(f"  {etiqueta}: 2 intentos sin avance ({motivo}); corto la reparación.")
+                    break
             firma = _firma_error(verif.diagnostico)
             if diagnosticos_vistos.count(firma) >= 3:
                 informe.notas.append(f"{etiqueta}: la reparación no logró avances (mismo diagnóstico repetido).")
@@ -1824,13 +1922,15 @@ class Orquestador:
             intento += 1
             experto = ""
             if fallos_seguidos >= self.settings.umbral_escalada and self.escalador.disponible():
+                experto_usado = True
                 experto = self.escalador.diagnosticar(self.ws, pedido, verif.diagnostico, verif.archivos,
                                                       "\n---\n".join(intentos_txt[-2:])) or ""
                 if experto:
                     informe.escaladas += 1
                     fallos_seguidos = 0
             if (fallos_seguidos >= 1 and not forense_hecho and self.settings.forense
-                    and verif.tests is not None and not verif.tests.ok):
+                    and verif.tests is not None and not verif.tests.ok
+                    and not diagnostico_obvio(verif.diagnostico)):
                 # el primer intento no alcanzó: antes de seguir probando, investigar con método
                 forense_hecho = True
                 try:
@@ -1862,14 +1962,27 @@ class Orquestador:
                 self.ui.aviso(f"  {etiqueta}: el reparador no pudo terminar ({recortar(motivo, 160)}); dejo la "
                               "reparación acá.")
                 break
-            intentos_txt.append(recortar(res.resumen, 1200))
-            sin_cambios = 0 if self.ws.checkpoints.diff_desde(rcid).strip() else sin_cambios + 1
+            diff_intento = self.ws.checkpoints.diff_desde(rcid)
+            sin_cambios = 0 if diff_intento.strip() else sin_cambios + 1
             verif = verificador()
             self._mostrar_verificacion(verif)
+            # Lo que el próximo intento tiene que saber: QUÉ cambió este (el diff, no solo su relato) y en qué terminó.
+            resultado_txt = (verif.conteo.texto() if verif.conteo.reconocido
+                             else _primera_linea_util(verif.diagnostico) or "sin cambios en la verificación")
+            intentos_txt.append(recortar(res.resumen, 600)
+                                + (f"\nLo que cambió:\n```diff\n{recortar(diff_intento, 1500)}\n```" if diff_intento.strip()
+                                   else "\n(No cambió ningún archivo.)")
+                                + f"\nResultado: {resultado_txt}")
             if verif.ok:
                 self._aprender(antes.diagnostico, rcid, res.resumen, informe)
                 continue
             fallos_seguidos += 1
+            if not diff_intento.strip():
+                inutiles.append(f"intento {intento}: no cambió ningún archivo")
+            elif _firma_error(verif.diagnostico) == firma and not verificacion_mejor(verif, antes):
+                inutiles.append(f"intento {intento}: el mismo error sigue igual")
+            elif not (self.settings.guardia_regresion and verificacion_peor(verif, antes)):
+                inutiles.clear()
             if self.settings.guardia_regresion and verificacion_peor(verif, antes):
                 # el intento EMPEORÓ las cosas (2 fallos → 13): se revierte entero y se sigue desde lo que había
                 revertidos = self.ws.checkpoints.deshacer(rcid)
@@ -1878,8 +1991,48 @@ class Orquestador:
                 informe.notas.append(f"{etiqueta}: se revirtió el intento {intento} porque empeoró los tests")
                 intentos_txt[-1] += (f"\n(ESTE INTENTO EMPEORÓ LOS TESTS de {antes.conteo.texto()} a "
                                      f"{verif.conteo.texto()} y se revirtió: no lo repitas)")
+                if not inutiles or not inutiles[-1].startswith(f"intento {intento}:"):
+                    inutiles.append(f"intento {intento}: empeoró los tests y se revirtió")
                 verif = antes
         return verif
+
+    def _liberar_especificacion_mala(self, verif: Verificacion, informe: InformeBuild) -> list:
+        """Tests de la especificación de ESTA build que están protegidos, participan del fallo y tienen problemas
+        propios (rotos o acoplados a la implementación): se desprotegen para que se puedan corregir. La tarea igual
+        los tiene que dejar en verde (pasan a _spec_rotos). Los tests que ya existían antes de la build no se tocan."""
+        spec = set(informe.spec_tests or [])
+        if not spec:
+            return []
+        fallados = list(verif.conteo.nombres_fallados) if verif.conteo.reconocido else []
+        liberados = []
+        for rel in sorted(spec & set(getattr(self, "_protegidos", {}))):
+            participa = rel in (verif.diagnostico or "") or any(_es_de_especificacion(n, {rel: None}) for n in fallados)
+            if not participa or not (self.ws.raiz / rel).is_file():
+                continue
+            try:
+                texto = self.ws.leer(rel)
+            except (OSError, ValueError, ErrorRuta):
+                continue
+            malo = (rel.endswith(".py") and acoples_a_la_implementacion(texto)) or \
+                tests_de_especificacion_rotos(validar_archivos(self.ws, [rel]))
+            if not malo:
+                continue
+            self._protegidos.pop(rel, None)
+            liberados.append(rel)
+        if liberados:
+            self._spec_rotos = sorted(set(getattr(self, "_spec_rotos", [])) | set(liberados))
+            diario = getattr(self, "_diario_build", None)
+            if diario is not None:
+                registro, previo = diario
+                for rel in liberados:
+                    previo.setdefault("tests_protegidos", {}).pop(rel, None)
+                previo["spec_rotos"] = list(self._spec_rotos)
+                registro.guardar(previo)
+            self.ui.aviso("  La reparación no avanza y el bloqueo es la especificación (" + ", ".join(liberados)
+                          + ": rota o acoplada a la implementación). La libero para que se pueda corregir.")
+            informe.notas.append("Se liberaron tests de la especificación con problemas propios: "
+                                 + ", ".join(liberados))
+        return liberados
 
     # ------------------------------------------------------------ REAPER X (10 roles)
     def _consultar_rol_x(self, rol: str, prompt: str, max_tokens: int = 1500) -> tuple:
@@ -2493,6 +2646,9 @@ class Orquestador:
             if plan is None:
                 self.ui.tenue("Construcción cancelada; no se tocó ningún archivo.")
                 return InformeBuild("cancelada")
+            if not self.settings.tests_primero:
+                for aviso in fusionar_tareas_de_solo_tests(plan):
+                    self.ui.tenue("  " + aviso)
             problemas_grafo = errores_grafo_build(plan)
             if problemas_grafo:
                 self.ui.error("El plan no es ejecutable: " + "; ".join(problemas_grafo)
@@ -2577,11 +2733,20 @@ class Orquestador:
             informe.spec_tests = list(espec)
             previo["spec_tests"] = list(espec)
             previo["tests_protegidos"] = {p: self.ws.hash(p) for p in self._protegidos}
+            previo["spec_rotos"] = list(self._spec_rotos)
             previo["especificacion_completa"] = True
             _cerrar_fase(previo)
+            avisos_fusion = fusionar_tareas_de_solo_tests(
+                plan, {a for a in espec if self.ws.existe(a)})
+            for aviso in avisos_fusion:
+                self.ui.tenue("  " + aviso)
+            if avisos_fusion:
+                informe.plan = plan
+                previo["plan"] = asdict(plan)
             registro_build.guardar(previo)
         elif reanudar:
             informe.spec_tests = list(previo.get("spec_tests", self._protegidos))
+            self._spec_rotos = [r for r in previo.get("spec_rotos", []) if isinstance(r, str)]
 
         self.ui.fase(numero_fase, "Implementación" + (" · torneo" if self.settings.torneo and self.settings.candidatos > 1 else ""))
         numero_fase += 1
