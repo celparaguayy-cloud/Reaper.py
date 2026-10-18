@@ -286,3 +286,16 @@ pasó de etapa 2 FALLIDA a 5/5.
 - (d) Los formatos nativos que entiende el parser amplían lo que se toma como llamada: revisar falsos positivos con JSON de datos en la respuesta.
 
 Regresión 1210 tests OK en Python 3.10/3.11/3.12/3.13.
+
+## 19. Ronda de caza 2: un test liberado no se puede vaciar (NO VERIFICADO con un modelo real)
+
+Detalle en `REAPER_FUSION_PRUEBAS.md` §25. Responde a los puntos (a) y (b) del §18: `debilitamiento_de_test` y
+`tests_que_verifican` (`15c`), `_marcar_spec_rotos` y `_tests_debilitados` (`25_pipeline`), el intento extra tras una
+liberación tardía en `_reparar_con_escalada`, y tautologías del tipo `x or True`.
+
+**A auditar:**
+- (a) La guardia cuenta tests que verifican algo; un reparador todavía puede debilitar el CONTENIDO (cambiar un valor esperado por el que da el código). Eso no se detecta.
+- (b) `_test_verifica` acepta cualquier método que empiece con `assert`, incluidos los mocks: un test que solo hace `m.assert_not_called()` cuenta como verificación.
+- (c) El intento extra solo existe si se liberó algo; ¿conviene limitarlo al rol reparador de la tarea y no a la reparación final?
+
+Regresión 1217 tests OK en Python 3.10/3.11/3.12/3.13.

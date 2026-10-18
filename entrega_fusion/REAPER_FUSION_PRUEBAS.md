@@ -766,3 +766,35 @@ internas, no de la conexión), si un test liberado se debilita (lo frena solo el
 cuánto tarda un modelo real. **NO VERIFICADO con un modelo real.**
 
 Regresión: **1210 tests OK** en Python 3.10/3.11/3.12/3.13.
+
+## 25. Ronda de caza 2: un test liberado no se puede vaciar (NO VERIFICADO con un modelo real)
+
+Hueco que dejó el §24: liberar un test de la especificación roto o acoplado permitía "arreglarlo" vaciándolo. El
+simulador lo mostró de punta a punta con `MOCK_ACOPLADO=1 MOCK_DEBILITA=1`: un reparador que, cuando lo dejan tocar el
+test, primero lo cambia por `self.assertTrue(callable(registrar_venta) or True)`. La versión del §24 dio el proyecto por
+**TERMINADO Y VERIFICADO con ese test vacío** (un falso verde: ni el examen de realidad lo atajaba).
+
+| Arreglo | Dónde |
+|---|---|
+| Al liberar un test (o al no protegerlo por roto o acoplado) se anota cuántos tests que VERIFICAN algo tenía: un assert que no es tautología, un `assert*` de unittest, un `assert_called*` de un mock, `raises` o `fail`. Si después tiene menos o se borró, la verificación falla con **TEST DEBILITADO**, por tarea y al final | `tests_que_verifican`, `debilitamiento_de_test` (`15c`), `_marcar_spec_rotos` y `_tests_debilitados` (`25_pipeline`), persistido en el diario (`minimo_tests`) |
+| `assertTrue(x or True)`, `assertFalse(not True)`, `assert f or 1`: siempre verdaderos, ahora son tautologías (también para el examen de realidad) | `_siempre_verdadero` / `_siempre_falso` (`15c`) |
+| Con 2 intentos por tarea (`umbral_escalada=1`), la liberación se decidía después del último intento y nunca servía. Ahora hay UN intento más, solo si se liberó algo | `_reparar_con_escalada` |
+| Con los tests en verde pero sin quedar verificada, la pantalla decía "✓ tests: pasaron" y arrancaba otra reparación sin explicar nada. Ahora muestra "pero no queda verificada: <motivo>" | `_mostrar_verificacion` |
+
+Un primer intento de la guardia daba un falso positivo con tests que solo verifican con un mock
+(`run.assert_called_once_with(9999)`). Lo atajó `TestEspecificacionPropiaEnRojo` en la suite completa, y por eso ahora
+se compara contra lo que verificaba el original.
+
+**Mediciones (OpenRouter simulado, CLI real):**
+
+| Escenario | Resultado |
+|---|---|
+| Reparador que vacía el test liberado (`MOCK_ACOPLADO=1 MOCK_DEBILITA=1`) | antes: TERMINADO con el test vacío (falso verde); **ahora: lo rechaza ("pero no queda verificada: TEST DEBILITADO") y queda el test real**, 5/5 |
+| Caos fuerte (nivel 2), semillas 4–9 | **6/6 terminadas**, 73 a 87 pedidos |
+| Caos extremo (nivel 3), semillas 1–3 | (medición en curso; se completa en la próxima entrega) |
+| Tests acoplados + caos moderado (semillas 1–2) / test roto + implementador flojo + caos moderado (semillas 1–2) | 4/4 terminadas (73, 74, 84, 84 pedidos) |
+| Cupo diario agotado a los 40 pedidos y `continuar` "al otro día" | se detiene; al otro día termina 5/5 con 60 pedidos en total, sin rehacer nada |
+| Ctrl+C a los 90 s y el mismo comando otra vez | "Interrumpido" con el comando para seguir; retoma y termina 5/5 |
+
+Tests: +8 (`48zr_autotest_liberados.py`). Con el código anterior fallan 4; los otros son guardas. Regresión: **1217
+tests OK** en Python 3.10/3.11/3.12/3.13. **NO VERIFICADO con un modelo real.**
