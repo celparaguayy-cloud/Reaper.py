@@ -17,7 +17,11 @@ class TestLiberadosDebilitamiento(BaseTest):
     def test_detecta_casos_borrados_y_asserts_vacios(self):
         self.assertEqual(debilitamiento_de_test(_PR3_TEST_REAL, 1), [])
         self.assertEqual(debilitamiento_de_test(_LIB_TEST_DOS, 2), [])
-        self.assertTrue(any("tenía 2 test(s) y ahora tiene 1" in h for h in debilitamiento_de_test(_PR3_TEST_REAL, 2)))
+        self.assertTrue(any("tenía 2 test(s) que verifican algo y ahora tiene 1" in h
+                            for h in debilitamiento_de_test(_PR3_TEST_REAL, 2)))
+        mock = "import unittest\n\n\nclass T(unittest.TestCase):\n    def test_x(self):\n        run.assert_called_once_with(1)\n"
+        self.assertEqual(debilitamiento_de_test(mock, 1), [])                 # un assert de mock verifica algo
+        self.assertEqual(debilitamiento_de_test(_LIB_TEST_VACIO, 0), [])      # el original tampoco verificaba nada
         self.assertTrue(any("sin un assert real" in h for h in debilitamiento_de_test(_LIB_TEST_VACIO, 1)))
         sin_assert = _LIB_TEST_VACIO.replace("self.assertTrue(True)", "validate_stock(None, 1, 1)")
         self.assertTrue(any("test_stock_suficiente" in h for h in debilitamiento_de_test(sin_assert, 1)))
@@ -47,7 +51,7 @@ class TestLiberadosDebilitamiento(BaseTest):
                                          lambda: orq.verificar(cid))
 
     def test_vaciar_el_test_liberado_no_cuenta_como_arreglo(self):
-        ws, _ui, orq, informe = self._orq()
+        ws, ui, orq, informe = self._orq()
         vistos = []
 
         def reparar(pedido, verif, cid, base_fallaba, experto="", contexto=""):
@@ -62,6 +66,7 @@ class TestLiberadosDebilitamiento(BaseTest):
         self.assertIn("TEST DEBILITADO (tests/test_sales.py)", vistos[3])   # antes: verde con assertTrue(True)
         self.assertIn("sin un assert real", vistos[3])
         self.assertEqual(ws.leer("tests/test_sales.py"), _PR3_TEST_REAL)
+        self.assertIn("pero no queda verificada: TEST DEBILITADO", ui.texto_registrado())   # se ve POR QUÉ
 
     def test_borrar_el_test_liberado_tampoco(self):
         ws, _ui, orq, informe = self._orq()

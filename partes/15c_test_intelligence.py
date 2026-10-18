@@ -313,19 +313,44 @@ def analizar_tests_python(fuente: str) -> ResultadoInteligencia:
     return res
 
 
+def _test_verifica(fn) -> bool:
+    """¿El test verifica ALGO? Un assert que no es tautología, un assert* de unittest (incluido assertRaises), un
+    assert_called*/assert_any_call de un mock, pytest.raises o self.fail."""
+    if any(not _es_tautologia(a.test) for a in _ti_walk(fn, ast.Assert)):
+        return True
+    for call in _ti_walk(fn, ast.Call):
+        metodo = call.func.attr if isinstance(call.func, ast.Attribute) else ""
+        if metodo.startswith("assert") and not _tautologia_en_assert_metodo(call):
+            return True
+        if metodo == "fail" or _ti_src(call.func).endswith("raises"):
+            return True
+    return False
+
+
+def tests_que_verifican(fuente: str) -> tuple[list, list]:
+    """(nombres de los tests que verifican algo, nombres de los que no). Sintaxis inválida: ([], [])."""
+    try:
+        arbol = ast.parse(fuente)
+    except SyntaxError:
+        return [], []
+    verifican, vacios = [], []
+    for fn in ast.walk(arbol):
+        if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)) and fn.name.startswith("test"):
+            (verifican if _test_verifica(fn) else vacios).append(fn.name)
+    return verifican, vacios
+
+
 def debilitamiento_de_test(fuente: str, minimo: int) -> list[str]:
     """Un test de la especificación que se liberó (estaba roto o acoplado a la implementación) se puede REESCRIBIR para
-    que pruebe el comportamiento, pero no VACIAR: no puede quedar con menos tests que el original ni con tests sin un
-    assert real (sin assert o solo tautologías)."""
-    res = analizar_tests_python(fuente)
-    problemas = []
-    if len(res.tests) < minimo:
-        problemas.append(f"tenía {minimo} test(s) y ahora tiene {len(res.tests)}")
-    vacios = sorted({p.test for p in res.problemas if p.tipo == "SIN_ASSERT"}
-                    | {t.nombre for t in res.tests if 0 < t.asserts <= t.tautologias})
+    que pruebe el comportamiento, pero no VACIAR: tiene que seguir teniendo al menos `minimo` tests que verifiquen algo
+    (los que tenía el original). Borrar casos, dejarlos sin assert o con tautologías baja la cuenta."""
+    verifican, vacios = tests_que_verifican(fuente)
+    if len(verifican) >= minimo:
+        return []
+    problema = f"tenía {minimo} test(s) que verifican algo y ahora tiene {len(verifican)}"
     if vacios:
-        problemas.append("tests sin un assert real: " + ", ".join(vacios[:6]))
-    return problemas
+        problema += "; sin un assert real: " + ", ".join(sorted(vacios)[:6])
+    return [problema]
 
 
 def inteligencia_para_prompt(fuente: str, maximo: int = 8) -> str:

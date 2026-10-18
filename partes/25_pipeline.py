@@ -2014,7 +2014,7 @@ class Orquestador:
             if not rel.endswith(".py") or rel in minimos:
                 continue
             try:
-                minimos[rel] = len(analizar_tests_python(self.ws.leer(rel)).tests)
+                minimos[rel] = len(tests_que_verifican(self.ws.leer(rel))[0])
             except (OSError, ValueError, ErrorRuta):
                 continue
 
@@ -3055,6 +3055,11 @@ class Orquestador:
             else:
                 self.ui.error('aceptación independiente: FALLIDA')
                 self.ui.tenue(recortar(verif.aceptacion.resumen(1500), 1500))
+        if not verif.ok and not malos and verif.tests is not None and verif.tests.ok and verif.diagnostico \
+                and (verif.aceptacion is None or verif.aceptacion.ok):
+            # Tests en verde pero NO verificada (test liberado vaciado, entrega incompleta, no arranca...): sin esta
+            # línea se veía "✓ tests: pasaron" y otra reparación, sin saber por qué.
+            self.ui.aviso(f"  pero no queda verificada: {recortar(_primera_linea_util(verif.diagnostico), 220)}")
 
     def _guardar_informe(self, pedido: str, informe: InformeBuild) -> Optional[Path]:
         try:

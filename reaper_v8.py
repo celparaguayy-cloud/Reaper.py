@@ -9491,19 +9491,44 @@ def analizar_tests_python(fuente: str) -> ResultadoInteligencia:
     return res
 
 
+def _test_verifica(fn) -> bool:
+    """¿El test verifica ALGO? Un assert que no es tautología, un assert* de unittest (incluido assertRaises), un
+    assert_called*/assert_any_call de un mock, pytest.raises o self.fail."""
+    if any(not _es_tautologia(a.test) for a in _ti_walk(fn, ast.Assert)):
+        return True
+    for call in _ti_walk(fn, ast.Call):
+        metodo = call.func.attr if isinstance(call.func, ast.Attribute) else ""
+        if metodo.startswith("assert") and not _tautologia_en_assert_metodo(call):
+            return True
+        if metodo == "fail" or _ti_src(call.func).endswith("raises"):
+            return True
+    return False
+
+
+def tests_que_verifican(fuente: str) -> tuple[list, list]:
+    """(nombres de los tests que verifican algo, nombres de los que no). Sintaxis inválida: ([], [])."""
+    try:
+        arbol = ast.parse(fuente)
+    except SyntaxError:
+        return [], []
+    verifican, vacios = [], []
+    for fn in ast.walk(arbol):
+        if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)) and fn.name.startswith("test"):
+            (verifican if _test_verifica(fn) else vacios).append(fn.name)
+    return verifican, vacios
+
+
 def debilitamiento_de_test(fuente: str, minimo: int) -> list[str]:
     """Un test de la especificación que se liberó (estaba roto o acoplado a la implementación) se puede REESCRIBIR para
-    que pruebe el comportamiento, pero no VACIAR: no puede quedar con menos tests que el original ni con tests sin un
-    assert real (sin assert o solo tautologías)."""
-    res = analizar_tests_python(fuente)
-    problemas = []
-    if len(res.tests) < minimo:
-        problemas.append(f"tenía {minimo} test(s) y ahora tiene {len(res.tests)}")
-    vacios = sorted({p.test for p in res.problemas if p.tipo == "SIN_ASSERT"}
-                    | {t.nombre for t in res.tests if 0 < t.asserts <= t.tautologias})
+    que pruebe el comportamiento, pero no VACIAR: tiene que seguir teniendo al menos `minimo` tests que verifiquen algo
+    (los que tenía el original). Borrar casos, dejarlos sin assert o con tautologías baja la cuenta."""
+    verifican, vacios = tests_que_verifican(fuente)
+    if len(verifican) >= minimo:
+        return []
+    problema = f"tenía {minimo} test(s) que verifican algo y ahora tiene {len(verifican)}"
     if vacios:
-        problemas.append("tests sin un assert real: " + ", ".join(vacios[:6]))
-    return problemas
+        problema += "; sin un assert real: " + ", ".join(sorted(vacios)[:6])
+    return [problema]
 
 
 def inteligencia_para_prompt(fuente: str, maximo: int = 8) -> str:
@@ -17854,7 +17879,7 @@ class Orquestador:
             if not rel.endswith(".py") or rel in minimos:
                 continue
             try:
-                minimos[rel] = len(analizar_tests_python(self.ws.leer(rel)).tests)
+                minimos[rel] = len(tests_que_verifican(self.ws.leer(rel))[0])
             except (OSError, ValueError, ErrorRuta):
                 continue
 
@@ -18895,6 +18920,11 @@ class Orquestador:
             else:
                 self.ui.error('aceptación independiente: FALLIDA')
                 self.ui.tenue(recortar(verif.aceptacion.resumen(1500), 1500))
+        if not verif.ok and not malos and verif.tests is not None and verif.tests.ok and verif.diagnostico \
+                and (verif.aceptacion is None or verif.aceptacion.ok):
+            # Tests en verde pero NO verificada (test liberado vaciado, entrega incompleta, no arranca...): sin esta
+            # línea se veía "✓ tests: pasaron" y otra reparación, sin saber por qué.
+            self.ui.aviso(f"  pero no queda verificada: {recortar(_primera_linea_util(verif.diagnostico), 220)}")
 
     def _guardar_informe(self, pedido: str, informe: InformeBuild) -> Optional[Path]:
         try:
@@ -54068,7 +54098,11 @@ class TestLiberadosDebilitamiento(BaseTest):
     def test_detecta_casos_borrados_y_asserts_vacios(self):
         self.assertEqual(debilitamiento_de_test(_PR3_TEST_REAL, 1), [])
         self.assertEqual(debilitamiento_de_test(_LIB_TEST_DOS, 2), [])
-        self.assertTrue(any("tenía 2 test(s) y ahora tiene 1" in h for h in debilitamiento_de_test(_PR3_TEST_REAL, 2)))
+        self.assertTrue(any("tenía 2 test(s) que verifican algo y ahora tiene 1" in h
+                            for h in debilitamiento_de_test(_PR3_TEST_REAL, 2)))
+        mock = "import unittest\n\n\nclass T(unittest.TestCase):\n    def test_x(self):\n        run.assert_called_once_with(1)\n"
+        self.assertEqual(debilitamiento_de_test(mock, 1), [])                 # un assert de mock verifica algo
+        self.assertEqual(debilitamiento_de_test(_LIB_TEST_VACIO, 0), [])      # el original tampoco verificaba nada
         self.assertTrue(any("sin un assert real" in h for h in debilitamiento_de_test(_LIB_TEST_VACIO, 1)))
         sin_assert = _LIB_TEST_VACIO.replace("self.assertTrue(True)", "validate_stock(None, 1, 1)")
         self.assertTrue(any("test_stock_suficiente" in h for h in debilitamiento_de_test(sin_assert, 1)))
@@ -54098,7 +54132,7 @@ class TestLiberadosDebilitamiento(BaseTest):
                                          lambda: orq.verificar(cid))
 
     def test_vaciar_el_test_liberado_no_cuenta_como_arreglo(self):
-        ws, _ui, orq, informe = self._orq()
+        ws, ui, orq, informe = self._orq()
         vistos = []
 
         def reparar(pedido, verif, cid, base_fallaba, experto="", contexto=""):
@@ -54113,6 +54147,7 @@ class TestLiberadosDebilitamiento(BaseTest):
         self.assertIn("TEST DEBILITADO (tests/test_sales.py)", vistos[3])   # antes: verde con assertTrue(True)
         self.assertIn("sin un assert real", vistos[3])
         self.assertEqual(ws.leer("tests/test_sales.py"), _PR3_TEST_REAL)
+        self.assertIn("pero no queda verificada: TEST DEBILITADO", ui.texto_registrado())   # se ve POR QUÉ
 
     def test_borrar_el_test_liberado_tampoco(self):
         ws, _ui, orq, informe = self._orq()
