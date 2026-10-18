@@ -8,10 +8,18 @@ primero, torneo, revisor, qa, juez). Fallas configurables por variables de entor
   MOCK_ESTADO=archivo    → contador persistente de pedidos (para simular el día siguiente: se borra)
   MOCK_FLOJO=1           → el implementador escribe una venta que NO controla el stock; el reparador la arregla
   MOCK_TEST_ROTO=1       → el especificador escribe tests/test_db.py usando db SIN importarlo y no lo corrige
+  MOCK_CAOS=nivel        → MODELO GRATIS FLOJO (0 apagado, 1 moderado, 2 fuerte), con las fallas reales del teléfono:
+                           cohere piensa sin responder (salvo razonamiento none/minimal) y tiene límite 15/min; Nvidia
+                           da 500; respuestas vacías; "Upstream idle timeout"; herramientas mal escritas (<contenido>,
+                           código en ``` sin <content>, <tool_call>{json}, <function=...>, basura, duplicadas); anuncia
+                           acciones sin hacerlas; lee archivos de más; el juez a veces no responde JSON.
+  MOCK_SEMILLA=n         → semilla del caos (misma semilla = misma corrida, para comparar antes/después)
 Log de cada pedido (modelo, rol, status) en MOCK_LOG.
 """
+import collections
 import json
 import os
+import random
 import re
 import sys
 import threading
@@ -47,6 +55,20 @@ def _turno(mensajes):
     return sum(1 for m in mensajes if m["role"] == "assistant")
 
 
+_RE_ESCRITO = re.compile(r"(?:Creé|Modifiqué) ([\w./-]+) \(|([\w./-]+) ya tenía exactamente ese contenido")
+
+
+def _escritos(mensajes):
+    """Archivos que REAPER confirmó escritos en ESTA conversación: el cerebro avanza por eso y no por número de turno,
+    así una llamada mal formada (o anunciada sin herramienta) se reintenta como haría un modelo real."""
+    hechos = set()
+    usuarios = [m["content"] for m in mensajes if m["role"] == "user"][1:]
+    for texto in usuarios:
+        for a, b in _RE_ESCRITO.findall(texto):
+            hechos.add(a or b)
+    return hechos
+
+
 def _etapa(texto):
     m = re.search(r"ETAPA (\d+) de (\d+)", texto)
     return m.group(1) if m else "1"
@@ -66,11 +88,12 @@ def cerebro(mensajes):
         return rol, R.terminar_xml(G.PLANES.get(etapa, G.PLANES["1"]))
     if rol == "especificador":
         tests = [a for t in _tareas_de(etapa) for a in G.TAREAS[t] if a.startswith("tests/")]
-        if turno < len(tests):
-            contenido = G.ARCHIVOS[tests[turno]]
-            if os.environ.get("MOCK_TEST_ROTO") and tests[turno] == "tests/test_db.py":
+        pendientes = [a for a in tests if a not in _escritos(mensajes)]
+        if pendientes:
+            contenido = G.ARCHIVOS[pendientes[0]]
+            if os.environ.get("MOCK_TEST_ROTO") and pendientes[0] == "tests/test_db.py":
                 contenido = _TEST_DB_ROTO                 # usa db sin importarlo (como el teléfono) y no lo corrige
-            return rol, R.herramienta_xml("write_to_file", path=tests[turno], content=contenido)
+            return rol, ("tool", "write_to_file", {"path": pendientes[0], "content": contenido})
         return rol, R.terminar_xml("tests escritos: fallan por ImportError hasta que exista el código (esperado)")
     if rol == "implementador":
         tarea = re.search(r"TU TAREA AHORA \(#[^)]*\):\n(.*?)\n\n", primero, re.S)
@@ -79,12 +102,12 @@ def cerebro(mensajes):
         if marca is None:
             # Sin la marca no sé qué tarea es: escribo todo lo que falte de la etapa (como un modelo "proactivo").
             archivos = [a for t in _tareas_de(etapa) for a in G.TAREAS[t]]
-        codigo = [a for a in archivos if not a.startswith("tests/")]
-        if turno < len(codigo):
-            contenido = G.ARCHIVOS[codigo[turno]]
-            if os.environ.get("MOCK_FLOJO") and codigo[turno] == "almacen/ventas.py":
+        codigo = [a for a in archivos if not a.startswith("tests/") and a not in _escritos(mensajes)]
+        if codigo:
+            contenido = G.ARCHIVOS[codigo[0]]
+            if os.environ.get("MOCK_FLOJO") and codigo[0] == "almacen/ventas.py":
                 contenido = _VENTAS_FLOJA                 # vende aunque no haya stock
-            return rol, R.herramienta_xml("write_to_file", path=codigo[turno], content=contenido)
+            return rol, ("tool", "write_to_file", {"path": codigo[0], "content": contenido})
         return rol, R.terminar_xml("listo: implementado y con los tests en verde")
     if rol == "juez":
         texto = R.MockLLM.ultimo_usuario(mensajes)
@@ -92,14 +115,73 @@ def cerebro(mensajes):
             return rol, '{"criterios": ["lo pedido funciona y tiene tests"]}'
         return rol, '{"cumple": true, "confianza": "high", "evidence_ids": ["EV-TESTS"]}'
     if rol in ("reparador", "integrador") and ("AGREGARLE las líneas import" in primero or "nombres indefinidos" in primero) \
-            and turno == 0 and "tests/test_db.py" in primero:
-        return rol, R.herramienta_xml("write_to_file", path="tests/test_db.py", content=G.ARCHIVOS["tests/test_db.py"])
-    if rol in ("reparador", "integrador") and "ventas" in primero and turno == 0 and os.environ.get("MOCK_FLOJO"):
+            and "tests/test_db.py" not in _escritos(mensajes) and "tests/test_db.py" in primero:
+        return rol, ("tool", "write_to_file", {"path": "tests/test_db.py", "content": G.ARCHIVOS["tests/test_db.py"]})
+    if rol in ("reparador", "integrador") and "ventas" in primero and os.environ.get("MOCK_FLOJO") \
+            and "almacen/ventas.py" not in _escritos(mensajes):
         # El reparador ve el test que falla (SinStock no se lanzó) y escribe la versión correcta.
-        return rol, R.herramienta_xml("write_to_file", path="almacen/ventas.py", content=G.ARCHIVOS["almacen/ventas.py"])
+        return rol, ("tool", "write_to_file", {"path": "almacen/ventas.py", "content": G.ARCHIVOS["almacen/ventas.py"]})
     if rol in ("revisor", "qa", "reparador", "integrador", "explorador"):
         return rol, R.terminar_xml("revisado: sin cambios necesarios")
     return rol or "?", R.terminar_xml("sin cambios")
+
+
+NIVEL = float(os.environ.get("MOCK_CAOS", "0") or 0)
+SEMILLA = os.environ.get("MOCK_SEMILLA", "1")
+_PEDIDOS_POR_MODELO = collections.defaultdict(collections.deque)
+
+
+def _render(rol, nombre, params, rng):
+    """La llamada de herramienta, a veces escrita como la escribían los modelos gratis reales. → (texto, desorden)."""
+    xml = R.herramienta_xml(nombre, **params)
+    if NIVEL <= 0 or rng.random() > 0.30 * NIVEL:
+        return xml, ""
+    ruta = params.get("path", "")
+    opciones = ["contenido", "fence", "tool_call", "function", "basura", "duplicada", "anuncia", "lee"]
+    elegido = rng.choice(opciones)
+    if elegido == "contenido":
+        return xml.replace("<content>", "<contenido>").replace("</content>", "</contenido>"), elegido
+    if elegido == "fence" and "content" in params:
+        return f"<{nombre}>\n<path>{ruta}</path>\n```python\n{params['content']}\n```\n</{nombre}>", elegido
+    if elegido == "tool_call":
+        return "<tool_call>\n" + json.dumps({"name": nombre, "arguments": params}, ensure_ascii=False) + "\n</tool_call>", elegido
+    if elegido == "function":
+        cuerpo = "".join(f"<parameter={k}>\n{v}\n</parameter>\n" for k, v in params.items())
+        return f"<function={nombre}>\n{cuerpo}</function>", elegido
+    if elegido == "basura":
+        return "<label>HECHO</label>\nAHORA: voy a escribir el archivo.\n\n" + xml, elegido
+    if elegido == "duplicada":
+        return xml + "\n\n" + xml, elegido
+    if elegido == "anuncia":
+        if rol in ("reparador", "integrador"):
+            return "VERIFICACIÓN\n\nAhora, ejecutemos los tests para ver si pasan.", elegido
+        return f"Ahora voy a escribir {ruta} con la implementación completa, siguiendo la interfaz del plan.", elegido
+    return R.herramienta_xml("read_file", path=ruta or "README.md"), "lee"
+
+
+def _caos_http(modelo, pedido, rng):
+    """Falla del PROVEEDOR para este pedido ('' = ninguna)."""
+    if NIVEL <= 0:
+        return ""
+    ahora = time.time()
+    with LOCK:
+        cola = _PEDIDOS_POR_MODELO[modelo]
+        while cola and ahora - cola[0] > 60:
+            cola.popleft()
+        cola.append(ahora)
+        en_un_minuto = len(cola)
+    if "cohere" in modelo and en_un_minuto > 15:
+        return "limite15"
+    effort = (pedido.get("reasoning") or {}).get("effort")
+    if "cohere" in modelo and effort not in ("none", "minimal") and rng.random() < 0.35 * NIVEL:
+        return "razona"
+    if "nvidia" in modelo and rng.random() < 0.05 * NIVEL:
+        return "500"
+    if rng.random() < 0.05 * NIVEL:
+        return "vacia"
+    if rng.random() < 0.04 * NIVEL:
+        return "idle"
+    return ""
 
 
 _VENTAS_FLOJA = G.ARCHIVOS["almacen/ventas.py"].replace(
@@ -160,8 +242,18 @@ class Manejador(BaseHTTPRequestHandler):
             n = e["pedidos"]
             _guardar_estado(e)
         rol, texto = cerebro(mensajes)
+        rng = random.Random(f"{SEMILLA}-{n}")
         registro = {"n": n, "modelo": modelo, "rol": rol, "max_tokens": pedido.get("max_tokens"),
                     "reasoning": pedido.get("reasoning"), "status": 200}
+        if isinstance(texto, tuple):
+            texto, desorden = _render(rol, texto[1], texto[2], rng)
+            if desorden:
+                registro["desorden"] = desorden
+        elif rol == "juez" and NIVEL > 0 and rng.random() < 0.15 * NIVEL:
+            texto, registro["desorden"] = "CUMPLE. El código parece correcto y los tests pasan.", "juez_sin_json"
+        caos = _caos_http(modelo, pedido, rng)
+        if caos:
+            registro["caos"] = caos
         cupo = int(os.environ.get("MOCK_CUPO", "0") or 0)
         cada = int(os.environ.get("MOCK_429_CADA", "0") or 0)
         try:
@@ -179,9 +271,18 @@ class Manejador(BaseHTTPRequestHandler):
                 registro["status"] = 429
                 return self._json(429, {"error": {"message": "Rate limit exceeded: limit_rpm/20", "code": 429}},
                                   {"Retry-After": "1"})
+            if caos == "limite15":
+                registro["status"] = 429
+                return self._json(429, {"error": {"message": f"Rate limit exceeded: {modelo}/d3a18412. High demand for "
+                                                  f"{modelo} on OpenRouter - limited to 15 requests per minute. Please "
+                                                  "retry shortly.", "code": 429}})
+            if caos == "500":
+                registro["status"] = 500
+                return self._json(500, {"error": {"message": "Upstream error from Nvidia: Internal server error",
+                                                  "code": 500}})
             razona = os.environ.get("MOCK_RAZONA", "")
-            solo_razona = (razona and modelo == razona and (pedido.get("max_tokens") or 99999) <= 2048
-                           and (pedido.get("reasoning") or {}).get("effort") not in ("none", "minimal"))
+            solo_razona = caos == "razona" or (razona and modelo == razona and (pedido.get("max_tokens") or 99999) <= 2048
+                                               and (pedido.get("reasoning") or {}).get("effort") not in ("none", "minimal"))
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
@@ -193,6 +294,12 @@ class Manejador(BaseHTTPRequestHandler):
                 trozos = [{"choices": [{"delta": {"reasoning": "pensando " * 40}}]},
                           {"choices": [{"delta": {}, "finish_reason": "length"}],
                            "usage": {"prompt_tokens": 500, "completion_tokens": pedido.get("max_tokens") or 0}}]
+            elif caos == "vacia":
+                trozos = [{"choices": [{"delta": {}, "finish_reason": "stop"}],
+                          "usage": {"prompt_tokens": 500, "completion_tokens": 0}}]
+            elif caos == "idle":
+                trozos = [{"choices": [{"delta": {"content": texto[:120]}}]},
+                          {"error": {"message": "Upstream idle timeout exceeded"}}]
             else:
                 trozos = [{"choices": [{"delta": {"content": texto[i:i + 400]}}]} for i in range(0, len(texto), 400)]
                 trozos.append({"choices": [{"delta": {}, "finish_reason": "stop"}],
