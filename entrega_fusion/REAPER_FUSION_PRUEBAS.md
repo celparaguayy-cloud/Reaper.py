@@ -756,7 +756,7 @@ Con la misma semilla, la secuencia de fallas es la misma. El pedido es el almac�
 | Escenario | Antes (`2edcb50`) | Después |
 |---|---|---|
 | Caos fuerte (nivel 2), semillas 1–3 | 2/3 terminadas: 119, 128 y 95 pedidos. La semilla 3 se detuvo en la etapa 5: el especificador escribió `<tool_call>{json}` (no se entendía), después anunció dos veces sin hacer nada y el reparador no escribió el test que faltaba | **3/3 terminadas**: 74, 86 y 71 pedidos (−35 %) |
-| Caos moderado (nivel 1), semillas 1–3 | 3/3: 99, 95 y 90 pedidos | (medición en curso; se completa en la próxima entrega) |
+| Caos moderado (nivel 1), semillas 1–3 | 3/3: 99, 95 y 90 pedidos | **3/3**: 69, 69 y 64 pedidos (−29 %), unos 4m15s cada una (antes unos 6m30s) |
 | Tercera prueba real (`MOCK_ACOPLADO=1`): el especificador escribe `tests/test_ventas.py` acoplado (mockea la conexión y exige el SQL exacto) y no lo corrige aunque se lo pidan | **Etapa 2 FALLIDA, 1/5**, igual que en el teléfono | **5/5 terminadas**, 64 pedidos: no lo protege, falla y el reparador lo reescribe con sqlite real |
 | El proyecto trabado por la versión vieja + `--grande continuar` con la nueva (lo que tiene que hacer el usuario) | — | **5/5 terminadas**, 52 pedidos. Dos intentos chocan con el test protegido, REAPER lo libera y el tercero lo reescribe |
 | Normal / test roto (`MOCK_TEST_ROTO`) / implementador flojo (`MOCK_FLOJO`) | 78 pedidos (normal) | 59 / 66 / 63 pedidos, todos terminados |
